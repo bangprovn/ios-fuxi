@@ -81,5 +81,17 @@ int main(){
   const char *second=strstr(buffer,"top2 ");assert(second && strstr(second,"pass 64x16 colors=1 load=C store=S") && strstr(second,"n/submit=2.00") && strstr(second,"copies=1.0") && strstr(second,"avg_ms=0.125"));
   assert(strstr(buffer,"top3 op 0x0") && !strstr(buffer,"top4 ") && times.submitCount()==0);
  }
+ { // per-draw GPU times: the pass with the largest draw sum wins, draws ranked, begin markers skipped; SPIR-V statistics
+  std::vector<DrawInfo> infos;std::vector<uint64_t> ns;
+  auto begin=[&](uint32_t w,uint32_t h,uint64_t t){DrawInfo m{};m.begin=true;m.passW=w;m.passH=h;infos.push_back(m);ns.push_back(t);};
+  auto draw=[&](uint32_t pipe,uint64_t t,uint8_t kind){DrawInfo d{};d.pipeline=pipe;d.count=6;d.blend=1;d.texCount=1;d.tex[0]={1125,2436,80,kind};d.instr=12;infos.push_back(d);ns.push_back(t);};
+  begin(64,16,900000);draw(1,50000,0);begin(1125,2436,400000);for(uint32_t i=0;i<7;++i)draw(0x100+i,100000+i*10000,i==3?1:0);
+  char buffer[4096]{};FILE *o=fmemopen(buffer,sizeof buffer,"w");reportDraws(o,infos,ns);fclose(o);
+  assert(strstr(buffer,"passes=2 top_pass=1 1125x2436 draws=7") && strstr(buffer,"top1 ms=0.160 pipe=000106") && strstr(buffer,"top5 ms=0.120") && !strstr(buffer,"top6 "));
+  assert(strstr(buffer,"[1125x2436 fmt=80 linear]") && strstr(buffer,"frag_instr=12") && !strstr(buffer,"pipe=000001"));
+  uint32_t code[18]={0x07230203,0x10000,0,10,0};code[5]=(4u<<16)|21;code[9]=(5u<<16)|87;code[14]=(3u<<16)|246;code[17]=(1u<<16)|252;
+  auto st=spirvStats(code,sizeof code/4);assert(st.instr==4 && st.samples==1 && st.loops==1 && st.kills==1);
+  std::vector<DrawInfo> none;std::vector<uint64_t> zero;char quiet[64]{};FILE *q=fmemopen(quiet,sizeof quiet,"w");reportDraws(q,none,zero);fclose(q);assert(!quiet[0]);
+ }
  puts("PASS: bounded frame percentiles/reset/overflow/max, log fields, CPU mask and thread-local attribution");
 }

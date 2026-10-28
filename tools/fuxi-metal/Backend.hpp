@@ -98,7 +98,7 @@ struct VariantKey {
  explicit VariantKey(const DrawInput &input){for(unsigned i=0;i<resourceSlots;++i){auto *w=&words[i*8];w[0]=input.formats[i];w[1]=input.filters[i];memcpy(w+2,&input.lodMin[i],4);memcpy(w+3,&input.lodMax[i],4);for(unsigned stage=0;stage<2;++stage){w[4+stage*2]=input.buffers[stage][i].length!=0;w[5+stage*2]=input.buffers[stage][i].bytes;}}}
  bool operator==(const VariantKey &other) const {return words==other.words;}
 };
-struct Pipeline {ShadowWindow shadowWindows[2][resourceSlots]{};std::array<uint32_t,resourceSlots> textureTypes{};size_t references=1,retainedBytes=0;void *translation{};CompileOptions options{};uint32_t fetchMask{};bool orderedColorAccess=false;std::vector<std::pair<uint32_t,VkRenderPass>> renders;VkPipeline pipeline{},stripPipeline{};std::array<VkPipeline,2> linePipelines{};Translation recipe{};VkPipelineLayout layout{};VkRenderPass render{};uint32_t pushOffset{},pushSize{},pushStages{};uint8_t pushBytes[128]{};VkDescriptorSetLayout setLayout{};VkSampler bakedSamplers[16]{};BakedSampler bakedSamplerInfo[16]{};MipAccess mipAccess[2];uint32_t readOnlyStorage[2]{};std::vector<Descriptor> descriptors;std::vector<Buffer *> constantBlobs;std::vector<std::array<uint8_t,32>> blobHashes;std::vector<std::pair<VariantKey,Pipeline *>> variants;
+struct Pipeline {uint32_t id{},fragInstr{},fragSamples{},fragLoops{},fragKills{};ShadowWindow shadowWindows[2][resourceSlots]{};std::array<uint32_t,resourceSlots> textureTypes{};size_t references=1,retainedBytes=0;void *translation{};CompileOptions options{};uint32_t fetchMask{};bool orderedColorAccess=false;std::vector<std::pair<uint32_t,VkRenderPass>> renders;VkPipeline pipeline{},stripPipeline{};std::array<VkPipeline,2> linePipelines{};Translation recipe{};VkPipelineLayout layout{};VkRenderPass render{};uint32_t pushOffset{},pushSize{},pushStages{};uint8_t pushBytes[128]{};VkDescriptorSetLayout setLayout{};VkSampler bakedSamplers[16]{};BakedSampler bakedSamplerInfo[16]{};MipAccess mipAccess[2];uint32_t readOnlyStorage[2]{};std::vector<Descriptor> descriptors;std::vector<Buffer *> constantBlobs;std::vector<std::array<uint8_t,32>> blobHashes;std::vector<std::pair<VariantKey,Pipeline *>> variants;
 };
 struct BufferBind {Buffer *buffer{};uint64_t offset{};bool bytes=false;uint32_t end{};
  uint64_t length() const{return end?end:buffer?buffer->length:0;}};
@@ -209,7 +209,7 @@ private:
  // kind bits name the resource for conflict diagnostics: 1 buffer, 2 shadow backing, 4 texture, 8 surface, 16 index.
  struct HostUse {VkDeviceMemory memory;const void *address;size_t bytes;uint8_t kind=1;Buffer *buffer=nullptr;};
  struct SubmitSlot {
-  VkCommandPool commandPool{};VkCommandBuffer command{};VkFence submitFence{};VkQueryPool queryPool{},passPool{};
+  VkCommandPool commandPool{};VkCommandBuffer command{};VkFence submitFence{};VkQueryPool queryPool{},passPool{},drawPool{};
   Buffer *aliasScratch=nullptr;VkDescriptorPool descriptorPool{};uint32_t descriptorSets{};
   std::vector<VkDescriptorPoolSize> descriptorCapacity;std::vector<HostUse> hostUses,writes,uses;bool busy=false;
  } slots[2];
@@ -221,7 +221,14 @@ private:
  static constexpr size_t frameCacheLimit=512,viewCacheLimit=512;
  static uint64_t frameKey(const std::array<Texture *,8> &t,VkRenderPass render,const std::array<uint32_t,8> &levels){uint64_t h=0xcbf29ce484222325ull;for(size_t i=0;i<8;++i)h=((h^uint64_t(uintptr_t(t[i])))*0x100000001b3ull^levels[i])*0x100000001b3ull;return (h^uint64_t(uintptr_t(render)))*0x100000001b3ull;}
  static uint64_t viewKey(const Texture *t,VkFormat format,const std::array<uint32_t,4> &c,uint32_t base,uint32_t count){uint64_t h=0xcbf29ce484222325ull;for(uint64_t x:{uint64_t(uintptr_t(t)),uint64_t(format),uint64_t(c[0])|uint64_t(c[1])<<8|uint64_t(c[2])<<16|uint64_t(c[3])<<24,uint64_t(base)<<32|count})h=(h^x)*0x100000001b3ull;return h;}
- static constexpr uint32_t passStampLimit=255;static inline PassTimes passTimes;
+ static constexpr uint32_t passStampLimit=255;static inline PassTimes passTimes;uint64_t drawSampleSerial=0;
+ void readDrawTimes(VkQueryPool pool,const std::vector<DrawInfo> &infos){
+  if(!pool || infos.empty())return;std::vector<uint64_t> ticks(infos.size()+1),delta(infos.size());
+  if(GetQueryPoolResults(device,pool,0,uint32_t(ticks.size()),ticks.size()*sizeof(uint64_t),ticks.data(),sizeof(uint64_t),VK_QUERY_RESULT_64_BIT)!=VK_SUCCESS)return;
+  uint64_t mask=timestampBits>=64?UINT64_MAX:(uint64_t(1)<<timestampBits)-1;
+  for(size_t i=0;i<infos.size();++i)delta[i]=uint64_t(double((ticks[i+1]-ticks[i])&mask)*timestampPeriod);
+  reportDraws(stderr,infos,delta);
+ }
  void readPassTimes(VkQueryPool pool,const std::vector<PassInfo> &infos,uint64_t whole){
   if(!pool || infos.empty())return;std::vector<uint64_t> ticks(infos.size()+1),delta(infos.size());
   if(GetQueryPoolResults(device,pool,0,uint32_t(ticks.size()),ticks.size()*sizeof(uint64_t),ticks.data(),sizeof(uint64_t),VK_QUERY_RESULT_64_BIT)!=VK_SUCCESS)return;
@@ -242,7 +249,7 @@ private:
  void clearSubmitObjects(SubmitSlot &slot) {
   auto &descriptorPool=slot.descriptorPool;auto &queryPool=slot.queryPool;auto &submitFence=slot.submitFence;auto &commandPool=slot.commandPool;auto &command=slot.command;auto &descriptorSets=slot.descriptorSets;auto &descriptorCapacity=slot.descriptorCapacity;
   if(descriptorPool)DestroyDescriptorPool(device,descriptorPool,nullptr);
-  if(queryPool)DestroyQueryPool(device,queryPool,nullptr);if(slot.passPool)DestroyQueryPool(device,slot.passPool,nullptr);slot.passPool={};
+  if(queryPool)DestroyQueryPool(device,queryPool,nullptr);if(slot.passPool)DestroyQueryPool(device,slot.passPool,nullptr);slot.passPool={};if(slot.drawPool)DestroyQueryPool(device,slot.drawPool,nullptr);slot.drawPool={};
   if(submitFence)DestroyFence(device,submitFence,nullptr);
   if(commandPool)DestroyCommandPool(device,commandPool,nullptr);
   descriptorPool={};queryPool={};submitFence={};commandPool={};command={};descriptorSets=0;descriptorCapacity.clear();
@@ -530,6 +537,7 @@ public:
    };
    if((formatProperties.linearTilingFeatures&required)!=(uint32_t)required)return fallback("linear texture format features unavailable");
    // A shadowed buffer's bytes are rewritten each frame; sampling it in place would pin the buffer to every flight reading it. A copy through a shadow image lets the storage be renamed.
+   if(usage==1 && systemTranslationPolicy().linearShadow && uint64_t(width)*height>=65536)return fallback("sampled linear texture copied to optimal tiling");
    if(shadowed && usage==1 && systemTranslationPolicy().shadowRename && !b->imported)return fallback("shadowed buffer samples through a copy (rename)");
    if(b->imported){
     ci.pNext=&external;
@@ -864,7 +872,7 @@ public:
   try{p->renders.push_back({key,render});}catch(...){DestroyRenderPass(device,render,nullptr);throw;}return render;
  }
  Pipeline *createPipeline(Translation translated,const CompileOptions &options) {
-  auto &tr=Translator::get();auto *p=new Pipeline{};p->options=options;
+  auto &tr=Translator::get();auto *p=new Pipeline{};p->options=options;{static std::atomic<uint32_t> serial{0};p->id=++serial;auto st=spirvStats(translated.fragment,translated.fragmentCount);p->fragInstr=st.instr;p->fragSamples=st.samples;p->fragLoops=st.loops;p->fragKills=st.kills;}
   if(tr.shadow_windows){ShadowWindow windows[2][resourceSlots]{};if(tr.shadow_windows(translated.handle,&windows[0][0])==1)memcpy(p->shadowWindows,windows,sizeof(windows));}
   p->textureTypes.fill(2);if(tr.texture_type)for(unsigned slot=0;slot<resourceSlots;++slot)p->textureTypes[slot]=tr.texture_type(translated.handle,slot);
   auto cleanup=[&]{if(translated.handle)tr.free(translated.handle);};
@@ -1446,13 +1454,16 @@ public:
     if(!submitFence){VkFenceCreateInfo fi{};fi.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;check(CreateFence(device,&fi,nullptr,&submitFence));++reuseCounts.fences;++submitObjectCreates;++submitPoolCreates;}
     else check(ResetFences(device,1,&submitFence));
     if(systemTranslationPolicy().passTimes && supportsTimestamps() && !slot.passPool){VkQueryPoolCreateInfo pi{};pi.sType=VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;pi.queryType=VK_QUERY_TYPE_TIMESTAMP;pi.queryCount=passStampLimit+1;check(CreateQueryPool(device,&pi,nullptr,&slot.passPool));}
+    if(systemTranslationPolicy().drawTimes && supportsTimestamps() && !slot.drawPool){VkQueryPoolCreateInfo pi{};pi.sType=VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;pi.queryType=VK_QUERY_TYPE_TIMESTAMP;pi.queryCount=passStampLimit+1;check(CreateQueryPool(device,&pi,nullptr,&slot.drawPool));}
     if(supportsTimestamps() && !queryPool){VkQueryPoolCreateInfo qi{};qi.sType=VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;qi.queryType=VK_QUERY_TYPE_TIMESTAMP;qi.queryCount=2;check(CreateQueryPool(device,&qi,nullptr,&queryPool));++reuseCounts.queries;++submitObjectCreates;++submitPoolCreates;}
    }
    VkCommandBuffer cmd=command;VkQueryPool timestamps=queryPool;VkFence fence=submitFence;VkQueryPool passQ=timestamps && systemTranslationPolicy().passTimes?slot.passPool:VkQueryPool{};
+   VkQueryPool drawQ=timestamps && systemTranslationPolicy().drawTimes && drawSampleSerial++%30==0?slot.drawPool:VkQueryPool{};std::vector<DrawInfo> drawInfos;
    auto recordStart=std::chrono::steady_clock::now();uint64_t recordObjects=objectNanos;
    VkCommandBufferBeginInfo bi{};bi.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;bi.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;{PhaseTimer phase(SubPhase::cmdBegin);check(BeginCommandBuffer(cmd,&bi));}
    if(timestamps){CmdResetQueryPool(cmd,timestamps,0,2);CmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,timestamps,0);}
    if(passQ){CmdResetQueryPool(cmd,passQ,0,passStampLimit+1);CmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,passQ,0);}
+   if(drawQ){CmdResetQueryPool(cmd,drawQ,0,passStampLimit+1);CmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,drawQ,0);}
    uint32_t stampCopies=0,stampBarriers=0;std::vector<PassInfo> passInfos;PassInfo cur{};
    auto pb=[&](auto &&...a){++stampBarriers;if(currentFrame)++currentFrame->pipelineBarriers;{PhaseTimer phase(SubPhase::barriers);CmdPipelineBarrier(cmd,a...);}};
    VkMemoryBarrier barrier{};barrier.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;barrier.srcAccessMask=VK_ACCESS_HOST_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
@@ -1651,6 +1662,7 @@ public:
       if(passQ){cur.areaW=ri.renderArea.extent.width;cur.areaH=ri.renderArea.extent.height;}
      }
      if(currentFrame)++currentFrame->passes;{PhaseTimer phase(SubPhase::passes);CmdBeginRenderPass(cmd,&ri,VK_SUBPASS_CONTENTS_INLINE);}
+     if(drawQ && drawInfos.size()<passStampLimit){DrawInfo m{};m.begin=true;m.passW=ri.renderArea.extent.width;m.passH=ri.renderArea.extent.height;drawInfos.push_back(m);CmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,drawQ,uint32_t(drawInfos.size()));}
      }else if(currentFrame)++currentFrame->mergedDraws;
      auto pipeline=topologyPipeline(op.pipeline,op.topology);
      if(pipeline!=boundPipeline){CmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline);boundPipeline=pipeline;}
@@ -1710,9 +1722,16 @@ public:
       }
       if(set!=boundSet || op.pipeline->layout!=boundLayout){CmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,op.pipeline->layout,0,1,&set,0,nullptr);boundSet=set;boundLayout=op.pipeline->layout;}
      }
+     DrawInfo di{};
+     if(currentFrame || drawQ){const auto &po=op.pipeline->options;di.pipeline=op.pipeline->id;di.count=draw.count;di.blend=po.blend;di.srcRGB=po.srcRGB;di.dstRGB=po.dstRGB;di.srcAlpha=po.srcAlpha;di.dstAlpha=po.dstAlpha;di.mask=po.mask;di.instr=op.pipeline->fragInstr;di.samples=op.pipeline->fragSamples;di.loops=op.pipeline->fragLoops;di.kills=op.pipeline->fragKills;
+      for(unsigned i=0;i<draw.descriptorCount;++i){const auto &d=draw.descriptors[i];if(d.source || (d.type!=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && d.type!=VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) || d.slot>=resourceSlots)continue;
+       auto *t=d.slot==0 && !op.samples[0]?op.sourceTexture:op.samples[d.slot];if(!t)continue;uint8_t kind=t->tiling==VK_IMAGE_TILING_LINEAR?1:t->shadow?2:0;uint64_t bytes=uint64_t(t->width)*t->height*texelBytes(t->format);
+       if(currentFrame){if(kind==1){++currentFrame->sampleLinear;currentFrame->sampleLinearBytes+=bytes;}else if(kind==2){++currentFrame->sampleShadow;currentFrame->sampleShadowBytes+=bytes;}else{++currentFrame->sampleOptimal;currentFrame->sampleOptimalBytes+=bytes;}}
+       if(di.texCount<4){di.tex[di.texCount++]={t->width,t->height,t->format,kind};}}}
      {PhaseTimer phase(SubPhase::record);for(unsigned i=0;i<draw.pushCount;++i){auto &w=draw.pushes[i];CmdPushConstants(cmd,op.pipeline->layout,w.stages,w.offset,w.size,w.bytes);}
      for(unsigned i=0;i<draw.vertexCount;++i){auto b=op.buffers[0][draw.vertexSlots[i]].buffer;VkDeviceSize offset=draw.vertexOffsets[i];CmdBindVertexBuffers(cmd,draw.vertexBindings[i],1,&b->buffer,&offset);}
      if(draw.indexed){CmdBindIndexBuffer(cmd,op.indices->buffer,draw.indexOffset,op.indexWidth==2?VK_INDEX_TYPE_UINT16:VK_INDEX_TYPE_UINT32);CmdDrawIndexed(cmd,draw.count,1,draw.first,0,0);}else CmdDraw(cmd,draw.count,1,draw.first,0);}
+     if(drawQ && drawInfos.size()<passStampLimit){drawInfos.push_back(di);CmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,drawQ,uint32_t(drawInfos.size()));}
      if(opIndex==passEnd){PhaseTimer phase(SubPhase::passes);CmdEndRenderPass(cmd);}
     } else if(op.texture && op.clearOnly && ((op.areaWidth && op.areaWidth!=op.texture->levelWidth(op.dstLevel)) || (op.areaHeight && op.areaHeight!=op.texture->levelHeight(op.dstLevel)))) {
      // Empty partial passes still execute Metal load/store over the chosen area.
@@ -1822,7 +1841,7 @@ public:
    if(timestamps){uint64_t ticks[2]{};check(GetQueryPoolResults(device,timestamps,0,2,sizeof(ticks),ticks,sizeof(uint64_t),VK_QUERY_RESULT_64_BIT));
     uint64_t mask=timestampBits>=64?UINT64_MAX:(uint64_t(1)<<timestampBits)-1;
     uint64_t elapsed=(uint64_t)(double((ticks[1]-ticks[0])&mask)*timestampPeriod);
-    gpuNanos.fetch_add(elapsed);if(currentFrame){currentFrame->gpuExec+=elapsed;++currentFrame->gpuSamples;}++gpuSamples;readPassTimes(passQ,passInfos,elapsed);
+    gpuNanos.fetch_add(elapsed);if(currentFrame){currentFrame->gpuExec+=elapsed;++currentFrame->gpuSamples;}++gpuSamples;readPassTimes(passQ,passInfos,elapsed);readDrawTimes(drawQ,drawInfos);
    }
    auto invalidateStart=std::chrono::steady_clock::now();
    for(auto *t:textures)if(t->mapped && !coherent(t->memoryType)) {VkMappedMemoryRange r{};r.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;r.memory=t->memory;r.size=VK_WHOLE_SIZE;++invalidateCalls;check(InvalidateMappedMemoryRanges(device,1,&r));}
@@ -1850,7 +1869,7 @@ public:
    for(const auto &op:ops){if(op.pipeline && std::find(pinnedPipelines.begin(),pinnedPipelines.end(),op.pipeline)==pinnedPipelines.end())pinnedPipelines.push_back(op.pipeline);
     auto add=[&](Sampler *s){if(s && std::find(pinnedSamplers.begin(),pinnedSamplers.end(),s)==pinnedSamplers.end())pinnedSamplers.push_back(s);};add(op.sampler);for(auto *s:op.samplers)add(s);}
    pinPhase.reset();auto retired=std::make_shared<bool>(false);
-   std::function<void()> finish=[this,&slot,fence,timestamps,passQ,passInfos,pinnedBuffers,pinnedTextures,pinnedPipelines,pinnedSamplers,sampleViews,frames,emptyRenders,aliasBuffer,neutralBuffer,submitQueued,retired] {
+   std::function<void()> finish=[this,&slot,fence,timestamps,passQ,passInfos,drawQ,drawInfos,pinnedBuffers,pinnedTextures,pinnedPipelines,pinnedSamplers,sampleViews,frames,emptyRenders,aliasBuffer,neutralBuffer,submitQueued,retired] {
     // Fence waits never hold the device/recording mutex. One owner retires each ticket.
     if(*retired)return;*retired=true;
     auto waitStart=FrameClock::now();VkResult result;
@@ -1871,7 +1890,7 @@ public:
      if(timestamps){uint64_t ticks[2]{};check(GetQueryPoolResults(device,timestamps,0,2,sizeof(ticks),ticks,sizeof(uint64_t),VK_QUERY_RESULT_64_BIT));
       uint64_t mask=timestampBits>=64?UINT64_MAX:(uint64_t(1)<<timestampBits)-1;
       uint64_t elapsed=uint64_t(double((ticks[1]-ticks[0])&mask)*timestampPeriod);
-      gpuNanos+=elapsed;if(currentFrame){currentFrame->gpuExec+=elapsed;++currentFrame->gpuSamples;}++gpuSamples;readPassTimes(passQ,passInfos,elapsed);
+      gpuNanos+=elapsed;if(currentFrame){currentFrame->gpuExec+=elapsed;++currentFrame->gpuSamples;}++gpuSamples;readPassTimes(passQ,passInfos,elapsed);readDrawTimes(drawQ,drawInfos);
      }
      auto invalidateStart=FrameClock::now();
      for(auto *t:pinnedTextures)if(t->mapped && !coherent(t->memoryType)){VkMappedMemoryRange r{};r.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;r.memory=t->memory;r.size=VK_WHOLE_SIZE;++invalidateCalls;check(InvalidateMappedMemoryRanges(device,1,&r));}

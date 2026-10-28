@@ -13,6 +13,35 @@ struct PassInfo {
  uint32_t width=0,height=0,colors=0,draws=0,copies=0,barriers=0;uint32_t load=0; // load: 2 bits per attachment (0 dont-care, 1 load, 2 clear)
  uint32_t store=0,areaW=0,areaH=0;uint8_t kind=0; // store: 1 bit per attachment; kind 0 draw pass, 1 empty pass, 2 transfer/other op
 };
+// Per-draw GPU time inside render passes (FUXI_MTL_GPU_DRAW_TIMES=1, one submit in 30). Stamp 0 is the submit start; every entry owns the next
+// stamp. A begin marker closes a pass-opening stamp (its delta holds the preceding copies/barriers and is not a draw); the report picks the pass with
+// the largest summed draw time and prints its 5 most expensive draws.
+struct DrawTex {uint32_t width=0,height=0,format=0;uint8_t kind=0;}; // kind 0 optimal, 1 linear alias, 2 optimal shadow of a buffer
+struct DrawInfo {
+ bool begin=false;uint32_t pipeline=0,count=0,blend=0,srcRGB=0,dstRGB=0,srcAlpha=0,dstAlpha=0,mask=0,instr=0,samples=0,loops=0,kills=0,texCount=0,passW=0,passH=0;DrawTex tex[4];
+};
+// Counts SPIR-V instructions, image samples, loop merges and discards in a fragment shader (word stream; header is 5 words).
+struct SpirvStats {uint32_t words=0,instr=0,samples=0,loops=0,kills=0;};
+inline SpirvStats spirvStats(const uint32_t *w,size_t n){
+ SpirvStats s;s.words=uint32_t(n);if(!w || n<5)return s;
+ for(size_t i=5;i<n;){uint32_t op=w[i]&0xffffu,len=w[i]>>16;if(!len || i+len>n)break;++s.instr;
+  if(op>=87 && op<=95)++s.samples;else if(op==246)++s.loops;else if(op==252 || op==4416 || op==5380)++s.kills;i+=len;}
+ return s;
+}
+inline void reportDraws(FILE *out,const std::vector<DrawInfo> &infos,const std::vector<uint64_t> &ns,size_t top=5){
+ std::vector<uint64_t> passNs;std::vector<size_t> first;int cur=-1;
+ for(size_t i=0;i<infos.size() && i<ns.size();++i){if(infos[i].begin){passNs.push_back(0);first.push_back(i+1);cur=int(passNs.size())-1;}else if(cur>=0)passNs[cur]+=ns[i];}
+ if(passNs.empty())return;size_t best=0;for(size_t i=1;i<passNs.size();++i)if(passNs[i]>passNs[best])best=i;
+ size_t b=first[best],e=b;while(e<infos.size() && e<ns.size() && !infos[e].begin)++e;
+ std::vector<size_t> order;for(size_t i=b;i<e;++i)order.push_back(i);
+ std::sort(order.begin(),order.end(),[&](size_t x,size_t y){return ns[x]>ns[y];});
+ const auto &h=infos[b-1];
+ fprintf(out,"FUXI MTL: gpu draw times passes=%zu top_pass=%zu %ux%u draws=%zu sum_ms=%.3f\n",passNs.size(),best,h.passW,h.passH,e-b,passNs[best]/1e6);
+ for(size_t k=0;k<top && k<order.size();++k){const auto &d=infos[order[k]];
+  fprintf(out,"FUXI MTL: gpu draw top%zu ms=%.3f pipe=%06x verts=%u blend=%u rgb=%u/%u a=%u/%u mask=%u frag_instr=%u samples=%u loops=%u kills=%u tex=%u",k+1,ns[order[k]]/1e6,d.pipeline,d.count,d.blend,d.srcRGB,d.dstRGB,d.srcAlpha,d.dstAlpha,d.mask,d.instr,d.samples,d.loops,d.kills,d.texCount);
+  for(unsigned t=0;t<d.texCount && t<4;++t)fprintf(out," [%ux%u fmt=%u %s]",d.tex[t].width,d.tex[t].height,d.tex[t].format,d.tex[t].kind==1?"linear":d.tex[t].kind==2?"shadow":"optimal");
+  fprintf(out,"\n");}
+}
 class PassTimes {
  struct Row {PassInfo info;uint64_t count=0,totalNs=0,maxNs=0,draws=0,copies=0,barriers=0,areaPixels=0,fullPixels=0;};
  std::mutex mutex;std::unordered_map<uint64_t,Row> rows;uint64_t submits=0,passes=0,passNs=0,wholeNs=0;
