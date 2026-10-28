@@ -72,9 +72,9 @@ void main(){color=c.value;}
         subprocess.run(common+['-shared', '-fPIC', str(ROOT/'tools/fuxi-metal/TextureShadowBridge.cpp'), '-o', str(d/'texture-bridge.so')], check=True)
         subprocess.run(common+['-DFUXI_MTL_HOST_TEST', '-DFUXI_MTL_ICD="'+str(a.icd.resolve())+'"',
             '-DFUXI_MTL_TRANSLATOR="'+str(d/'texture-bridge.so')+'"', str(ROOT/'tools/fuxi-metal/TextureShadowCopyTests.cpp'), '-ldl', '-pthread', '-o', str(d/'texture-pixels')], check=True)
-        for args in ('', 'fuxigpuoverlap=1 fuxigpusubmit=1'):
-            for rt, reuse in (('0', '0'), ('1', '0'), ('1', '1')):
-                subprocess.run([str(d/'texture-pixels')], env=dict(texture_env, FUXI_MTL_RT_SHADOW=rt, FUXI_MTL_RT_SHADOW_REUSE=reuse, FUXI_MTL_TEST_BOOTARGS='fuxigpuframetrace=1 '+args), check=True, timeout=60)
+        for args in ('', 'fuxigpuoverlap=1 fuxigpusubmit=1', 'fuxigpumerge=1 fuxigpuperf=7'):
+            for rt, reuse, rename in (('0', '0', '0'), ('1', '0', '0'), ('1', '1', '0'), ('0', '0', '1'), ('1', '1', '1')):
+                subprocess.run([str(d/'texture-pixels')], env=dict(texture_env, FUXI_MTL_RT_SHADOW=rt, FUXI_MTL_RT_SHADOW_REUSE=reuse, FUXI_MTL_RT_RENAME=rename, FUXI_MTL_TEST_BOOTARGS='fuxigpuframetrace=1 '+args), check=True, timeout=60)
         subprocess.run(common+['-DFUXI_MTL_HOST_TEST', '-DFUXI_MTL_ICD="'+str(a.icd.resolve())+'"',
             '-DFUXI_MTL_TRANSLATOR="'+str(d/'texture-bridge.so')+'"', str(ROOT/'tools/fuxi-metal/AdmissionTests.cpp'), '-ldl', '-pthread', '-o', str(d/'admission')], check=True)
         subprocess.run([str(d/'admission')], env=dict(texture_env, FUXI_MTL_TEST_BOOTARGS='fuxigpuframetrace=1 fuxigpuoverlap=1 fuxigpusubmit=1'), check=True, timeout=60)
@@ -83,7 +83,7 @@ void main(){color=c.value;}
             subprocess.run(common+extra+['-shared', '-fPIC', str(ROOT/'tools/fuxi-metal/ShadowBridge.cpp'), '-o', str(d/'bridge.so')], check=True)
             subprocess.run(common+['-DFUXI_MTL_HOST_TEST', '-DFUXI_MTL_ICD="'+str(a.icd.resolve())+'"',
                 '-DFUXI_MTL_TRANSLATOR="'+str(d/'bridge.so')+'"', str(ROOT/'tools/fuxi-metal/ShadowCopyTests.cpp'), '-ldl', '-pthread', '-o', str(d/'pixels')], check=True)
-            for args in ('', 'fuxigpuoverlap=1 fuxigpusubmit=1'):
+            for args in ('', 'fuxigpuoverlap=1 fuxigpusubmit=1', 'fuxigpumerge=1 fuxigpuperf=7'):
                 runenv = dict(env, FUXI_MTL_TEST_BOOTARGS='fuxigpuframetrace=1 '+args)
                 runenv.pop('SHADOW_OLD_ADAPTER', None)
                 if old:

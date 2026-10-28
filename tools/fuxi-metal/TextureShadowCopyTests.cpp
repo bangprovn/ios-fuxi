@@ -39,8 +39,49 @@ static void rtShadowReadback(Backend &b){
  if(on){uint64_t created=b.rtShadowCreated;b.destroy(t);t=b.linearTexture(buffer,80,5,n,n,0,n*4);run({clear(t,1.f,0.f,0.f,2,512)});assert(b.rtShadowCreated==created);for(uint32_t y:{0u,1023u})for(uint32_t x:{0u,1023u}){auto *q=px(buffer,x,y);bool inside=x<512 && y<512;assert(inside?(q[0]==0 && q[1]==0 && q[2]==255):(q[0]==255 && q[1]==0 && q[2]==0));}}
  b.destroy(t);b.destroy(t2);b.destroy(buffer);b.destroy(other);
 }
+// FUXI_MTL_RT_RENAME: an offscreen texture overwritten in turn between main-target passes is renamed and hoisted; the main-target bytes must be identical either way,
+// and an offscreen pass that samples the main target (directly or through a copy) must never move above the pass that wrote it.
+static void renameReplay(Backend &b){
+ const bool on=getenv("FUXI_MTL_RT_RENAME") && !strcmp(getenv("FUXI_MTL_RT_RENAME"),"1");
+ CompileOptions options;options.format=30;auto *pipeline=b.compilePipeline(nullptr,"control",nullptr,"control",options);auto *sampler=b.allocateSampler(false,false);
+ auto *main=b.allocateTexture(30,5,1100,1000),*x=b.allocateTexture(30,5,16,16),*y=b.allocateTexture(30,5,16,16),*s1=b.allocateTexture(30,5,16,16),*s2=b.allocateTexture(30,5,16,16);
+ auto *out=b.allocate(16*16*2);uint64_t encoder=0;
+ auto clear=[&](Texture *t,float r,float g,float bl){Operation c{};c.texture=t;c.clearOnly=true;c.load=2;c.clear[0]=r;c.clear[1]=g;c.clear[2]=bl;c.clear[3]=1;return c;};
+ auto draw=[&](Texture *target,Texture *src,uint32_t load,int32_t x0,uint32_t w){Operation d{};d.texture=target;d.pipeline=pipeline;d.samples[0]=src;d.samplers[0]=sampler;d.viewport={0,16,16,-16,0,1};d.scissor={{x0,0},{w,16}};d.load=load;d.encoderID=++encoder;return d;};
+ FrameSample trace;auto run=[&](std::vector<Operation> ops){Operation read{};read.texture=main;read.dst=out;read.to=0;read.width=16;read.height=16;ops.push_back(read);std::function<void()> retire;trace=FrameSample{};{FrameTraceScope scope(&trace);b.submit(std::move(ops),{},systemTranslationPolicy().overlap?&retire:nullptr);}if(retire)retire();};
+ const uint8_t A[2]={0,255},B[2]={255,0},Z[2]={0,0};
+ auto px=[&](unsigned xx,unsigned yy){return (const uint8_t *)out->contents+(yy*16+xx)*2;};
+ auto expect=[&](unsigned xx,unsigned yy,const uint8_t *c){assert(!memcmp(px(xx,yy),c,2));};
+ // 1) main, off, main, off(same texture again), main ... twelve main passes split by eleven offscreen passes, every pass in its own encoder
+ {uint64_t renamed=b.rtRenamed,hoisted=b.rtHoisted,before=b.rtMainBefore,after=b.rtMainAfter;
+  std::vector<Operation> ops{clear(s1,0.f,1.f,0.f),clear(s2,1.f,0.f,0.f)};
+  for(unsigned k=0;k<12;++k){if(k)ops.push_back(draw(x,k%2?s1:s2,2,0,16));ops.push_back(draw(main,k?x:s1,k?1:2,int32_t(k),1));}
+  run(ops);printf("RENAME_REPLAY encoded render passes=%llu draws=%llu merge=%d perf=%u rename=%d\n",(unsigned long long)trace.passes,(unsigned long long)trace.draws,int(systemTranslationPolicy().merge),systemTranslationPolicy().perf,int(on));
+  if(systemTranslationPolicy().merge && (systemTranslationPolicy().perf&2))assert(trace.passes==(on?12u:23u)); // twelve main-target passes and eleven offscreen ones; renaming + hoisting leaves one main pass
+  for(unsigned k=0;k<12;++k)for(unsigned yy:{0u,15u})expect(k,yy,k==0?A:(k%2?A:B));
+  expect(12,0,Z);expect(15,15,Z);
+  if(on){printf("RENAME_REPLAY main_runs %llu -> %llu renamed=%llu hoisted=%llu\n",(unsigned long long)(b.rtMainBefore-before),(unsigned long long)(b.rtMainAfter-after),(unsigned long long)(b.rtRenamed-renamed),(unsigned long long)(b.rtHoisted-hoisted));
+   assert(b.rtMainBefore-before==12 && b.rtMainAfter-after==1 && b.rtRenamed-renamed==10 && b.rtHoisted>hoisted);}
+ }
+ // 2) an offscreen pass sampling the main target directly stays below the pass that wrote it
+ {uint64_t before=b.rtMainBefore;(void)before;
+  std::vector<Operation> ops{clear(s1,0.f,1.f,0.f),clear(s2,1.f,0.f,0.f)};
+  ops.push_back(draw(main,s1,2,0,8));ops.push_back(draw(x,main,2,0,16));ops.push_back(draw(main,x,1,0,1));ops.push_back(draw(x,s2,2,0,16));ops.push_back(draw(main,x,1,8,1));
+  run(ops);
+  expect(0,0,A);expect(0,1,Z);expect(1,0,A);expect(7,15,A);expect(8,0,B);expect(9,0,Z);
+ }
+ // 3) an offscreen pass sampling a copy of the main target stays below the copy
+ {std::vector<Operation> ops{clear(s1,0.f,1.f,0.f),clear(s2,1.f,0.f,0.f)};
+  ops.push_back(draw(main,s1,2,0,8));
+  Operation copy{};copy.texture=y;copy.sourceTexture=main;copy.width=16;copy.height=16;ops.push_back(copy);
+  ops.push_back(draw(x,y,2,0,16));ops.push_back(draw(main,x,1,0,16));ops.push_back(draw(x,s2,2,0,16));ops.push_back(draw(main,x,1,15,1));
+  run(ops);
+  expect(0,0,A);expect(7,15,A);expect(8,0,Z);expect(14,3,Z);expect(15,0,B);expect(15,15,B);
+ }
+ b.destroy(pipeline);b.dropPipelineCacheForTest();b.destroy(sampler);b.destroy(main);b.destroy(x);b.destroy(y);b.destroy(s1);b.destroy(s2);b.destroy(out);
+}
 int main(){
- Backend b;ShadowPool pool;auto baseline=b.resourceBytes();aliasReadback(b);rtShadowReadback(b);
+ Backend b;ShadowPool pool;auto baseline=b.resourceBytes();aliasReadback(b);rtShadowReadback(b);renameReplay(b);
  auto *targetBuffer=b.allocate(65536);auto *target=b.linearTexture(targetBuffer,80,5,16,16,0,64);assert(!target->shadow && target->borrowedMemory);auto *out=b.allocate(25*16*16*4);auto *sampler=b.allocateSampler(false,false);
  CompileOptions options;auto *pipeline=b.compilePipeline(nullptr,"control",nullptr,"control",options);
  struct Source {Buffer *buffer;Texture *texture;std::vector<uint8_t> cpu;};std::vector<Source> sources;

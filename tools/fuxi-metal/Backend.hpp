@@ -202,7 +202,7 @@ private:
   size_t freed=0;for(size_t i=0;i<bufferPool.size() && freed<want;){if(all || want!=SIZE_MAX || now-bufferPool[i].idleSince>bufferPoolIdleNs){freed+=bufferPool[i].charged;auto e=bufferPool[i];bufferPool.erase(bufferPool.begin()+i);freePooledBuffer(e);}else ++i;}
   return freed;
  }
- void trimMemoryUnlocked(bool all=false,uint64_t now=memoryNow()){if(all)releaseRtShadows();
+ void trimMemoryUnlocked(bool all=false,uint64_t now=memoryNow()){if(all){releaseRtShadows();releaseRenamePool();}
   if(poisoned)return;
   trimBuffers(now,all);
   textureMemory.trim(now,all,[&](VkDeviceMemory h,size_t bytes){freePooledUnlocked(h,bytes);});
@@ -481,7 +481,7 @@ public:
   artifactCache.close();
   for(auto &slot:slots)clearSubmitObjects(slot);clearFrames();clearViews();for(auto &slot:slots){destroyUnlocked(slot.aliasScratch);slot.aliasScratch=nullptr;}
   objects.clear([&](Pipeline *p){drawPlans.invalidate(p);destroyPipelineUnlocked(p);});
-  releaseRtShadows();
+  releaseRtShadows();releaseRenamePool();
   pipelineCache.close();trimMemoryUnlocked(true);reportRtCounters();passTimes.report(stderr);
   if(device && DestroyDevice) DestroyDevice(device,nullptr);
   if(instance && DestroyInstance) DestroyInstance(instance,nullptr);
@@ -1192,11 +1192,13 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
  void rtForget(Texture *t) {rtForget((const void *)t);}
  void releaseRtShadows() {for(auto &e:rtShadows)destroyTextureUnlocked(e.second.s);rtShadows.clear();rtRefused.clear();}
  void reportRtCounters() {
+  if(systemTranslationPolicy().rtRename){uint64_t mb=0;for(auto &e:renamePool)mb+=uint64_t(e.w)*e.h*texelBytes(e.format);
+   fprintf(stderr,"FUXI MTL: rt rename submits=%llu renamed=%llu hoisted=%llu merged_main_passes=%llu main_runs_before=%llu main_runs_after=%llu pool_images=%zu pool_mb=%.2f\n",(unsigned long long)rtRenameSubmits,(unsigned long long)rtRenamed,(unsigned long long)rtHoisted,(unsigned long long)rtMergedMain,(unsigned long long)rtMainBefore,(unsigned long long)rtMainAfter,renamePool.size(),double(mb)/1048576.0);}
   fprintf(stderr,"FUXI MTL: rt shadow enabled=%d reuse=%d shadows=%zu created=%llu in=%llu in_skipped=%llu reused=%llu out=%llu syncs=%llu copy_src_redirects=%llu eligible_uses=%llu linear_large_uses=%llu sync_compiles=%llu sync_compile_ms=%.1f\n",
    int(systemTranslationPolicy().rtShadow),int(systemTranslationPolicy().rtReuse),rtShadows.size(),(unsigned long long)rtShadowCreated,(unsigned long long)rtShadowIn,(unsigned long long)rtShadowInSkipped,(unsigned long long)rtShadowReused,(unsigned long long)rtShadowOut,(unsigned long long)rtShadowSyncs,(unsigned long long)rtShadowRedirects,(unsigned long long)rtEligibleSeen,(unsigned long long)rtLinearLargeSeen,(unsigned long long)syncCompiles.load(),double(syncCompileNs.load())/1e6);
  }
  // One compact line describing the op stream of a submit: P(passes: WxH tiling#id d=draws), C(copy src->dst), U(upload), M(mips), B(buffer op). L=linear O=optimal S=rt-shadow.
- void logOpSequence(const std::vector<Operation> &ops) {
+ void logOpSequence(const std::vector<Operation> &ops,const char *tag) {
   auto tl=[](Texture *t){return t->rtTarget?'S':t->tiling==VK_IMAGE_TILING_LINEAR?'L':'O';};
   auto id=[](Texture *t){return unsigned((uintptr_t(t)>>4)&0xfff);};
   std::string line;char tmp[200];size_t i=0;std::string last;unsigned repeat=0;
@@ -1212,7 +1214,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
    else emit("B");
    ++i;}
   if(repeat>1){snprintf(tmp,sizeof tmp,"x%u",repeat);line+=tmp;}
-  fprintf(stderr,"FUXI MTL: op sequence ops=%zu %s%s\n",ops.size(),line.c_str(),i<ops.size()?" ...":"");
+  fprintf(stderr,"FUXI MTL: op sequence%s ops=%zu %s%s\n",tag,ops.size(),line.c_str(),i<ops.size()?" ...":"");
  }
  // FUXI_MTL_RT_SHADOW=1. A large LINEAR color target (an IOSurface-backed swap buffer) renders into a persistent OPTIMAL shadow image so the GPU can tile/compress it.
  // Per submit, in op order: the first render use copies linear->shadow unless the pass fully overwrites it; any non-render use of the linear image, or of anything else
@@ -1290,14 +1292,14 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
   for(auto it=rtShadows.begin();it!=rtShadows.end();){if(it->second.used+900<rtSubmits){destroyTextureUnlocked(it->second.s);it=rtShadows.erase(it);}else ++it;}
   ops.swap(out);
  }
- void reorderPasses(std::vector<Operation> &ops) {
-  std::vector<PassGroup> groups;
+
+ bool buildGroups(const std::vector<Operation> &ops,std::vector<PassGroup> &groups) {
   auto plainDraw=[](const Operation &op){
    if(!op.texture || !op.pipeline || op.clearOnly || op.upload || op.generateMips || op.src || op.dst || !op.encoderID || op.pipeline->fetchMask)return false;
    for(const auto &d:op.pipeline->descriptors)if(d.type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || d.type==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || d.type==VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER || d.type==VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT)return false;
    return true;};
   for(size_t i=0;i<ops.size();++i){const auto &op=ops[i];PassGroup g{i,i,!plainDraw(op),op.colorCount,op.colorMask,{},{},{},{}};
-   if(!g.barrier){if(op.colorCount>8)return;for(unsigned k=0;k<op.colorCount;++k){auto c=op.color(k);g.targets[k]=c.texture;g.levels[k]=c.level;}}
+   if(!g.barrier){if(op.colorCount>8)return false;for(unsigned k=0;k<op.colorCount;++k){auto c=op.color(k);g.targets[k]=c.texture;g.levels[k]=c.level;}}
    if(!g.barrier && !groups.empty() && groups.back().sameTargets(g)){groups.back().last=i;}else groups.push_back(std::move(g));
    if(groups.back().barrier)continue;auto &cur=groups.back();
    auto addTexture=[&](Texture *t){if(t && std::find(cur.samples.begin(),cur.samples.end(),t)==cur.samples.end())cur.samples.push_back(t);};
@@ -1305,6 +1307,62 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
    for(auto *s:op.samples)addTexture(s);addTexture(op.sourceTexture);addBuffer(op.indices);
    for(unsigned stage=0;stage<2;++stage)for(unsigned k=0;k<resourceSlots;++k)addBuffer(op.buffers[stage][k].buffer);
   }
+  return true;
+ }
+ // FUXI_MTL_RT_RENAME=1. A small private texture that several passes in one submit fully overwrite in turn (load clear/dont-care, whole area) keeps one real image only for its
+ // last version; every earlier version is renamed onto a pooled transient image. That removes the write-after-read hazards that pinned the passes between two main-target passes,
+ // so hoistOffscreen can move them ahead and the main-target passes become adjacent (and merge). Dependencies are still judged by groupsConflict, so a pass that samples or
+ // copies from the main target never moves above its writer.
+ struct RenameImage {Texture *t;uint32_t w,h,format,usage;uint64_t used;};
+ std::vector<RenameImage> renamePool;uint64_t rtRenamed=0,rtHoisted=0,rtMergedMain=0,rtMainBefore=0,rtMainAfter=0,rtRenameSubmits=0;
+ bool smallOffscreen(Texture *t) {return t && t->tiling==VK_IMAGE_TILING_OPTIMAL && !t->imported && !t->backingBuffer && !t->shadow && !t->rtTarget && !t->mapped && !t->borrowedMemory && t->textureType==2 && t->levels==1 && t->depth==1 && !(t->usage&VK_IMAGE_USAGE_STORAGE_BIT) && uint64_t(t->width)*t->height<=(1u<<20);}
+ Texture *renameAcquire(Texture *like,std::vector<Texture *> &held) {
+  uint32_t usage=(like->usage&VK_IMAGE_USAGE_SAMPLED_BIT?1u:0u)|(like->usage&VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT?4u:0u);if(!usage)return nullptr;
+  for(auto &e:renamePool)if(e.t->references==1 && e.used!=rtRenameSubmits && e.w==like->width && e.h==like->height && e.format==like->format && e.usage==usage){e.used=rtRenameSubmits;++e.t->references;held.push_back(e.t);return e.t;}
+  if(renamePool.size()>=32)return nullptr;
+  try {auto *t=allocateTextureUnlocked(like->format,usage,like->width,like->height);renamePool.push_back({t,like->width,like->height,like->format,usage,rtRenameSubmits});++t->references;held.push_back(t);return t;}catch(const std::exception &) {return nullptr;}
+ }
+ void releaseRenamePool() {for(auto &e:renamePool)destroyTextureUnlocked(e.t);renamePool.clear();}
+ size_t countMainRuns(const std::vector<Operation> &ops) {
+  size_t runs=0;Texture *last=nullptr;
+  for(const auto &op:ops){if(!(op.texture && (op.pipeline || op.clearOnly))){last=nullptr;continue;}
+   if(smallOffscreen(op.texture)){last=nullptr;continue;} // an offscreen pass between two main passes splits them
+   if(op.texture!=last)++runs;last=op.texture;}
+  return runs;
+ }
+ void renameOffscreen(std::vector<Operation> &ops,std::vector<Texture *> &held) {
+  std::vector<Texture *> candidates;
+  for(const auto &op:ops){if(!(op.pipeline || op.clearOnly))continue;for(unsigned i=0;i<std::min(op.colorCount,8u);++i){auto *t=op.color(i).texture;if(smallOffscreen(t) && std::find(candidates.begin(),candidates.end(),t)==candidates.end())candidates.push_back(t);}}
+  auto refers=[](const Operation &op,Texture *t){if(op.texture==t || op.sourceTexture==t)return true;for(auto *s:op.samples)if(s==t)return true;for(unsigned i=0;i<std::min(op.colorCount,8u);++i)if(op.color(i).texture==t)return true;return false;};
+  auto replace=[](Operation &op,Texture *from,Texture *to){if(op.texture==from)op.texture=to;if(op.sourceTexture==from)op.sourceTexture=to;for(auto &s:op.samples)if(s==from)s=to;
+   for(unsigned i=0;i<std::min(op.colorCount,8u);++i){auto c=op.color(i);if(c.texture==from){c.texture=to;op.setColor(i,c);}}};
+  for(auto *t:candidates){
+   std::vector<size_t> starts;bool bad=false;
+   for(size_t n=0;n<ops.size() && !bad;++n){const auto &op=ops[n];if(!(op.pipeline || op.clearOnly))continue;bool begins=false;
+    for(unsigned i=0;i<std::min(op.colorCount,8u);++i){auto c=op.color(i);if(c.texture!=t)continue;if(c.level)bad=true;
+     const bool full=(!op.areaWidth || op.areaWidth==t->width) && (!op.areaHeight || op.areaHeight==t->height);if(c.load!=1 && full)begins=true;}
+    if(begins){for(auto *s:op.samples)if(s==t)bad=true;if(op.sourceTexture==t)bad=true;starts.push_back(n);}}
+   if(bad || starts.size()<2)continue;
+   for(size_t k=0;k+1<starts.size();++k){auto *tmp=renameAcquire(t,held);if(!tmp)break;
+    for(size_t n=starts[k];n<starts[k+1];++n)if(refers(ops[n],t))replace(ops[n],t,tmp);
+    ++rtRenamed;}
+  }
+ }
+ void hoistOffscreen(std::vector<Operation> &ops) {
+  std::vector<PassGroup> groups;if(!buildGroups(ops,groups))return;
+  std::vector<size_t> order;order.reserve(groups.size());unsigned moved=0;
+  for(size_t gi=0;gi<groups.size();++gi){auto &g=groups[gi];size_t insertAt=order.size();
+   bool offscreen=!g.barrier;if(offscreen)for(auto *t:g.targets)if(t && !smallOffscreen(t))offscreen=false;
+   if(offscreen){size_t scanned=0;for(size_t k=order.size();k-->0 && scanned<256;++scanned){auto &o=groups[order[k]];if(o.barrier || groupsConflict(o,g))break;insertAt=k;}}
+   if(insertAt!=order.size())++moved;
+   order.insert(order.begin()+insertAt,gi);}
+  if(!moved)return;
+  std::vector<Operation> sorted;sorted.reserve(ops.size());
+  for(auto gi:order)for(size_t i=groups[gi].first;i<=groups[gi].last;++i)sorted.push_back(ops[i]);
+  ops.swap(sorted);rtHoisted+=moved;
+ }
+ void reorderPasses(std::vector<Operation> &ops) {
+  std::vector<PassGroup> groups;if(!buildGroups(ops,groups))return;
   // Groups merged above may hold a barrier-free duplicate signature elsewhere; hop each plain group back to the last equal-target group.
   std::vector<size_t> order;order.reserve(groups.size());unsigned hops=0;
   for(size_t gi=0;gi<groups.size();++gi){auto &g=groups[gi];size_t insertAt=order.size();
@@ -1329,9 +1387,15 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
   auto *timing=systemTranslationPolicy().frameTrace?currentFrame:nullptr;
   std::unique_lock<std::mutex> guard(mutex,std::defer_lock);{PhaseTimer phase(SubPhase::wait);guard.lock();}
   if(currentFrame)currentFrame->backendLock+=since(submitStart);
-  requireLive();if(systemTranslationPolicy().reorder && systemTranslationPolicy().merge && ops.size()>2)reorderPasses(ops);
+  requireLive();
+  const bool sequenceLog=systemTranslationPolicy().passTimes && (opSequenceSubmits++%300)==1;
+  struct HoldRelease {Backend &b;std::vector<Texture *> held;~HoldRelease(){for(auto *t:held)b.destroyTextureUnlocked(t);}} renameHold{*this,{}};
+  const bool rtRenaming=systemTranslationPolicy().rtRename && ops.size()>2;size_t mainBefore=0;
+  if(rtRenaming){if(sequenceLog)logOpSequence(ops," pre");++rtRenameSubmits;mainBefore=countMainRuns(ops);renameOffscreen(ops,renameHold.held);hoistOffscreen(ops);}
+  if(systemTranslationPolicy().reorder && systemTranslationPolicy().merge && ops.size()>2)reorderPasses(ops);
+  if(rtRenaming){size_t after=countMainRuns(ops);rtMainBefore+=mainBefore;rtMainAfter+=after;if(mainBefore>after)rtMergedMain+=mainBefore-after;}
   if(systemTranslationPolicy().rtShadow)rtShadowRewrite(ops);
-  if(systemTranslationPolicy().passTimes && (opSequenceSubmits++%300)==1)logOpSequence(ops);
+  if(sequenceLog)logOpSequence(ops,"");
   std::vector<HostUse> hostUses,writes,uses;
   auto addUse=[](std::vector<HostUse> &list,VkDeviceMemory memory,const void *address,size_t bytes,uint8_t kind=1,Buffer *buffer=nullptr){for(auto &old:list)if(old.memory==memory && old.address==address && old.bytes==bytes){old.kind|=kind;return;}list.push_back({memory,address,bytes,kind,buffer});};
   auto bufferUse=[&](std::vector<HostUse> &list,Buffer *b,uint8_t kind=1){if(b)addUse(list,b->memory,b->contents,b->length,kind,b);};
@@ -1469,7 +1533,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
      if(!op.colorCount || op.colorCount>maxColorAttachments || !op.colorMask || (op.colorMask&~((1u<<op.colorCount)-1)) || (op.pipeline && op.colorCount!=op.pipeline->options.colorCount))throw std::runtime_error("draw/pass color count mismatch");
      for(unsigned i=0;i<op.colorCount;++i){auto c=op.color(i);auto *t=c.texture;
       if(!t){if(op.pipeline && op.pipeline->options.color(i).format)throw std::runtime_error("missing render attachment");continue;}addTexture(t);
-      if(!t || c.level>=t->levels || c.load>2 || c.store>1 || (op.pipeline && t->format!=op.pipeline->options.color(i).format))throw std::runtime_error("attachment["+std::to_string(i)+"] target/level/format/actions");
+      if(!t || c.level>=t->levels || c.load>2 || c.store>1 || (op.pipeline && t->format!=op.pipeline->options.color(i).format))throw std::runtime_error("attachment["+std::to_string(i)+"] target/level/format/actions"+(t?" format="+std::to_string(t->format)+" level="+std::to_string(c.level)+" load="+std::to_string(c.load)+" store="+std::to_string(c.store)+(op.pipeline?" pipeline="+std::to_string(op.pipeline->options.color(i).format):std::string()):std::string(" null target")));
       if(op.areaWidth>t->levelWidth(c.level) || op.areaHeight>t->levelHeight(c.level))throw std::runtime_error("render area exceeds attachment");
       if(t->levelWidth(c.level)!=op.texture->levelWidth(op.dstLevel) || t->levelHeight(c.level)!=op.texture->levelHeight(op.dstLevel))throw std::runtime_error("attachment size mismatch");
       if(orderedColorAccess && op.pipeline && !(t->usage&VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT))throw std::runtime_error("ordered target lacks INPUT_ATTACHMENT");
