@@ -17,6 +17,7 @@
 #include "PixelFormats.hpp"
 #include "ObjectCache.hpp"
 #include "Translator.hpp"
+#include "PrewarmStore.hpp"
 #include "DrawSafety.hpp"
 #include "BackboardGate.hpp"
 namespace fuxi {
@@ -57,6 +58,8 @@ public:
  static inline std::atomic<uint64_t> submits{0},submitPrepareNanos{0},submitWaitNanos{0},submitRetireNanos{0};
  static inline std::function<void()> beforeSubmit;
  static inline bool modelPipelines=false;static inline std::function<void(const Operation &)> modelDraw;
+ void registerLibrary(void *,LibraryHash){}
+ void unregisterLibrary(void *){}
  void requireLive(){if(poisoned || backboardGate.refusesResources())throw std::runtime_error("device poisoned or backboardd failure latched");}
  uint32_t maxTextureDimension() const{return limits.dimension;}
  size_t resourceBytes() const{return limits.used;}
