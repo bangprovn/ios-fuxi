@@ -54,6 +54,22 @@ int main(){
   s=run("shadow-fill",{many[0],fill,lo},2);pixels("shadow-fill",target);assert(counter("render_merge_copies")-copies==2 && s.shadowRefreshSkipped==0);
   s=run("shadow-transitions",{lo,lo},merge?1:2);if(perf)assert(s.imageBarriers<=2);
   b.destroy(sh);b.destroy(sb);}
+ // Independent groups hop so equal-attachment groups merge; dependent groups (RAW, WAR) keep their order. Pixels must match with the hop disabled.
+ {bool hop=systemTranslationPolicy().reorder && merge && cross;put(target,173);put(blur,91);put(backdrop,55);
+  auto fa=draw;fa.load=1;fa.encoderID=50;auto fb=fa;fb.encoderID=51;fb.samples[0]=layers[2];auto fc=fa;fc.encoderID=52;fc.samples[0]=layers[3];
+  auto gb=draw;gb.texture=blur;gb.load=2;gb.encoderID=53;gb.samples[0]=layers[1];auto gc=draw;gc.texture=backdrop;gc.load=2;gc.encoderID=54;gc.samples[0]=layers[3];
+  run("reorder-independent",{fa,gb,fb,gc,fc},hop?3:5);pixels("reorder-independent",target);pixels("reorder-independent-blur",blur);pixels("reorder-independent-backdrop",backdrop);
+  put(target,173);put(blur,91);auto raw=fa;raw.encoderID=55;raw.samples[0]=blur; // reads what gb wrote: must stay after gb
+  run("reorder-raw",{fa,gb,raw},hop?3:3);pixels("reorder-raw",target);
+  put(target,173);put(blur,91);auto early=fa;early.encoderID=56;early.samples[0]=blur; // reads blur before gb overwrites it (WAR)
+  run("reorder-war",{early,gb,fb},hop?2:3);pixels("reorder-war",target);pixels("reorder-war-blur",blur);}
+ // Render area = scissor box when every attachment LOADs; pixels outside the box keep their value, and a CLEAR load never shrinks.
+ {bool areaOn=systemTranslationPolicy().renderArea;put(target,173);auto sm=draw;sm.load=1;sm.encoderID=60;sm.scissor={{4,4},{6,5}};
+  auto s2=run("render-area",{sm},1);assert(s2.renderAreaShrunk==(areaOn?1u:0u) && s2.renderAreaPasses==1 && (!areaOn || s2.renderAreaPixels==30));pixels("render-area",target);
+  for(unsigned y=0;y<16;++y)for(unsigned x=0;x<16;++x)if(x<4||x>=10||y<4||y>=9)for(unsigned q=0;q<4;++q)assert(((uint8_t *)read->contents)[(y*16+x)*4+q]==(q==3?41:173));
+  auto two=sm;two.encoderID=61;two.scissor={{9,2},{3,3}};two.samples[0]=layers[1];put(target,173);auto s3=run("render-area-union",{sm,two},merge&&cross?1:2);pixels("render-area-union",target);
+  assert(!merge || !cross || !areaOn || s3.renderAreaPixels==uint64_t(8)*7);
+  sm.load=2;put(target,173);auto s4=run("render-area-clear",{sm},1);assert(!s4.renderAreaShrunk);pixels("render-area-clear",target);}
  // Recording failure restores the layouts and defined bits despite queued batches.
  auto layout=target->layout,sourceLayout=layers[0]->layout;auto defined=target->definedLevels;b.failBeforeQueue=true;bool failed=false;
  try{b.submit({draw,consumer});}catch(...){failed=true;}assert(failed && !b.poisoned && target->layout==layout && layers[0]->layout==sourceLayout && target->definedLevels==defined);

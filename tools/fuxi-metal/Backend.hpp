@@ -1005,6 +1005,54 @@ public:
  }
  // The caller must invoke retirement exactly once, before Backend destruction.
  // Slots pin every referenced object, including resources released by the client.
+ // Hoist independent render groups so passes on the same attachments become adjacent (and then merge). A group is a run of draws with the
+ // same attachments; anything that is not a plain draw (copies, uploads, clears, mips, storage or fetch shaders) is a fixed barrier no group
+ // crosses. Group B hops over earlier groups only when no target of one is a target, sample or aliasing buffer of the other.
+ struct PassGroup {size_t first,last;bool barrier;unsigned count,mask;std::array<Texture *,8> targets{};std::array<uint32_t,8> levels{};std::vector<Texture *> samples;std::vector<Buffer *> buffers;
+  bool sameTargets(const PassGroup &o) const{return !barrier && !o.barrier && count==o.count && mask==o.mask && targets==o.targets && levels==o.levels;}};
+ static bool textureTouch(const Texture *a,const Texture *b){return a==b || a->image==b->image || memoryAlias(a,b) || hostRangesOverlap(a->mapped,a->allocated,b->mapped,b->allocated);}
+ static bool bufferTouchesTexture(const Buffer *b,const Texture *t){return b->memory==t->memory || hostRangesOverlap(b->contents,b->length,t->mapped,t->allocated);}
+ static bool groupsConflict(const PassGroup &a,const PassGroup &b){
+  auto writes=[](const PassGroup &w,const PassGroup &r){
+   for(auto *t:w.targets){if(!t)continue;
+    for(auto *u:r.targets)if(u && textureTouch(t,u))return true;
+    for(auto *s:r.samples){if(textureTouch(t,s))return true;if(s->shadow && s->backingBuffer && bufferTouchesTexture(s->backingBuffer,t))return true;}
+    for(auto *x:r.buffers)if(bufferTouchesTexture(x,t))return true;}
+   return false;};
+  return writes(a,b) || writes(b,a);
+ }
+ void reorderPasses(std::vector<Operation> &ops) {
+  std::vector<PassGroup> groups;
+  auto plainDraw=[](const Operation &op){
+   if(!op.texture || !op.pipeline || op.clearOnly || op.upload || op.generateMips || op.src || op.dst || !op.encoderID || op.pipeline->fetchMask)return false;
+   for(const auto &d:op.pipeline->descriptors)if(d.type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || d.type==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || d.type==VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER || d.type==VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT)return false;
+   return true;};
+  for(size_t i=0;i<ops.size();++i){const auto &op=ops[i];PassGroup g{i,i,!plainDraw(op),op.colorCount,op.colorMask,{},{},{},{}};
+   if(!g.barrier){if(op.colorCount>8)return;for(unsigned k=0;k<op.colorCount;++k){auto c=op.color(k);g.targets[k]=c.texture;g.levels[k]=c.level;}}
+   if(!g.barrier && !groups.empty() && groups.back().sameTargets(g)){groups.back().last=i;}else groups.push_back(std::move(g));
+   if(groups.back().barrier)continue;auto &cur=groups.back();
+   auto addTexture=[&](Texture *t){if(t && std::find(cur.samples.begin(),cur.samples.end(),t)==cur.samples.end())cur.samples.push_back(t);};
+   auto addBuffer=[&](Buffer *b){if(b && std::find(cur.buffers.begin(),cur.buffers.end(),b)==cur.buffers.end())cur.buffers.push_back(b);};
+   for(auto *s:op.samples)addTexture(s);addTexture(op.sourceTexture);addBuffer(op.indices);
+   for(unsigned stage=0;stage<2;++stage)for(unsigned k=0;k<resourceSlots;++k)addBuffer(op.buffers[stage][k].buffer);
+  }
+  // Groups merged above may hold a barrier-free duplicate signature elsewhere; hop each plain group back to the last equal-target group.
+  std::vector<size_t> order;order.reserve(groups.size());unsigned hops=0;
+  for(size_t gi=0;gi<groups.size();++gi){auto &g=groups[gi];size_t insertAt=order.size();
+   if(!g.barrier){size_t scanned=0;
+    for(size_t k=order.size();k-->0 && scanned<64;++scanned){auto &o=groups[order[k]];
+     if(o.barrier)break;
+     if(o.sameTargets(g)){insertAt=k+1;break;}
+     if(groupsConflict(o,g))break;}
+   }
+   if(insertAt!=order.size())hops+=unsigned(order.size()-insertAt);
+   order.insert(order.begin()+insertAt,gi);
+  }
+  if(!hops)return;
+  std::vector<Operation> sorted;sorted.reserve(ops.size());
+  for(auto gi:order)for(size_t i=groups[gi].first;i<=groups[gi].last;++i)sorted.push_back(ops[i]);
+  ops.swap(sorted);if(currentFrame)currentFrame->passReorders+=hops;
+ }
  void submit(std::vector<Operation> ops,const std::function<void()> &scheduled={},std::function<void()> *retirement=nullptr,const std::function<void()> &prepare={},const std::vector<PrepareWrite> *prepareWrites=nullptr) {
   PhaseTimer submitPhase(SubPhase::other);
   auto submitStart=std::chrono::steady_clock::now();auto submitQueued=submitStart;
@@ -1012,7 +1060,8 @@ public:
   auto *timing=systemTranslationPolicy().frameTrace?currentFrame:nullptr;
   std::unique_lock<std::mutex> guard(mutex,std::defer_lock);{PhaseTimer phase(SubPhase::wait);guard.lock();}
   if(currentFrame)currentFrame->backendLock+=since(submitStart);
-  requireLive();std::vector<HostUse> hostUses,writes,uses;
+  requireLive();if(systemTranslationPolicy().reorder && systemTranslationPolicy().merge && ops.size()>2)reorderPasses(ops);
+  std::vector<HostUse> hostUses,writes,uses;
   auto addUse=[](std::vector<HostUse> &list,VkDeviceMemory memory,const void *address,size_t bytes,uint8_t kind=1,Buffer *buffer=nullptr){for(auto &old:list)if(old.memory==memory && old.address==address && old.bytes==bytes){old.kind|=kind;return;}list.push_back({memory,address,bytes,kind,buffer});};
   auto bufferUse=[&](std::vector<HostUse> &list,Buffer *b,uint8_t kind=1){if(b)addUse(list,b->memory,b->contents,b->length,kind,b);};
   auto textureUse=[&](std::vector<HostUse> &list,Texture *t){if(t){addUse(list,t->memory,t->mapped,t->allocated);bufferUse(list,t->backingBuffer);}};
@@ -1587,6 +1636,20 @@ public:
      }
      VkRenderPassBeginInfo ri{};ri.sType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;ri.renderPass=render;ri.framebuffer=frame;
      ri.renderArea={{0,0},boundaryPerf && passEnd>opIndex?mergeAreas[opIndex]:VkExtent2D{op.areaWidth?op.areaWidth:op.texture->levelWidth(op.dstLevel),op.areaHeight?op.areaHeight:op.texture->levelHeight(op.dstLevel)}};ri.clearValueCount=used;ri.pClearValues=clears;
+     { // Render area = bounding box of the pass's scissors (a draw can never write outside its scissor). Only when every attachment LOADs:
+       // a CLEAR or DONT_CARE load covers the whole attachment in Metal, and LOAD+STORE leaves untouched pixels as they were, so a smaller area is exact.
+      uint64_t fullPixels=uint64_t(ri.renderArea.extent.width)*ri.renderArea.extent.height;bool shrunk=false;
+      if(systemTranslationPolicy().renderArea && used){
+       bool allLoad=true;for(unsigned i=0;i<op.colorCount;++i){auto c=op.color(i);if(c.texture && c.load!=1)allLoad=false;}
+       uint64_t x0=UINT64_MAX,y0=UINT64_MAX,x1=0,y1=0;
+       if(allLoad)for(size_t i=opIndex;i<=passEnd;++i){const auto &r=ops[i].scissor;if(!r.extent.width || !r.extent.height || r.offset.x<0 || r.offset.y<0)continue;
+        x0=std::min<uint64_t>(x0,uint64_t(r.offset.x));y0=std::min<uint64_t>(y0,uint64_t(r.offset.y));x1=std::max<uint64_t>(x1,uint64_t(r.offset.x)+r.extent.width);y1=std::max<uint64_t>(y1,uint64_t(r.offset.y)+r.extent.height);}
+       x1=std::min<uint64_t>(x1,ri.renderArea.extent.width);y1=std::min<uint64_t>(y1,ri.renderArea.extent.height);
+       if(allLoad && x0<x1 && y0<y1 && (x1-x0)*(y1-y0)<fullPixels){ri.renderArea={{int32_t(x0),int32_t(y0)},{uint32_t(x1-x0),uint32_t(y1-y0)}};shrunk=true;}
+      }
+      if(currentFrame){++currentFrame->renderAreaPasses;currentFrame->renderAreaFullPixels+=fullPixels;currentFrame->renderAreaPixels+=uint64_t(ri.renderArea.extent.width)*ri.renderArea.extent.height;if(shrunk)++currentFrame->renderAreaShrunk;}
+      if(passQ){cur.areaW=ri.renderArea.extent.width;cur.areaH=ri.renderArea.extent.height;}
+     }
      if(currentFrame)++currentFrame->passes;{PhaseTimer phase(SubPhase::passes);CmdBeginRenderPass(cmd,&ri,VK_SUBPASS_CONTENTS_INLINE);}
      }else if(currentFrame)++currentFrame->mergedDraws;
      auto pipeline=topologyPipeline(op.pipeline,op.topology);

@@ -90,7 +90,7 @@ struct FrameSample {
  // Submits that waited on a flight for each resource kind (buffer, shadow, texture, surface, index) and shadow storage renames that avoided the wait.
  std::array<uint64_t,5> conflictKinds{};std::array<uint64_t,6> renameDeclined{};uint64_t shadowRenames=0,shadowRenameBytes=0; // declined: off, not_backing, direct_use, texture, budget, other
  uint64_t drainSubmits=0,prepareDrains=0,prepareUnknownDrains=0,prepareConflictWaits=0,indexUploadDrains=0,indexGPUWritableDrains=0,indexUploadSubmits=0,indexReadOnlySubmits=0,indexGPUWritableSubmits=0;
- uint64_t snapshotReusedBytes=0,shadowSkippedBytes=0,shadowHashSkipped=0,shadowHashCopied=0,shadowHashBytes=0,shadowHashNs=0;
+ uint64_t snapshotReusedBytes=0,shadowSkippedBytes=0,shadowHashSkipped=0,shadowHashCopied=0,shadowHashBytes=0,shadowHashNs=0,renderAreaPasses=0,renderAreaShrunk=0,renderAreaPixels=0,renderAreaFullPixels=0,passReorders=0;
  // Last observed handler batch / explicit wait, sampled on the following commit.
  uint64_t priorDelivery=0,priorHandlers=0,priorWaitCompleted=0;
  // Command buffer creation (steady clock); the window derives frame-to-frame cadence.
@@ -223,7 +223,7 @@ public:
   for(size_t i=0;i<totals.conflictKinds.size();++i)totals.conflictKinds[i]+=s.conflictKinds[i];for(size_t i=0;i<totals.renameDeclined.size();++i)totals.renameDeclined[i]+=s.renameDeclined[i];totals.shadowRenames+=s.shadowRenames;totals.shadowRenameBytes+=s.shadowRenameBytes;totals.drainWaits+=s.drainWaits;totals.conflictWaits+=s.conflictWaits;totals.slotWaits+=s.slotWaits;
   totals.shadowWaits+=s.shadowWaits;totals.drainSubmits+=s.drainSubmits;totals.prepareDrains+=s.prepareDrains;totals.prepareUnknownDrains+=s.prepareUnknownDrains;totals.prepareConflictWaits+=s.prepareConflictWaits;totals.indexUploadDrains+=s.indexUploadDrains;totals.indexGPUWritableDrains+=s.indexGPUWritableDrains;
   totals.indexUploadSubmits+=s.indexUploadSubmits;totals.indexReadOnlySubmits+=s.indexReadOnlySubmits;totals.indexGPUWritableSubmits+=s.indexGPUWritableSubmits;
-  totals.snapshotReusedBytes+=s.snapshotReusedBytes;totals.shadowSkippedBytes+=s.shadowSkippedBytes;totals.shadowHashSkipped+=s.shadowHashSkipped;totals.shadowHashCopied+=s.shadowHashCopied;totals.shadowHashBytes+=s.shadowHashBytes;totals.shadowHashNs+=s.shadowHashNs;
+  totals.snapshotReusedBytes+=s.snapshotReusedBytes;totals.shadowSkippedBytes+=s.shadowSkippedBytes;totals.shadowHashSkipped+=s.shadowHashSkipped;totals.shadowHashCopied+=s.shadowHashCopied;totals.shadowHashBytes+=s.shadowHashBytes;totals.shadowHashNs+=s.shadowHashNs;totals.renderAreaPasses+=s.renderAreaPasses;totals.renderAreaShrunk+=s.renderAreaShrunk;totals.renderAreaPixels+=s.renderAreaPixels;totals.renderAreaFullPixels+=s.renderAreaFullPixels;totals.passReorders+=s.passReorders;
   gpuUnavailable+=!s.gpuSamples;++cpus[s.cpu<8?s.cpu:8];encodeUnknown+=s.encodeCountsUnknown;
  }
  uint64_t size() const{return count;}
@@ -279,6 +279,7 @@ public:
   fprintf(out," plan_hits/frame=%.2f plan_misses/frame=%.2f",totals.planHits/n,totals.planMisses/n);
   fprintf(out," snapshot_bytes/frame=%.2f shadow_copy_bytes/frame=%.2f",totals.snapshotBytes/n,totals.shadowCopyBytes/n);
   fprintf(out," shadow_hash_skipped/frame=%.2f shadow_hash_copied/frame=%.2f shadow_hash_skipped_bytes/frame=%.0f shadow_hash_ms/frame=%.3f",totals.shadowHashSkipped/n,totals.shadowHashCopied/n,totals.shadowHashBytes/n,totals.shadowHashNs/n/1e6);
+  fprintf(out," render_area_pct=%.1f render_area_shrunk/frame=%.2f pass_reorders/frame=%.2f",totals.renderAreaFullPixels?100.0*totals.renderAreaPixels/totals.renderAreaFullPixels:100.0,totals.renderAreaShrunk/n,totals.passReorders/n);
   fprintf(out," shadow_scanned_indices/frame=%.2f shadow_full_reasons=",totals.shadowScannedIndices/n);for(size_t i=0;i<totals.shadowFullReasons.size();++i)fprintf(out,"%s%s:%.2f",i?",":"",shadowFullReasonNames[i],totals.shadowFullReasons[i]/n);
   fprintf(out," texture_shadow_bytes/frame=%.2f texture_repitched_bytes/frame=%.2f texture_shadow_uses=sampled:%.2f,target:%.2f,other:%.2f",totals.textureShadowBytes/n,totals.textureRepitchedBytes/n,totals.textureShadowUses[0]/n,totals.textureShadowUses[1]/n,totals.textureShadowUses[2]/n);
   auto stage=[&](const char *name,uint64_t FrameSample::*field){fprintf(out," %s=%.3f/%.3f",name,p(field,50),p(field,90));};

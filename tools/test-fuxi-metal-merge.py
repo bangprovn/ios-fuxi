@@ -71,6 +71,8 @@ void main() {color=textureLod(image,vec2(0.5),constants.lod);}
         assert ca_before == (29, 29, 57, 25) and ca_after == (2, 2, 5, 3)
         assert counts(before, 'mip-batch') == (4, 4, 7, 1)
         assert counts(after, 'mip-batch') == (0, 0, 2, 1)
+        for off in ({'FUXI_MTL_PASS_REORDER': '0'}, {'FUXI_MTL_RENDER_AREA': '0'}, {'FUXI_MTL_PASS_REORDER': '0', 'FUXI_MTL_RENDER_AREA': '0'}):
+            assert pixels(invoke(d/'barriers', controls+'fuxigpuperf=7', **off)) == pixels(after), 'pass reorder/render area changed pixels: '+str(off)
         for args in ('', 'fuxigpuperf=4', controls+'fuxigpuperf=4', controls+'fuxigpuperf=5', controls+'fuxigpuperf=6'):
             assert pixels(invoke(d/'barriers', args)) == pixels(before), 'boundary controls differ: '+args
         print('PASS: CA boundary A/B pixels, exact batch counts, all independent bit combinations')
