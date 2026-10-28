@@ -502,7 +502,7 @@ static NSData *constantSnapshot(MTLFunctionConstantValues *values) {
 @end
 @implementation FuxiLibrary
 - (MTLLibraryType)type {CENSUS();return MTLLibraryTypeExecutable;}
-- (void)dealloc {if(_library)fuxi::Translator::get().close(_library);[_device release];[super dealloc];}
+- (void)dealloc {if(_library){if(_device)owner(_device)->backend->unregisterLibrary(_library);fuxi::Translator::get().close(_library);}[_device release];[super dealloc];}
 - (id)device {CENSUS();return _device;}
 - (id)newFunctionWithDescriptor:(MTLFunctionDescriptor *)d error:(NSError **)error {CENSUS();
  if(error)*error=nil;
@@ -1851,7 +1851,7 @@ static NSString *surfaceDescriptorText(IOSurfaceRef surface,NSUInteger plane){
  const void *bytes=nullptr;size_t size=0;dispatch_data_t mapped=dispatch_data_create_map(data,&bytes,&size);
  if(!mapped)return metalError(error,"map library failed");
  FuxiLibrary *lib=[FuxiLibrary new];lib->_device=[self retain];char why[2048]{};
- try {auto &tr=fuxi::Translator::get();fuxi::Translator::OptionsScope scope(tr);lib->_library=tr.open((const uint8_t *)bytes,size,why,sizeof(why));}
+ try {auto &tr=fuxi::Translator::get();fuxi::Translator::OptionsScope scope(tr);lib->_library=tr.open((const uint8_t *)bytes,size,why,sizeof(why));if(lib->_library)owner(self)->backend->registerLibrary(lib->_library,fuxi::libraryHash(bytes,size));}
  catch(const std::exception &e) {dispatch_release(mapped);[lib release];return metalError(error,e.what());}
  dispatch_release(mapped);if(!lib->_library) {[lib release];return metalError(error,why);}return lib;
 }

@@ -5,6 +5,7 @@
 #include <vulkan/vulkan.h>
 #include <dlfcn.h>
 #include <algorithm>
+#include <deque>
 #include <array>
 #include <map>
 #include <cstdlib>
@@ -44,6 +45,7 @@
 #include "CompileBoost.hpp"
 #include "PipelineCache.hpp"
 #include "ArtifactCache.hpp"
+#include "PrewarmStore.hpp"
 #include "BackboardGate.hpp"
 #include "FramebufferFetch.hpp"
 #include "VertexProfile.hpp"
@@ -137,6 +139,13 @@ class Backend {
  Translator::CacheScope artifactCallbacks{};Translator::CacheScopeVerified artifactCallbacksVerified{};
  bool creationFeedback=false,cacheStopping=false;
  std::thread cacheWorker;std::condition_variable cacheWake;
+ // Startup prewarm. Recipes of pipelines compiled in earlier runs (stored beside the translation cache) are recompiled on a low-priority thread as soon as
+ // both of their libraries exist; a draw that needs one meanwhile waits for that single compile (compiling set), never starting a second.
+ struct PrewarmLib {void *lib;LibraryHash hash;unsigned pins;};
+ std::mutex prewarmMutex;std::condition_variable prewarmWake;std::vector<PrewarmLib> prewarmLibs;std::vector<Recipe> prewarmRecipes;std::deque<size_t> prewarmQueue;
+ std::thread prewarmThread;bool prewarmStopping=false,prewarmRunning=false;uint64_t prewarmDone=0,prewarmHitCount=0,prewarmFailed=0;double prewarmMs=0;
+ std::unordered_set<std::string> recipeKeys,compiling;std::condition_variable compileDone;
+ static inline thread_local bool prewarmWorker=false,unlockForCompile=false;static inline thread_local int lastCompileWasHit=0;
 #ifdef __APPLE__
  dispatch_source_t memoryPressure{};dispatch_semaphore_t pressureStopped{};
  void startMemoryPressure(){
@@ -436,7 +445,9 @@ public:
     if(identified)artifactCallbacks=Translator::get().artifactScope;
     artifactCallbacksVerified=Translator::get().artifactScopeVerified;
     if(artifactCallbacksVerified)artifactCache.setVerifier(Translator::get().artifactVerify);
-    if(artifactCallbacks)artifactCache.open(props,driver,id,translator,client);
+    if(artifactCallbacks){artifactCache.open(props,driver,id,translator,client);
+     for(auto &blob:artifactCache.recipes()){Recipe r;if(decodeRecipe(blob.data(),blob.size(),r))prewarmRecipes.push_back(std::move(r));}
+     fprintf(stderr,"FUXI MTL: prewarm recipes loaded=%zu\n",prewarmRecipes.size());}
     else fprintf(stderr,"FUXI MTL: translation cache unavailable (bridge capability)\n");
     fprintf(stderr,"FUXI MTL: persistent caches enabled period=5s driver_feedback=%u\n",unsigned(creationFeedback));
    }
@@ -461,6 +472,7 @@ public:
 #endif
   // Join before device/cache destruction, including poisoned contexts. A sleeping
   // worker owns no GPU resource and wakes immediately on shutdown.
+  {{std::lock_guard<std::mutex> guard(prewarmMutex);prewarmStopping=true;}prewarmWake.notify_all();if(prewarmThread.joinable())prewarmThread.join();}
   if(cacheWorker.joinable()){{std::lock_guard<std::mutex> guard(mutex);cacheStopping=true;}cacheWake.notify_all();cacheWorker.join();}
   {std::unique_lock<std::mutex> lock(mutex);submitWake.wait(lock,[&]{return !slots[0].busy && !slots[1].busy;});}
   if(poisoned) return; // Unknown GPU ownership: leave reclamation to process death/KMD containment.
@@ -803,6 +815,66 @@ public:
 
  bool supportsOrderedColorAccess() const {return orderedColorAccess;}
  bool requiresSampling(const Pipeline *p) const {return std::any_of(p->descriptors.begin(),p->descriptors.end(),[](const Descriptor &d){return d.type==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || d.type==VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;});}
+ // Called with the backend lock held on a compile miss/product-hit: remember how to rebuild this pipeline in a later run.
+ void recordRecipe(const uint8_t *identity,void *v,const char *vn,void *f,const char *fn,const CompileOptions &options) {
+  try {
+   if(cacheMode!=CacheMode::persistent || !artifactCache.available())return;
+   std::string key=recipeKey(identity);if(!recipeKeys.insert(key).second)return;
+   Recipe r;{std::lock_guard<std::mutex> lock(prewarmMutex);bool gv=false,gf=false;for(auto &l:prewarmLibs){if(l.lib==v){r.vertex=l.hash;gv=true;}if(l.lib==f){r.fragment=l.hash;gf=true;}}if(!gv || !gf)return;}
+   r.vertexName=vn;r.fragmentName=fn;packOptions(options,r.options);auto blob=encodeRecipe(r);
+   ArtifactCache::Access access(artifactCache);ArtifactCache::write(&access,(const uint8_t *)key.data(),blob.data(),blob.size());
+  }catch(...){}
+ }
+ // Frontend hooks: a library with these contents now exists (or is about to be closed).
+ void registerLibrary(void *lib,LibraryHash hash) {
+  try {
+   std::lock_guard<std::mutex> lock(prewarmMutex);prewarmLibs.push_back({lib,hash,0});
+   bool queued=false;
+   for(size_t i=0;i<prewarmRecipes.size();++i){auto &r=prewarmRecipes[i];if(r.queued)continue;PrewarmLib *vl=nullptr,*fl=nullptr;
+    for(auto &l:prewarmLibs){if(l.hash==r.vertex)vl=&l;if(l.hash==r.fragment)fl=&l;}
+    if(vl && fl){r.queued=true;prewarmQueue.push_back(i);queued=true;}}
+   if(queued && !prewarmThread.joinable() && !prewarmStopping)prewarmThread=std::thread([this]{prewarmLoop();});
+   if(queued)prewarmWake.notify_all();
+  }catch(...){}
+ }
+ void unregisterLibrary(void *lib) {
+  std::unique_lock<std::mutex> lock(prewarmMutex);
+  prewarmWake.wait(lock,[&]{for(auto &l:prewarmLibs)if(l.lib==lib && l.pins)return false;return true;});
+  prewarmLibs.erase(std::remove_if(prewarmLibs.begin(),prewarmLibs.end(),[&](const PrewarmLib &l){return l.lib==lib;}),prewarmLibs.end());
+ }
+ void prewarmLoop() {
+  prewarmWorker=true;
+#ifdef __APPLE__
+  pthread_set_qos_class_self_np(QOS_CLASS_UTILITY,0);
+#endif
+  std::unique_lock<std::mutex> lock(prewarmMutex);uint64_t batchStart=0;auto began=std::chrono::steady_clock::now();
+  while(true){
+   prewarmWake.wait(lock,[&]{return prewarmStopping || !prewarmQueue.empty();});
+   if(prewarmStopping)return;
+   if(!prewarmRunning){prewarmRunning=true;began=std::chrono::steady_clock::now();batchStart=prewarmDone+prewarmFailed;}
+   size_t index=prewarmQueue.front();prewarmQueue.pop_front();
+   Recipe r=prewarmRecipes[index];PrewarmLib *vl=nullptr,*fl=nullptr;
+   for(auto &l:prewarmLibs){if(l.hash==r.vertex)vl=&l;if(l.hash==r.fragment)fl=&l;}
+   if(!vl || !fl){++prewarmFailed;continue;}
+   void *vlib=vl->lib,*flib=fl->lib;++vl->pins;if(fl!=vl)++fl->pins;
+   lock.unlock();
+   bool hit=false,ok=false;
+   try {
+    auto options=std::make_unique<CompileOptions>();
+    if(unpackOptions(r.options.data(),r.options.size(),*options)){
+     lastCompileWasHit=0;auto *p=compilePipeline(vlib,r.vertexName.c_str(),flib,r.fragmentName.c_str(),*options);hit=lastCompileWasHit==1;destroy(p);ok=true;}
+   }catch(...){}
+   lock.lock();
+   for(auto &l:prewarmLibs)if(l.lib==vlib || l.lib==flib)--l.pins;
+   if(ok){++prewarmDone;if(hit)++prewarmHitCount;}else ++prewarmFailed;
+   prewarmWake.notify_all();
+   if(prewarmQueue.empty()){
+    prewarmMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-began).count();
+    fprintf(stderr,"FUXI MTL: prewarm n=%llu ms=%.1f hits=%llu failed=%llu\n",(unsigned long long)(prewarmDone+prewarmFailed-batchStart),prewarmMs,(unsigned long long)prewarmHitCount,(unsigned long long)prewarmFailed);
+    prewarmRunning=false;
+   }
+  }
+ }
  Pipeline *compilePipeline(void *v,const char *vn,void *f,const char *fn,const CompileOptions &options=CompileOptions{}) {
   auto requested=std::chrono::steady_clock::now();
   std::unique_lock<std::mutex> guard(mutex);auto acquired=std::chrono::steady_clock::now();requireLive();Translation translated{};auto &tr=Translator::get();char error[2048]{};
@@ -832,9 +904,13 @@ public:
   timing.identity=timing.lap();
   if(timing.enabled)fprintf(stderr,"FUXI MTL: translation request id=%02x%02x%02x%02x vertex=%.96s fragment=%.96s objects=%zu\n",identity[0],identity[1],identity[2],identity[3],vn,fn,objects.count());
   std::string inputKey((const char *)identity,32);
+  // Another thread (prewarm or the draw path) may already be compiling this exact pipeline: wait for it, then take its object.
+  while(compiling.count(inputKey))compileDone.wait(guard);
+  requireLive();
   if(auto *cached=objects.acquire(inputKey)){
-   timing.result="object-hit";++pipelineHits;++objectHits;fprintf(stderr,"FUXI MTL: pipeline cache HIT %.3f ms\n",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count());return cached;
+   timing.result="object-hit";lastCompileWasHit=1;++pipelineHits;++objectHits;fprintf(stderr,"FUXI MTL: pipeline cache HIT %.3f ms\n",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count());return cached;
   }
+  struct Inflight {Backend &b;std::string key;Inflight(Backend &x,std::string k):b(x),key(std::move(k)){b.compiling.insert(key);}~Inflight(){b.compiling.erase(key);b.compileDone.notify_all();}} inflight(*this,inputKey);
   CompileBoostScope compileBoost("pipeline");
   int ok;
   { // Immutable library/options and instance queries need no device/queue lock.
@@ -857,15 +933,19 @@ public:
   timing.hash=timing.lap();
   std::string productKey=inputKey+std::string((const char *)hash,32);
   if(auto *cached=objects.acquire(productKey,true)){
-   timing.result="product-hit";tr.free(translated.handle);++pipelineHits;++objectHits;
+   timing.result="product-hit";lastCompileWasHit=1;tr.free(translated.handle);++pipelineHits;++objectHits;recordRecipe(identity,v,vn,f,fn,options);
    fprintf(stderr,"FUXI MTL: pipeline cache HIT %.3f ms\n",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count());return cached;
   }
-  ++pipelineMisses;++objectMisses;
+  ++pipelineMisses;++objectMisses;lastCompileWasHit=0;
+  struct Unlock {Unlock(){unlockForCompile=true;}~Unlock(){unlockForCompile=false;}} unlockScope;
   auto *p=createPipeline(translated,enabledOptions);timing.create=timing.lap();timing.result="miss";
   compileBoost.finish();
   try {objects.insert(inputKey,productKey,p,p->retainedBytes,[&](Pipeline *old){drawPlans.invalidate(old);destroyPipelineUnlocked(old);});}
   catch(...){destroyPipelineUnlocked(p);throw;}
-  fprintf(stderr,"FUXI MTL: pipeline cache MISS %.3f ms\n",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count());
+  {double missMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
+   fprintf(stderr,"FUXI MTL: pipeline cache MISS %.3f ms%s\n",missMs,prewarmWorker?" (prewarm)":"");
+   if(!prewarmWorker){syncCompiles.fetch_add(1);syncCompileNs.fetch_add(uint64_t(missMs*1e6));}
+   recordRecipe(identity,v,vn,f,fn,options);}
   return p;
  }
  VkRenderPass renderPass(Pipeline *p,const Operation *op) {
@@ -1026,7 +1106,11 @@ public:
 #ifdef VK_KHR_pipeline_executable_properties
    if(executableStats && topology==Topology::Triangle)gi.flags|=VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
 #endif
-   VkPipeline result{};auto rc=CreateGraphicsPipelines(device,cache,1,&gi,nullptr,&result);
+   VkPipeline result{};VkResult rc;
+   if(unlockForCompile){ // Turnip's compile can take hundreds of ms: do not hold the backend lock (submits, allocations) across it. The pipeline is not yet published.
+    mutex.unlock();rc=CreateGraphicsPipelines(device,cache,1,&gi,nullptr,&result);mutex.lock();
+    if(poisoned){if(rc==VK_SUCCESS && result)DestroyPipeline(device,result,nullptr);throw std::runtime_error("backend poisoned during pipeline compile");}
+   }else rc=CreateGraphicsPipelines(device,cache,1,&gi,nullptr,&result);
    if(rc==VK_SUCCESS && systemTranslationPolicy().frameTrace)++frameCounts.pipelines;
    if(rc!=VK_SUCCESS){if(result)DestroyPipeline(device,result,nullptr);check(rc);}
    if(systemTranslationPolicy().pipeStats && topology==Topology::Triangle)logPipelineStats(p,translated,result);
@@ -1101,8 +1185,10 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0;std::uno
  // Per submit, in op order: the first render use copies linear->shadow unless the pass fully overwrites it; any non-render use of the linear image, or of anything else
  // on its backing buffer, first copies shadow->linear (a sync); whatever is still newer in the shadow at the end is copied back last. The ops stay ordinary ops.
  void rtShadowRewrite(std::vector<Operation> &ops) {
-  auto eligible=[&](Texture *t){return t && !t->shadow && !t->rtTarget && t->tiling==VK_IMAGE_TILING_LINEAR && t->borrowedMemory && t->backingBuffer && (t->usage&VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) && t->textureType==2 && t->levels==1 && uint64_t(t->width)*t->height>=(1u<<20);};
-  bool any=false;for(const auto &op:ops){if(!(op.pipeline || op.clearOnly))continue;for(unsigned i=0;i<std::min(op.colorCount,8u);++i)if(eligible(op.color(i).texture))any=true;}
+  auto eligible=[&](Texture *t){return t && !t->shadow && !t->rtTarget && t->tiling==VK_IMAGE_TILING_LINEAR && (t->usage&VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) && t->textureType==2 && t->levels==1 && uint64_t(t->width)*t->height>=(1u<<20);};
+  bool any=false;for(const auto &op:ops){if(!(op.pipeline || op.clearOnly))continue;for(unsigned i=0;i<std::min(op.colorCount,8u);++i){auto *t=op.color(i).texture;
+   if(t && t->tiling==VK_IMAGE_TILING_LINEAR && uint64_t(t->width)*t->height>=(1u<<20) && currentFrame)++currentFrame->rtLinearLarge;
+   if(eligible(t)){any=true;if(currentFrame)++currentFrame->rtEligible;}}}
   if(!any)return;
   struct Entry {Texture *l,*s;bool newer,valid;};std::vector<Entry> entries;entries.reserve(4);
   auto entryFor=[&](Texture *l)->int{

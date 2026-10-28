@@ -120,7 +120,7 @@ public:
    filename=client+(enhanced?".pipelines":".cache");memcpy(identity.data(),enhanced?"FXMTLC02":"FXMTLC01",8);put(identity.data()+8,enhanced?2:1);put(identity.data()+12,uint32_t(diskHeaderBytes()));
    put(identity.data()+24,p.driverVersion);put(identity.data()+28,driver.driverID);
    memcpy(identity.data()+32,id.driverUUID,16);memcpy(identity.data()+48,driver.driverInfo,256);
-   if(translator)memcpy(identity.data()+304,translator,32);
+   // The translator build is deliberately not part of the Vulkan cache identity: the blob is keyed by driver and SPIR-V, so it stays valid across translator rebuilds.
    if(enhanced)memcpy(identity.data()+336,id.deviceUUID,VK_UUID_SIZE);
    if(valid && translator && mode!=CacheMode::disabled) {
 #ifdef FUXI_MTL_HOST_TEST

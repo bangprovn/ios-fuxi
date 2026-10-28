@@ -3,6 +3,7 @@
  * Never serialize library/AIR inputs. No cache lock spans translator work. */
 #pragma once
 #include "PipelineCache.hpp"
+#include "PrewarmStore.hpp"
 #include <algorithm>
 #include <memory>
 #include <mutex>
@@ -62,7 +63,7 @@ class ArtifactCache {
    if(verify)verification.resize(e.length);size_t copied=0;
    uint32_t check=~0u;
    for(size_t left=e.length;left;){size_t k=std::min(left,chunk.size());if(!transfer(fd,chunk.data(),k,at,false))return "read";checksum=crc(checksum,chunk.data(),k);check=crc(check,chunk.data(),k);if(verify){memcpy(verification.data()+copied,chunk.data(),k);copied+=k;}at+=k;left-=k;}
-   e.verified=verify && verify(e.key.data(),verification.data(),verification.size())==1;
+   e.verified=verify && !isRecipeKey(e.key.data()) && verify(e.key.data(),verification.data(),verification.size())==1;
    e.crc=~check;decoded.push_back(std::move(e));
   }
   if(at!=size_t(s.st_size))return "record";
@@ -102,7 +103,7 @@ class ArtifactCache {
   return true;
  }
 public:
- static constexpr size_t maxBytes=256*1024*1024,maxEntry=8*1024*1024,maxEntries=256;
+ static constexpr size_t maxBytes=256*1024*1024,maxEntry=8*1024*1024,maxEntries=1024;
  struct Access {ArtifactCache &cache;std::vector<uint8_t> bytes;explicit Access(ArtifactCache &c):cache(c){}};
  void open(const VkPhysicalDeviceProperties &p,const VkPhysicalDeviceDriverProperties &driver,const VkPhysicalDeviceIDProperties &id,const uint8_t *translator,const char *client) noexcept {
   if(!translator || !client || !clientName(client))return;
@@ -143,7 +144,7 @@ public:
    // Bound the anonymous append spool even if maintenance is unavailable.
    bool compact;{std::lock_guard<std::mutex> lock(c.mutex);compact=c.pendingBytes+n>maxBytes;}
    if(compact)c.checkpoint();
-   uint32_t checksum=~crc(~0u,bytes,n);bool verified=c.verify && c.verify(key,bytes,n)==1;
+   uint32_t checksum=~crc(~0u,bytes,n);bool verified=c.verify && !isRecipeKey(key) && c.verify(key,bytes,n)==1;
    Entry e{};memcpy(e.key.data(),key,32);e.length=n;e.crc=checksum;e.verified=verified;
    {std::lock_guard<std::mutex> lock(c.mutex);if(c.directory<0 || c.pendingBytes+n>maxBytes)return;
     if(!c.pending){std::string ignored;c.pending=c.temporary("pending",true,ignored);if(!c.pending)return;}
@@ -159,6 +160,15 @@ public:
   }catch(...){} // Optional cache failure must not fail shader translation.
  }
  static void outcome(void *context,uint32_t value) noexcept {auto &c=((Access *)context)->cache;std::lock_guard<std::mutex> lock(c.mutex);if(value==1)++c.hits;else {++c.misses;if(value==2)++c.rejected;}}
+ // Payloads of the prewarm recipes stored beside the translations (keys with the recipe prefix), oldest first.
+ std::vector<std::vector<uint8_t>> recipes() noexcept {
+  std::vector<std::vector<uint8_t>> out;
+  try {
+   std::vector<Entry> list;{std::lock_guard<std::mutex> lock(mutex);for(auto &e:entries)if(isRecipeKey(e.key.data()))list.push_back(e);}
+   for(auto &e:list){std::vector<uint8_t> bytes(e.length);if(!transfer(e.file->fd,bytes.data(),e.length,e.offset,false) || ~crc(~0u,bytes.data(),bytes.size())!=e.crc)continue;out.push_back(std::move(bytes));}
+  }catch(...){}
+  return out;
+ }
  bool available() const {std::lock_guard<std::mutex> lock(mutex);return directory>=0;}
  void checkpoint() noexcept {
   std::unique_lock<std::mutex> writer(saving,std::try_to_lock);if(!writer.owns_lock())return;

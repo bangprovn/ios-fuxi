@@ -51,6 +51,8 @@ inline unsigned frameCPU() {
 struct FrameCounts {uint64_t pipelines=0,descriptors=0,allocations=0;};
 // Count successful Vulkan pipeline/set/memory creations on the calling thread.
 inline thread_local FrameCounts frameCounts;
+// Pipelines compiled on the draw path (not by the background prewarm) and the time they blocked the caller; process-wide.
+inline std::atomic<uint64_t> syncCompiles{0},syncCompileNs{0};
 enum class MergeSplit : size_t {none,encoder,attachments,area,actions,attachmentSample,storage,shadow,fetch,nonDraw,bufferAlias,count};
 inline constexpr const char *mergeSplitNames[]={"none","encoder","attachments","area","actions","attachment_sample","storage","shadow","fetch","non_draw","buffer_alias"};
 // Exclusive per-phase wall time (nested phases pause their parent). Encode phases cover the frontend entry-point families on the calling thread and
@@ -90,7 +92,7 @@ struct FrameSample {
  // Submits that waited on a flight for each resource kind (buffer, shadow, texture, surface, index) and shadow storage renames that avoided the wait.
  std::array<uint64_t,5> conflictKinds{};std::array<uint64_t,6> renameDeclined{};uint64_t shadowRenames=0,shadowRenameBytes=0; // declined: off, not_backing, direct_use, texture, budget, other
  uint64_t drainSubmits=0,prepareDrains=0,prepareUnknownDrains=0,prepareConflictWaits=0,indexUploadDrains=0,indexGPUWritableDrains=0,indexUploadSubmits=0,indexReadOnlySubmits=0,indexGPUWritableSubmits=0;
- uint64_t snapshotReusedBytes=0,shadowSkippedBytes=0,shadowHashSkipped=0,shadowHashCopied=0,shadowHashBytes=0,shadowHashNs=0,renderAreaPasses=0,renderAreaShrunk=0,renderAreaPixels=0,renderAreaFullPixels=0,passReorders=0,sampleOptimal=0,sampleLinear=0,sampleShadow=0,sampleLinearBytes=0,sampleShadowBytes=0,sampleOptimalBytes=0,rtIn=0,rtInSkipped=0,rtOut=0,rtSyncs=0,rtBytes=0;
+ uint64_t snapshotReusedBytes=0,shadowSkippedBytes=0,shadowHashSkipped=0,shadowHashCopied=0,shadowHashBytes=0,shadowHashNs=0,renderAreaPasses=0,renderAreaShrunk=0,renderAreaPixels=0,renderAreaFullPixels=0,passReorders=0,sampleOptimal=0,sampleLinear=0,sampleShadow=0,sampleLinearBytes=0,sampleShadowBytes=0,sampleOptimalBytes=0,rtIn=0,rtInSkipped=0,rtOut=0,rtSyncs=0,rtBytes=0,rtEligible=0,rtLinearLarge=0;
  // Last observed handler batch / explicit wait, sampled on the following commit.
  uint64_t priorDelivery=0,priorHandlers=0,priorWaitCompleted=0;
  // Command buffer creation (steady clock); the window derives frame-to-frame cadence.
@@ -223,7 +225,7 @@ public:
   for(size_t i=0;i<totals.conflictKinds.size();++i)totals.conflictKinds[i]+=s.conflictKinds[i];for(size_t i=0;i<totals.renameDeclined.size();++i)totals.renameDeclined[i]+=s.renameDeclined[i];totals.shadowRenames+=s.shadowRenames;totals.shadowRenameBytes+=s.shadowRenameBytes;totals.drainWaits+=s.drainWaits;totals.conflictWaits+=s.conflictWaits;totals.slotWaits+=s.slotWaits;
   totals.shadowWaits+=s.shadowWaits;totals.drainSubmits+=s.drainSubmits;totals.prepareDrains+=s.prepareDrains;totals.prepareUnknownDrains+=s.prepareUnknownDrains;totals.prepareConflictWaits+=s.prepareConflictWaits;totals.indexUploadDrains+=s.indexUploadDrains;totals.indexGPUWritableDrains+=s.indexGPUWritableDrains;
   totals.indexUploadSubmits+=s.indexUploadSubmits;totals.indexReadOnlySubmits+=s.indexReadOnlySubmits;totals.indexGPUWritableSubmits+=s.indexGPUWritableSubmits;
-  totals.snapshotReusedBytes+=s.snapshotReusedBytes;totals.shadowSkippedBytes+=s.shadowSkippedBytes;totals.shadowHashSkipped+=s.shadowHashSkipped;totals.shadowHashCopied+=s.shadowHashCopied;totals.shadowHashBytes+=s.shadowHashBytes;totals.shadowHashNs+=s.shadowHashNs;totals.renderAreaPasses+=s.renderAreaPasses;totals.renderAreaShrunk+=s.renderAreaShrunk;totals.renderAreaPixels+=s.renderAreaPixels;totals.renderAreaFullPixels+=s.renderAreaFullPixels;totals.passReorders+=s.passReorders;totals.sampleOptimal+=s.sampleOptimal;totals.sampleLinear+=s.sampleLinear;totals.sampleShadow+=s.sampleShadow;totals.sampleLinearBytes+=s.sampleLinearBytes;totals.sampleShadowBytes+=s.sampleShadowBytes;totals.sampleOptimalBytes+=s.sampleOptimalBytes;totals.rtIn+=s.rtIn;totals.rtInSkipped+=s.rtInSkipped;totals.rtOut+=s.rtOut;totals.rtSyncs+=s.rtSyncs;totals.rtBytes+=s.rtBytes;
+  totals.snapshotReusedBytes+=s.snapshotReusedBytes;totals.shadowSkippedBytes+=s.shadowSkippedBytes;totals.shadowHashSkipped+=s.shadowHashSkipped;totals.shadowHashCopied+=s.shadowHashCopied;totals.shadowHashBytes+=s.shadowHashBytes;totals.shadowHashNs+=s.shadowHashNs;totals.renderAreaPasses+=s.renderAreaPasses;totals.renderAreaShrunk+=s.renderAreaShrunk;totals.renderAreaPixels+=s.renderAreaPixels;totals.renderAreaFullPixels+=s.renderAreaFullPixels;totals.passReorders+=s.passReorders;totals.sampleOptimal+=s.sampleOptimal;totals.sampleLinear+=s.sampleLinear;totals.sampleShadow+=s.sampleShadow;totals.sampleLinearBytes+=s.sampleLinearBytes;totals.sampleShadowBytes+=s.sampleShadowBytes;totals.sampleOptimalBytes+=s.sampleOptimalBytes;totals.rtIn+=s.rtIn;totals.rtInSkipped+=s.rtInSkipped;totals.rtOut+=s.rtOut;totals.rtSyncs+=s.rtSyncs;totals.rtEligible+=s.rtEligible;totals.rtLinearLarge+=s.rtLinearLarge;totals.rtBytes+=s.rtBytes;
   gpuUnavailable+=!s.gpuSamples;++cpus[s.cpu<8?s.cpu:8];encodeUnknown+=s.encodeCountsUnknown;
  }
  uint64_t size() const{return count;}
@@ -268,6 +270,7 @@ public:
    p(&FrameSample::gpuExec,50),p(&FrameSample::gpuExec,90),draws/n,passes/n,counts.pipelines/n,counts.descriptors/n,counts.allocations/n);
   for(unsigned i=0;i<8;++i)fprintf(out,"%s%u:%llu",i?",":"",i,(unsigned long long)cpus[i]);
   fprintf(out,",unknown:%llu encode_counts_unknown=%llu gpu_exec_unavailable=%llu",(unsigned long long)cpus[8],(unsigned long long)encodeUnknown,(unsigned long long)gpuUnavailable);
+  {static uint64_t prevCompiles=0,prevNs=0;uint64_t c=syncCompiles.load(),ns=syncCompileNs.load();fprintf(out," sync_compiles=%llu sync_compile_ms=%.1f",(unsigned long long)(c-prevCompiles),double(ns-prevNs)/1e6);prevCompiles=c;prevNs=ns;}
   if(systemTranslationPolicy().overlap)fprintf(out," overlap_depth=%.0f/%.0f completion_ms=%.3f/%.3f worker_depth=%.0f/%.0f",double(percentile(&FrameSample::inflight,50)),double(percentile(&FrameSample::inflight,90)),p(&FrameSample::completionLatency,50),p(&FrameSample::completionLatency,90),double(percentile(&FrameSample::workerDepth,50)),double(percentile(&FrameSample::workerDepth,90)));
   if(systemTranslationPolicy().merge){fprintf(out," merged_draws/frame=%.2f merged_splits=",mergedDraws/n);
    for(size_t i=1;i<mergeSplits.size();++i)fprintf(out,"%s%s:%llu",i==1?"":",",mergeSplitNames[i],(unsigned long long)mergeSplits[i]);}
@@ -279,7 +282,7 @@ public:
   fprintf(out," plan_hits/frame=%.2f plan_misses/frame=%.2f",totals.planHits/n,totals.planMisses/n);
   fprintf(out," snapshot_bytes/frame=%.2f shadow_copy_bytes/frame=%.2f",totals.snapshotBytes/n,totals.shadowCopyBytes/n);
   fprintf(out," shadow_hash_skipped/frame=%.2f shadow_hash_copied/frame=%.2f shadow_hash_skipped_bytes/frame=%.0f shadow_hash_ms/frame=%.3f",totals.shadowHashSkipped/n,totals.shadowHashCopied/n,totals.shadowHashBytes/n,totals.shadowHashNs/n/1e6);
-  fprintf(out," rt_shadow_in/frame=%.2f rt_shadow_in_skipped/frame=%.2f rt_shadow_out/frame=%.2f rt_shadow_syncs/frame=%.2f rt_shadow_mb/frame=%.2f",totals.rtIn/n,totals.rtInSkipped/n,totals.rtOut/n,totals.rtSyncs/n,totals.rtBytes/n/1048576.0);
+  fprintf(out," rt_shadow_in/frame=%.2f rt_shadow_in_skipped/frame=%.2f rt_shadow_out/frame=%.2f rt_shadow_syncs/frame=%.2f rt_shadow_mb/frame=%.2f rt_shadow_eligible/frame=%.2f rt_linear_large_targets/frame=%.2f",totals.rtIn/n,totals.rtInSkipped/n,totals.rtOut/n,totals.rtSyncs/n,totals.rtBytes/n/1048576.0,totals.rtEligible/n,totals.rtLinearLarge/n);
   fprintf(out," sampled/frame=optimal:%.2f,linear:%.2f,shadow:%.2f sampled_mb/frame=optimal:%.2f,linear:%.2f,shadow:%.2f",totals.sampleOptimal/n,totals.sampleLinear/n,totals.sampleShadow/n,totals.sampleOptimalBytes/n/1048576.0,totals.sampleLinearBytes/n/1048576.0,totals.sampleShadowBytes/n/1048576.0);
   fprintf(out," render_area_pct=%.1f render_area_shrunk/frame=%.2f pass_reorders/frame=%.2f",totals.renderAreaFullPixels?100.0*totals.renderAreaPixels/totals.renderAreaFullPixels:100.0,totals.renderAreaShrunk/n,totals.passReorders/n);
   fprintf(out," shadow_scanned_indices/frame=%.2f shadow_full_reasons=",totals.shadowScannedIndices/n);for(size_t i=0;i<totals.shadowFullReasons.size();++i)fprintf(out,"%s%s:%.2f",i?",":"",shadowFullReasonNames[i],totals.shadowFullReasons[i]/n);
