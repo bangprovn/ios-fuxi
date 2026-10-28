@@ -18,7 +18,7 @@ struct PassInfo {
 // the largest summed draw time and prints its 5 most expensive draws.
 struct DrawTex {uint32_t width=0,height=0,format=0;uint8_t kind=0,backed=0,imported=0;}; // kind 0 optimal, 1 linear alias, 2 optimal shadow of a buffer
 struct DrawInfo {
- bool begin=false;uint32_t pipeline=0,count=0,blend=0,srcRGB=0,dstRGB=0,srcAlpha=0,dstAlpha=0,mask=0,instr=0,samples=0,loops=0,kills=0,texCount=0,passW=0,passH=0,scW=0,scH=0;DrawTex tex[4];
+ bool begin=false;uint32_t pipeline=0,count=0,blend=0,srcRGB=0,dstRGB=0,srcAlpha=0,dstAlpha=0,mask=0,instr=0,samples=0,loops=0,kills=0,texCount=0,passW=0,passH=0,scW=0,scH=0;int32_t scX=0,scY=0;DrawTex tex[4];
 };
 // Counts SPIR-V instructions, image samples, loop merges and discards in a fragment shader (word stream; header is 5 words).
 struct SpirvStats {uint32_t words=0,instr=0,samples=0,loops=0,kills=0,fetches=0,specConsts=0,switches=0,condBranches=0,selections=0,calls=0,phis=0,converts=0,f16Types=0,f32Types=0,relaxed=0,accessChains=0,quantize=0,loopsDontUnroll=0,loopsNone=0;};
@@ -30,10 +30,26 @@ inline SpirvStats spirvStats(const uint32_t *w,size_t n){
   else if(op==115)++s.converts;else if(op==65)++s.accessChains;else if(op==22 && len>=3){if(w[i+2]==16)++s.f16Types;else if(w[i+2]==32)++s.f32Types;}else if(op==71 && len>=3 && w[i+2]==0)++s.relaxed;i+=len;}
  return s;
 }
+// Upper bound for occlusion culling inside a pass: an opaque draw (no blend, all channels, no discard) is a candidate when a later opaque draw of the same pass has a scissor containing its own.
+// Geometry is not inspected, so this only says where a coverage proof would pay off; loadElide counts passes whose first draw is opaque over the whole render area (the load of the previous contents would be dead).
+struct OcclusionStats {uint32_t draws=0,candidates=0,loadElide=0,passes=0;uint64_t totalNs=0,candidateNs=0;};
+inline OcclusionStats drawOcclusion(const std::vector<DrawInfo> &infos,const std::vector<uint64_t> &ns) {
+ OcclusionStats r;size_t n=std::min(infos.size(),ns.size());
+ auto opaque=[](const DrawInfo &d){return !d.begin && !d.blend && d.mask==15 && !d.kills && d.scW && d.scH;};
+ auto inside=[](const DrawInfo &a,const DrawInfo &b){return int64_t(b.scX)<=a.scX && int64_t(b.scY)<=a.scY && int64_t(b.scX)+b.scW>=int64_t(a.scX)+a.scW && int64_t(b.scY)+b.scH>=int64_t(a.scY)+a.scH;};
+ for(size_t i=0;i<n;){
+  if(!infos[i].begin){++i;continue;}
+  size_t b=i+1,e=b;while(e<n && !infos[e].begin)++e;++r.passes;
+  if(e>b && opaque(infos[b]) && infos[b].scX<=0 && infos[b].scY<=0 && infos[b].scW>=infos[i].passW && infos[b].scH>=infos[i].passH)++r.loadElide;
+  for(size_t k=b;k<e;++k){++r.draws;r.totalNs+=ns[k];if(!opaque(infos[k]))continue;for(size_t j=k+1;j<e;++j)if(opaque(infos[j]) && inside(infos[k],infos[j])){++r.candidates;r.candidateNs+=ns[k];break;}}
+  i=e;}
+ return r;
+}
 inline void reportDraws(FILE *out,const std::vector<DrawInfo> &infos,const std::vector<uint64_t> &ns,size_t top=5){
  std::vector<uint64_t> passNs;std::vector<size_t> first;int cur=-1;
  for(size_t i=0;i<infos.size() && i<ns.size();++i){if(infos[i].begin){passNs.push_back(0);first.push_back(i+1);cur=int(passNs.size())-1;}else if(cur>=0)passNs[cur]+=ns[i];}
- if(passNs.empty())return;size_t best=0;for(size_t i=1;i<passNs.size();++i)if(passNs[i]>passNs[best])best=i;
+ if(passNs.empty())return;{auto o=drawOcclusion(infos,ns);fprintf(out,"FUXI MTL: gpu draw occlusion passes=%u draws=%u hidden_candidates=%u hidden_ms=%.3f of_ms=%.3f load_elide_candidates=%u (upper bound from scissor containment; geometry not inspected)\n",o.passes,o.draws,o.candidates,o.candidateNs/1e6,o.totalNs/1e6,o.loadElide);}
+ size_t best=0;for(size_t i=1;i<passNs.size();++i)if(passNs[i]>passNs[best])best=i;
  size_t b=first[best],e=b;while(e<infos.size() && e<ns.size() && !infos[e].begin)++e;
  std::vector<size_t> order;for(size_t i=b;i<e;++i)order.push_back(i);
  std::sort(order.begin(),order.end(),[&](size_t x,size_t y){return ns[x]>ns[y];});

@@ -55,7 +55,7 @@ public:
  static inline std::atomic<uint64_t> pipelineHits{0},pipelineMisses{0},gpuNanos{0},gpuSamples{0};
  static inline std::atomic<uint64_t> pipelineCacheLoadResult{0},pipelineCacheLoadBytes{0},pipelineCacheSaveResult{0},pipelineCacheSaveBytes{0},pipelineCacheSaveCount{0},pipelineCacheSaveFailures{0};
  static inline std::atomic<uint64_t> submitObjectsNanos{0},submitDescriptorsNanos{0},submitRecordNanos{0},shadowCopyNanos{0},submitFlushNanos{0},submitInvalidateNanos{0},flushCalls{0},invalidateCalls{0},emptySubmits{0},submitObjectCreates{0},submitPoolCreates{0},submitFrameCreates{0},submitViewCreates{0};
- static inline std::atomic<uint64_t> submits{0},submitPrepareNanos{0},submitWaitNanos{0},submitRetireNanos{0};
+ static inline std::atomic<uint64_t> submits{0},submitPrepareNanos{0},submitWaitNanos{0},submitRetireNanos{0},submitSlotWaitNanos{0},submitBlocked{0},submitBlockedFull{0},submitBlockedDrain{0},submitBlockedConflict{0},submitEntered{0};
  static inline std::function<void()> beforeSubmit;
  static inline bool modelPipelines=false;static inline std::function<void(const Operation &)> modelDraw;
  void registerLibrary(void *,LibraryHash){}

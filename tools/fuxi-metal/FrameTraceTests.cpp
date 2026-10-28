@@ -91,7 +91,15 @@ int main(){
   assert(strstr(buffer,"[1125x2436 fmt=80 linear]") && strstr(buffer,"frag_instr=12") && !strstr(buffer,"pipe=000001"));
   uint32_t code[18]={0x07230203,0x10000,0,10,0};code[5]=(4u<<16)|21;code[9]=(5u<<16)|87;code[14]=(3u<<16)|246;code[17]=(1u<<16)|252;
   auto st=spirvStats(code,sizeof code/4);assert(st.instr==4 && st.samples==1 && st.loops==1 && st.kills==1);
-  std::vector<DrawInfo> none;std::vector<uint64_t> zero;char quiet[64]{};FILE *q=fmemopen(quiet,sizeof quiet,"w");reportDraws(q,none,zero);fclose(q);assert(!quiet[0]);
+  {std::vector<DrawInfo> in;std::vector<uint64_t> t;
+  auto begin=[&](){DrawInfo m{};m.begin=true;m.passW=1000;m.passH=2000;in.push_back(m);t.push_back(0);};
+  auto opq=[&](int x,int y,uint32_t w,uint32_t h,uint64_t ns,bool blend=false){DrawInfo d{};d.count=6;d.blend=blend;d.mask=15;d.scX=x;d.scY=y;d.scW=w;d.scH=h;in.push_back(d);t.push_back(ns);};
+  begin();opq(0,0,1000,2000,500,false);opq(100,100,300,300,200,false);opq(0,0,1000,2000,50,false);opq(100,100,10,10,7,true); // pass 1: the first two are hidden by the third; the blended one is not opaque
+  begin();opq(0,0,500,500,40,false);opq(500,0,500,500,60,false); // pass 2: disjoint, none hidden, first draw does not cover the pass
+  begin();opq(0,0,1000,2000,30,false);{DrawInfo k{};k.count=6;k.mask=15;k.kills=1;k.scW=1000;k.scH=2000;in.push_back(k);t.push_back(9);} // pass 3: a discarding draw never occludes
+  auto o=drawOcclusion(in,t);assert(o.passes==3 && o.draws==8 && o.candidates==2 && o.candidateNs==700 && o.totalNs==896 && o.loadElide==2);
+  auto m=drawOcclusion({},{});assert(!m.draws && !m.candidates);}
+ std::vector<DrawInfo> none;std::vector<uint64_t> zero;char quiet[64]{};FILE *q=fmemopen(quiet,sizeof quiet,"w");reportDraws(q,none,zero);fclose(q);assert(!quiet[0]);
  }
  puts("PASS: bounded frame percentiles/reset/overflow/max, log fields, CPU mask and thread-local attribution");
 }

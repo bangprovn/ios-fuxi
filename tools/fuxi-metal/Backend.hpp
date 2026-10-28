@@ -211,7 +211,7 @@ private:
   size_t freed=0;for(size_t i=0;i<bufferPool.size() && freed<want;){if(all || want!=SIZE_MAX || now-bufferPool[i].idleSince>bufferPoolIdleNs){freed+=bufferPool[i].charged;auto e=bufferPool[i];bufferPool.erase(bufferPool.begin()+i);freePooledBuffer(e);}else ++i;}
   return freed;
  }
- void trimMemoryUnlocked(bool all=false,uint64_t now=memoryNow()){if(all){releaseRtShadows();releaseRenamePool();}
+ void trimMemoryUnlocked(bool all=false,uint64_t now=memoryNow()){if(all){releaseRtShadows();releaseRenamePool();releaseSampleShadows();}
   if(poisoned)return;
   trimBuffers(now,all);
   textureMemory.trim(now,all,[&](VkDeviceMemory h,size_t bytes){freePooledUnlocked(h,bytes);});
@@ -231,6 +231,7 @@ private:
     if(shortBy())slabMemory.reclaim(shortBy(),[&](VkDeviceMemory h,size_t n){freePooledUnlocked(h,n);});}};
   reclaim();
   if(shortBy() && !optionalAlloc && !inSubmit && !poisoned){
+   if(!sampleShadows.empty()){releaseSampleShadows();++optionalSheds;reclaim();}
    if(!renamePool.empty()){releaseRenamePool();++optionalSheds;reclaim();}
    if(shortBy() && !rtShadows.empty()){releaseRtShadows();++optionalSheds;reclaim();}
    if(optionalSheds)fprintf(stderr,"FUXI MTL: budget pressure shed optional memory (sheds=%llu used=%zu need=%zu)\n",(unsigned long long)optionalSheds,limits.used,bytes);
@@ -326,7 +327,7 @@ public:
  static inline auto &pipelineCacheSaveResult=PipelineCache::saveResult,&pipelineCacheSaveBytes=PipelineCache::saveBytes;
  static inline auto &pipelineCacheSaveCount=PipelineCache::saveCount,&pipelineCacheSaveFailures=PipelineCache::saveFailures;
  // CPU cost of submit(): entry to QueueSubmit (incl. the lock), the fence wait, and retirement.
- static inline std::atomic<uint64_t> submits{0},submitPrepareNanos{0},submitWaitNanos{0},submitRetireNanos{0};
+ static inline std::atomic<uint64_t> submits{0},submitPrepareNanos{0},submitWaitNanos{0},submitRetireNanos{0},submitSlotWaitNanos{0},submitBlocked{0},submitBlockedFull{0},submitBlockedDrain{0},submitBlockedConflict{0},submitEntered{0};
  static inline std::atomic<uint64_t> submitObjectsNanos{0},submitDescriptorsNanos{0},submitRecordNanos{0},shadowCopyNanos{0},submitFlushNanos{0},submitInvalidateNanos{0};
  static inline std::atomic<uint64_t> flushCalls{0},invalidateCalls{0},emptySubmits{0},submitObjectCreates{0},submitPoolCreates{0},submitFrameCreates{0},submitViewCreates{0};
  std::map<std::array<uint64_t,7>,Texture *> imports;
@@ -514,7 +515,7 @@ public:
   artifactCache.close();
   for(auto &slot:slots)clearSubmitObjects(slot);clearFrames();clearViews();for(auto &slot:slots){destroyUnlocked(slot.aliasScratch);slot.aliasScratch=nullptr;}
   objects.clear([&](Pipeline *p){drawPlans.invalidate(p);destroyPipelineUnlocked(p);});
-  releaseRtShadows();releaseRenamePool();
+  releaseRtShadows();releaseRenamePool();releaseSampleShadows();
   pipelineCache.close();trimMemoryUnlocked(true);reportRtCounters();passTimes.report(stderr);
   if(device && DestroyDevice) DestroyDevice(device,nullptr);
   if(instance && DestroyInstance) DestroyInstance(instance,nullptr);
@@ -616,8 +617,16 @@ public:
    if((formatProperties.linearTilingFeatures&required)!=(uint32_t)required)return fallback("linear texture format features unavailable");
    // A shadowed buffer's bytes are rewritten each frame; sampling it in place would pin the buffer to every flight reading it. A copy through a shadow image lets the storage be renamed.
    if(usage==1 && systemTranslationPolicy().sampleShadow && uint64_t(width)*height>=systemTranslationPolicy().sampleMinPx){ // FUXI_MTL_SAMPLE_SHADOW: optional, so it may only use budget below the headroom; refused -> the texture samples the linear memory in place
-    Texture *copy=nullptr;try{OptionalScope optional(*this);copy=allocateTextureUnlocked(format,1,width,height);}catch(const std::exception &){++sampleShadowRefused;}
-    if(copy){if(t->image)DestroyImage(device,t->image,nullptr);delete t;t=nullptr;copy->shadow=true;b->shadowBacking=true;copy->backingBuffer=b;++b->references;copy->backingOffset=offset;copy->backingRow=row;++sampleShadowCreated;sampleShadowBytes+=copy->allocated;return copy;}
+    // CA creates a new MTLTexture over the same buffer range every frame (J215: 1271 shadows, 0 hits), so the shadow is keyed by (buffer, offset, pitch, extent, format) and shared by reference; hash staleness is per shadow.
+    std::array<uint64_t,7> key{uint64_t(uintptr_t(b)),offset,row,width,height,format,0};expireSampleShadows(60);
+    auto hit=sampleShadows.find(key);
+    if(hit!=sampleShadows.end()){hit->second.used=submits;++hit->second.t->references;++sampleShadowReused;delete t;t=nullptr;return hit->second.t;}
+    uint64_t need=uint64_t(width)*height*texelBytes(format);
+    while(sampleShadows.size()>=sampleShadowEntryCap || sampleShadowLiveBytes()+need>sampleShadowByteCap){if(!evictIdleSampleShadow(30))break;}
+    Texture *copy=nullptr;
+    if(sampleShadows.size()<sampleShadowEntryCap && sampleShadowLiveBytes()+need<=sampleShadowByteCap){try{OptionalScope optional(*this);copy=allocateTextureUnlocked(format,1,width,height);}catch(const std::exception &){++sampleShadowRefused;}}
+    else ++sampleShadowCapped;
+    if(copy){delete t;t=nullptr;copy->shadow=true;b->shadowBacking=true;copy->backingBuffer=b;++b->references;copy->backingOffset=offset;copy->backingRow=row;++sampleShadowCreated;sampleShadowBytes+=copy->allocated;++copy->references;sampleShadows[key]={copy,uint64_t(submits)};return copy;}
    }
    if(usage==1 && systemTranslationPolicy().linearShadow && uint64_t(width)*height>=systemTranslationPolicy().sampleMinPx)return fallback("sampled linear texture copied to optimal tiling");
    if(shadowed && usage==1 && systemTranslationPolicy().shadowRename && !b->imported)return fallback("shadowed buffer samples through a copy (rename)");
@@ -1253,7 +1262,8 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
  void rtForget(Texture *t) {rtForget((const void *)t);}
  void releaseRtShadows() {for(auto &e:rtShadows)destroyTextureUnlocked(e.second.s);rtShadows.clear();rtRefused.clear();}
  void reportRtCounters() {
-  if(systemTranslationPolicy().sampleShadow)fprintf(stderr,"FUXI MTL: sample shadow min_px=%u created=%llu created_mb=%.2f refused=%llu copies=%llu hits=%llu stale_invalidations=%llu copied_mb=%.1f hashed_mb=%.1f hash_ms=%.2f\n",systemTranslationPolicy().sampleMinPx,(unsigned long long)sampleShadowCreated,sampleShadowBytes/1048576.0,(unsigned long long)sampleShadowRefused,(unsigned long long)sampleCopies,(unsigned long long)sampleHits,(unsigned long long)sampleInvalidations,sampleCopiedBytes/1048576.0,sampleHashedBytes/1048576.0,sampleHashNs/1e6);
+  {uint64_t n=submitEntered,s=submits;if(n && s)fprintf(stderr,"FUXI MTL: submit pipeline submits=%llu encode_ms=%.3f slot_wait_ms=%.3f blocked_pct=%.1f blocked_full=%llu blocked_drain=%llu blocked_conflict=%llu gpu_latency_ms=%.3f retire_host_ms=%.3f (per submit; encode includes slot waits; gpu_latency is queue submit to fence)\n",(unsigned long long)n,submitPrepareNanos/1e6/n,submitSlotWaitNanos/1e6/n,100.0*submitBlocked/n,(unsigned long long)submitBlockedFull,(unsigned long long)submitBlockedDrain,(unsigned long long)submitBlockedConflict,submitWaitNanos/1e6/s,submitRetireNanos/1e6/s);}
+  if(systemTranslationPolicy().sampleShadow)fprintf(stderr,"FUXI MTL: sample shadow min_px=%u created=%llu created_mb=%.2f reused=%llu capped=%llu evicted=%llu live=%zu live_mb=%.2f refused=%llu copies=%llu hits=%llu stale_invalidations=%llu copied_mb=%.1f hashed_mb=%.1f hash_ms=%.2f\n",systemTranslationPolicy().sampleMinPx,(unsigned long long)sampleShadowCreated,sampleShadowBytes/1048576.0,(unsigned long long)sampleShadowReused,(unsigned long long)sampleShadowCapped,(unsigned long long)sampleShadowEvicted,sampleShadows.size(),sampleShadowLiveBytes()/1048576.0,(unsigned long long)sampleShadowRefused,(unsigned long long)sampleCopies,(unsigned long long)sampleHits,(unsigned long long)sampleInvalidations,sampleCopiedBytes/1048576.0,sampleHashedBytes/1048576.0,sampleHashNs/1e6);
   if(systemTranslationPolicy().rtRename){uint64_t mb=0;for(auto &e:renamePool)mb+=uint64_t(e.w)*e.h*texelBytes(e.format);
    fprintf(stderr,"FUXI MTL: rt rename submits=%llu renamed=%llu hoisted=%llu merged_main_passes=%llu main_runs_before=%llu main_runs_after=%llu pool_images=%zu pool_mb=%.2f\n",(unsigned long long)rtRenameSubmits,(unsigned long long)rtRenamed,(unsigned long long)rtHoisted,(unsigned long long)rtMergedMain,(unsigned long long)rtMainBefore,(unsigned long long)rtMainAfter,renamePool.size(),double(mb)/1048576.0);}
   fprintf(stderr,"FUXI MTL: rt shadow enabled=%d reuse=%d shadows=%zu created=%llu in=%llu in_skipped=%llu reused=%llu out=%llu syncs=%llu copy_src_redirects=%llu eligible_uses=%llu linear_large_uses=%llu sync_compiles=%llu sync_compile_ms=%.1f\n",
@@ -1433,7 +1443,12 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
     ++rtRenamed;}
   }
  }
- std::atomic<uint64_t> sampleShadowCreated{0},sampleShadowRefused{0},sampleShadowBytes{0},sampleHits{0},sampleCopies{0},sampleInvalidations{0},sampleHashedBytes{0},sampleCopiedBytes{0},sampleHashNs{0};unsigned hoistLogged=0;std::atomic<uint64_t> relaxedPipelines{0},relaxedMarks{0};
+ struct SampleShadow {Texture *t;uint64_t used;};std::map<std::array<uint64_t,7>,SampleShadow> sampleShadows;static constexpr size_t sampleShadowEntryCap=48;static constexpr uint64_t sampleShadowByteCap=16u<<20;
+ uint64_t sampleShadowLiveBytes() const {uint64_t n=0;for(auto &e:sampleShadows)n+=uint64_t(e.second.t->width)*e.second.t->height*texelBytes(e.second.t->format);return n;}
+ bool evictIdleSampleShadow(uint64_t idle) {auto best=sampleShadows.end();for(auto i=sampleShadows.begin();i!=sampleShadows.end();++i)if(i->second.t->references==1 && submits-i->second.used>=idle && (best==sampleShadows.end() || i->second.used<best->second.used))best=i;if(best==sampleShadows.end())return false;auto *t=best->second.t;sampleShadows.erase(best);destroyTextureUnlocked(t);++sampleShadowEvicted;return true;}
+ void expireSampleShadows(uint64_t idle) {if(sampleShadows.empty())return;for(;;){bool any=false;for(auto &e:sampleShadows)if(e.second.t->references==1 && submits-e.second.used>=idle*5){any=true;break;}if(!any || !evictIdleSampleShadow(idle*5))return;}}
+ void releaseSampleShadows() {auto all=std::move(sampleShadows);sampleShadows.clear();for(auto &e:all)destroyTextureUnlocked(e.second.t);}
+ std::atomic<uint64_t> sampleShadowReused{0},sampleShadowCapped{0},sampleShadowEvicted{0},sampleShadowCreated{0},sampleShadowRefused{0},sampleShadowBytes{0},sampleHits{0},sampleCopies{0},sampleInvalidations{0},sampleHashedBytes{0},sampleCopiedBytes{0},sampleHashNs{0};unsigned hoistLogged=0;std::atomic<uint64_t> relaxedPipelines{0},relaxedMarks{0};
  void hoistOffscreen(std::vector<Operation> &ops) {
   std::vector<PassGroup> groups;if(!buildGroups(ops,groups,true))return;
   std::vector<size_t> order;order.reserve(groups.size());unsigned moved=0,offs=0;std::map<std::string,unsigned> reasons;std::map<std::string,std::string> examples;
@@ -1526,15 +1541,15 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
   // maintenance still excludes every shared allocation; undeclared prepare drains.
   unsigned kindSeen=0;bool sawDrain=false,sawIndex=false,sawUpload=false,sawPrepare=false,sawUnknown=false,sawPrepConflict=false,sawDrainWait=false,sawConflict=false,sawSlots=false,otherIndices=false;
   if(currentFrame){bool upload=false;for(auto &op:ops)if(op.indices)(op.indices->upload?upload:otherIndices)=true;currentFrame->indexUploadSubmits+=upload;}
-  auto slotStart=FrameClock::now();auto waitPhase=std::make_unique<PhaseTimer>(SubPhase::wait);
+  bool blockFull=false,blockDrain=false,blockConflict=false;auto slotStart=FrameClock::now();auto waitPhase=std::make_unique<PhaseTimer>(SubPhase::wait);
   submitWake.wait(guard,[&]{if(poisoned)return true;bool index=indexHazard(),unknown=prepare && !declared,prepConflict=declared && prepareConflicts(),drain=unknown || index,busy=slots[0].busy || slots[1].busy,conflict=conflicts() || prepConflict,full=slots[0].busy && (!retirement || slots[1].busy);
    if(currentFrame){auto once=[](bool value,bool &seen,uint64_t &count){if(value && !seen){++count;seen=true;}};
     once(drain,sawDrain,currentFrame->drainSubmits);once(index,sawIndex,currentFrame->indexGPUWritableDrains);once(indexHazard(true),sawUpload,currentFrame->indexUploadDrains);once(bool(prepare),sawPrepare,currentFrame->prepareDrains);once(unknown,sawUnknown,currentFrame->prepareUnknownDrains);once(prepConflict,sawPrepConflict,currentFrame->prepareConflictWaits);
     once(drain && busy,sawDrainWait,currentFrame->drainWaits);once(conflict,sawConflict,currentFrame->conflictWaits);once(full,sawSlots,currentFrame->slotWaits);
     if(conflict || index){unsigned m=conflictKinds()|(index?16u:0u);for(unsigned k=0;k<5;++k)if((m>>k&1) && !(kindSeen>>k&1)){kindSeen|=1u<<k;++currentFrame->conflictKinds[k];}}}
-   return !full && (!drain || !busy) && !conflict;
+   bool ready=!full && (!drain || !busy) && !conflict;if(!ready){blockFull|=full;blockDrain|=drain && busy;blockConflict|=conflict;}return ready;
   });
-  waitPhase.reset();
+  waitPhase.reset();++submitEntered;if(blockFull || blockDrain || blockConflict){++submitBlocked;submitBlockedFull+=blockFull;submitBlockedDrain+=blockDrain;submitBlockedConflict+=blockConflict;submitSlotWaitNanos+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(FrameClock::now()-slotStart).count());}
   if(currentFrame){currentFrame->indexGPUWritableSubmits+=sawIndex;currentFrame->indexReadOnlySubmits+=otherIndices && !sawIndex;}
   if(currentFrame)currentFrame->slotWait+=since(slotStart);
   requireLive();
@@ -2150,7 +2165,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
       }
       if(set!=boundSet || op.pipeline->layout!=boundLayout){CmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,op.pipeline->layout,0,1,&set,0,nullptr);boundSet=set;boundLayout=op.pipeline->layout;}
      }
-     DrawInfo di{};di.scW=op.scissor.extent.width;di.scH=op.scissor.extent.height;
+     DrawInfo di{};di.scW=op.scissor.extent.width;di.scH=op.scissor.extent.height;di.scX=op.scissor.offset.x;di.scY=op.scissor.offset.y;
      if(currentFrame || drawQ){const auto &po=op.pipeline->options;di.pipeline=op.pipeline->id;di.count=draw.count;di.blend=po.blend;di.srcRGB=po.srcRGB;di.dstRGB=po.dstRGB;di.srcAlpha=po.srcAlpha;di.dstAlpha=po.dstAlpha;di.mask=po.mask;di.instr=op.pipeline->fragInstr;di.samples=op.pipeline->fragSamples;di.loops=op.pipeline->fragLoops;di.kills=op.pipeline->fragKills;
       for(unsigned i=0;i<draw.descriptorCount;++i){const auto &d=draw.descriptors[i];if(d.source || (d.type!=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && d.type!=VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) || d.slot>=resourceSlots)continue;
        auto *t=d.slot==0 && !op.samples[0]?op.sourceTexture:op.samples[d.slot];if(!t)continue;uint8_t kind=t->tiling==VK_IMAGE_TILING_LINEAR?1:t->shadow?2:0;uint64_t bytes=uint64_t(t->width)*t->height*texelBytes(t->format);
