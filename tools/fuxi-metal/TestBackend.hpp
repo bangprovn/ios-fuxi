@@ -96,7 +96,7 @@ public:
  Pipeline *compilePipeline(void *,const char *v,void *,const char *f,const CompileOptions &options=CompileOptions{}) {
   if(!modelPipelines)throw std::runtime_error("M4 CPU model has no translation");
   // The ABI input consists only of initialized 32-bit fields/byte arrays.
-  static_assert(sizeof(CompileOptions)==40360);
+  static_assert(sizeof(CompileOptions)==40364);
   std::string key=std::string(v)+"/"+f+"/";key.append((const char *)&options,sizeof(options));
   if(auto *p=objects.acquire(key)){++pipelineHits;return p;}
   ++pipelineMisses;auto *p=new Pipeline{};p->options=options;objects.insert(key,key,p,sizeof(Pipeline),[&](Pipeline *old){destroy(old);});return p;

@@ -277,7 +277,7 @@ private:
 #ifdef VK_KHR_pipeline_executable_properties
  PFN_vkGetPipelineExecutablePropertiesKHR GetPipelineExecutablePropertiesKHR{};PFN_vkGetPipelineExecutableStatisticsKHR GetPipelineExecutableStatisticsKHR{};
 #endif
- bool executableStats=false;
+ bool executableStats=false;uint32_t deviceFeatures=0;
  PFN_vkGetPhysicalDeviceImageFormatProperties2 GetPhysicalDeviceImageFormatProperties2{};
  PFN_vkDestroyInstance DestroyInstance{};PFN_vkGetInstanceProcAddr gipa{};
 #define FIELD(n) PFN_vk##n n{};
@@ -385,8 +385,23 @@ public:
     fprintf(stderr,"FUXI MTL: pipeline executable statistics %s\n",executableStats?"enabled":"unavailable");
    }
 #endif
-   VkPhysicalDeviceFeatures2 core{};core.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;GetPhysicalDeviceFeatures2(physical,&core);
-   VkPhysicalDeviceFeatures enables{};enables.independentBlend=core.features.independentBlend;enables.samplerAnisotropy=core.features.samplerAnisotropy;di.pEnabledFeatures=&enables;
+   // 16-bit float/storage, int16 and robustness: enable what the GPU reports (kill switches FUXI_MTL_F16=0 / FUXI_MTL_ROBUST=0). The same mask goes to the translator.
+   VkPhysicalDeviceVulkan11Features have11{};have11.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;VkPhysicalDeviceVulkan12Features have12{};have12.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+   VkPhysicalDeviceRobustness2FeaturesEXT haveRob{};haveRob.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT;bool robExt=false;
+   for(const auto &ext:extensions)if(!strcmp(ext.extensionName,VK_EXT_ROBUSTNESS_2_EXTENSION_NAME))robExt=true;
+   VkPhysicalDeviceFeatures2 core{};core.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;core.pNext=&have11;have11.pNext=&have12;if(robExt)have12.pNext=&haveRob;GetPhysicalDeviceFeatures2(physical,&core);
+   const auto &policy=systemTranslationPolicy();
+   if(policy.f16){if(have12.shaderFloat16)deviceFeatures|=featFloat16;if(have11.storageBuffer16BitAccess)deviceFeatures|=featStorage16;if(have11.uniformAndStorageBuffer16BitAccess)deviceFeatures|=featUniform16;if(core.features.shaderInt16)deviceFeatures|=featInt16;}
+   if(policy.robust){if(core.features.robustBufferAccess)deviceFeatures|=featRobustBuffer;if(robExt && haveRob.robustBufferAccess2)deviceFeatures|=featRobustBuffer2;if(robExt && haveRob.robustImageAccess2)deviceFeatures|=featRobustImage2;}
+   VkPhysicalDeviceVulkan11Features en11{};en11.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;VkPhysicalDeviceVulkan12Features en12{};en12.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+   VkPhysicalDeviceRobustness2FeaturesEXT enRob{};enRob.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT;
+   en12.shaderFloat16=(deviceFeatures&featFloat16)?VK_TRUE:VK_FALSE;en11.storageBuffer16BitAccess=(deviceFeatures&featStorage16)?VK_TRUE:VK_FALSE;en11.uniformAndStorageBuffer16BitAccess=(deviceFeatures&featUniform16)?VK_TRUE:VK_FALSE;
+   enRob.robustBufferAccess2=(deviceFeatures&featRobustBuffer2)?VK_TRUE:VK_FALSE;enRob.robustImageAccess2=(deviceFeatures&featRobustImage2)?VK_TRUE:VK_FALSE;
+   {const void *chain=di.pNext;if(deviceFeatures&(featRobustBuffer2|featRobustImage2)){enRob.pNext=const_cast<void *>(chain);chain=&enRob;enabledExtensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);}
+    en12.pNext=const_cast<void *>(chain);en11.pNext=&en12;di.pNext=&en11;}
+   fprintf(stderr,"FUXI MTL: device features mask=0x%x float16=%d storage16=%d uniform16=%d int16=%d robust_buffer=%d robust_buffer2=%d robust_image2=%d (supported: f16=%d s16=%d u16=%d i16=%d rb=%d rb2=%d ri2=%d)\n",deviceFeatures,!!(deviceFeatures&featFloat16),!!(deviceFeatures&featStorage16),!!(deviceFeatures&featUniform16),!!(deviceFeatures&featInt16),!!(deviceFeatures&featRobustBuffer),!!(deviceFeatures&featRobustBuffer2),!!(deviceFeatures&featRobustImage2),
+    int(have12.shaderFloat16),int(have11.storageBuffer16BitAccess),int(have11.uniformAndStorageBuffer16BitAccess),int(core.features.shaderInt16),int(core.features.robustBufferAccess),int(robExt && haveRob.robustBufferAccess2),int(robExt && haveRob.robustImageAccess2));
+   VkPhysicalDeviceFeatures enables{};enables.independentBlend=core.features.independentBlend;enables.samplerAnisotropy=core.features.samplerAnisotropy;enables.shaderInt16=(deviceFeatures&featInt16)?VK_TRUE:VK_FALSE;enables.robustBufferAccess=(deviceFeatures&featRobustBuffer)?VK_TRUE:VK_FALSE;di.pEnabledFeatures=&enables;
    // Without the feature an anisotropic Metal sampler degrades to plain filtering.
    maxAnisotropy=enables.samplerAnisotropy?std::max(1.f,props.limits.maxSamplerAnisotropy):1;
    independentBlend=enables.independentBlend;maxColorAttachments=std::min(8u,props.limits.maxColorAttachments);
@@ -810,7 +825,7 @@ public:
     fprintf(stderr,"FUXI MTL: translation timing result=%s wait_ms=%.3f identity_ms=%.3f compile_ms=%.3f hash_ms=%.3f create_ms=%.3f total_ms=%.3f process_cpu_ms=%.3f peak_rss_kib=%ld relock_ms=%.3f\n",result,std::chrono::duration<double,std::milli>(acquired-requested).count(),identity,compile,hash,create,std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-requested).count(),cpuMs(end)-cpuMs(cpu),long(rss),relock);}}
   } timing{systemTranslationPolicy().trace,requested,acquired,start};
   if(timing.enabled)getrusage(RUSAGE_SELF,&timing.cpu);
-  auto enabledOptions=options;enabledOptions.orderedColorAccess=orderedColorAccess;enabledOptions.independentBlend=independentBlend;
+  auto enabledOptions=options;enabledOptions.orderedColorAccess=orderedColorAccess;enabledOptions.independentBlend=independentBlend;enabledOptions.deviceFeatures=deviceFeatures;
   uint8_t identity[32]{};
   if(!tr.identity(v,vn,f,fn,&enabledOptions,identity,error,sizeof(error)))throw std::runtime_error(error);
   timing.identity=timing.lap();
@@ -1025,8 +1040,8 @@ public:
  // exposes VK_KHR_pipeline_executable_properties, the post-optimization statistics (ir3 instruction counts, registers, spills).
  void logPipelineStats(Pipeline *p,const Translation &t,VkPipeline pipeline) {
   auto st=spirvStats(t.fragment,t.fragmentCount);auto vs=spirvStats(t.vertex,t.vertexCount);
-  fprintf(stderr,"FUXI MTL: pipeline stats pipe=%06x frag=%s vert=%s frag_words=%u frag_instr=%u samples=%u fetches=%u loops=%u kills=%u spec_consts=%u switches=%u cond_br=%u selections=%u calls=%u phis=%u converts=%u f16_types=%u f32_types=%u relaxed=%u access_chains=%u vert_instr=%u vk_specs=%u fn_constants=%u/%u\n",
-   p->id,t.fragmentEntry?t.fragmentEntry:"?",t.vertexEntry?t.vertexEntry:"?",st.words,st.instr,st.samples,st.fetches,st.loops,st.kills,st.specConsts,st.switches,st.condBranches,st.selections,st.calls,st.phis,st.converts,st.f16Types,st.f32Types,st.relaxed,st.accessChains,vs.instr,t.specCount,p->options.constantCount[0],p->options.constantCount[1]);
+  fprintf(stderr,"FUXI MTL: pipeline stats pipe=%06x frag=%s vert=%s frag_words=%u frag_instr=%u samples=%u fetches=%u loops=%u kills=%u spec_consts=%u switches=%u cond_br=%u selections=%u calls=%u phis=%u converts=%u f16_types=%u f32_types=%u relaxed=%u access_chains=%u quantize_f16=%u loops_dontunroll=%u loops_none=%u vert_instr=%u vk_specs=%u fn_constants=%u/%u\n",
+   p->id,t.fragmentEntry?t.fragmentEntry:"?",t.vertexEntry?t.vertexEntry:"?",st.words,st.instr,st.samples,st.fetches,st.loops,st.kills,st.specConsts,st.switches,st.condBranches,st.selections,st.calls,st.phis,st.converts,st.f16Types,st.f32Types,st.relaxed,st.accessChains,st.quantize,st.loopsDontUnroll,st.loopsNone,vs.instr,t.specCount,p->options.constantCount[0],p->options.constantCount[1]);
   if(const char *dir=getenv("FUXI_MTL_SPIRV_DUMP_DIR")){ // raw SPIR-V of heavy pipelines for offline spirv-dis; the directory must already exist
    if(st.instr>=5000 && t.fragment){char path[512];snprintf(path,sizeof path,"%s/pipe%06x.frag.spv",dir,p->id);if(FILE *f=fopen(path,"wb")){fwrite(t.fragment,4,t.fragmentCount,f);fclose(f);fprintf(stderr,"FUXI MTL: pipeline stats pipe=%06x dumped fragment SPIR-V\n",p->id);}}}
   for(unsigned stage=0;stage<2;++stage){unsigned n=std::min<unsigned>(p->options.constantCount[stage],maxFunctionConstants);if(!n)continue;

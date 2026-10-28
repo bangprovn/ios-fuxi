@@ -8,7 +8,7 @@
 #include <iterator>
 #include <vector>
 static_assert(sizeof(fuxi::Constant)==156 && offsetof(fuxi::CompileOptions,constants)==160);
-static_assert(sizeof(fuxi::CompileOptions)==40360);
+static_assert(sizeof(fuxi::CompileOptions)==40364);
 int main(int argc,char **argv) {
  assert(argc==3);
  for(auto base:{3u,16u,29u,33u,37u,41u,45u,49u,53u}) {

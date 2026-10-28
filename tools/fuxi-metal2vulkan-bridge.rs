@@ -57,7 +57,7 @@ pub struct ColorBlend {blend:u32,mask:u32,factors:[u32;6]}
 #[repr(C)]
 #[derive(Clone,Copy,Debug)]
 pub struct CompileOptions {format:u32,blend:u32,src_rgb:u32,dst_rgb:u32,rgb_op:u32,src_alpha:u32,dst_alpha:u32,alpha_op:u32,mask:u32,strip:u32,
- attributes:[Attribute;8],strides:[u32;4],constant_count:[u32;2],constants:[[Constant;128];2],ordered_color_access:u32,independent_blend:u32,color_count:u32,colors:[ColorOptions;7]}
+ attributes:[Attribute;8],strides:[u32;4],constant_count:[u32;2],constants:[[Constant;128];2],ordered_color_access:u32,independent_blend:u32,color_count:u32,colors:[ColorOptions;7],device_features:u32}
 impl CompileOptions {
  fn color(&self,i:usize)->ColorOptions {if i>0 {self.colors[i-1]} else {ColorOptions{format:self.format,blend:self.blend,src_rgb:self.src_rgb,dst_rgb:self.dst_rgb,rgb_op:self.rgb_op,src_alpha:self.src_alpha,dst_alpha:self.dst_alpha,alpha_op:self.alpha_op,mask:self.mask}}}
 }
@@ -504,7 +504,7 @@ unsafe fn name<'a>(p:*const c_char)->Result<&'a str,String> {
 }
 fn hash_options(hash:&mut Sha256,o:&CompileOptions)->Result<(),String> {
         for field in [o.format,o.blend,o.src_rgb,o.dst_rgb,o.rgb_op,o.src_alpha,o.dst_alpha,o.alpha_op,o.mask,o.strip,o.ordered_color_access] {hash.update(field.to_le_bytes());}
-        hash.update(o.independent_blend.to_le_bytes());hash.update(o.color_count.to_le_bytes());
+        hash.update(o.independent_blend.to_le_bytes());hash.update(o.device_features.to_le_bytes());hash.update(o.color_count.to_le_bytes());
         for c in o.colors {for field in [c.format,c.blend,c.src_rgb,c.dst_rgb,c.rgb_op,c.src_alpha,c.dst_alpha,c.alpha_op,c.mask]{hash.update(field.to_le_bytes());}}
         for attr in &o.attributes {for field in [attr.format,attr.offset,attr.buffer]{hash.update(field.to_le_bytes());}}
         for stride in o.strides {hash.update(stride.to_le_bytes());}
@@ -563,6 +563,16 @@ fn hash_product(p:&Product)->[u8;32] {
         let mut enabled=EnableSet::new();
         if options.independent_blend>1{return Err("independent blend enable".into());}
         if options.independent_blend==1{enabled.features.insert(VkFeature::IndependentBlend);}
+        // Must equal the VkDevice enables Backend made (CompileOptions::deviceFeatures). Bits: 1 f16, 2 storage16, 4 uniform16, 8 int16, 16 robustBufferAccess, 32 robustBufferAccess2, 64 robustImageAccess2.
+        if options.device_features>>7!=0 {return Err("unknown device feature bits".into());}
+        if options.device_features&1!=0 {enabled.features.insert(VkFeature::ShaderFloat16);}
+        if options.device_features&2!=0 {enabled.features.insert(VkFeature::StorageBuffer16BitAccess);}
+        if options.device_features&4!=0 {enabled.features.insert(VkFeature::UniformAndStorageBuffer16BitAccess);}
+        if options.device_features&8!=0 {enabled.features.insert(VkFeature::ShaderInt16);}
+        if options.device_features&16!=0 {enabled.features.insert(VkFeature::RobustBufferAccess);}
+        if options.device_features&32!=0 {enabled.features.insert(VkFeature::RobustBufferAccess2);}
+        if options.device_features&64!=0 {enabled.features.insert(VkFeature::RobustImageAccess2);}
+        if options.device_features&96!=0 {enabled.extensions.insert(VkExtension::ExtRobustness2);}
         if options.ordered_color_access!=0 {
             enabled.features.insert(VkFeature::RasterizationOrderColorAttachmentAccess);
             enabled.extensions.insert(VkExtension::ExtRasterizationOrderAttachmentAccess);
@@ -765,7 +775,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<DrawBufferRebase>(),48);assert_eq!(std::mem::size_of::<DrawRebase>(),1800);
         assert_eq!(std::mem::size_of::<Translation>(),2488);
         assert_eq!(std::mem::size_of::<Constant>(),156);
-        assert_eq!(std::mem::size_of::<CompileOptions>(),40360);
+        assert_eq!(std::mem::size_of::<CompileOptions>(),40364);
         assert_eq!(std::mem::offset_of!(CompileOptions,constants),160);
         for (base,width) in [(3,4),(16,2),(29,4),(33,4),(37,2),(41,2),(45,1),(49,1),(53,1)] {
             for lane in 0..4 {assert_eq!(constant_payload_size(base+lane),width*(lane+1));}

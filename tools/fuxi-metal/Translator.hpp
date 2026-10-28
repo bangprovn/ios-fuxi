@@ -23,12 +23,15 @@ struct ColorOptions {
  uint32_t format=0,blend=0,srcRGB=1,dstRGB=0,rgbOp=0,srcAlpha=1,dstAlpha=0,alphaOp=0,mask=15;
 };
 struct ColorBlend {uint32_t blend{},mask{},factors[6]{};};
+// DeviceFeature bits: 1 shaderFloat16, 2 storageBuffer16BitAccess, 4 uniformAndStorageBuffer16BitAccess, 8 shaderInt16, 16 robustBufferAccess, 32 robustBufferAccess2, 64 robustImageAccess2.
+enum DeviceFeature : uint32_t {featFloat16=1,featStorage16=2,featUniform16=4,featInt16=8,featRobustBuffer=16,featRobustBuffer2=32,featRobustImage2=64};
 struct CompileOptions {
  uint32_t format=80,blend=0,srcRGB=1,dstRGB=0,rgbOp=0,srcAlpha=1,dstAlpha=0,alphaOp=0,mask=15,strip=0;
  Attribute attributes[8]{};uint32_t strides[4]{};uint32_t constantCount[2]{};Constant constants[2][maxFunctionConstants]{};
  // Actual VkDevice enables, supplied by Backend; never inferred from support.
  uint32_t orderedColorAccess{};
  uint32_t independentBlend{};uint32_t colorCount=1;ColorOptions colors[7]{};
+ uint32_t deviceFeatures{}; // bitmask of the extra VkDevice enables below; must equal the VkFeature set the bridge gives metal2vulkan
  ColorOptions color(unsigned i) const {return i?colors[i-1]:ColorOptions{format,blend,srcRGB,dstRGB,rgbOp,srcAlpha,dstAlpha,alphaOp,mask};}
 };
 struct Descriptor {uint32_t binding{},type{},stages{},slot{},sampler{},format{},components[4]{};uint64_t offset{},range{};uint32_t set{},source{};};

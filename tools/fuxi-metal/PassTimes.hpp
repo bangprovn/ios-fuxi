@@ -21,11 +21,11 @@ struct DrawInfo {
  bool begin=false;uint32_t pipeline=0,count=0,blend=0,srcRGB=0,dstRGB=0,srcAlpha=0,dstAlpha=0,mask=0,instr=0,samples=0,loops=0,kills=0,texCount=0,passW=0,passH=0;DrawTex tex[4];
 };
 // Counts SPIR-V instructions, image samples, loop merges and discards in a fragment shader (word stream; header is 5 words).
-struct SpirvStats {uint32_t words=0,instr=0,samples=0,loops=0,kills=0,fetches=0,specConsts=0,switches=0,condBranches=0,selections=0,calls=0,phis=0,converts=0,f16Types=0,f32Types=0,relaxed=0,accessChains=0;};
+struct SpirvStats {uint32_t words=0,instr=0,samples=0,loops=0,kills=0,fetches=0,specConsts=0,switches=0,condBranches=0,selections=0,calls=0,phis=0,converts=0,f16Types=0,f32Types=0,relaxed=0,accessChains=0,quantize=0,loopsDontUnroll=0,loopsNone=0;};
 inline SpirvStats spirvStats(const uint32_t *w,size_t n){
  SpirvStats s;s.words=uint32_t(n);if(!w || n<5)return s;
  for(size_t i=5;i<n;){uint32_t op=w[i]&0xffffu,len=w[i]>>16;if(!len || i+len>n)break;++s.instr;
-  if(op>=87 && op<=94)++s.samples;else if(op==95)++s.fetches;else if(op==246)++s.loops;else if(op==252 || op==4416 || op==5380)++s.kills;
+  if(op>=87 && op<=94)++s.samples;else if(op==95)++s.fetches;else if(op==246){++s.loops;if(len>=4){if(w[i+3]&2u)++s.loopsDontUnroll;else if(!w[i+3])++s.loopsNone;}}else if(op==116)++s.quantize;else if(op==252 || op==4416 || op==5380)++s.kills;
   else if(op>=48 && op<=52)++s.specConsts;else if(op==251)++s.switches;else if(op==250)++s.condBranches;else if(op==247)++s.selections;else if(op==57)++s.calls;else if(op==245)++s.phis;
   else if(op==115)++s.converts;else if(op==65)++s.accessChains;else if(op==22 && len>=3){if(w[i+2]==16)++s.f16Types;else if(w[i+2]==32)++s.f32Types;}else if(op==71 && len>=3 && w[i+2]==0)++s.relaxed;i+=len;}
  return s;
