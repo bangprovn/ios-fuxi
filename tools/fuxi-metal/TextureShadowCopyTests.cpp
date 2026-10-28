@@ -129,6 +129,7 @@ int main(){
   assert(hashOn?(full || (trace.shadowHashSkipped>0 && !trace.shadowHashCopied)):(!trace.shadowHashSkipped && !trace.shadowHashCopied));return std::vector<uint8_t>(p,p+out->length);
  };
  for(unsigned frame=0;frame<3;++frame){auto reference=run(true,frame,false);assert(run(false,frame,false)==reference);assert(run(false,frame,true)==reference);assert(run(false,frame,false)==reference);assert(run(false,frame,false,true)==reference);}
+ if(systemTranslationPolicy().sampleShadow){assert(b.sampleShadowCreated+b.sampleShadowRefused==25 && b.sampleCopies>0 && (!systemTranslationPolicy().shadowHash || b.sampleHits>0) && (!b.sampleShadowCreated || b.sampleShadowBytes>0));}
  printf("PASS: 25 linear textures/125 draws, CPU writes between frames, frozen post-commit bytes, sampled pitch mismatch full/bounded/fallback pixels; per-stage CPU bytes %llu -> %llu; GPU repitch bytes unchanged %llu (%s)\n",(unsigned long long)before,(unsigned long long)after,(unsigned long long)(repitched*5),systemTranslationPolicy().overlap?"overlap":"synchronous");
  for(auto &s:sources){b.destroy(s.texture);b.destroy(s.buffer);}b.destroy(pipeline);b.dropPipelineCacheForTest();b.destroy(sampler);b.destroy(out);b.destroy(target);b.destroy(targetBuffer);b.trimMemory();assert(b.resourceBytes()==baseline);
 }

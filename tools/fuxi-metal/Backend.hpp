@@ -49,6 +49,7 @@
 #include "PipelineCache.hpp"
 #include "ArtifactCache.hpp"
 #include "SpirvRelax.hpp"
+#include "SpirvLoops.hpp"
 #include "PrewarmStore.hpp"
 #include "BackboardGate.hpp"
 #include "FramebufferFetch.hpp"
@@ -614,7 +615,11 @@ public:
    };
    if((formatProperties.linearTilingFeatures&required)!=(uint32_t)required)return fallback("linear texture format features unavailable");
    // A shadowed buffer's bytes are rewritten each frame; sampling it in place would pin the buffer to every flight reading it. A copy through a shadow image lets the storage be renamed.
-   if(usage==1 && systemTranslationPolicy().linearShadow && uint64_t(width)*height>=65536)return fallback("sampled linear texture copied to optimal tiling");
+   if(usage==1 && systemTranslationPolicy().sampleShadow && uint64_t(width)*height>=systemTranslationPolicy().sampleMinPx){ // FUXI_MTL_SAMPLE_SHADOW: optional, so it may only use budget below the headroom; refused -> the texture samples the linear memory in place
+    Texture *copy=nullptr;try{OptionalScope optional(*this);copy=allocateTextureUnlocked(format,1,width,height);}catch(const std::exception &){++sampleShadowRefused;}
+    if(copy){if(t->image)DestroyImage(device,t->image,nullptr);delete t;t=nullptr;copy->shadow=true;b->shadowBacking=true;copy->backingBuffer=b;++b->references;copy->backingOffset=offset;copy->backingRow=row;++sampleShadowCreated;sampleShadowBytes+=copy->allocated;return copy;}
+   }
+   if(usage==1 && systemTranslationPolicy().linearShadow && uint64_t(width)*height>=systemTranslationPolicy().sampleMinPx)return fallback("sampled linear texture copied to optimal tiling");
    if(shadowed && usage==1 && systemTranslationPolicy().shadowRename && !b->imported)return fallback("shadowed buffer samples through a copy (rename)");
    if(b->imported){
     ci.pNext=&external;
@@ -1181,6 +1186,10 @@ public:
   auto st=spirvStats(t.fragment,t.fragmentCount);auto vs=spirvStats(t.vertex,t.vertexCount);
   fprintf(stderr,"FUXI MTL: pipeline stats pipe=%06x frag=%s vert=%s frag_words=%u frag_instr=%u samples=%u fetches=%u loops=%u kills=%u spec_consts=%u switches=%u cond_br=%u selections=%u calls=%u phis=%u converts=%u f16_types=%u f32_types=%u relaxed=%u access_chains=%u quantize_f16=%u loops_dontunroll=%u loops_none=%u vert_instr=%u vk_specs=%u fn_constants=%u/%u\n",
    p->id,t.fragmentEntry?t.fragmentEntry:"?",t.vertexEntry?t.vertexEntry:"?",st.words,st.instr,st.samples,st.fetches,st.loops,st.kills,st.specConsts,st.switches,st.condBranches,st.selections,st.calls,st.phis,st.converts,st.f16Types,st.f32Types,st.relaxed,st.accessChains,st.quantize,st.loopsDontUnroll,st.loopsNone,vs.instr,t.specCount,p->options.constantCount[0],p->options.constantCount[1]);
+  if(st.instr>=5000 && t.fragment){auto loops=spirvLoopReport(t.fragment,t.fragmentCount);unsigned bounds[5]{},sampleLoops=0,maxDepth=0;const char *names[]={"const","uniform","texel","local","unknown"};
+   for(auto &l:loops){for(unsigned k=0;k<5;++k)if(l.bound==names[k])++bounds[k];if(l.samples)++sampleLoops;if(l.depth>maxDepth)maxDepth=l.depth;}
+   fprintf(stderr,"FUXI MTL: pipeline loops pipe=%06x n=%zu const=%u uniform=%u texel=%u local=%u unknown=%u loops_with_samples=%u max_depth=%u\n",p->id,loops.size(),bounds[0],bounds[1],bounds[2],bounds[3],bounds[4],sampleLoops,maxDepth);
+   std::string line;char b[96];for(size_t i=0;i<loops.size() && i<48;++i){auto &l=loops[i];snprintf(b,sizeof b," L%zu[d%u,blk%u,i%u,s%u,%s]",i,l.depth,l.blocks,l.insts,l.samples,l.bound.c_str());line+=b;if(i%6==5 || i+1==loops.size() || i==47){fprintf(stderr,"FUXI MTL: pipeline loops pipe=%06x%s\n",p->id,line.c_str());line.clear();}}}
   if(const char *dir=getenv("FUXI_MTL_SPIRV_DUMP_DIR")){ // raw SPIR-V of heavy pipelines for offline spirv-dis; the directory must already exist
    if(st.instr>=5000 && t.fragment){char path[512];snprintf(path,sizeof path,"%s/pipe%06x.frag.spv",dir,p->id);if(FILE *f=fopen(path,"wb")){fwrite(t.fragment,4,t.fragmentCount,f);fclose(f);fprintf(stderr,"FUXI MTL: pipeline stats pipe=%06x dumped fragment SPIR-V\n",p->id);}}}
   for(unsigned stage=0;stage<2;++stage){unsigned n=std::min<unsigned>(p->options.constantCount[stage],maxFunctionConstants);if(!n)continue;
@@ -1244,6 +1253,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
  void rtForget(Texture *t) {rtForget((const void *)t);}
  void releaseRtShadows() {for(auto &e:rtShadows)destroyTextureUnlocked(e.second.s);rtShadows.clear();rtRefused.clear();}
  void reportRtCounters() {
+  if(systemTranslationPolicy().sampleShadow)fprintf(stderr,"FUXI MTL: sample shadow min_px=%u created=%llu created_mb=%.2f refused=%llu copies=%llu hits=%llu stale_invalidations=%llu copied_mb=%.1f hashed_mb=%.1f hash_ms=%.2f\n",systemTranslationPolicy().sampleMinPx,(unsigned long long)sampleShadowCreated,sampleShadowBytes/1048576.0,(unsigned long long)sampleShadowRefused,(unsigned long long)sampleCopies,(unsigned long long)sampleHits,(unsigned long long)sampleInvalidations,sampleCopiedBytes/1048576.0,sampleHashedBytes/1048576.0,sampleHashNs/1e6);
   if(systemTranslationPolicy().rtRename){uint64_t mb=0;for(auto &e:renamePool)mb+=uint64_t(e.w)*e.h*texelBytes(e.format);
    fprintf(stderr,"FUXI MTL: rt rename submits=%llu renamed=%llu hoisted=%llu merged_main_passes=%llu main_runs_before=%llu main_runs_after=%llu pool_images=%zu pool_mb=%.2f\n",(unsigned long long)rtRenameSubmits,(unsigned long long)rtRenamed,(unsigned long long)rtHoisted,(unsigned long long)rtMergedMain,(unsigned long long)rtMainBefore,(unsigned long long)rtMainAfter,renamePool.size(),double(mb)/1048576.0);}
   fprintf(stderr,"FUXI MTL: rt shadow enabled=%d reuse=%d shadows=%zu created=%llu in=%llu in_skipped=%llu reused=%llu out=%llu syncs=%llu copy_src_redirects=%llu eligible_uses=%llu linear_large_uses=%llu sync_compiles=%llu sync_compile_ms=%.1f\n",
@@ -1423,7 +1433,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
     ++rtRenamed;}
   }
  }
- unsigned hoistLogged=0;std::atomic<uint64_t> relaxedPipelines{0},relaxedMarks{0};
+ std::atomic<uint64_t> sampleShadowCreated{0},sampleShadowRefused{0},sampleShadowBytes{0},sampleHits{0},sampleCopies{0},sampleInvalidations{0},sampleHashedBytes{0},sampleCopiedBytes{0},sampleHashNs{0};unsigned hoistLogged=0;std::atomic<uint64_t> relaxedPipelines{0},relaxedMarks{0};
  void hoistOffscreen(std::vector<Operation> &ops) {
   std::vector<PassGroup> groups;if(!buildGroups(ops,groups,true))return;
   std::vector<size_t> order;order.reserve(groups.size());unsigned moved=0,offs=0;std::map<std::string,unsigned> reasons;std::map<std::string,std::string> examples;
@@ -1984,12 +1994,12 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
     if(!systemTranslationPolicy().shadowHash || !t->shadow)return false;
     auto *backing=t->backingBuffer;size_t pixel=texelBytes(t->format),rowBytes=size_t(t->width)*pixel;
     bool eligible=backing && backing->contents && t->height && rowBytes && t->backingRow>=rowBytes && t->backingOffset<=backing->length && (size_t(t->height)-1)*t->backingRow+rowBytes<=backing->length-t->backingOffset;
-    if(!eligible || writesBacking(backing)){t->shadowHashed=false;return false;}
+    if(!eligible || writesBacking(backing)){if(t->shadowHashed)++sampleInvalidations;t->shadowHashed=false;return false;}
     uint64_t h;auto known=submitHashes.find(t);
     if(known!=submitHashes.end())h=known->second;
-    else {auto start=FrameClock::now();h=hashRows((const uint8_t *)backing->contents+t->backingOffset,t->height,t->backingRow,rowBytes);submitHashes[t]=h;if(currentFrame)currentFrame->shadowHashNs+=frameNanos(start);}
-    if(t->shadowHashed && t->shadowHash==h && t->isDefined(0)){if(currentFrame){++currentFrame->shadowHashSkipped;currentFrame->shadowHashBytes+=rowBytes*t->height;}return true;}
-    t->shadowHash=h;t->shadowHashed=true;if(currentFrame)++currentFrame->shadowHashCopied;return false;
+    else {auto start=FrameClock::now();h=hashRows((const uint8_t *)backing->contents+t->backingOffset,t->height,t->backingRow,rowBytes);submitHashes[t]=h;sampleHashNs+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(FrameClock::now()-start).count());sampleHashedBytes+=rowBytes*t->height;if(currentFrame)currentFrame->shadowHashNs+=frameNanos(start);}
+    if(t->shadowHashed && t->shadowHash==h && t->isDefined(0)){++sampleHits;if(currentFrame){++currentFrame->shadowHashSkipped;currentFrame->shadowHashBytes+=rowBytes*t->height;}return true;}
+    t->shadowHash=h;t->shadowHashed=true;++sampleCopies;sampleCopiedBytes+=rowBytes*t->height;if(currentFrame)++currentFrame->shadowHashCopied;return false;
    };
    auto refreshImages=[&](size_t opIndex){diagnosticOp=opIndex;const auto &op=ops[opIndex];
     // Once per run, after preceding writes and before any sample transitions.
@@ -2145,7 +2155,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
       for(unsigned i=0;i<draw.descriptorCount;++i){const auto &d=draw.descriptors[i];if(d.source || (d.type!=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && d.type!=VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) || d.slot>=resourceSlots)continue;
        auto *t=d.slot==0 && !op.samples[0]?op.sourceTexture:op.samples[d.slot];if(!t)continue;uint8_t kind=t->tiling==VK_IMAGE_TILING_LINEAR?1:t->shadow?2:0;uint64_t bytes=uint64_t(t->width)*t->height*texelBytes(t->format);
        if(currentFrame){if(kind==1){++currentFrame->sampleLinear;currentFrame->sampleLinearBytes+=bytes;}else if(kind==2){++currentFrame->sampleShadow;currentFrame->sampleShadowBytes+=bytes;}else{++currentFrame->sampleOptimal;currentFrame->sampleOptimalBytes+=bytes;}}
-       if(di.texCount<4){di.tex[di.texCount++]={t->width,t->height,t->format,kind};}}}
+       if(di.texCount<4){di.tex[di.texCount++]={t->width,t->height,t->format,kind,uint8_t(t->backingBuffer!=nullptr),uint8_t(t->imported || (t->backingBuffer && t->backingBuffer->imported))};}}}
      {PhaseTimer phase(SubPhase::record);for(unsigned i=0;i<draw.pushCount;++i){auto &w=draw.pushes[i];CmdPushConstants(cmd,op.pipeline->layout,w.stages,w.offset,w.size,w.bytes);}
      for(unsigned i=0;i<draw.vertexCount;++i){auto b=op.buffers[0][draw.vertexSlots[i]].buffer;VkDeviceSize offset=draw.vertexOffsets[i];CmdBindVertexBuffers(cmd,draw.vertexBindings[i],1,&b->buffer,&offset);}
      if(draw.indexed){CmdBindIndexBuffer(cmd,op.indices->buffer,draw.indexOffset,op.indexWidth==2?VK_INDEX_TYPE_UINT16:VK_INDEX_TYPE_UINT32);CmdDrawIndexed(cmd,draw.count,1,draw.first,0,0);}else CmdDraw(cmd,draw.count,1,draw.first,0);}

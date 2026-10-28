@@ -16,7 +16,7 @@ struct PassInfo {
 // Per-draw GPU time inside render passes (FUXI_MTL_GPU_DRAW_TIMES=1, one submit in 30). Stamp 0 is the submit start; every entry owns the next
 // stamp. A begin marker closes a pass-opening stamp (its delta holds the preceding copies/barriers and is not a draw); the report picks the pass with
 // the largest summed draw time and prints its 5 most expensive draws.
-struct DrawTex {uint32_t width=0,height=0,format=0;uint8_t kind=0;}; // kind 0 optimal, 1 linear alias, 2 optimal shadow of a buffer
+struct DrawTex {uint32_t width=0,height=0,format=0;uint8_t kind=0,backed=0,imported=0;}; // kind 0 optimal, 1 linear alias, 2 optimal shadow of a buffer
 struct DrawInfo {
  bool begin=false;uint32_t pipeline=0,count=0,blend=0,srcRGB=0,dstRGB=0,srcAlpha=0,dstAlpha=0,mask=0,instr=0,samples=0,loops=0,kills=0,texCount=0,passW=0,passH=0,scW=0,scH=0;DrawTex tex[4];
 };
@@ -41,7 +41,7 @@ inline void reportDraws(FILE *out,const std::vector<DrawInfo> &infos,const std::
  fprintf(out,"FUXI MTL: gpu draw times passes=%zu top_pass=%zu %ux%u draws=%zu sum_ms=%.3f\n",passNs.size(),best,h.passW,h.passH,e-b,passNs[best]/1e6);
  for(size_t k=0;k<top && k<order.size();++k){const auto &d=infos[order[k]];
   fprintf(out,"FUXI MTL: gpu draw top%zu ms=%.3f pipe=%06x verts=%u blend=%u rgb=%u/%u a=%u/%u mask=%u frag_instr=%u samples=%u loops=%u kills=%u scissor=%ux%u ns_per_kpx=%.1f tex=%u",k+1,ns[order[k]]/1e6,d.pipeline,d.count,d.blend,d.srcRGB,d.dstRGB,d.srcAlpha,d.dstAlpha,d.mask,d.instr,d.samples,d.loops,d.kills,d.scW,d.scH,(d.scW&&d.scH)?double(ns[order[k]])/(double(d.scW)*d.scH/1000.0):0.0,d.texCount);
-  for(unsigned t=0;t<d.texCount && t<4;++t)fprintf(out," [%ux%u fmt=%u %s]",d.tex[t].width,d.tex[t].height,d.tex[t].format,d.tex[t].kind==1?"linear":d.tex[t].kind==2?"shadow":"optimal");
+  for(unsigned t=0;t<d.texCount && t<4;++t)fprintf(out," [%ux%u fmt=%u %s%s%s]",d.tex[t].width,d.tex[t].height,d.tex[t].format,d.tex[t].kind==1?"linear":d.tex[t].kind==2?"shadow":"optimal",d.tex[t].backed?" buffer-backed":"",d.tex[t].imported?" imported":"");
   fprintf(out,"\n");}
 }
 class PassTimes {
