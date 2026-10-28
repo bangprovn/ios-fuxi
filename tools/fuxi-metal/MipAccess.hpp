@@ -19,8 +19,10 @@ struct MipSampler {bool known=false;uint32_t mip=0;float lo=0,hi=0;};
 // control flow, image provenance or instruction forms widen the result; they
 // never select a mip based on attachment level, texture dimensions or names.
 class MipAccess {
- struct Inst {std::vector<uint32_t> w;uint32_t op=0;};
- std::vector<Inst> code;std::vector<size_t> defs;std::vector<uint32_t> bindings;
+ // Instructions are views into one flat copy of the module (about 2-3x smaller than a heap vector per instruction); the view is why copying is deleted.
+ struct Span {const uint32_t *p=nullptr;size_t n=0;size_t size() const{return n;}const uint32_t &operator[](size_t i) const{return p[i];}const uint32_t *begin() const{return p;}const uint32_t *end() const{return p+n;}};
+ struct Inst {Span w;uint32_t op=0;};
+ std::vector<uint32_t> store;std::vector<Inst> code;std::vector<uint32_t> defs;std::vector<uint32_t> bindings;
  bool valid=false;
  const Inst *def(uint32_t id) const {return id<defs.size() && defs[id]<code.size()?&code[defs[id]]:nullptr;}
  uint32_t decoration(uint32_t id,uint32_t kind,uint32_t member=UINT32_MAX) const {
@@ -89,19 +91,19 @@ class MipAccess {
   return NAN;
  }
 public:
- size_t retainedBytes() const {size_t n=code.capacity()*sizeof(Inst)+defs.capacity()*sizeof(size_t)+bindings.capacity()*sizeof(uint32_t);for(auto &i:code)n+=i.w.capacity()*sizeof(uint32_t);return n;}
- MipAccess()=default;
+ size_t retainedBytes() const {return code.capacity()*sizeof(Inst)+defs.capacity()*sizeof(uint32_t)+bindings.capacity()*sizeof(uint32_t)+store.capacity()*sizeof(uint32_t);}
+ MipAccess()=default;MipAccess(const MipAccess &)=delete;MipAccess &operator=(const MipAccess &)=delete;MipAccess(MipAccess &&)=default;MipAccess &operator=(MipAccess &&)=default;
  MipAccess(const uint32_t *words,size_t count){
   if(!words || count<5 || count>4*1024*1024 || words[0]!=0x07230203 || !words[3] || words[3]>1024*1024)return;
-  defs.assign(words[3],SIZE_MAX);
+  defs.assign(words[3],UINT32_MAX);store.assign(words,words+count);
   for(size_t at=5;at<count;){uint32_t n=words[at]>>16,op=words[at]&65535;if(!n || n>count-at)return;
-   Inst i{{words+at,words+at+n},op};auto &w=i.w;uint32_t result=0;
+   Inst i{Span{store.data()+at,n},op};auto &w=i.w;uint32_t result=0;
    if((op>=19 && op<=39) || op==7 || op==11) {if(n>=2)result=w[1];}
    else if((op>=41 && op<=52) || op==59 || op==61 || op==65 || op==66 || (op>=79 && op<=200) || op==245){if(n>=3)result=w[2];}
-   if(result){if(result>=defs.size() || defs[result]!=SIZE_MAX)return;defs[result]=code.size();}
+   if(result){if(result>=defs.size() || defs[result]!=UINT32_MAX)return;defs[result]=uint32_t(code.size());}
    code.push_back(std::move(i));at+=n;
   }
-  bindings.assign(defs.size(),UINT32_MAX);std::vector<uint32_t> sets(defs.size(),UINT32_MAX);
+  code.shrink_to_fit();bindings.assign(defs.size(),UINT32_MAX);std::vector<uint32_t> sets(defs.size(),UINT32_MAX);
   for(auto &i:code)if(i.op==71 && i.w.size()>=4 && i.w[1]<defs.size()){
    if(i.w[2]==33)bindings[i.w[1]]=i.w[3];if(i.w[2]==34)sets[i.w[1]]=i.w[3];
   }

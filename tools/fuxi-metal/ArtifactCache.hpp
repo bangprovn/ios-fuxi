@@ -169,6 +169,8 @@ public:
   }catch(...){}
   return out;
  }
+ unsigned long long hitCount() const {std::lock_guard<std::mutex> lock(mutex);return hits;}
+ unsigned long long missCount() const {std::lock_guard<std::mutex> lock(mutex);return misses;}
  bool available() const {std::lock_guard<std::mutex> lock(mutex);return directory>=0;}
  void checkpoint() noexcept {
   std::unique_lock<std::mutex> writer(saving,std::try_to_lock);if(!writer.owns_lock())return;

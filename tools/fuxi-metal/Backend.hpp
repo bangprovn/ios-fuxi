@@ -189,7 +189,7 @@ class Backend {
  }
  char mesaStatus[96]{};std::map<std::string,std::pair<Buffer *,size_t>> blobShare;uint64_t blobSharedHits=0;
  // 256 pipelines: the old 32-entry LRU evicted every prewarmed pipeline before its first draw
- ObjectCache<Pipeline,256,64u*1024*1024> objects;ResourceLimits limits;DrawPlanCache<Pipeline> drawPlans;
+ ObjectCache<Pipeline,256,192u*1024*1024> objects;ResourceLimits limits;DrawPlanCache<Pipeline> drawPlans;
  TransientMemory<VkDeviceMemory> textureMemory;SlabMemory<VkDeviceMemory> slabMemory;
 public:
  bool slabsEnabled=!systemTranslationPolicy().noSlab;
@@ -214,12 +214,27 @@ private:
   slabMemory.trim(now,all,[&](VkDeviceMemory h,size_t bytes){freePooledUnlocked(h,bytes);});
  }
  void freePooledUnlocked(VkDeviceMemory h,size_t bytes){frameKernelCall([&]{FreeMemory(device,h,nullptr);});--liveMemoryObjects;liveMemoryBytes-=bytes;limits.release(bytes);}
+ // Optional features (rename pool, render target shadows) allocate with optionalAlloc set: they may only use budget minus optionalHeadroom, so CA's own textures always keep room.
+ // A CA allocation that would be rejected first sheds the pool, then the shadows (never while a submit is rewriting ops that point at them), and only then fails.
+ static constexpr size_t optionalHeadroom=64u<<20;
+ bool optionalAlloc=false,inSubmit=false;uint64_t optionalRefusals=0,optionalSheds=0;
  void reserveMemoryUnlocked(size_t bytes){
-  if(bytes>ResourceLimits::budget-limits.used && !poisoned){trimBuffers(0,false,bytes-(ResourceLimits::budget-limits.used));}
-  if(bytes>ResourceLimits::budget-limits.used && !poisoned){textureMemory.reclaim(bytes-(ResourceLimits::budget-limits.used),[&](VkDeviceMemory h,size_t n){freePooledUnlocked(h,n);});
-   if(bytes>ResourceLimits::budget-limits.used)slabMemory.reclaim(bytes-(ResourceLimits::budget-limits.used),[&](VkDeviceMemory h,size_t n){freePooledUnlocked(h,n);});}
+  const size_t cap=optionalAlloc?ResourceLimits::budget-optionalHeadroom:ResourceLimits::budget;
+  auto shortBy=[&]()->size_t{return limits.used+bytes>cap?limits.used+bytes-cap:0;};
+  auto reclaim=[&](){
+   if(shortBy() && !poisoned)trimBuffers(0,false,shortBy());
+   if(shortBy() && !poisoned){textureMemory.reclaim(shortBy(),[&](VkDeviceMemory h,size_t n){freePooledUnlocked(h,n);});
+    if(shortBy())slabMemory.reclaim(shortBy(),[&](VkDeviceMemory h,size_t n){freePooledUnlocked(h,n);});}};
+  reclaim();
+  if(shortBy() && !optionalAlloc && !inSubmit && !poisoned){
+   if(!renamePool.empty()){releaseRenamePool();++optionalSheds;reclaim();}
+   if(shortBy() && !rtShadows.empty()){releaseRtShadows();++optionalSheds;reclaim();}
+   if(optionalSheds)fprintf(stderr,"FUXI MTL: budget pressure shed optional memory (sheds=%llu used=%zu need=%zu)\n",(unsigned long long)optionalSheds,limits.used,bytes);
+  }
+  if(optionalAlloc && shortBy()){++optionalRefusals;throw std::runtime_error("optional feature headroom");}
   limits.reserve(bytes);
  }
+ struct OptionalScope {Backend &b;bool old;explicit OptionalScope(Backend &x):b(x),old(x.optionalAlloc){b.optionalAlloc=true;}~OptionalScope(){b.optionalAlloc=old;}};
  // Two independently resettable lanes. A busy lane belongs to its retirement.
  // kind bits name the resource for conflict diagnostics: 1 buffer, 2 shadow backing, 4 texture, 8 surface, 16 index.
  struct HostUse {VkDeviceMemory memory;const void *address;size_t bytes;uint8_t kind=1;Buffer *buffer=nullptr;};
@@ -328,16 +343,20 @@ public:
 #endif
  void trimMemory(){std::lock_guard<std::mutex> guard(mutex);trimMemoryUnlocked(true);}
  uint32_t maxTextureDimension() const{return limits.dimension;}
+ uint64_t optionalShedCount() const{return optionalSheds;}
  size_t resourceBytes() const{std::lock_guard<std::mutex> guard(mutex);return limits.used;}
  bool supportsTimestamps() const{return timestampBits && timestampPeriod>0;}
  explicit Backend(const char *client="unknown") {
   setenv("TU_DARWIN_SERVICE","NativeAdrenoGpuPublished",1);
+  if(const char *mb=getenv("FUXI_MTL_PIPELINE_CACHE_MB")){long v=atol(mb);if(v>=8 && v<=1024)objects.byteLimit=size_t(v)<<20;} // host heap bound of the pipeline object cache (default 192)
   setenv("TU_DARWIN_OPEN_TYPE","0",1);setupTurnip();
   {const char *mesa=getenv("FUXI_MTL_MESA_DISK_CACHE"); // experiment: let Mesa/Turnip keep its own shader cache under the fuxi-metal directory (any uid; status is repeated in the cache period line because boot-time lines can be lost)
-   if(mesa && !strcmp(mesa,"1")){int a=::mkdir("/private/var/db/fuxi-metal",0755),ae=a?errno:0,c=::mkdir("/private/var/db/fuxi-metal/mesa-cache",0700),ce=c?errno:0;struct stat st{};int ok=!stat("/private/var/db/fuxi-metal/mesa-cache",&st) && access("/private/var/db/fuxi-metal/mesa-cache",W_OK)==0;
+   if(mesa && !strcmp(mesa,"1")){ // same private per-client directory as the translation and pipeline caches (the parent is root-owned, so /private/var/db itself is not writable for uid 501)
+    int dir=openClientStorage(client),made=-1,ok=0,e=0;char path[160]{};
+    if(dir>=0){made=mkdirat(dir,"mesa",0700);e=made?errno:0;snprintf(path,sizeof path,"/private/var/db/fuxi-metal/%s-%lu/mesa",client,(unsigned long)geteuid());struct stat st{};ok=(!made||e==EEXIST)&&!stat(path,&st)&&access(path,W_OK)==0;::close(dir);}
     unsetenv("MESA_SHADER_CACHE_DISABLE");unsetenv("MESA_GLSL_CACHE_DISABLE");
-    if(ok){setenv("MESA_SHADER_CACHE_DIR","/private/var/db/fuxi-metal/mesa-cache",1);setenv("MESA_GLSL_CACHE_DIR","/private/var/db/fuxi-metal/mesa-cache",1);setenv("MESA_SHADER_CACHE_MAX_SIZE","64M",0);}
-    snprintf(mesaStatus,sizeof mesaStatus,"dir_ok=%d uid=%d mkdir_parent=%d/%d mkdir_cache=%d/%d",ok,int(geteuid()),a,ae,c,ce);fprintf(stderr,"FUXI MTL: mesa disk cache %s\n",mesaStatus);}}setenv("MESA_LOG_LEVEL","warning",0);  // info logs a line per submit; env may raise it
+    if(ok){setenv("MESA_SHADER_CACHE_DIR",path,1);setenv("MESA_GLSL_CACHE_DIR",path,1);setenv("MESA_SHADER_CACHE_MAX_SIZE","64M",0);}
+    snprintf(mesaStatus,sizeof mesaStatus,"dir_ok=%d uid=%d storage_fd=%d mkdir=%d/%d",ok,int(geteuid()),dir,made,e);fprintf(stderr,"FUXI MTL: mesa disk cache %s\n",mesaStatus);}}setenv("MESA_LOG_LEVEL","warning",0);  // info logs a line per submit; env may raise it
   try {
    library=dlopen(FUXI_MTL_ICD,RTLD_NOW|RTLD_LOCAL);
    if(!library) throw std::runtime_error("dlopen Turnip failed");
@@ -958,7 +977,7 @@ public:
   try {objects.insert(inputKey,productKey,p,p->retainedBytes,[&](Pipeline *old){drawPlans.invalidate(old);destroyPipelineUnlocked(old);});}
   catch(...){destroyPipelineUnlocked(p);throw;}
   {double missMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
-   fprintf(stderr,"FUXI MTL: pipeline cache MISS %.3f ms%s\n",missMs,prewarmWorker?" (prewarm)":"");
+   fprintf(stderr,"FUXI MTL: pipeline cache MISS %.3f ms%s identity=%.1f translate=%.1f create=%.1f translation_hits=%llu misses=%llu\n",missMs,prewarmWorker?" (prewarm)":"",timing.identity,timing.compile,timing.create,(unsigned long long)artifactCache.hitCount(),(unsigned long long)artifactCache.missCount());
    if(!prewarmWorker){syncCompiles.fetch_add(1);syncCompileNs.fetch_add(uint64_t(missMs*1e6));}
    recordRecipe(identity,v,vn,f,fn,options);}
   return p;
@@ -1061,6 +1080,7 @@ public:
    for(auto &d:p->descriptors)if(d.type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)for(unsigned stage=0;stage<2;++stage)
     if(d.binding<16 && (d.stages&(stage?16u:1u)) && p->mipAccess[stage].readOnlyStorage(d.binding))p->readOnlyStorage[stage]|=1u<<d.binding;
    p->retainedBytes+=p->mipAccess[0].retainedBytes()+p->mipAccess[1].retainedBytes();
+   {static std::atomic<unsigned> br{0};unsigned n=br.fetch_add(1);if(n<5||n%25==0)fprintf(stderr,"FUXI MTL: pipeline bytes n=%u total=%zu struct=%zu spirv=%zu mip_vertex=%zu mip_fragment=%zu blobs_new_or_shared=%u\n",n,p->retainedBytes,sizeof(Pipeline),size_t(translated.vertexCount+translated.fragmentCount)*4,p->mipAccess[0].retainedBytes(),p->mipAccess[1].retainedBytes(),translated.blobCount);}
    auto began=std::chrono::steady_clock::now();
    try {
     p->pipeline=buildTopologyPipeline(p,Topology::Triangle);
@@ -1267,8 +1287,8 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
    auto it=rtShadows.find(key);
    if(it!=rtShadows.end() && (it->second.w!=l->width || it->second.h!=l->height || it->second.format!=l->format || it->second.sampled!=sampled || it->second.offset!=l->backingOffset || it->second.row!=l->backingRow)){destroyTextureUnlocked(it->second.s);rtShadows.erase(it);it=rtShadows.end();}
    if(it==rtShadows.end()){if(rtRefused.count(key))return -1;
-    while(rtShadows.size()>=8){auto victim=rtShadows.begin();for(auto v=rtShadows.begin();v!=rtShadows.end();++v)if(v->second.used<victim->second.used)victim=v;destroyTextureUnlocked(victim->second.s);rtShadows.erase(victim);}
-    try {auto *s=allocateTextureUnlocked(l->format,sampled|4u,l->width,l->height);s->rtTarget=true;
+    while(!rtShadows.empty() && (rtShadows.size()>=8 || rtShadowBytes()+uint64_t(l->width)*l->height*texelBytes(l->format)>shadowBytesCap)){auto victim=rtShadows.begin();for(auto v=rtShadows.begin();v!=rtShadows.end();++v)if(v->second.used<victim->second.used)victim=v;destroyTextureUnlocked(victim->second.s);rtShadows.erase(victim);}
+    try {OptionalScope optionalScope(*this);auto *s=allocateTextureUnlocked(l->format,sampled|4u,l->width,l->height);s->rtTarget=true;
      it=rtShadows.emplace(key,RtEntry{s,l->width,l->height,l->format,sampled,l->backingOffset,l->backingRow,0,false}).first;++rtShadowCreated;
      fprintf(stderr,"FUXI MTL: render target shadow created %ux%u format=%u (optimal, %zu bytes) key=%03x total_created=%llu live=%zu\n",l->width,l->height,l->format,s->allocated,unsigned((uintptr_t(key)>>4)&0xfff),(unsigned long long)rtShadowCreated,rtShadows.size());}
     catch(const std::exception &e){rtRefused.insert(key);fprintf(stderr,"FUXI MTL: render target shadow refused: %s\n",e.what());return -1;}}
@@ -1354,11 +1374,16 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
  struct RenameImage {Texture *t;uint32_t w,h,format,usage;uint64_t used;};
  std::vector<RenameImage> renamePool;uint64_t rtRenamed=0,rtHoisted=0,rtMergedMain=0,rtMainBefore=0,rtMainAfter=0,rtRenameSubmits=0;
  bool smallOffscreen(Texture *t) {return t && t->tiling==VK_IMAGE_TILING_OPTIMAL && !t->imported && !t->backingBuffer && !t->shadow && !t->rtTarget && !t->mapped && !t->borrowedMemory && t->textureType==2 && t->levels==1 && t->depth==1 && !(t->usage&VK_IMAGE_USAGE_STORAGE_BIT) && uint64_t(t->width)*t->height<=(2u<<20);}
+ static constexpr uint64_t renamePoolCap=20u<<20,shadowBytesCap=48u<<20;
+ uint64_t renamePoolBytes() const {uint64_t n=0;for(auto &e:renamePool)n+=uint64_t(e.w)*e.h*texelBytes(e.format);return n;}
+ uint64_t rtShadowBytes() const {uint64_t n=0;for(auto &e:rtShadows)n+=uint64_t(e.second.w)*e.second.h*texelBytes(e.second.format);return n;}
+ void expireRenamePool() {for(size_t i=0;i<renamePool.size();){auto &e=renamePool[i];if(e.t->references==1 && rtRenameSubmits-e.used>300){destroyTextureUnlocked(e.t);renamePool.erase(renamePool.begin()+i);}else ++i;}} // idle for 300 submits
  Texture *renameAcquire(Texture *like,std::vector<Texture *> &held) {
   uint32_t usage=(like->usage&VK_IMAGE_USAGE_SAMPLED_BIT?1u:0u)|(like->usage&VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT?4u:0u);if(!usage)return nullptr;
   for(auto &e:renamePool)if(e.t->references==1 && e.used!=rtRenameSubmits && e.w==like->width && e.h==like->height && e.format==like->format && e.usage==usage){e.used=rtRenameSubmits;++e.t->references;held.push_back(e.t);return e.t;}
   if(renamePool.size()>=32)return nullptr;
-  try {auto *t=allocateTextureUnlocked(like->format,usage,like->width,like->height);renamePool.push_back({t,like->width,like->height,like->format,usage,rtRenameSubmits});++t->references;held.push_back(t);return t;}catch(const std::exception &) {return nullptr;}
+  if(renamePoolBytes()+uint64_t(like->width)*like->height*texelBytes(like->format)>renamePoolCap)return nullptr; // bounded pool: bigger passes still hoist, they just are not renamed
+  try {OptionalScope optionalScope(*this);auto *t=allocateTextureUnlocked(like->format,usage,like->width,like->height);renamePool.push_back({t,like->width,like->height,like->format,usage,rtRenameSubmits});++t->references;held.push_back(t);return t;}catch(const std::exception &) {return nullptr;}
  }
  void releaseRenamePool() {for(auto &e:renamePool)destroyTextureUnlocked(e.t);renamePool.clear();}
  size_t countMainRuns(const std::vector<Operation> &ops) {
@@ -1369,7 +1394,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
   return runs;
  }
  void renameOffscreen(std::vector<Operation> &ops,std::vector<Texture *> &held) {
-  std::vector<Texture *> candidates;
+  expireRenamePool();std::vector<Texture *> candidates;
   for(const auto &op:ops){if(!(op.pipeline || op.clearOnly))continue;for(unsigned i=0;i<std::min(op.colorCount,8u);++i){auto *t=op.color(i).texture;if(smallOffscreen(t) && std::find(candidates.begin(),candidates.end(),t)==candidates.end())candidates.push_back(t);}}
   auto refers=[](const Operation &op,Texture *t){if(op.texture==t || op.sourceTexture==t)return true;for(auto *s:op.samples)if(s==t)return true;for(unsigned i=0;i<std::min(op.colorCount,8u);++i)if(op.color(i).texture==t)return true;return false;};
   auto replace=[](Operation &op,Texture *from,Texture *to){if(op.texture==from)op.texture=to;if(op.sourceTexture==from)op.sourceTexture=to;for(auto &s:op.samples)if(s==from)s=to;
@@ -1391,10 +1416,11 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
   std::vector<PassGroup> groups;if(!buildGroups(ops,groups))return;
   std::vector<size_t> order;order.reserve(groups.size());unsigned moved=0,offs=0;std::map<std::string,unsigned> reasons;std::map<std::string,std::string> examples;
   struct HoistLog {Backend &b;std::vector<PassGroup> &groups;unsigned &offs;unsigned &moved;std::map<std::string,unsigned> &reasons;std::map<std::string,std::string> &examples;
-   ~HoistLog(){if(b.hoistLogged>=20 || !offs)return;++b.hoistLogged;std::string line;for(auto &r:reasons){line+=" "+r.first+"="+std::to_string(r.second);auto e=examples.find(r.first);if(e!=examples.end())line+="["+e->second+"]";}
+   ~HoistLog(){if(!(b.hoistLogged<20 || b.rtRenameSubmits%300==1))return;++b.hoistLogged;std::string line;for(auto &r:reasons){line+=" "+r.first+"="+std::to_string(r.second);auto e=examples.find(r.first);if(e!=examples.end())line+="["+e->second+"]";}
     fprintf(stderr,"FUXI MTL: rt hoist n=%u groups=%zu offscreen=%u moved=%u reasons:%s\n",b.hoistLogged,groups.size(),offs,moved,line.c_str());}} hoistLog{*this,groups,offs,moved,reasons,examples};
   for(size_t gi=0;gi<groups.size();++gi){auto &g=groups[gi];size_t insertAt=order.size();
-   bool offscreen=!g.barrier;if(offscreen)for(auto *t:g.targets)if(t && !smallOffscreen(t))offscreen=false;
+   if(g.barrier)reasons[std::string("barrier:")+barrierWhy(ops[g.first])]++;
+   bool offscreen=!g.barrier;if(offscreen)for(auto *t:g.targets)if(t && !smallOffscreen(t)){offscreen=false;reasons["main-or-large-group"]++;break;}
    if(offscreen){++offs;size_t scanned=0;const char *why=nullptr;bool stoppedAtEnd=false;const PassGroup *blocker=nullptr;
     for(size_t k=order.size();k-->0 && scanned<256;++scanned){auto &o=groups[order[k]];if(o.barrier){why=barrierWhy(ops[o.first]);blocker=&o;break;}if(auto *c=conflictWhy(o,g)){why=c;blocker=&o;break;}insertAt=k;}
     if(!why)stoppedAtEnd=true;
@@ -1427,6 +1453,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
   ops.swap(sorted);if(currentFrame)currentFrame->passReorders+=hops;
  }
  void submit(std::vector<Operation> ops,const std::function<void()> &scheduled={},std::function<void()> *retirement=nullptr,const std::function<void()> &prepare={},const std::vector<PrepareWrite> *prepareWrites=nullptr) {
+  struct InSubmit {bool &f;explicit InSubmit(bool &x):f(x){f=true;}~InSubmit(){f=false;}} inSubmitScope(inSubmit);
   PhaseTimer submitPhase(SubPhase::other);
   auto submitStart=std::chrono::steady_clock::now();auto submitQueued=submitStart;
   auto since=[](std::chrono::steady_clock::time_point t){return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-t).count();};

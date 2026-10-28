@@ -78,6 +78,14 @@ static void renameReplay(Backend &b){
   run(ops);
   expect(0,0,A);expect(7,15,A);expect(8,0,Z);expect(14,3,Z);expect(15,0,B);expect(15,15,B);
  }
+ if(on){ // budget scenario: the pool must give way to CA allocations instead of failing them, and optional allocations must stay below the headroom
+  assert(b.renamePoolBytes()>0 || b.renamePool.empty());
+  std::vector<Texture *> keep;uint64_t sheds=b.optionalShedCount();bool failed=false;
+  for(int i=0;i<12 && !failed;++i){try{keep.push_back(b.allocateTexture(30,5,4096,4096));}catch(const std::exception &){failed=true;}}
+  printf("RENAME_BUDGET allocated=%zu textures failed=%d pool_images=%zu sheds=%llu used_mb=%zu\n",keep.size(),int(failed),b.renamePool.size(),(unsigned long long)(b.optionalShedCount()-sheds),b.resourceBytes()>>20);
+  assert(keep.size()>=6 && b.renamePool.empty()); // 6x32 MB fits only if the pool (and its pooled memory) was shed before refusing a CA texture
+  for(auto *t:keep)b.destroy(t);b.trimMemory();
+ }
  b.destroy(pipeline);b.dropPipelineCacheForTest();b.destroy(sampler);b.destroy(main);b.destroy(x);b.destroy(y);b.destroy(s1);b.destroy(s2);b.destroy(out);
 }
 int main(){
