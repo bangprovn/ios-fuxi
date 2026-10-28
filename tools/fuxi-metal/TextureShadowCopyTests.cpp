@@ -13,28 +13,30 @@ static void aliasReadback(Backend &b){
 }
 // FUXI_MTL_RT_SHADOW: a 1M-pixel linear target renders through an optimal shadow; the linear bytes must match the direct path after every sync point.
 static void rtShadowReadback(Backend &b){
- const bool on=getenv("FUXI_MTL_RT_SHADOW") && !strcmp(getenv("FUXI_MTL_RT_SHADOW"),"1");const uint32_t n=1024;
+ const bool on=getenv("FUXI_MTL_RT_SHADOW") && !strcmp(getenv("FUXI_MTL_RT_SHADOW"),"1"),reuse=on && getenv("FUXI_MTL_RT_SHADOW_REUSE") && !strcmp(getenv("FUXI_MTL_RT_SHADOW_REUSE"),"1");const uint32_t n=1024;
  auto *buffer=b.allocate(n*n*4),*other=b.allocate(n*n*4);auto *t=b.linearTexture(buffer,80,5,n,n,0,n*4),*t2=b.linearTexture(other,80,5,n,n,0,n*4);assert(t->borrowedMemory && t2->borrowedMemory);
  auto run=[&](std::vector<Operation> ops){std::function<void()> retire;b.submit(std::move(ops),{},systemTranslationPolicy().overlap?&retire:nullptr);if(retire)retire();};
  auto clear=[&](Texture *x,float r,float g,float bl,unsigned load,uint32_t area){Operation c{};c.texture=x;c.clearOnly=true;c.load=load;c.clear[0]=r;c.clear[1]=g;c.clear[2]=bl;c.clear[3]=1;c.areaWidth=c.areaHeight=area;return c;};
  auto px=[&](Buffer *x,uint32_t xx,uint32_t yy){return (const uint8_t *)x->contents+(size_t(yy)*n+xx)*4;};
  run({clear(t,.25f,.5f,.75f,2,0)});
  for(uint32_t y:{0u,511u,1023u})for(uint32_t x:{0u,700u,1023u}){auto *q=px(buffer,x,y);assert(q[0]==191 && q[1]==128 && q[2]==64 && q[3]==255);}
- if(on){assert(t->rtShadow && t->rtShadow->rtTarget && b.rtShadowOut>=1 && b.rtShadowIn==0 && b.rtShadowInSkipped>=1);}
+ if(on){assert(b.rtShadowOf(t) && b.rtShadowOf(t)->rtTarget && b.rtShadowOut>=1 && b.rtShadowIn==0 && b.rtShadowInSkipped>=1);}
  // partial clear over untouched linear bytes: the shadow must be seeded from the linear image first
  uint64_t inBefore=b.rtShadowIn;run({clear(t,1.f,0.f,0.f,2,512)});
  for(uint32_t y:{0u,511u,512u,1023u})for(uint32_t x:{0u,511u,512u,1023u}){auto *q=px(buffer,x,y);bool inside=x<512 && y<512;assert(inside?(q[0]==0 && q[1]==0 && q[2]==255):(q[0]==191 && q[1]==128 && q[2]==64));}
- if(on)assert(b.rtShadowIn==inBefore+1);
+ if(on)assert(b.rtShadowIn==inBefore+(reuse?0:1)); // with reuse the previous submit left linear == shadow, so no copy-in
  // a copy reading the target in the same submit as the render that wrote it must see the new bytes (sync before the copy)
- uint64_t syncs=b.rtShadowSyncs;Operation copy{};copy.texture=t2;copy.sourceTexture=t;
+ uint64_t syncs=b.rtShadowSyncs,redirects=b.rtShadowRedirects;Operation copy{};copy.texture=t2;copy.sourceTexture=t;
  run({clear(t,0.f,1.f,0.f,2,0),copy});
  for(uint32_t y:{0u,1023u})for(uint32_t x:{0u,1023u}){auto *q=px(other,x,y);assert(q[0]==0 && q[1]==255 && q[2]==0);q=px(buffer,x,y);assert(q[0]==0 && q[1]==255 && q[2]==0);}
- if(on)assert(b.rtShadowSyncs==syncs+1);
+ if(on)assert(b.rtShadowSyncs==syncs && b.rtShadowRedirects==redirects+1); // the copy reads the shadow directly: no sync-out
  // a write to the linear image between two renders makes the shadow stale: the second render must reload it
  inBefore=b.rtShadowIn;Operation over{};over.texture=t;over.sourceTexture=t2;
  run({clear(t2,0.f,0.f,1.f,2,0),over,clear(t,1.f,1.f,1.f,2,512)});
  for(uint32_t y:{0u,511u,512u,1023u})for(uint32_t x:{0u,511u,512u,1023u}){auto *q=px(buffer,x,y);bool inside=x<512 && y<512;assert(inside?(q[0]==255 && q[1]==255 && q[2]==255):(q[0]==255 && q[1]==0 && q[2]==0));}
  if(on)assert(b.rtShadowIn==inBefore+1);
+ // CA recreates the drawable texture around the same memory: the shadow is keyed by that memory and must survive
+ if(on){uint64_t created=b.rtShadowCreated;b.destroy(t);t=b.linearTexture(buffer,80,5,n,n,0,n*4);run({clear(t,1.f,0.f,0.f,2,512)});assert(b.rtShadowCreated==created);for(uint32_t y:{0u,1023u})for(uint32_t x:{0u,1023u}){auto *q=px(buffer,x,y);bool inside=x<512 && y<512;assert(inside?(q[0]==0 && q[1]==0 && q[2]==255):(q[0]==255 && q[1]==0 && q[2]==0));}}
  b.destroy(t);b.destroy(t2);b.destroy(buffer);b.destroy(other);
 }
 int main(){
