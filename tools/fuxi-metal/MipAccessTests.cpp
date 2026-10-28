@@ -55,5 +55,14 @@ int main(){
  wrongSet.add(71,{72,34,1});assert(!MipAccess(wrongSet.words.data(),wrongSet.words.size()).readOnlyStorage(9));
  storage.add(59,{71,73,12});storage.add(71,{73,34,0});storage.add(71,{73,33,9});assert(!readonly()); // another writable variable at the same binding
  storage.words.push_back(0);assert(!readonly());assert(!MipAccess().readOnlyStorage(9));
+ // May-write analysis: loads and access chains do not write; stores, atomics, copies and calls through a derived pointer do; absent bindings are untouched.
+ {Module rw;rw.add(30,{70,2});rw.add(32,{71,12,70});rw.add(59,{71,72,12});rw.add(71,{72,34,0});rw.add(71,{72,33,9});
+  auto may=[&](uint32_t b){return MipAccess(rw.words.data(),rw.words.size()).mayWriteBinding(b);};
+  assert(!may(9));rw.add(61,{4,80,72});assert(!may(9));rw.add(65,{71,81,72,10});rw.add(61,{4,82,81});assert(!may(9));assert(!may(10));
+  auto reads=rw;rw.add(62,{81,82});assert(may(9));
+  rw=reads;rw.add(233,{4,83,81,1,0,82});assert(may(9)); // atomic through the chain
+  rw=reads;rw.add(57,{4,84,60,81});assert(may(9)); // pointer passed to a function
+  rw=reads;rw.add(63,{81,85});assert(may(9)); // copy memory
+  assert(MipAccess().mayWriteBinding(9));}
  puts("PASS: mip access constants/uniforms/push/clamps, unions, rebased views, unknown/fetch/malformed refusal");
 }

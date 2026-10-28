@@ -114,6 +114,22 @@ public:
  // variable contract in this final module. Missing bindings, malformed modules,
  // decoration groups/member-only contracts and unfamiliar forms stay unknown.
  // This is a declaration proof, not a guess based on observed OpLoad uses.
+ // True unless the module provably never writes through the variable bound to descriptorBinding: every use of a pointer derived from it must be a load or
+ // an access chain/copy that stays derived. Any other use (OpStore, atomics, OpCopyMemory, function calls, ExtInst...) counts as a possible write.
+ bool mayWriteBinding(uint32_t descriptorBinding) const {
+  if(!valid)return true;
+  std::vector<char> derived(defs.size(),0);bool any=false;
+  for(uint32_t id=0;id<bindings.size();++id)if(bindings[id]==descriptorBinding){auto *v=def(id);if(v && v->op==59){derived[id]=1;any=true;}}
+  if(!any)return false;
+  for(auto &i:code){auto &w=i.w;
+   switch(i.op){
+   case 5:case 6:case 71:case 72:case 15:case 59:case 61:break; // names, decorations, entry interface, the variable, loads
+   case 65:case 66:case 83:case 124:if(w.size()>=4 && w[3]<derived.size() && derived[w[3]] && w[2]<derived.size()){derived[w[2]]=1;for(size_t k=4;k<w.size();++k)if(w[k]<derived.size() && derived[w[k]])return true;}break;
+   default:for(size_t k=1;k<w.size();++k)if(w[k]<derived.size() && derived[w[k]])return true;
+   }
+  }
+  return false;
+ }
  bool readOnlyStorage(uint32_t descriptorBinding) const {
   if(!valid)return false;bool found=false;
   for(uint32_t id=0;id<bindings.size();++id)if(bindings[id]==descriptorBinding){

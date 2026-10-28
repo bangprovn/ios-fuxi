@@ -78,6 +78,10 @@ static void renameReplay(Backend &b){
   run(ops);
   expect(0,0,A);expect(7,15,A);expect(8,0,Z);expect(14,3,Z);expect(15,0,B);expect(15,15,B);
  }
+ {Pipeline pl{};Operation op{};op.texture=main;op.pipeline=&pl;op.encoderID=1;Descriptor d{};d.type=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;pl.descriptors.push_back(d);
+  assert(Backend::barrierWhy(op,false)!=nullptr && Backend::barrierWhy(op,true)==nullptr); // storage-lowered buffer arguments that the shader only reads are not hazards
+  pl.fetchMask=1;assert(Backend::barrierWhy(op,false)!=nullptr && Backend::barrierWhy(op,true)==nullptr); // fb fetch depends only on the pass's own target
+  pl.writesStorage=true;assert(Backend::barrierWhy(op,true)!=nullptr);}
  if(on){ // budget scenario: the pool must give way to CA allocations instead of failing them, and optional allocations must stay below the headroom
   assert(b.renamePoolBytes()>0 || b.renamePool.empty());
   std::vector<Texture *> keep;uint64_t sheds=b.optionalShedCount();bool failed=false;

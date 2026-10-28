@@ -104,7 +104,7 @@ struct VariantKey {
  explicit VariantKey(const DrawInput &input){for(unsigned i=0;i<resourceSlots;++i){auto *w=&words[i*8];w[0]=input.formats[i];w[1]=input.filters[i];memcpy(w+2,&input.lodMin[i],4);memcpy(w+3,&input.lodMax[i],4);for(unsigned stage=0;stage<2;++stage){w[4+stage*2]=input.buffers[stage][i].length!=0;w[5+stage*2]=input.buffers[stage][i].bytes;}}}
  bool operator==(const VariantKey &other) const {return words==other.words;}
 };
-struct Pipeline {uint32_t id{},fragInstr{},fragSamples{},fragLoops{},fragKills{};ShadowWindow shadowWindows[2][resourceSlots]{};std::array<uint32_t,resourceSlots> textureTypes{};size_t references=1,retainedBytes=0;void *translation{};CompileOptions options{};uint32_t fetchMask{};bool orderedColorAccess=false;std::vector<std::pair<uint32_t,VkRenderPass>> renders;VkPipeline pipeline{},stripPipeline{};std::array<VkPipeline,2> linePipelines{};Translation recipe{};VkPipelineLayout layout{};VkRenderPass render{};uint32_t pushOffset{},pushSize{},pushStages{};uint8_t pushBytes[128]{};VkDescriptorSetLayout setLayout{};VkSampler bakedSamplers[16]{};BakedSampler bakedSamplerInfo[16]{};MipAccess mipAccess[2];uint32_t readOnlyStorage[2]{};std::vector<Descriptor> descriptors;std::vector<Buffer *> constantBlobs;std::vector<std::string> blobKeys;std::vector<std::array<uint8_t,32>> blobHashes;std::vector<std::pair<VariantKey,Pipeline *>> variants;
+struct Pipeline {uint32_t id{},fragInstr{},fragSamples{},fragLoops{},fragKills{};ShadowWindow shadowWindows[2][resourceSlots]{};std::array<uint32_t,resourceSlots> textureTypes{};size_t references=1,retainedBytes=0;bool writesStorage=false;void *translation{};CompileOptions options{};uint32_t fetchMask{};bool orderedColorAccess=false;std::vector<std::pair<uint32_t,VkRenderPass>> renders;VkPipeline pipeline{},stripPipeline{};std::array<VkPipeline,2> linePipelines{};Translation recipe{};VkPipelineLayout layout{};VkRenderPass render{};uint32_t pushOffset{},pushSize{},pushStages{};uint8_t pushBytes[128]{};VkDescriptorSetLayout setLayout{};VkSampler bakedSamplers[16]{};BakedSampler bakedSamplerInfo[16]{};MipAccess mipAccess[2];uint32_t readOnlyStorage[2]{};std::vector<Descriptor> descriptors;std::vector<Buffer *> constantBlobs;std::vector<std::string> blobKeys;std::vector<std::array<uint8_t,32>> blobHashes;std::vector<std::pair<VariantKey,Pipeline *>> variants;
 };
 struct BufferBind {Buffer *buffer{};uint64_t offset{};bool bytes=false;uint32_t end{};
  uint64_t length() const{return end?end:buffer?buffer->length:0;}};
@@ -185,6 +185,8 @@ class Backend {
   fprintf(stderr,"FUXI MTL: cache period driver hits=%llu misses=%llu unknown=%llu objects hits=%llu misses=%llu live=%zu evictions=%zu bytes=%zu blobs=%zu blob_shared=%llu mesa_cache=%s\n",
    (unsigned long long)driverHits,(unsigned long long)driverMisses,(unsigned long long)driverUnknown,
    (unsigned long long)objectHits,(unsigned long long)objectMisses,objects.count(),objects.evictions,objects.totalBytes(),blobShare.size(),(unsigned long long)blobSharedHits,mesaStatus[0]?mesaStatus:"off");
+  {size_t variants=0,largest=0,largestVariants=0;objects.each([&](Pipeline *p,size_t n){variants+=p->variants.size();if(n>largest){largest=n;largestVariants=p->variants.size();}});
+   fprintf(stderr,"FUXI MTL: cache period object bytes live=%zu variants=%zu avg_kb=%zu largest_kb=%zu largest_variants=%zu (entry bytes include runtime variants: each variant is a full pipeline, up to 8 per entry)\n",objects.count(),variants,objects.count()?objects.totalBytes()/objects.count()/1024:0,largest/1024,largestVariants);}
   driverHits=driverMisses=driverUnknown=objectHits=objectMisses=0;return checkpoint;
  }
  char mesaStatus[96]{};std::map<std::string,std::pair<Buffer *,size_t>> blobShare;uint64_t blobSharedHits=0;
@@ -1080,6 +1082,8 @@ public:
    for(auto &d:p->descriptors)if(d.type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)for(unsigned stage=0;stage<2;++stage)
     if(d.binding<16 && (d.stages&(stage?16u:1u)) && p->mipAccess[stage].readOnlyStorage(d.binding))p->readOnlyStorage[stage]|=1u<<d.binding;
    p->retainedBytes+=p->mipAccess[0].retainedBytes()+p->mipAccess[1].retainedBytes();
+   for(auto &d:p->descriptors){if(d.type==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || d.type==VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER)p->writesStorage=true;
+    else if(d.type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && d.binding<16)for(unsigned stage=0;stage<2;++stage)if((d.stages&(stage?16u:1u)) && !(p->readOnlyStorage[stage]&(1u<<d.binding)) && p->mipAccess[stage].mayWriteBinding(d.binding))p->writesStorage=true;}
    {static std::atomic<unsigned> br{0};unsigned n=br.fetch_add(1);if(n<5||n%25==0)fprintf(stderr,"FUXI MTL: pipeline bytes n=%u total=%zu struct=%zu spirv=%zu mip_vertex=%zu mip_fragment=%zu blobs_new_or_shared=%u\n",n,p->retainedBytes,sizeof(Pipeline),size_t(translated.vertexCount+translated.fragmentCount)*4,p->mipAccess[0].retainedBytes(),p->mipAccess[1].retainedBytes(),translated.blobCount);}
    auto began=std::chrono::steady_clock::now();
    try {
@@ -1337,9 +1341,12 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
  }
 
  // Why an op is not a reorderable plain draw (nullptr when it is one). Also used to explain blocked hoists.
- static const char *barrierWhy(const Operation &op) {
+ // relaxed (RT_RENAME): metal2vulkan lowers every Metal buffer argument to a storage buffer and fb-fetch passes only depend on their own targets, so a pass is a barrier only when its shader may write storage.
+ static const char *barrierWhy(const Operation &op,bool relaxed=false) {
   if(!op.texture)return op.src||op.dst?"copy":"no-target";if(!op.pipeline)return "no-pipeline";if(op.clearOnly)return "clear-only";if(op.upload)return "upload";if(op.generateMips)return "mips";
-  if(op.src||op.dst)return "copy";if(!op.encoderID)return "no-encoder";if(op.pipeline->fetchMask)return "framebuffer-fetch";
+  if(op.src||op.dst)return "copy";if(!op.encoderID)return "no-encoder";
+  if(relaxed)return op.pipeline->writesStorage?"storage-write":nullptr;
+  if(op.pipeline->fetchMask)return "framebuffer-fetch";
   for(const auto &d:op.pipeline->descriptors)if(d.type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER||d.type==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE||d.type==VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER)return "storage-resource";else if(d.type==VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT)return "input-attachment";
   return nullptr;
  }
@@ -1354,8 +1361,8 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
   if(auto *r=writes(a,b,"target-vs-target","earlier-writes-what-later-samples","earlier-writes-memory-of-later-buffer"))return r;
   return writes(b,a,"target-vs-target","later-writes-what-earlier-samples","later-writes-memory-of-earlier-buffer");
  }
- bool buildGroups(const std::vector<Operation> &ops,std::vector<PassGroup> &groups) {
-  auto plainDraw=[](const Operation &op){return barrierWhy(op)==nullptr;};
+ bool buildGroups(const std::vector<Operation> &ops,std::vector<PassGroup> &groups,bool relaxed=false) {
+  auto plainDraw=[relaxed](const Operation &op){return barrierWhy(op,relaxed)==nullptr;};
   for(size_t i=0;i<ops.size();++i){const auto &op=ops[i];PassGroup g{i,i,!plainDraw(op),op.colorCount,op.colorMask,{},{},{},{}};
    if(!g.barrier){if(op.colorCount>8)return false;for(unsigned k=0;k<op.colorCount;++k){auto c=op.color(k);g.targets[k]=c.texture;g.levels[k]=c.level;}}
    if(!g.barrier && !groups.empty() && groups.back().sameTargets(g)){groups.back().last=i;}else groups.push_back(std::move(g));
@@ -1413,16 +1420,16 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
  }
  unsigned hoistLogged=0;
  void hoistOffscreen(std::vector<Operation> &ops) {
-  std::vector<PassGroup> groups;if(!buildGroups(ops,groups))return;
+  std::vector<PassGroup> groups;if(!buildGroups(ops,groups,true))return;
   std::vector<size_t> order;order.reserve(groups.size());unsigned moved=0,offs=0;std::map<std::string,unsigned> reasons;std::map<std::string,std::string> examples;
   struct HoistLog {Backend &b;std::vector<PassGroup> &groups;unsigned &offs;unsigned &moved;std::map<std::string,unsigned> &reasons;std::map<std::string,std::string> &examples;
    ~HoistLog(){if(!(b.hoistLogged<20 || b.rtRenameSubmits%300==1))return;++b.hoistLogged;std::string line;for(auto &r:reasons){line+=" "+r.first+"="+std::to_string(r.second);auto e=examples.find(r.first);if(e!=examples.end())line+="["+e->second+"]";}
     fprintf(stderr,"FUXI MTL: rt hoist n=%u groups=%zu offscreen=%u moved=%u reasons:%s\n",b.hoistLogged,groups.size(),offs,moved,line.c_str());}} hoistLog{*this,groups,offs,moved,reasons,examples};
   for(size_t gi=0;gi<groups.size();++gi){auto &g=groups[gi];size_t insertAt=order.size();
-   if(g.barrier)reasons[std::string("barrier:")+barrierWhy(ops[g.first])]++;
+   if(g.barrier)reasons[std::string("barrier:")+barrierWhy(ops[g.first],true)]++;
    bool offscreen=!g.barrier;if(offscreen)for(auto *t:g.targets)if(t && !smallOffscreen(t)){offscreen=false;reasons["main-or-large-group"]++;break;}
    if(offscreen){++offs;size_t scanned=0;const char *why=nullptr;bool stoppedAtEnd=false;const PassGroup *blocker=nullptr;
-    for(size_t k=order.size();k-->0 && scanned<256;++scanned){auto &o=groups[order[k]];if(o.barrier){why=barrierWhy(ops[o.first]);blocker=&o;break;}if(auto *c=conflictWhy(o,g)){why=c;blocker=&o;break;}insertAt=k;}
+    for(size_t k=order.size();k-->0 && scanned<256;++scanned){auto &o=groups[order[k]];if(o.barrier){why=barrierWhy(ops[o.first],true);blocker=&o;break;}if(auto *c=conflictWhy(o,g)){why=c;blocker=&o;break;}insertAt=k;}
     if(!why)stoppedAtEnd=true;
     if(insertAt==order.size()){const char *key=why?why:"nothing-before";reasons[key]++;if(blocker&&examples.find(key)==examples.end()&&g.targets[0])examples[key]=(blocker->targets[0]?std::to_string(blocker->targets[0]->width)+"x"+std::to_string(blocker->targets[0]->height):std::string("barrier-op"))+"->"+std::to_string(g.targets[0]->width)+"x"+std::to_string(g.targets[0]->height);}
     else if(stoppedAtEnd)reasons["moved-to-start"]++;else reasons["moved-partly"]++;}
@@ -1434,7 +1441,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
   ops.swap(sorted);rtHoisted+=moved;
  }
  void reorderPasses(std::vector<Operation> &ops) {
-  std::vector<PassGroup> groups;if(!buildGroups(ops,groups))return;
+  std::vector<PassGroup> groups;if(!buildGroups(ops,groups,systemTranslationPolicy().rtRename))return;
   // Groups merged above may hold a barrier-free duplicate signature elsewhere; hop each plain group back to the last equal-target group.
   std::vector<size_t> order;order.reserve(groups.size());unsigned hops=0;
   for(size_t gi=0;gi<groups.size();++gi){auto &g=groups[gi];size_t insertAt=order.size();
