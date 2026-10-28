@@ -274,6 +274,10 @@ private:
  PFN_vkGetPhysicalDeviceFormatProperties GetPhysicalDeviceFormatProperties{};
  PFN_vkGetPhysicalDeviceExternalBufferProperties GetPhysicalDeviceExternalBufferProperties{};
  PFN_vkGetMemoryHostPointerPropertiesEXT GetMemoryHostPointerPropertiesEXT{};
+#ifdef VK_KHR_pipeline_executable_properties
+ PFN_vkGetPipelineExecutablePropertiesKHR GetPipelineExecutablePropertiesKHR{};PFN_vkGetPipelineExecutableStatisticsKHR GetPipelineExecutableStatisticsKHR{};
+#endif
+ bool executableStats=false;
  PFN_vkGetPhysicalDeviceImageFormatProperties2 GetPhysicalDeviceImageFormatProperties2{};
  PFN_vkDestroyInstance DestroyInstance{};PFN_vkGetInstanceProcAddr gipa{};
 #define FIELD(n) PFN_vk##n n{};
@@ -372,6 +376,15 @@ public:
     order.rasterizationOrderDepthAttachmentAccess=order.rasterizationOrderStencilAttachmentAccess=VK_FALSE;
     if(orderedColorAccess){enabledExtensions.push_back(VK_EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME);di.pNext=&order;}
    }
+#ifdef VK_KHR_pipeline_executable_properties
+   VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR exec{};exec.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR;
+   if(systemTranslationPolicy().pipeStats){
+    bool have=false;for(const auto &ext:extensions)if(!strcmp(ext.extensionName,VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME))have=true;
+    if(have){VkPhysicalDeviceFeatures2 supported{};supported.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;supported.pNext=&exec;GetPhysicalDeviceFeatures2(physical,&supported);
+     if(exec.pipelineExecutableInfo){exec.pNext=const_cast<void *>(di.pNext);di.pNext=&exec;enabledExtensions.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);executableStats=true;}}
+    fprintf(stderr,"FUXI MTL: pipeline executable statistics %s\n",executableStats?"enabled":"unavailable");
+   }
+#endif
    VkPhysicalDeviceFeatures2 core{};core.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;GetPhysicalDeviceFeatures2(physical,&core);
    VkPhysicalDeviceFeatures enables{};enables.independentBlend=core.features.independentBlend;enables.samplerAnisotropy=core.features.samplerAnisotropy;di.pEnabledFeatures=&enables;
    // Without the feature an anisotropic Metal sampler degrades to plain filtering.
@@ -390,6 +403,9 @@ public:
    di.enabledExtensionCount=enabledExtensions.size();di.ppEnabledExtensionNames=enabledExtensions.data();
    check(CreateDevice(physical,&di,nullptr,&device));
    GetMemoryHostPointerPropertiesEXT=(PFN_vkGetMemoryHostPointerPropertiesEXT)GetDeviceProcAddr(device,"vkGetMemoryHostPointerPropertiesEXT");
+#ifdef VK_KHR_pipeline_executable_properties
+   if(executableStats){GetPipelineExecutablePropertiesKHR=(PFN_vkGetPipelineExecutablePropertiesKHR)GetDeviceProcAddr(device,"vkGetPipelineExecutablePropertiesKHR");GetPipelineExecutableStatisticsKHR=(PFN_vkGetPipelineExecutableStatisticsKHR)GetDeviceProcAddr(device,"vkGetPipelineExecutableStatisticsKHR");if(!GetPipelineExecutablePropertiesKHR || !GetPipelineExecutableStatisticsKHR)executableStats=false;}
+#endif
 #define LOAD(n) n=(PFN_vk##n)GetDeviceProcAddr(device,"vk" #n);if(!n) throw std::runtime_error("missing vk" #n);
    FUXI_VK_FUNCTIONS(LOAD)
 #undef LOAD
@@ -991,15 +1007,50 @@ public:
    auto cache=pipelineCache.get();
    VkPipelineCreationFeedback feedback{};VkPipelineCreationFeedbackCreateInfo feedbackInfo{};
    if(creationFeedback){feedbackInfo.sType=VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO;feedbackInfo.pPipelineCreationFeedback=&feedback;gi.pNext=&feedbackInfo;}
+#ifdef VK_KHR_pipeline_executable_properties
+   if(executableStats && topology==Topology::Triangle)gi.flags|=VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+#endif
    VkPipeline result{};auto rc=CreateGraphicsPipelines(device,cache,1,&gi,nullptr,&result);
    if(rc==VK_SUCCESS && systemTranslationPolicy().frameTrace)++frameCounts.pipelines;
    if(rc!=VK_SUCCESS){if(result)DestroyPipeline(device,result,nullptr);check(rc);}
+   if(systemTranslationPolicy().pipeStats && topology==Topology::Triangle)logPipelineStats(p,translated,result);
    if(cacheMode==CacheMode::persistent){
     if(!(feedback.flags&VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT))++driverUnknown;
     else if(feedback.flags&VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT)++driverHits;else ++driverMisses;
    }
    cleanup();return result;
   }catch(...){cleanup();throw;}
+ }
+ // FUXI_MTL_PIPELINE_STATS=1: what the translator produced for this pipeline (entry points, bound function constants, SPIR-V shape) and, when the driver
+ // exposes VK_KHR_pipeline_executable_properties, the post-optimization statistics (ir3 instruction counts, registers, spills).
+ void logPipelineStats(Pipeline *p,const Translation &t,VkPipeline pipeline) {
+  auto st=spirvStats(t.fragment,t.fragmentCount);auto vs=spirvStats(t.vertex,t.vertexCount);
+  fprintf(stderr,"FUXI MTL: pipeline stats pipe=%06x frag=%s vert=%s frag_words=%u frag_instr=%u samples=%u fetches=%u loops=%u kills=%u spec_consts=%u switches=%u cond_br=%u selections=%u calls=%u phis=%u converts=%u f16_types=%u f32_types=%u relaxed=%u access_chains=%u vert_instr=%u vk_specs=%u fn_constants=%u/%u\n",
+   p->id,t.fragmentEntry?t.fragmentEntry:"?",t.vertexEntry?t.vertexEntry:"?",st.words,st.instr,st.samples,st.fetches,st.loops,st.kills,st.specConsts,st.switches,st.condBranches,st.selections,st.calls,st.phis,st.converts,st.f16Types,st.f32Types,st.relaxed,st.accessChains,vs.instr,t.specCount,p->options.constantCount[0],p->options.constantCount[1]);
+  if(const char *dir=getenv("FUXI_MTL_SPIRV_DUMP_DIR")){ // raw SPIR-V of heavy pipelines for offline spirv-dis; the directory must already exist
+   if(st.instr>=5000 && t.fragment){char path[512];snprintf(path,sizeof path,"%s/pipe%06x.frag.spv",dir,p->id);if(FILE *f=fopen(path,"wb")){fwrite(t.fragment,4,t.fragmentCount,f);fclose(f);fprintf(stderr,"FUXI MTL: pipeline stats pipe=%06x dumped fragment SPIR-V\n",p->id);}}}
+  for(unsigned stage=0;stage<2;++stage){unsigned n=std::min<unsigned>(p->options.constantCount[stage],maxFunctionConstants);if(!n)continue;
+   std::string line;char b[96];for(unsigned i=0;i<n && i<24;++i){const auto &c=p->options.constants[stage][i];std::string hex;for(unsigned k=0;k<c.size && k<16;++k){snprintf(b,sizeof b,"%02x",c.bytes[k]);hex+=b;}
+    snprintf(b,sizeof b," %s#%u:t%u=",c.name[0]?c.name:"-",c.index,c.type);line+=b;line+=hex;}
+   fprintf(stderr,"FUXI MTL: pipeline stats pipe=%06x %s constants%s\n",p->id,stage?"fragment":"vertex",line.c_str());}
+  for(unsigned i=0;i<t.specCount && i<32;++i){const auto &e=t.specs[i];uint64_t v=0;if(e.size<=8 && e.offset+e.size<=t.specSize)memcpy(&v,t.specData+e.offset,e.size);fprintf(stderr,"FUXI MTL: pipeline stats pipe=%06x vk_spec id=%u size=%u value=%llu\n",p->id,e.id,e.size,(unsigned long long)v);}
+#ifdef VK_KHR_pipeline_executable_properties
+  if(!executableStats || !pipeline)return;
+  VkPipelineInfoKHR info{};info.sType=VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR;info.pipeline=pipeline;uint32_t count=0;
+  if(GetPipelineExecutablePropertiesKHR(device,&info,&count,nullptr)!=VK_SUCCESS || !count || count>16)return;
+  std::vector<VkPipelineExecutablePropertiesKHR> props(count);for(auto &x:props){x={};x.sType=VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR;}
+  if(GetPipelineExecutablePropertiesKHR(device,&info,&count,props.data())<0)return;
+  for(uint32_t e=0;e<count;++e){VkPipelineExecutableInfoKHR ei{};ei.sType=VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR;ei.pipeline=pipeline;ei.executableIndex=e;uint32_t n=0;
+   if(GetPipelineExecutableStatisticsKHR(device,&ei,&n,nullptr)!=VK_SUCCESS || !n || n>64)continue;
+   std::vector<VkPipelineExecutableStatisticKHR> stats(n);for(auto &x:stats){x={};x.sType=VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR;}
+   if(GetPipelineExecutableStatisticsKHR(device,&ei,&n,stats.data())<0)continue;
+   std::string line;char b[160];
+   for(uint32_t k=0;k<n;++k){const auto &s=stats[k];
+    switch(s.format){case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR:snprintf(b,sizeof b," %s=%u",s.name,unsigned(s.value.b32));break;case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR:snprintf(b,sizeof b," %s=%lld",s.name,(long long)s.value.i64);break;
+     case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR:snprintf(b,sizeof b," %s=%llu",s.name,(unsigned long long)s.value.u64);break;default:snprintf(b,sizeof b," %s=%.3f",s.name,s.value.f64);}
+    for(char *q=b+1;*q && *q!='=';++q)if(*q==' ')*q='_';line+=b;}
+   fprintf(stderr,"FUXI MTL: pipeline exec pipe=%06x stage=0x%x name=%s%s\n",p->id,unsigned(props[e].stages),props[e].name,line.c_str());}
+#endif
  }
  VkPipeline topologyPipeline(Pipeline *p,Topology topology) {
   requireLive();if(!validTopology(topology))throw std::runtime_error("invalid pipeline topology");
