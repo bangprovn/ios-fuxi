@@ -179,12 +179,13 @@ class Backend {
    checkpoint=true;cacheCheckpoint=CacheClock::now();
   }
   artifactCache.report();
-  fprintf(stderr,"FUXI MTL: cache period driver hits=%llu misses=%llu unknown=%llu objects hits=%llu misses=%llu\n",
+  fprintf(stderr,"FUXI MTL: cache period driver hits=%llu misses=%llu unknown=%llu objects hits=%llu misses=%llu live=%zu evictions=%zu\n",
    (unsigned long long)driverHits,(unsigned long long)driverMisses,(unsigned long long)driverUnknown,
-   (unsigned long long)objectHits,(unsigned long long)objectMisses);
+   (unsigned long long)objectHits,(unsigned long long)objectMisses,objects.count(),objects.evictions);
   driverHits=driverMisses=driverUnknown=objectHits=objectMisses=0;return checkpoint;
  }
- ObjectCache<Pipeline> objects;ResourceLimits limits;DrawPlanCache<Pipeline> drawPlans;
+ // 256 pipelines: the old 32-entry LRU evicted every prewarmed pipeline before its first draw
+ ObjectCache<Pipeline,256,64u*1024*1024> objects;ResourceLimits limits;DrawPlanCache<Pipeline> drawPlans;
  TransientMemory<VkDeviceMemory> textureMemory;SlabMemory<VkDeviceMemory> slabMemory;
 public:
  bool slabsEnabled=!systemTranslationPolicy().noSlab;
@@ -327,7 +328,10 @@ public:
  bool supportsTimestamps() const{return timestampBits && timestampPeriod>0;}
  explicit Backend(const char *client="unknown") {
   setenv("TU_DARWIN_SERVICE","NativeAdrenoGpuPublished",1);
-  setenv("TU_DARWIN_OPEN_TYPE","0",1);setupTurnip();setenv("MESA_LOG_LEVEL","warning",0);  // info logs a line per submit; env may raise it
+  setenv("TU_DARWIN_OPEN_TYPE","0",1);setupTurnip();
+  {const char *mesa=getenv("FUXI_MTL_MESA_DISK_CACHE"); // experiment: let Mesa/Turnip keep its own shader cache under the root-owned fuxi-metal directory
+   if(mesa && !strcmp(mesa,"1") && geteuid()==0){::mkdir("/private/var/db/fuxi-metal",0755);::mkdir("/private/var/db/fuxi-metal/mesa-cache",0700);
+    setenv("MESA_SHADER_CACHE_DIR","/private/var/db/fuxi-metal/mesa-cache",0);setenv("MESA_SHADER_CACHE_MAX_SIZE","64M",0);fprintf(stderr,"FUXI MTL: mesa disk cache dir set (MESA_SHADER_CACHE_DIR)\n");}}setenv("MESA_LOG_LEVEL","warning",0);  // info logs a line per submit; env may raise it
   try {
    library=dlopen(FUXI_MTL_ICD,RTLD_NOW|RTLD_LOCAL);
    if(!library) throw std::runtime_error("dlopen Turnip failed");
@@ -847,7 +851,8 @@ public:
  void prewarmLoop() {
   prewarmWorker=true;
 #ifdef __APPLE__
-  pthread_set_qos_class_self_np(QOS_CLASS_UTILITY,0);
+  {const char *q=getenv("FUXI_MTL_PREWARM_QOS"); // utility (default) runs on efficiency cores and can lose every race with the first draws; "initiated" or "default" trade that for CPU contention
+   pthread_set_qos_class_self_np(q && !strcmp(q,"initiated")?QOS_CLASS_USER_INITIATED:q && !strcmp(q,"default")?QOS_CLASS_DEFAULT:QOS_CLASS_UTILITY,0);}
 #endif
   std::unique_lock<std::mutex> lock(prewarmMutex);uint64_t batchStart=0;auto began=std::chrono::steady_clock::now();
   while(true){
@@ -939,6 +944,8 @@ public:
    fprintf(stderr,"FUXI MTL: pipeline cache HIT %.3f ms\n",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count());return cached;
   }
   ++pipelineMisses;++objectMisses;lastCompileWasHit=0;
+  {static std::atomic<unsigned> reasons{0};if(reasons.fetch_add(1)<10)fprintf(stderr,"FUXI MTL: pipeline miss reason=%s input=%02x%02x%02x%02x product=%02x%02x%02x%02x objects=%zu evictions=%zu prewarm=%d\n",objects.wasEvicted(inputKey)?"lru-evicted-rebuild":"first-sight-or-key-differs",
+   (unsigned)(uint8_t)inputKey[0],(unsigned)(uint8_t)inputKey[1],(unsigned)(uint8_t)inputKey[2],(unsigned)(uint8_t)inputKey[3],(unsigned)(uint8_t)productKey[32],(unsigned)(uint8_t)productKey[33],(unsigned)(uint8_t)productKey[34],(unsigned)(uint8_t)productKey[35],objects.count(),objects.evictions,int(prewarmWorker));}
   struct Unlock {Unlock(){unlockForCompile=true;}~Unlock(){unlockForCompile=false;}} unlockScope;
   auto *p=createPipeline(translated,enabledOptions);timing.create=timing.lap();timing.result="miss";
   compileBoost.finish();
@@ -1103,8 +1110,9 @@ public:
    gi.pViewportState=&vp;gi.pRasterizationState=&raster;gi.pMultisampleState=&ms;gi.pColorBlendState=&bs;gi.layout=p->layout;gi.renderPass=p->render;
    VkDynamicState dynamicStates[]={VK_DYNAMIC_STATE_VIEWPORT,VK_DYNAMIC_STATE_SCISSOR};VkPipelineDynamicStateCreateInfo dynamic{};dynamic.sType=VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;dynamic.dynamicStateCount=2;dynamic.pDynamicStates=dynamicStates;gi.pDynamicState=&dynamic;
    auto cache=pipelineCache.get();
-   VkPipelineCreationFeedback feedback{};VkPipelineCreationFeedbackCreateInfo feedbackInfo{};
-   if(creationFeedback){feedbackInfo.sType=VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO;feedbackInfo.pPipelineCreationFeedback=&feedback;gi.pNext=&feedbackInfo;}
+   VkPipelineCreationFeedback feedback{},stageFeedback[2]{};VkPipelineCreationFeedbackCreateInfo feedbackInfo{};
+   if(creationFeedback){feedbackInfo.sType=VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO;feedbackInfo.pPipelineCreationFeedback=&feedback;feedbackInfo.pipelineStageCreationFeedbackCount=2;feedbackInfo.pPipelineStageCreationFeedbacks=stageFeedback;gi.pNext=&feedbackInfo;}
+   auto createStart=std::chrono::steady_clock::now();
 #ifdef VK_KHR_pipeline_executable_properties
    if(executableStats && topology==Topology::Triangle)gi.flags|=VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
 #endif
@@ -1113,6 +1121,12 @@ public:
     mutex.unlock();rc=CreateGraphicsPipelines(device,cache,1,&gi,nullptr,&result);mutex.lock();
     if(poisoned){if(rc==VK_SUCCESS && result)DestroyPipeline(device,result,nullptr);throw std::runtime_error("backend poisoned during pipeline compile");}
    }else rc=CreateGraphicsPipelines(device,cache,1,&gi,nullptr,&result);
+   if(rc==VK_SUCCESS){static std::atomic<unsigned> diag{0};unsigned n=diag.fetch_add(1);
+    if(n<10){size_t cacheBytes=0;if(cache)GetPipelineCacheData(device,cache,&cacheBytes,nullptr);
+     fprintf(stderr,"FUXI MTL: pipeline create diag n=%u topology=%d ms=%.2f feedback_valid=%d cache_hit=%d stage_ms=%.2f/%.2f stage_hit=%d/%d cache_bytes=%zu flags=0x%x\n",n,int(topology),std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-createStart).count(),
+      int(!!(feedback.flags&VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT)),int(!!(feedback.flags&VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT)),stageFeedback[0].duration/1e6,stageFeedback[1].duration/1e6,
+      int(!!(stageFeedback[0].flags&VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT)),int(!!(stageFeedback[1].flags&VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT)),cacheBytes,unsigned(gi.flags));}
+   }
    if(rc==VK_SUCCESS && systemTranslationPolicy().frameTrace)++frameCounts.pipelines;
    if(rc!=VK_SUCCESS){if(result)DestroyPipeline(device,result,nullptr);check(rc);}
    if(systemTranslationPolicy().pipeStats && topology==Topology::Triangle)logPipelineStats(p,translated,result);
