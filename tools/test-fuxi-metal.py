@@ -156,6 +156,16 @@ static uint64_t counter(const char *name) {return strcmp(name,"cntfrq_el0")?tick
 static uint64_t mach_absolute_time(void) {return ticks;}
 #define rsr(r) counter(r)
 static unsigned fg_abi_present_wait;
+#define G4_FB_PA 0xb8000000ULL
+#define G4_FB_MAP 10371072u
+#define FG_CACHE_SLOTS 4u
+#define FG_SOURCE_VA 0x50000000u
+#define FG_SOURCE_L3 8u
+#define FG_INL_SRC_VA 0x90000000u
+#define FG_INL_FB_VA 0xa0000000u
+static unsigned fg_abi_inline,fg_inl_ready,fg_root_client,fg_inl_busy,fg_inl_fbmask,fg_scanout_double_requested,fg_scanout_triple_requested;
+static uint64_t presentL2[512];
+static volatile uint64_t *fg_l2(void) {return presentL2;}
 static unsigned fg_access_failed,fg_busy,fg_client_busy,g3_wptr,g3_bank=2,g3_asid=3;
 static unsigned cacheClean,cacheInvalidate,ncimportArg;
 static int PE_parse_boot_argn(const char *name,void *value,size_t bytes) {
@@ -693,6 +703,44 @@ int main(void) {
   #undef QSTART
   #undef DONE_UP_TO
   puts("PASS: queue mode (bit 512): queued submits keep the client root, in-order retirement with per-job deadline, depth/ring limits, TLBI only after a map, present stops queueing, fault in job 2 keeps job 1, unmap/import handoff per job");
+ }
+ /* Inline root (bit 21, needs 512): the client root keeps its window and stays installed; a copy in flight never refuses or delays a client job. */
+ {
+  uint64_t sz[1]={4096},ad[1]={va},f1=0,f2=0,f3=0;
+  uint32_t ttbrC=(uint32_t)FG_ABI_PT;
+  #define DONE_UP_TO(n) g_wr(G3_FENCE_PA,FG_ABI_FENCE_OFF+4,(n))
+  seed();ncimportArg=2097152;assert(fg_abi_init() && !fg_abi_inline); /* 512 is required */
+  seed();ncimportArg=512|2097152;fg_scanout_double_requested=1;fg_scanout_triple_requested=0;memset(presentL2,0,sizeof presentL2);presentL2[128+3]=0x41000|3;
+  assert(fg_abi_init() && fg_abi_inline && !fg_inl_ready && !fg_inl_usable());assert(!fuxi_gpu_abi_map(va,source,bytes,3,0,2));
+  assert(!fuxi_gpu_abi_submit(ad,sz,1,&f1) && f1==1 && fg_root_client && fg_inl_ready==1 && fg_inl_usable() && sregs[(g_cb(g3_bank)+0x20)/4]==ttbrC && fg_inl_fbmask==3);
+  { volatile uint64_t *root=(volatile uint64_t *)G_PTR(FG_ABI_PT),*l2=(volatile uint64_t *)G_PTR(FG_INL_L2);
+    assert(root[2]==(FG_INL_L2|3) && !root[3] && l2[256]==(FG_INL_L3|3) && l2[256+9]==((FG_INL_L3+9u*4096)|3) && !l2[256+10]);
+    volatile uint64_t *t0l3=(volatile uint64_t *)G_PTR(FG_INL_L3),*t5=(volatile uint64_t *)G_PTR(FG_INL_L3+5u*4096);
+    assert(t0l3[0]==(G4_FB_PA|3|(3u<<8)|(1u<<10)|(1u<<6)) && t0l3[511]==((G4_FB_PA+511u*4096)|3|(3u<<8)|(1u<<10)|(1u<<6)));
+    assert(t5[0]==(0xb8a00000ULL|3|(3u<<8)|(1u<<10)|(1u<<6)));
+    assert(l2[128+3]==(0x41000|3) && !l2[128+4]);
+    fg_inl_mirror(4,0x77000|1);assert(l2[132]==(0x77000|1));fg_inl_mirror(4,0);assert(!l2[132]); }
+  /* The job retires on its fence alone, without restoring the present root. */
+  complete();assert(!fuxi_gpu_abi_poll(1) && !fg_client_busy && fg_abi_completed==1 && sregs[(g_cb(g3_bank)+0x20)/4]==ttbrC);
+  /* A copy is in flight (ring not empty, fg_busy): the client is not refused, switches nothing, and retires although the copy is still queued. */
+  fg_busy=1;fg_inl_busy=1;regs[0x806]=(g3_wptr-100)&8191;regs[0x210]=0;
+  unsigned t0=tlbs;
+  assert(!fuxi_gpu_abi_submit(ad,sz,1,&f2) && f2==2 && tlbs==t0 && sregs[(g_cb(g3_bank)+0x20)/4]==ttbrC && fg_client_busy);
+  DONE_UP_TO(2);assert(!fuxi_gpu_abi_poll(2) && !fg_client_busy && fg_abi_completed==2 && sregs[(g_cb(g3_bank)+0x20)/4]==ttbrC);
+  fg_busy=0;fg_inl_busy=0;fg_scanout_reserved=1;assert(!fuxi_gpu_abi_submit(ad,sz,1,&f3) && f3==3);fg_scanout_reserved=0; /* no reservation exists in this mode */
+  /* Back to the present root for a classic copy: needs an idle GPU. */
+  assert(!fg_inl_to_present() && fg_root_client); /* the client job is running */
+  DONE_UP_TO(3);regs[0x806]=regs[0x807]=g3_wptr;assert(!fuxi_gpu_abi_poll(3));
+  assert(fg_inl_to_present() && !fg_root_client && sregs[(g_cb(g3_bank)+0x20)/4]==(uint32_t)G3_PT && !fg_inl_usable());
+  /* The next client submit installs its root again (idle GPU) and keeps it. */
+  assert(!fuxi_gpu_abi_submit(ad,sz,1,&f3) && f3==4 && fg_root_client && sregs[(g_cb(g3_bank)+0x20)/4]==ttbrC);
+  /* Window setup refused when the root slot is taken: old path for the whole run. */
+  seed();ncimportArg=512|2097152;assert(fg_abi_init());*(volatile uint64_t *)((uintptr_t)G_PTR(FG_ABI_PT)+16)=1;
+  assert(!fuxi_gpu_abi_map(va,source,bytes,3,0,2) && !fuxi_gpu_abi_submit(ad,sz,1,&f1) && fg_inl_ready==2 && !fg_root_client && !fg_inl_usable());
+  complete();assert(!fuxi_gpu_abi_poll(1) && !fg_client_busy && sregs[(g_cb(g3_bank)+0x20)/4]==(uint32_t)G3_PT);
+  #undef DONE_UP_TO
+  fg_abi_inline=0;fg_scanout_double_requested=0;
+  puts("PASS: inline root (bit 21): client-root window (carveout A/B + mirrored sources), root kept after retirement, copy in flight never refuses or delays a client job, fence-only retire, return to the present root, setup failure keeps the old path");
  }
  /* Legacy opt-in (fuxigpuncimport 256): a map waits for an idle GPU again. */
  seed();ncimportArg=256;assert(fg_abi_init() && fg_abi_mapwait);

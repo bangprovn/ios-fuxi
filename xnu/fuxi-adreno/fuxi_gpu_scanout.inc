@@ -1573,6 +1573,7 @@ int fuxi_gpu_scanout_reserve(void)
  FG_GUARD;
  if (!fuxi_gpu_ready()) return 1;
  if (fg_scanout_failed || fg_scanout_reserved || fg_busy) return 0;
+ if (fg_abi_inline && fg_inl_usable()) return 1; /* bit 21: no reservation, the copy queues behind client jobs in their root */
  if (fg_abi_live_for_scanout() && fg_abi_observe() != 0) { if (fg_client_busy) fg_abi_present_wait = 1; return 0; }
  if (fg_client_busy) { fg_abi_present_wait = 1; return 0; }
  fg_scanout_reserved = 1;

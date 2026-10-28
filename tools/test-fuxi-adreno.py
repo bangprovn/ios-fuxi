@@ -32,7 +32,7 @@ PREFIX = r'''
 #include <stdint.h>
 #define FG_ABI_WAKE() ((void)0)
 static unsigned fg_abi_present_wait, fg_client_busy, fg_scanout_owned, fg_scanout_writable, fg_scanout_requested, fg_scanout_preclean;
-static unsigned fg_scanout_double_active,fg_scanout_front,fg_scanout_back_ready,fg_scanout_ready_drops,fg_scanout_triple_requested,fg_scanout_ready,fg_scanout_copy;
+static unsigned fg_scanout_double_active,fg_scanout_front,fg_scanout_back_ready,fg_scanout_ready_drops,fg_scanout_triple_requested,fg_scanout_double_requested,fg_scanout_ready,fg_scanout_copy;
 static uintptr_t fg_scanout_source;
 static unsigned fg_scanout_pitch,fg_scanout_sx,fg_scanout_sy,fg_scanout_dx,fg_scanout_dy,fg_scanout_w,fg_scanout_h;
 static unsigned scanoutStops,verifyBad,dcvsKicks;
@@ -67,6 +67,16 @@ struct fg_times {
 };
 static struct fg_times times;
 static uint64_t fg_generation[4], model_l2[512];
+#define FG_INL_SRC_VA 0x90000000u
+#define FG_INL_FB_VA 0xa0000000u
+static unsigned fg_abi_inline, fg_inl_ready, fg_root_client, fg_inl_busy, fg_inl_fbmask, inl_usable_model, inl_present_calls;
+enum { FG_INL_NOROOT, FG_INL_WINDOW, FG_INL_RING, FG_INL_BUFFERS, FG_INL_CLIENT, FG_INL_SWITCH, FG_INL_REASONS };
+static uint32_t fg_inl_n, fg_inl_fb[FG_INL_REASONS], fg_inl_lat_n;
+static uint64_t fg_inl_lat, fg_inl_latmax, model_mirror[512];
+static void fg_inl_mirror(unsigned idx, uint64_t v) { model_mirror[((FG_SOURCE_VA>>21)&511)+idx]=v; }
+static int fg_inl_usable(void) { return fg_abi_inline && inl_usable_model; }
+static int fg_inl_to_present(void) { inl_present_calls++; if(fg_client_busy) return 0; fg_root_client=0; inl_usable_model=0; return 1; }
+static void absolutetime_to_nanoseconds(uint64_t a, uint64_t *n) { *n=a; }
 static unsigned fg_abi_coh, fg_abi_coh_wb, fg_src_n_wb, fg_src_n_nc, fg_src_n_ncstale; static unsigned char fg_src_wb[4];
 static ppnum_t fg_ppns[FG_SOURCE_BYTES/PAGE_SIZE+1];
 static uint64_t model_leaves[16384];
@@ -155,6 +165,7 @@ static int model_copy(unsigned slot,uint64_t gen,uintptr_t src,uint64_t len,
 }
 static uint32_t translated_pixel(unsigned va)
 {
+ if(va>=FG_INL_SRC_VA) va=va-FG_INL_SRC_VA+FG_SOURCE_VA; /* the client-root window aliases the present tables */
  assert(va>=FG_SOURCE_VA && va<FG_SOURCE_VA+FG_SOURCE_BYTES);
  unsigned offva=va-FG_SOURCE_VA;
  uint64_t desc=model_l2[((FG_SOURCE_VA>>21)&511)+offva/0x200000];
@@ -206,7 +217,7 @@ static int g3_gw(unsigned reg,unsigned value)
     assert(!((regs[0xb2c2]|regs[0x8c18])&63));
     for(unsigned y=0;y<h;y++) for(unsigned x=0;x<=bx-dx;x++) {
      assert(pending<2400*1080);
-     unsigned dst=regs[0x8c18]+y*dp+(dx+x)*4-G4_FB_VA;
+     unsigned dst=regs[0x8c18]+y*dp+(dx+x)*4-(regs[0x8c18]>=FG_INL_FB_VA ? FG_INL_FB_VA : G4_FB_VA);
      unsigned buffer=dst/0xa00000u;
      dst-=buffer*0xa00000u;
      assert(buffer<3 && (!fg_scanout_triple_requested || !fg_scanout_back_ready || buffer!=fg_scanout_ready));
@@ -346,6 +357,19 @@ int main(void)
  reset(); fg_abi_coh=0; fg_abi_coh_wb=0; assert(fuxi_gpu_map(0,2,(uintptr_t)source_buf,4352*10,&times) && !fg_src_wb[0]); fg_abi_coh=1; fg_abi_coh_wb=1;
  { uint64_t cleaned=clean_bytes; assert(fuxi_gpu_copy(0,2,(uintptr_t)source_buf,4352*10,4352,0,0,0,0,10,10,&times)==2 && clean_bytes>cleaned && fg_src_n_ncstale==1); }
  ticks+=200000; assert(fuxi_gpu_poll(&times)==1); fg_abi_coh=0; fg_abi_coh_wb=0;
+ /* Inline copy (bit 21): the client root is installed and a client job is running; the copy is queued, not refused, with the window VAs and its own fence. */
+ reset(); memset(model_mirror,0,sizeof model_mirror); fg_abi_inline=1; fg_inl_ready=1; fg_inl_fbmask=1; fg_root_client=1; inl_usable_model=1; fg_inl_n=0; memset(fg_inl_fb,0,sizeof fg_inl_fb);
+ assert(fuxi_gpu_map(0,1,(uintptr_t)source_buf,4352*10,&times) && !memcmp(model_mirror,model_l2,sizeof model_l2));
+ fg_client_busy=1; mode=6; /* GPU reports busy for the whole test: only the copy's own fence may retire it */
+ cache_clean=1; assert(fuxi_gpu_copy(0,1,(uintptr_t)source_buf,4352*10,4352,0,0,0,0,10,10,&times)==2 && fg_busy && fg_inl_busy && fg_inl_n==1 && !fg_abi_present_wait);
+ assert(fuxi_gpu_copy(0,1,(uintptr_t)source_buf,4352*10,4352,0,0,0,0,10,10,&times)==0); /* one present in flight */
+ ticks+=200000; assert(fuxi_gpu_poll(&times)==1 && !fg_busy && !fg_inl_busy && fg_inl_lat_n==1);
+ { uint32_t px; memcpy(&px,panel,4); uint32_t sp; memcpy(&sp,source_buf,4); assert(px==sp); }
+ /* No room in the ring, or an unmapped buffer set: classic path, which needs the present root and so refuses while the client runs. */
+ g3_wptr=(rptr+8191-100)&8191; cache_clean=1; assert(fuxi_gpu_copy(0,1,(uintptr_t)source_buf,4352*10,4352,0,0,0,0,10,10,&times)==0 && fg_inl_fb[FG_INL_RING]==1 && fg_inl_fb[FG_INL_CLIENT]==1 && inl_present_calls==1);
+ g3_wptr=rptr; fg_inl_fbmask=0; fg_scanout_double_requested=1; cache_clean=1; assert(fuxi_gpu_copy(0,1,(uintptr_t)source_buf,4352*10,4352,0,0,0,0,10,10,&times)==0 && fg_inl_fb[FG_INL_BUFFERS]==1);
+ fg_scanout_double_requested=0; fg_client_busy=0; mode=0; fg_abi_inline=0; fg_root_client=0; inl_usable_model=0;
+ reset();
  // Actual shared fault/reset accounting: saturate, count an asserted
  // containment reset once even if the bus drain is repeated.
  reset();fg_faults=fg_suspends=UINT64_MAX;

@@ -317,6 +317,15 @@ static uint64_t fg_generation[FG_CACHE_SLOTS];
 static unsigned fg_abi_coh, fg_abi_coh_wb; /* defined by the ABI backend below */
 static unsigned char fg_src_wb[FG_CACHE_SLOTS]; /* slot mapped write-back inner-shareable (AttrIndx 1) */
 static unsigned fg_src_n_wb, fg_src_n_nc, fg_src_n_ncstale;
+/* fuxigpuncimport bit 21 (2097152, needs queue mode 512): the present copy runs in the ABI client's address space (see fg_inl_setup). */
+static unsigned fg_abi_inline, fg_inl_ready, fg_root_client, fg_inl_busy, fg_inl_fbmask; /* ready: 0 untried 1 mapped 2 failed; root_client: the client root stays installed */
+enum { FG_INL_NOROOT, FG_INL_WINDOW, FG_INL_RING, FG_INL_BUFFERS, FG_INL_CLIENT, FG_INL_SWITCH, FG_INL_REASONS };
+static uint32_t fg_inl_n, fg_inl_fb[FG_INL_REASONS], fg_inl_lat_n;
+static uint64_t fg_inl_lat, fg_inl_latmax;
+static void fg_inl_mirror(unsigned idx, uint64_t v);
+static int fg_inl_usable(void), fg_inl_to_present(void);
+#define FG_INL_SRC_VA 0x90000000u
+#define FG_INL_FB_VA 0xa0000000u
 /* One transient PFN list, serialized by the surface cache lock. Keep lookup
  * and actual NC SMMU table stores in separate timing buckets. */
 static ppnum_t fg_ppns[FG_SOURCE_BYTES/PAGE_SIZE+1];
@@ -402,7 +411,7 @@ int fuxi_gpu_unmap(unsigned slot, struct fg_times *t)
  volatile uint64_t *l2 = fg_l2();
  unsigned first = ((FG_SOURCE_VA >> 21) & 511) + slot*FG_SOURCE_L3;
  for (unsigned i = 0; i < FG_SOURCE_L3; i++) {
-  l2[first+i] = 0;
+  l2[first+i] = 0; fg_inl_mirror(slot*FG_SOURCE_L3+i, 0);
  }
  uint32_t tlb[128] = {0};
  int err = g4_tlb(tlb);
@@ -455,6 +464,7 @@ int fuxi_gpu_map(unsigned slot, uint64_t generation, uintptr_t source,
    if ((leaves[at+j] & 0x0000000ffffff000ULL) != pa+(uint64_t)j*4096) contiguous = 0;
   if (contiguous) {
    l2[first+i] = (leaves[at] & ~3ULL) | 1; /* 2 MiB block */
+   fg_inl_mirror(slot*FG_SOURCE_L3+i, l2[first+i]);
    t->blocks++;
   } else {
    /* Architected 16-entry contiguous hint only for aligned, complete groups. */
@@ -466,6 +476,7 @@ int fuxi_gpu_map(unsigned slot, uint64_t generation, uintptr_t source,
     if (ok) { for (unsigned k = 0; k < 16; k++) leaves[j+k] |= 1ULL<<52; t->groups++; }
    }
    l2[first+i] = (FG_SOURCE_TABLE+slot*32768+i*4096) | 3;
+   fg_inl_mirror(slot*FG_SOURCE_L3+i, l2[first+i]);
   }
  }
  uint32_t tlb[128] = {0};
@@ -736,18 +747,20 @@ int fuxi_gpu_poll(struct fg_times *t)
  FG_GUARD;
  if (!fg_busy) return 1;
  int err = fg_access_failed || g3_faulted();
- if (!err && g3_read(G3_FENCE_PA+64) == fg_magic && g3_gr(0x806) == g3_wptr &&
-     g3_gr(0x807) == g3_wptr && !(g3_gr(0x210) & ~1u)) {
+ /* Inline copy (bit 21): client jobs may be queued behind it, so only its own fence says it retired. */
+ if (!err && g3_read(G3_FENCE_PA+64) == fg_magic && (fg_inl_busy || (g3_gr(0x806) == g3_wptr &&
+     g3_gr(0x807) == g3_wptr && !(g3_gr(0x210) & ~1u)))) {
   fg_scanout_stamps.fence = mach_absolute_time();
   t->wait += fg_scanout_stamps.fence-fg_submit_time;
+  if (fg_inl_busy) { uint64_t d = fg_scanout_stamps.fence-fg_submit_time; fg_inl_lat += d; fg_inl_lat_n++; if (d > fg_inl_latmax) fg_inl_latmax = d; }
   if (fg_scanout_requested && !fg_scanout_verify()) {
    fg_fail("scanout pixel mismatch", 0x604);
    int drained = fg_isolate();
-   fg_busy = 0; FG_ABI_WAKE();
+   fg_busy = fg_inl_busy = 0; FG_ABI_WAKE();
    if (!drained && fg_scanout_owned) (void)fg_scanout_stop("GPU DMA drain failed");
    return drained ? -1 : -2;
   }
-  fg_busy = 0;
+  fg_busy = fg_inl_busy = 0;
   FG_ABI_WAKE(); /* the copy retired: a client submit refused for it may go */
   return 1;
  }
@@ -755,7 +768,7 @@ int fuxi_gpu_poll(struct fg_times *t)
  fg_fail("async present fence/fault/deadline", 0x603);
  /* Only fault containment has bounded register polling; no scheduler wait. */
  int drained = fg_isolate();
- fg_busy = 0; FG_ABI_WAKE();
+ fg_busy = fg_inl_busy = 0; FG_ABI_WAKE();
  if (!drained && fg_scanout_owned) (void)fg_scanout_stop("GPU DMA drain failed");
  t->wait += mach_absolute_time()-fg_submit_time;
  return drained ? -1 : -2;
@@ -766,8 +779,9 @@ int fuxi_gpu_copy(unsigned slot, uint64_t generation, uintptr_t source, uint64_t
 {
  FG_GUARD;
  if (fg_scanout_owned && !fg_scanout_writable) return 0;
- if (fg_client_busy) fg_abi_present_wait = 1;
- if (!fuxi_gpu_ready() || fg_busy || fg_client_busy || slot >= FG_CACHE_SLOTS || fg_generation[slot] != generation) return 0;
+ unsigned inl = fg_abi_inline && fg_inl_usable(); /* the client root is installed and stays: queue the copy in it */
+ if (!inl && fg_client_busy) fg_abi_present_wait = 1;
+ if (!fuxi_gpu_ready() || fg_busy || (!inl && fg_client_busy) || slot >= FG_CACHE_SLOTS || fg_generation[slot] != generation) return 0;
  if (!width || !height || width > 1080 || height > 2400 || dx > 1080-width || dy > 2400-height ||
      (source & 3) || (pitch & 3) || pitch > 131008 || ((uint64_t)sx+width)*4 > pitch ||
      length+(source&4095) > FG_SOURCE_BYTES ||
@@ -779,6 +793,13 @@ int fuxi_gpu_copy(unsigned slot, uint64_t generation, uintptr_t source, uint64_t
   if (((uint64_t)sx+width)*4 > pitch ||
       ((uint64_t)sy+height-1)*pitch+((uint64_t)sx+width)*4 > length) return 0;
  }
+ if (inl) {
+  /* Never refused for a client job: it lands in the same in-order ring. Room for the whole copy (at most about 450 words), else fall back. */
+  unsigned used = (g3_wptr-g3_gr(0x806)) & 8191, want = 1u | (fg_scanout_double_requested ? 2u : 0) | (fg_scanout_triple_requested ? 4u : 0);
+  unsigned why = fg_access_failed ? FG_INL_RING : used > 8191-1024 ? FG_INL_RING : (fg_inl_fbmask & want) != want ? FG_INL_BUFFERS : FG_INL_REASONS;
+  if (why != FG_INL_REASONS) { fg_inl_fb[why]++; inl = 0; }
+ } else if (fg_abi_inline) fg_inl_fb[fg_root_client ? FG_INL_WINDOW : fg_inl_ready == 2 ? FG_INL_WINDOW : FG_INL_NOROOT]++;
+ if (!inl && fg_root_client && !fg_inl_to_present()) { fg_inl_fb[fg_client_busy ? FG_INL_CLIENT : FG_INL_SWITCH]++; return 0; }
  uint64_t start = mach_absolute_time();
  /* Skip the source clean when the slot is mapped write-back inner-shareable (coherent-import self-test
   * bit 64 passed in wb mode) or the caller pre-cleaned (bit 20) while no coherence was active. A slot
@@ -808,8 +829,8 @@ int fuxi_gpu_copy(unsigned slot, uint64_t generation, uintptr_t source, uint64_t
  }
  g4_setup();
  for (unsigned y = 0; y < stride && y < height; y++)
-  fg_rect(FG_SOURCE_VA+slot*FG_SOURCE_BYTES+(source&4095)+(sy+y)*pitch+sx*4,
-      G4_FB_VA+(fg_scanout_double_active ? fg_scanout_copy*0xa00000u : 0)+(dy+y)*4320+dx*4, pitch, width, (height-1-y)/stride+1, stride);
+  fg_rect((inl ? FG_INL_SRC_VA : FG_SOURCE_VA)+slot*FG_SOURCE_BYTES+(source&4095)+(sy+y)*pitch+sx*4,
+      (inl ? FG_INL_FB_VA : G4_FB_VA)+(fg_scanout_double_active ? fg_scanout_copy*0xa00000u : 0)+(dy+y)*4320+dx*4, pitch, width, (height-1-y)/stride+1, stride);
  unsigned magic = ++fg_seq;
  if (!magic) magic = ++fg_seq;
  g4_end(G3_FENCE_VA+64, magic);
@@ -835,6 +856,18 @@ int fuxi_gpu_copy(unsigned slot, uint64_t generation, uintptr_t source, uint64_t
  fg_submit_time = mach_absolute_time();
  fg_scanout_stamps.submitted = fg_submit_time; fg_scanout_stamps.fence = 0;
  fg_busy = 1; fg_abi_present_wait = 0; /* the copy owns the GPU now; the client hold (bit 4096) ends */
+ fg_inl_busy = inl;
+ if (inl) {
+  fg_inl_n++;
+  if (!(fg_inl_n % 600)) {
+   uint64_t ns = 0, mx = 0;
+   if (fg_inl_lat_n) absolutetime_to_nanoseconds(fg_inl_lat/fg_inl_lat_n, &ns);
+   absolutetime_to_nanoseconds(fg_inl_latmax, &mx);
+   printf("FUXI GPU: inline_copies %u fallback_copies %u (no_root %u window %u ring %u buffers %u client_busy %u switch %u) queue_to_retire avg %llu us max %llu us\n", fg_inl_n,
+       fg_inl_fb[0]+fg_inl_fb[1]+fg_inl_fb[2]+fg_inl_fb[3]+fg_inl_fb[4]+fg_inl_fb[5], fg_inl_fb[0], fg_inl_fb[1], fg_inl_fb[2], fg_inl_fb[3], fg_inl_fb[4], fg_inl_fb[5], (unsigned long long)(ns/1000), (unsigned long long)(mx/1000));
+   fg_inl_lat = fg_inl_latmax = 0; fg_inl_lat_n = 0;
+  }
+ }
  FG_ABI_WAKE(); /* a held client submit re-checks: the hold ended, the GPU is busy with the copy */
  return 2; /* submitted; source is owned until poll retires this fence */
 }
