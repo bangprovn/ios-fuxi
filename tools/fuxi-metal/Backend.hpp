@@ -88,6 +88,7 @@ struct PrepareWrite {Buffer *buffer;uint64_t offset,bytes;};
 struct Texture : TextureLevels {VkImage image{};VkDeviceMemory memory{};VkImageView view{};size_t allocated{},charged{},memoryBytes{},references=1;
  uint32_t memoryType{};VkImageUsageFlags usage{};uint32_t format=80;VkFormat vkFormat=VK_FORMAT_B8G8R8A8_UNORM;
  // layout is level zero; levelLayouts[1..levels) track the remaining mips.
+ Texture *rtShadow{};bool rtShadowTried=false,rtTarget=false; // FUXI_MTL_RT_SHADOW: persistent optimal-tiled render target for a large linear image (owned)
  VkImageTiling tiling=VK_IMAGE_TILING_OPTIMAL;VkImageLayout layout=VK_IMAGE_LAYOUT_UNDEFINED;std::array<VkImageLayout,32> levelLayouts{};void *mapped{};bool imported=false,borrowedMemory=false;
  MemoryKey recycleKey{};bool recyclable=false,slabbed=false;uint64_t memOffset{},memExtent{};SlabMemory<VkDeviceMemory>::Block slabBlock{};std::array<uint64_t,7> importKey{};bool importCached=false;
  Buffer *backingBuffer{};size_t backingOffset{},backingRow{};bool shadow=false;uint64_t shadowHash{};bool shadowHashed=false; // hash of the backing rows the last recorded refresh copied
@@ -617,7 +618,7 @@ public:
    if(t->slabbed)slabMemory.release(t->slabBlock,memoryNow());
    else if(t->recyclable && textureMemory.put(t->recycleKey,t->memory,memoryNow()))t->charged=0;
    else {frameKernelCall([&]{return FreeMemory(device,t->memory,nullptr);});--liveMemoryObjects;liveMemoryBytes-=t->memoryBytes;}
-  }}limits.release(t->charged);destroyUnlocked(t->backingBuffer);delete t;return !poisoned;
+  }}limits.release(t->charged);destroyUnlocked(t->backingBuffer);if(t->rtShadow){auto *s=t->rtShadow;t->rtShadow=nullptr;destroyTextureUnlocked(s);}delete t;return !poisoned;
  }
  bool supportsHostImport() const {return hostImport && hostAlignment && GetMemoryHostPointerPropertiesEXT && GetPhysicalDeviceImageFormatProperties2;}
  void destroySamplerUnlocked(Sampler *s) {if(s && !--s->references){if(!poisoned && s->sampler)DestroySampler(device,s->sampler,nullptr);delete s;}}
@@ -1095,6 +1096,60 @@ public:
    return false;};
   return writes(a,b) || writes(b,a);
  }
+uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0;std::unordered_set<uint64_t> targetLogged;
+ // FUXI_MTL_RT_SHADOW=1. A large LINEAR color target (an IOSurface-backed swap buffer) renders into a persistent OPTIMAL shadow image so the GPU can tile/compress it.
+ // Per submit, in op order: the first render use copies linear->shadow unless the pass fully overwrites it; any non-render use of the linear image, or of anything else
+ // on its backing buffer, first copies shadow->linear (a sync); whatever is still newer in the shadow at the end is copied back last. The ops stay ordinary ops.
+ void rtShadowRewrite(std::vector<Operation> &ops) {
+  auto eligible=[&](Texture *t){return t && !t->shadow && !t->rtTarget && t->tiling==VK_IMAGE_TILING_LINEAR && t->borrowedMemory && t->backingBuffer && (t->usage&VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) && t->textureType==2 && t->levels==1 && uint64_t(t->width)*t->height>=(1u<<20);};
+  bool any=false;for(const auto &op:ops){if(!(op.pipeline || op.clearOnly))continue;for(unsigned i=0;i<std::min(op.colorCount,8u);++i)if(eligible(op.color(i).texture))any=true;}
+  if(!any)return;
+  struct Entry {Texture *l,*s;bool newer,valid;};std::vector<Entry> entries;entries.reserve(4);
+  auto entryFor=[&](Texture *l)->int{
+   for(size_t i=0;i<entries.size();++i)if(entries[i].l==l)return int(i);
+   if(!l->rtShadow){if(l->rtShadowTried)return -1;l->rtShadowTried=true;
+    try {l->rtShadow=allocateTextureUnlocked(l->format,(l->usage&VK_IMAGE_USAGE_SAMPLED_BIT?1u:0u)|4u,l->width,l->height);l->rtShadow->rtTarget=true;
+     fprintf(stderr,"FUXI MTL: render target shadow created %ux%u format=%u (optimal, %zu bytes)\n",l->width,l->height,l->format,l->rtShadow->allocated);}
+    catch(const std::exception &e){fprintf(stderr,"FUXI MTL: render target shadow refused: %s\n",e.what());return -1;}}
+   entries.push_back({l,l->rtShadow,false,false});return int(entries.size()-1);};
+  std::vector<Operation> out;out.reserve(ops.size()+8);
+  auto copyOp=[](Texture *dst,Texture *src){Operation c{};c.texture=dst;c.sourceTexture=src;return c;};
+  auto bytesOf=[&](Texture *t){return uint64_t(t->width)*t->height*texelBytes(t->format);};
+  auto syncOut=[&](Entry &e,bool final){if(!e.newer)return;out.push_back(copyOp(e.l,e.s));e.newer=false;e.valid=true;++rtShadowOut;if(!final)++rtShadowSyncs;
+   if(currentFrame){++currentFrame->rtOut;if(!final)++currentFrame->rtSyncs;currentFrame->rtBytes+=bytesOf(e.l);}};
+  for(const auto &original:ops){
+   Operation op=original;const bool render=op.pipeline || op.clearOnly;
+   // Anything aliasing a shadowed image's memory other than its own target/sample role needs the linear bytes current first.
+   for(auto &e:entries){
+    Buffer *buf=e.l->backingBuffer;auto aliases=[&](Texture *t){return t && (t==e.l || (t->backingBuffer && t->backingBuffer==buf));};
+    bool hit=false,write=false;
+    if(render){
+     for(unsigned i=0;i<std::min(op.colorCount,8u);++i){auto *t=op.color(i).texture;if(aliases(t) && t!=e.l){hit=write=true;}}
+     for(auto *t:op.samples)if(aliases(t) && t!=e.l)hit=true;
+     if(op.sourceTexture && aliases(op.sourceTexture) && op.sourceTexture!=e.l)hit=true;
+    }else{
+     if(aliases(op.texture)){hit=true;if(op.upload || op.sourceTexture || op.generateMips)write=true;}
+     if(aliases(op.sourceTexture))hit=true;
+    }
+    if(buf){if(op.src==buf)hit=true;if(op.dst==buf)hit=write=true;if(op.indices==buf)hit=true;
+     for(unsigned s=0;s<2;++s)for(unsigned k=0;k<resourceSlots;++k)if(op.buffers[s][k].buffer==buf)hit=write=true;}
+    if(hit){syncOut(e,false);if(write)e.valid=false;}
+   }
+   if(render){
+    for(unsigned i=0;i<std::min(op.colorCount,8u);++i){auto c=op.color(i);if(!eligible(c.texture))continue;int ei=entryFor(c.texture);if(ei<0)continue;auto &e=entries[ei];
+     if(!e.newer){bool full=(!op.areaWidth || op.areaWidth==c.texture->width) && (!op.areaHeight || op.areaHeight==c.texture->height);
+      if(!e.valid && (c.load==1 || !full)){out.push_back(copyOp(e.s,e.l));++rtShadowIn;if(currentFrame){++currentFrame->rtIn;currentFrame->rtBytes+=bytesOf(e.l);}}
+      else if(!e.valid){++rtShadowInSkipped;if(currentFrame)++currentFrame->rtInSkipped;}
+      e.newer=true;e.valid=false;}
+     c.texture=e.s;op.setColor(i,c);}
+    for(auto &e:entries)if(e.newer){for(auto &s:op.samples)if(s==e.l)s=e.s;if(op.sourceTexture==e.l)op.sourceTexture=e.s;}
+   }else for(auto &e:entries){ // a non-render use of the linear image itself (copy, blit, readback, mip) was synced above; writes made the shadow stale
+    if(op.texture==e.l && (op.upload || op.sourceTexture || op.generateMips))e.valid=false;}
+   out.push_back(std::move(op));
+  }
+  for(auto &e:entries)syncOut(e,true);
+  ops.swap(out);
+ }
  void reorderPasses(std::vector<Operation> &ops) {
   std::vector<PassGroup> groups;
   auto plainDraw=[](const Operation &op){
@@ -1135,6 +1190,7 @@ public:
   std::unique_lock<std::mutex> guard(mutex,std::defer_lock);{PhaseTimer phase(SubPhase::wait);guard.lock();}
   if(currentFrame)currentFrame->backendLock+=since(submitStart);
   requireLive();if(systemTranslationPolicy().reorder && systemTranslationPolicy().merge && ops.size()>2)reorderPasses(ops);
+  if(systemTranslationPolicy().rtShadow)rtShadowRewrite(ops);
   std::vector<HostUse> hostUses,writes,uses;
   auto addUse=[](std::vector<HostUse> &list,VkDeviceMemory memory,const void *address,size_t bytes,uint8_t kind=1,Buffer *buffer=nullptr){for(auto &old:list)if(old.memory==memory && old.address==address && old.bytes==bytes){old.kind|=kind;return;}list.push_back({memory,address,bytes,kind,buffer});};
   auto bufferUse=[&](std::vector<HostUse> &list,Buffer *b,uint8_t kind=1){if(b)addUse(list,b->memory,b->contents,b->length,kind,b);};
@@ -1701,7 +1757,13 @@ public:
      if(!continuation){
      std::optional<Operation> passOp;
      if(passEnd>opIndex){passOp=op;for(unsigned i=0;i<op.colorCount;++i){auto c=passOp->color(i);if(!c.texture)continue;c.store=ops[passEnd].color(i).store;passOp->setColor(i,c);}}
-     if(passQ){cur={};cur.width=op.texture->levelWidth(op.dstLevel);cur.height=op.texture->levelHeight(op.dstLevel);cur.colors=used;
+     if(passQ || systemTranslationPolicy().rtShadow || systemTranslationPolicy().pipeStats){auto *t=op.texture;uint8_t tl=t->rtTarget?2:t->tiling==VK_IMAGE_TILING_LINEAR?1:0;
+      uint64_t key=0xcbf29ce484222325ull;for(uint64_t x:{uint64_t(t->width),uint64_t(t->height),uint64_t(t->format),uint64_t(tl),uint64_t(t->backingBuffer && t->backingBuffer->imported),uint64_t(t->usage)})key=(key^x)*0x100000001b3ull;
+      if(targetLogged.insert(key).second){
+       bool imported=t->backingBuffer && t->backingBuffer->imported;bool wide=t->vkFormat==VK_FORMAT_B8G8R8A8_UNORM || t->vkFormat==VK_FORMAT_R8G8B8A8_UNORM || t->vkFormat==VK_FORMAT_A2B10G10R10_UNORM_PACK32 || t->vkFormat==VK_FORMAT_R16G16B16A16_SFLOAT;
+       fprintf(stderr,"FUXI MTL: render target %ux%u format=%u vk=%d tiling=%s imported=%d borrowed=%d usage=0x%x storage=%d input_attachment=%d ubwc=%s (derived from tiling/format/usage; not queried)\n",t->width,t->height,t->format,int(t->vkFormat),tl==1?"linear":tl==2?"optimal(rt-shadow)":"optimal",int(imported),int(t->borrowedMemory),unsigned(t->usage),!!(t->usage&VK_IMAGE_USAGE_STORAGE_BIT),!!(t->usage&VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT),
+        tl==1?"no(linear)":(t->usage&VK_IMAGE_USAGE_STORAGE_BIT)?"no(storage)":wide?"possible":"unknown(format)");}}
+     if(passQ){cur={};cur.width=op.texture->levelWidth(op.dstLevel);cur.tiling=op.texture->rtTarget?2:op.texture->tiling==VK_IMAGE_TILING_LINEAR?1:0;cur.height=op.texture->levelHeight(op.dstLevel);cur.colors=used;
       for(unsigned i=0,u=0;i<op.colorCount && u<8;++i){auto c=op.color(i);if(!c.texture)continue;unsigned st=passEnd>opIndex?ops[passEnd].color(i).store:c.store;cur.load|=uint32_t(c.load&3u)<<(u*2);cur.store|=(st?1u:0u)<<u;++u;}}
      auto render=renderPass(op.pipeline,passOp?&*passOp:&op);
      VkFramebufferCreateInfo fi{};fi.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;fi.renderPass=render;

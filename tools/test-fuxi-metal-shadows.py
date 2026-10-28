@@ -73,7 +73,8 @@ void main(){color=c.value;}
         subprocess.run(common+['-DFUXI_MTL_HOST_TEST', '-DFUXI_MTL_ICD="'+str(a.icd.resolve())+'"',
             '-DFUXI_MTL_TRANSLATOR="'+str(d/'texture-bridge.so')+'"', str(ROOT/'tools/fuxi-metal/TextureShadowCopyTests.cpp'), '-ldl', '-pthread', '-o', str(d/'texture-pixels')], check=True)
         for args in ('', 'fuxigpuoverlap=1 fuxigpusubmit=1'):
-            subprocess.run([str(d/'texture-pixels')], env=dict(texture_env, FUXI_MTL_TEST_BOOTARGS='fuxigpuframetrace=1 '+args), check=True, timeout=60)
+            for rt in ('0', '1'):
+                subprocess.run([str(d/'texture-pixels')], env=dict(texture_env, FUXI_MTL_RT_SHADOW=rt, FUXI_MTL_TEST_BOOTARGS='fuxigpuframetrace=1 '+args), check=True, timeout=60)
         subprocess.run(common+['-DFUXI_MTL_HOST_TEST', '-DFUXI_MTL_ICD="'+str(a.icd.resolve())+'"',
             '-DFUXI_MTL_TRANSLATOR="'+str(d/'texture-bridge.so')+'"', str(ROOT/'tools/fuxi-metal/AdmissionTests.cpp'), '-ldl', '-pthread', '-o', str(d/'admission')], check=True)
         subprocess.run([str(d/'admission')], env=dict(texture_env, FUXI_MTL_TEST_BOOTARGS='fuxigpuframetrace=1 fuxigpuoverlap=1 fuxigpusubmit=1'), check=True, timeout=60)
