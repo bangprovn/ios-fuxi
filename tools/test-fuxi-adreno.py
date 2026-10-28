@@ -67,6 +67,7 @@ struct fg_times {
 };
 static struct fg_times times;
 static uint64_t fg_generation[4], model_l2[512];
+static unsigned fg_abi_coh, fg_abi_coh_wb, fg_src_n_wb, fg_src_n_nc, fg_src_n_ncstale; static unsigned char fg_src_wb[4];
 static ppnum_t fg_ppns[FG_SOURCE_BYTES/PAGE_SIZE+1];
 static uint64_t model_leaves[16384];
 static volatile uint64_t *fg_l2(void) { return model_l2; }
@@ -158,7 +159,7 @@ static uint32_t translated_pixel(unsigned va)
  unsigned offva=va-FG_SOURCE_VA;
  uint64_t desc=model_l2[((FG_SOURCE_VA>>21)&511)+offva/0x200000];
  uint64_t pte=(desc&3)==1 ? (desc&0xffffff000ULL)+(offva&0x1ff000)+(desc&0xffc)+3 : model_leaves[offva/4096];
- assert((pte&0xfff)==(3|(3u<<6)|(3u<<8)|(1u<<10)));
+ assert((pte&0xffb)==(3|(3u<<6)|(3u<<8)|(1u<<10)));
  uint64_t pa=(pte&0xffffff000ULL)|(va&4095);
  unsigned pn=(pa>>14)-1;
  assert(contiguous_pa || pn%3==0);
@@ -337,6 +338,14 @@ int main(void)
  CleanPoC_DcacheRegion_Force((uintptr_t)source_buf,4352*10); { uint64_t cleaned=clean_bytes; /* the caller's pre-clean */
  assert(fuxi_gpu_copy(0,1,(uintptr_t)source_buf,4352*10,4352,0,0,0,0,10,10,&times)==2 && clean_bytes==cleaned); }
  ticks+=200000; assert(fuxi_gpu_poll(&times)==1); fg_scanout_preclean=0;
+ /* Coherent write-back mode: the source is mapped AttrIndx 1 inner-shareable and not cleaned; a slot mapped NC before the probe still is. */
+ reset(); memset(fg_src_wb,0,sizeof fg_src_wb); fg_abi_coh=1; fg_abi_coh_wb=1; assert(fuxi_gpu_map(0,1,(uintptr_t)source_buf,4352*10,&times) && fg_src_wb[0]);
+ { unsigned n=0; for (unsigned i=0;i<11;i++) if (model_leaves[i] && (model_leaves[i]&(1u<<2)) && (model_leaves[i]&(3u<<8))==(3u<<8)) n++; assert(n>=10); }
+ { uint64_t cleaned=clean_bytes; cache_clean=1; assert(fuxi_gpu_copy(0,1,(uintptr_t)source_buf,4352*10,4352,0,0,0,0,10,10,&times)==2 && clean_bytes==cleaned && fg_src_n_wb==1); }
+ ticks+=200000; assert(fuxi_gpu_poll(&times)==1);
+ reset(); fg_abi_coh=0; fg_abi_coh_wb=0; assert(fuxi_gpu_map(0,2,(uintptr_t)source_buf,4352*10,&times) && !fg_src_wb[0]); fg_abi_coh=1; fg_abi_coh_wb=1;
+ { uint64_t cleaned=clean_bytes; assert(fuxi_gpu_copy(0,2,(uintptr_t)source_buf,4352*10,4352,0,0,0,0,10,10,&times)==2 && clean_bytes>cleaned && fg_src_n_ncstale==1); }
+ ticks+=200000; assert(fuxi_gpu_poll(&times)==1); fg_abi_coh=0; fg_abi_coh_wb=0;
  // Actual shared fault/reset accounting: saturate, count an asserted
  // containment reset once even if the bus drain is repeated.
  reset();fg_faults=fg_suspends=UINT64_MAX;

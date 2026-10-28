@@ -314,6 +314,9 @@ _Static_assert(FG_SOURCE_TABLE + FG_CACHE_SLOTS*FG_SOURCE_L3*4096 <= G3_PT+0x100
 /* Four disjoint 16 MiB windows. 4K SMMU granules support 2 MiB blocks or
  * 64 KiB contiguous leaf groups, NOT 16 KiB block descriptors. */
 static uint64_t fg_generation[FG_CACHE_SLOTS];
+static unsigned fg_abi_coh, fg_abi_coh_wb; /* defined by the ABI backend below */
+static unsigned char fg_src_wb[FG_CACHE_SLOTS]; /* slot mapped write-back inner-shareable (AttrIndx 1) */
+static unsigned fg_src_n_wb, fg_src_n_nc, fg_src_n_ncstale;
 /* One transient PFN list, serialized by the surface cache lock. Keep lookup
  * and actual NC SMMU table stores in separate timing buckets. */
 static ppnum_t fg_ppns[FG_SOURCE_BYTES/PAGE_SIZE+1];
@@ -404,6 +407,7 @@ int fuxi_gpu_unmap(unsigned slot, struct fg_times *t)
  uint32_t tlb[128] = {0};
  int err = g4_tlb(tlb);
  fg_generation[slot] = 0;
+ fg_src_wb[slot] = 0;
  if (t) t->unmap += mach_absolute_time()-start;
  if (err || fg_access_failed) {
   fg_fail("cached unmap TLB sync", err);
@@ -434,12 +438,13 @@ int fuxi_gpu_map(unsigned slot, uint64_t generation, uintptr_t source,
  }
  t->lookup += mach_absolute_time()-start;
  start = mach_absolute_time();
+ unsigned wb = fg_abi_coh == 1 && fg_abi_coh_wb; /* proven coherent: GPU snoops, no CPU clean */
  for (unsigned i = 0; i < pages; i++) {
   uintptr_t va = base+(uintptr_t)i*4096;
   ppnum_t ppn = fg_ppns[(va-first_page)>>PAGE_SHIFT];
   uint64_t pa = ((uint64_t)ppn << PAGE_SHIFT) | (va & PAGE_MASK);
   if (pa >= (1ULL<<36)) return 0;
-  leaves[i] = pa | 3 | (3u<<6) | (3u<<8) | (1u<<10);
+  leaves[i] = pa | 3 | (3u<<6) | (wb ? 1u<<2 : 0) | (3u<<8) | (1u<<10);
  }
  for (unsigned i = pages; i < 4096; i++) leaves[i] = 0;
  for (unsigned i = 0; i < FG_SOURCE_L3; i++) {
@@ -468,6 +473,7 @@ int fuxi_gpu_map(unsigned slot, uint64_t generation, uintptr_t source,
  t->map += mach_absolute_time()-start;
  if (err || fg_access_failed) { fg_fail("cached source TLB sync", err); return 0; }
  fg_generation[slot] = generation;
+ fg_src_wb[slot] = wb;
  t->misses++;
  return 1;
 }
@@ -774,11 +780,14 @@ int fuxi_gpu_copy(unsigned slot, uint64_t generation, uintptr_t source, uint64_t
       ((uint64_t)sy+height-1)*pitch+((uint64_t)sx+width)*4 > length) return 0;
  }
  uint64_t start = mach_absolute_time();
- /* Pre-cleaned (bit 20): the caller cleaned the whole source after excluding writers. A passing
-  * coherent-import self-test (bit 64, fg_abi_coh==1 with fg_abi_coh_wb) does NOT remove this clean:
-  * it proved MAIR index 1 (0xff write-back) inner-shareable import leaves, but fuxi_gpu_map maps the
-  * copy source through AttrIndx 0 (MAIR0 0xff44: 0x44 Normal NC), which never snoops CPU caches. */
- if (!fg_scanout_preclean) fg_clean(source, pitch, sx, sy, width, height);
+ /* Skip the source clean when the slot is mapped write-back inner-shareable (coherent-import self-test
+  * bit 64 passed in wb mode) or the caller pre-cleaned (bit 20) while no coherence was active. A slot
+  * mapped NC before the probe passed keeps AttrIndx 0 and is still cleaned. The destination stays NC. */
+ unsigned coh = fg_abi_coh == 1 && fg_abi_coh_wb;
+ if (fg_src_wb[slot]) fg_src_n_wb++;
+ else if (fg_scanout_preclean && !coh) fg_src_n_nc++;
+ else { fg_src_n_ncstale += coh; fg_clean(source, pitch, sx, sy, width, height); }
+ if (!((fg_src_n_wb+fg_src_n_nc+fg_src_n_ncstale) % 600)) printf("FUXI GPU: copy source wb_skip %u pre_cleaned %u cleaned_after_coh %u\n", fg_src_n_wb, fg_src_n_nc, fg_src_n_ncstale);
  t->clean += mach_absolute_time()-start;
  start = mach_absolute_time();
  int err = 0;
