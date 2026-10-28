@@ -68,6 +68,8 @@ struct fg_times {
 static struct fg_times times;
 static uint64_t fg_generation[4], model_l2[512];
 #define FG_INL_SRC_VA 0x90000000u
+#define FG_CP_STAMP 192u
+static uint32_t fg_cp_submit_lo, fg_cp_n, fg_cp_bad, fg_cp_pitch, fg_cp_rects; static uint64_t fg_cp_sum[4], fg_cp_max[4];
 #define FG_INL_FB_VA 0xa0000000u
 static unsigned fg_abi_inline, fg_inl_ready, fg_root_client, fg_inl_busy, fg_inl_fbmask, inl_usable_model, inl_present_calls;
 enum { FG_INL_NOROOT, FG_INL_WINDOW, FG_INL_RING, FG_INL_BUFFERS, FG_INL_CLIENT, FG_INL_SWITCH, FG_INL_REASONS };
@@ -128,8 +130,10 @@ static void CleanPoC_DcacheRegion_Force(uint64_t va,uint64_t n)
  cache_clean=1; clean_bytes+=n;
 }
 static int g4_tlb(uint32_t *d) { (void)d; return ++tlbs==fail_tlb ? 0xe03 : 0; }
-static unsigned g3_gr(unsigned reg) { return reg==0x806 ? rptr : reg==0x807 ? wptr : reg==0x210 && mode==6 ? 2 : 0; }
-static unsigned g3_read(uint64_t pa) { assert(pa==G3_FENCE_PA+64); return mode==8 && ticks<completion ? 0 : fence; }
+static uint32_t model_stamp[3], stamp_clock=1000;
+static unsigned g3_gr(unsigned reg) { return reg==0x806 ? rptr : reg==0x807 ? wptr : reg==0x210 && mode==6 ? 2 : reg==0x980 ? stamp_clock : 0; }
+static unsigned g3_read(uint64_t pa) { if(pa>=G3_FENCE_PA+192 && pa<=G3_FENCE_PA+208) return model_stamp[(pa-G3_FENCE_PA-192)/8]; assert(pa==G3_FENCE_PA+64); return mode==8 && ticks<completion ? 0 : fence; }
+static void g_wr(uint64_t base, uint32_t off, uint32_t v) { assert(base==G3_FENCE_PA && off>=192 && off<=208 && !v); model_stamp[(off-192)/8]=0; }
 #define GPU_GMU_CORE 0x03d6a000ULL
 #define FG_GMU_AHB_FENCE_STATUS (GPU_GMU_CORE+0x9313*4)
 #define FG_GMU_AHB_FENCE_CLR (GPU_GMU_CORE+0x9314*4)
@@ -232,6 +236,7 @@ static int g3_gw(unsigned reg,unsigned value)
    } else if(op==0x46 && n==4) {
     assert(!pending && a[0]==(49u|1u<<27) && a[1]==G3_FENCE_VA+64 && !a[2]);
     fence=a[3]; fences++;
+   } else if(op==0x3e) { assert(n==3 && a[0]==(0x980|(2u<<18)|(1u<<30)) && a[1]>=G3_FENCE_VA+192 && a[1]<=G3_FENCE_VA+208 && !a[2]); model_stamp[(a[1]-G3_FENCE_VA-192)/8]=(stamp_clock+=100);
    } else assert((op==0x26 && n==0) || (op==0x65 && n==1 && a[0]==12) || (op==0x46 && n==1));
   }
  }
@@ -283,12 +288,12 @@ int main(void)
  assert(source_buf && panel);
  for(unsigned i=0;i<FG_SOURCE_BYTES;i++) source_buf[i]=(i*13u+(i>>12)*17u)&255;
  reset(); copy_case(0,4320,0,0,0,0,1080,2400); /* one submission, two strided rects */
- assert(maxwords==97);
+ assert(maxwords==110);
  for(unsigned pitch=4324;pitch<=4336;pitch=(pitch==4324 ? 4328 : 4336)) {
   reset();copy_case(0,pitch,0,0,0,0,1080,2400);
   if(pitch==4336) break;
  }
- assert(maxwords==419);
+ assert(maxwords==432);
  for(unsigned phase=0;phase<16;phase++) {
   reset(); copy_case(phase*4,5008,17,3,19,7,1057,2311);
  }
@@ -471,7 +476,7 @@ def main():
             assert a + n <= b or b + m <= a, 'overlapping platform mappings'
     functions = ''.join(function(probe, n) for n in ('g3_parity', 'g3_pkt7', 'g4_pkt4', 'g4_reg', 'g4_event', 'g4_wfi', 'g4_setup', 'g4_end'))
     functions += function((ROOT / 'xnu/fuxi-adreno/fuxi_gpu_scanout.inc').read_text(), 'fg_scanout_target')
-    functions += ''.join(function(adapter, n) for n in ('fg_fail', 'fg_isolate', 'fuxi_gpu_unmap', 'fuxi_gpu_map', 'fg_rect', 'fg_clean', 'fg_ring_doorbell', 'fuxi_gpu_poll', 'fuxi_gpu_copy'))
+    functions += ''.join(function(adapter, n) for n in ('fg_fail', 'fg_isolate', 'fuxi_gpu_unmap', 'fuxi_gpu_map', 'fg_rect', 'fg_clean', 'fg_ring_doorbell', 'fg_cp_stamp', 'fg_cp_retire', 'fuxi_gpu_poll', 'fuxi_gpu_copy'))
     functions = re.sub(r'__asm__ volatile\([^;]*\);', ';', functions)
     constants = '\n'.join(line for line in sync.added_file('gpu-a740.h').splitlines() if line.startswith('#define G4_'))
     with tempfile.TemporaryDirectory() as d:

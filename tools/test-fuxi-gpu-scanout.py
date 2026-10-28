@@ -23,7 +23,7 @@ def module(name, path):
 
 
 PREFIX = r'''
-static unsigned fg_abi_coh, fg_abi_coh_wb, fg_abi_inline; static int fg_inl_usable(void) { return 0; }
+static unsigned fg_abi_inline; static int fg_inl_usable(void) { return 0; }
 #include <assert.h>
 #include <stdint.h>
 #include <stdlib.h>

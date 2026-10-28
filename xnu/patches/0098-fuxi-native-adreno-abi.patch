@@ -399,7 +399,7 @@
  /* Retain BOTH physical attempts, independently of the shared logical-call
   * report slot. Static storage only; no allocation or firmware in diagnostics. */
  static volatile struct {
-@@ -188,22 +307,38 @@
+@@ -188,22 +307,39 @@
  
  #define FG_SOURCE_VA 0x50000000u
  #define FG_SOURCE_BYTES 0x01000000u
@@ -412,6 +412,7 @@
   * 64 KiB contiguous leaf groups, NOT 16 KiB block descriptors. */
  static uint64_t fg_generation[FG_CACHE_SLOTS];
 +static unsigned fg_abi_coh, fg_abi_coh_wb; /* defined by the ABI backend below */
++static unsigned fg_scanout_preclean; /* bit 20; with a passing wb coherence probe it forces the old NC copy source (A/B knob), see fuxi_gpu_map */
 +static unsigned char fg_src_wb[FG_CACHE_SLOTS]; /* slot mapped write-back inner-shareable (AttrIndx 1) */
 +static unsigned fg_src_n_wb, fg_src_n_nc, fg_src_n_ncstale;
 +/* fuxigpuncimport bit 21 (2097152, needs queue mode 512): the present copy runs in the ABI client's address space (see fg_inl_setup). */
@@ -441,7 +442,7 @@
  static unsigned fg_started, fg_limit, fg_force, fg_seq;
  int fuxi_gpu_ready(void) { return __atomic_load_n(&fg_state, __ATOMIC_ACQUIRE) == 1; }
  static uint64_t fg_deadline, fg_submit_time;
-@@ -211,6 +346,7 @@
+@@ -211,6 +347,7 @@
  static int fg_expired(void) { return rsr("cntpct_el0") >= fg_deadline; }
  static void fg_fail(const char *reason, unsigned code)
  {
@@ -449,7 +450,7 @@
   __atomic_store_n(&fg_state, 2, __ATOMIC_RELEASE);
   printf("FUXI GPU: disabled permanently: %s (%#x), CPU present\n", reason, code);
  }
-@@ -237,7 +373,11 @@
+@@ -237,7 +374,11 @@
     if (fg_access(GPU_REG_BASE + 0x3c45*4, &v, 1, 0)) good = 0;
    }
   }
@@ -462,7 +463,7 @@
   delay(100);
   for (unsigned i = 0; i < 2; i++) {
    v = 2u << 16; (void)fg_access(GPU_SMMU_BASE + SMMU_S2CR(g3_slot[i]), &v, 1, 0);
-@@ -250,7 +390,7 @@
+@@ -250,7 +391,7 @@
  static int fg_source_tables(void)
  {
   volatile uint64_t *l2 = fg_l2();
@@ -471,7 +472,7 @@
   for (unsigned i = 0; i < FG_CACHE_SLOTS*FG_SOURCE_L3; i++) {
    unsigned slot = ((FG_SOURCE_VA >> 21) & 511) + i;
    if (l2[slot]) return 0;
-@@ -265,16 +405,18 @@
+@@ -265,16 +406,18 @@
   * new generation. No PFN scan or TLB invalidation on a cache hit. */
  int fuxi_gpu_unmap(unsigned slot, struct fg_times *t)
  {
@@ -491,7 +492,7 @@
   if (t) t->unmap += mach_absolute_time()-start;
   if (err || fg_access_failed) {
    fg_fail("cached unmap TLB sync", err);
-@@ -285,10 +427,11 @@
+@@ -285,10 +428,11 @@
  int fuxi_gpu_map(unsigned slot, uint64_t generation, uintptr_t source,
      uint64_t length, struct fg_times *t)
  {
@@ -504,11 +505,11 @@
   volatile uint64_t *l2 = fg_l2();
   unsigned first = ((FG_SOURCE_VA >> 21) & 511) + slot*FG_SOURCE_L3;
   unsigned pages = (length+(source&4095)+4095)/4096;
-@@ -304,12 +447,13 @@
+@@ -304,12 +448,13 @@
   }
   t->lookup += mach_absolute_time()-start;
   start = mach_absolute_time();
-+ unsigned wb = fg_abi_coh == 1 && fg_abi_coh_wb; /* proven coherent: GPU snoops, no CPU clean */
++ unsigned wb = fg_abi_coh == 1 && fg_abi_coh_wb && !fg_scanout_preclean; /* proven coherent: GPU snoops, no CPU clean; bit 20 keeps NC + clean */
   for (unsigned i = 0; i < pages; i++) {
    uintptr_t va = base+(uintptr_t)i*4096;
    ppnum_t ppn = fg_ppns[(va-first_page)>>PAGE_SHIFT];
@@ -519,7 +520,7 @@
   }
   for (unsigned i = pages; i < 4096; i++) leaves[i] = 0;
   for (unsigned i = 0; i < FG_SOURCE_L3; i++) {
-@@ -320,6 +464,7 @@
+@@ -320,6 +465,7 @@
     if ((leaves[at+j] & 0x0000000ffffff000ULL) != pa+(uint64_t)j*4096) contiguous = 0;
    if (contiguous) {
     l2[first+i] = (leaves[at] & ~3ULL) | 1; /* 2 MiB block */
@@ -527,7 +528,7 @@
     t->blocks++;
    } else {
     /* Architected 16-entry contiguous hint only for aligned, complete groups. */
-@@ -331,6 +476,7 @@
+@@ -331,6 +477,7 @@
      if (ok) { for (unsigned k = 0; k < 16; k++) leaves[j+k] |= 1ULL<<52; t->groups++; }
     }
     l2[first+i] = (FG_SOURCE_TABLE+slot*32768+i*4096) | 3;
@@ -535,7 +536,7 @@
    }
   }
   uint32_t tlb[128] = {0};
-@@ -338,15 +484,95 @@
+@@ -338,15 +485,95 @@
   t->map += mach_absolute_time()-start;
   if (err || fg_access_failed) { fg_fail("cached source TLB sync", err); return 0; }
   fg_generation[slot] = generation;
@@ -632,7 +633,7 @@
   if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
       SecureDTGetProperty(chosen, "fuxi-gpu-memory", &prop, &bytes) != kSuccess ||
       bytes != 16 || ((uint64_t *)prop)[0] != FG_SCRATCH || ((uint64_t *)prop)[1] != FG_SCRATCH_SIZE) {
-@@ -359,7 +585,7 @@
+@@ -359,7 +586,7 @@
   }
   kern_return_t kr = fg_map_windows();
   if (kr != KERN_SUCCESS) { fg_fail("uncached mapping failed", kr); goto out; }
@@ -641,7 +642,7 @@
   if (h->magic != FG_MAGIC || h->version != 1 || h->bytes != sizeof(*h) || h->reserved ||
       h->base != FG_SCRATCH || h->size != FG_SCRATCH_SIZE) {
    fg_fail("missing/invalid cold firmware handoff", 3); goto out;
-@@ -367,7 +593,7 @@
+@@ -367,7 +594,7 @@
   for (unsigned i = 0; i < 3; i++) {
    unsigned n = h->fw_size[i];
    if (!n || n > FG_FW_SLOT || (n & 3) ||
@@ -650,7 +651,7 @@
     fg_fail("firmware size/checksum", i); goto out;
    }
   }
-@@ -385,15 +611,26 @@
+@@ -385,15 +612,26 @@
       "fence=%#x TRUST=%#x zap=%#x pixels=%#x\n", fg_limit == 13 ? 13 : 16,
       g_bank, g3_bank, g3_asid, g3_read(G3_FENCE_PA), g3_gr(0xf400),
       gpu_extra[13][2], gpu_extra[11][2]);
@@ -679,7 +680,7 @@
   out: return;
  }
  void fuxi_gpu_start(uint64_t fb, unsigned width, unsigned height, unsigned pitch)
-@@ -402,6 +639,28 @@
+@@ -402,6 +640,28 @@
   (void)PE_parse_boot_argn("fuxigpu", &enable, sizeof(enable));
   if (enable != 1 || fg_started) return;
   fg_started = 1; fg_limit = 17;
@@ -708,7 +709,7 @@
   (void)PE_parse_boot_argn("fuxigpu_stage", &fg_limit, sizeof(fg_limit));
   (void)PE_parse_boot_argn("fuxigpu_fail", &fg_force, sizeof(fg_force));
   if ((fg_limit != 13 && fg_limit != 16 && fg_limit != 17) ||
-@@ -451,23 +710,66 @@
+@@ -451,23 +711,96 @@
   }
   if (end) CleanPoC_DcacheRegion_Force(begin, end-begin);
  }
@@ -742,6 +743,35 @@
 +  if (!g3_gw(0x807, g3_wptr)) return 0;
 + }
 +}
++/* Per-copy GPU timestamps (always on): CP_REG_TO_MEM of the 64-bit always-on counter (19.2 MHz, reg 0x980) into the fence page at
++ * +192 (copy start, after a WFI), +200 (blits done, before the cache flush) and +208 (after the flush and the fence). The CPU reads the
++ * counter's low word at the doorbell and at the retiring poll: submit_to_start is the wait behind earlier ring work, blit and flush
++ * the copy's own execution, poll_late the time from the GPU finishing to the display tick noticing. Not yet observed on device. */
++#define FG_CP_STAMP 192u
++static uint32_t fg_cp_submit_lo, fg_cp_n, fg_cp_bad, fg_cp_pitch, fg_cp_rects;
++static uint64_t fg_cp_sum[4], fg_cp_max[4]; /* submit_to_start, blit, flush, poll_late */
++static void fg_cp_stamp(unsigned off)
++{
++ g3_emit(g3_pkt7(0x3e, 3)); g3_emit(0x980 | (2u<<18) | (1u<<30)); g3_emit(G3_FENCE_VA+off); g3_emit(0);
++}
++static void fg_cp_retire(void)
++{
++ uint32_t s0 = g3_read(G3_FENCE_PA+FG_CP_STAMP), s1 = g3_read(G3_FENCE_PA+FG_CP_STAMP+8), s2 = g3_read(G3_FENCE_PA+FG_CP_STAMP+16), now = g3_gr(0x980);
++ fg_cp_n++;
++ if (fg_access_failed || !s0 || !s1 || !s2) fg_cp_bad++;
++ else {
++  uint32_t v[4] = {s0-fg_cp_submit_lo, s1-s0, s2-s1, now-s2};
++  for (unsigned i = 0; i < 4; i++) { fg_cp_sum[i] += v[i]; if (v[i] > fg_cp_max[i]) fg_cp_max[i] = v[i]; }
++ }
++ if (!(fg_cp_n % 600)) {
++  #define FG_US(t) ((unsigned long long)((t)*10/192))
++  printf("FUXI GPU: copy_exec blit avg %llu max %llu us, flush avg %llu max %llu us; submit_to_start avg %llu max %llu us; poll_late avg %llu max %llu us (copies %u no_stamp %u pitch %u rect_classes %u)\n",
++      FG_US(fg_cp_sum[1]/600), FG_US(fg_cp_max[1]), FG_US(fg_cp_sum[2]/600), FG_US(fg_cp_max[2]), FG_US(fg_cp_sum[0]/600), FG_US(fg_cp_max[0]),
++      FG_US(fg_cp_sum[3]/600), FG_US(fg_cp_max[3]), fg_cp_n, fg_cp_bad, fg_cp_pitch, fg_cp_rects);
++  #undef FG_US
++  memset(fg_cp_sum, 0, sizeof fg_cp_sum); memset(fg_cp_max, 0, sizeof fg_cp_max);
++ }
++}
  /* Called once per display tick; never sleeps, spins for completion or submits.
   * A completed fence wins over a late timer/deadline. */
  int fuxi_gpu_poll(struct fg_times *t)
@@ -758,6 +788,7 @@
 +     g3_gr(0x807) == g3_wptr && !(g3_gr(0x210) & ~1u)))) {
 +  fg_scanout_stamps.fence = mach_absolute_time();
 +  t->wait += fg_scanout_stamps.fence-fg_submit_time;
++  fg_cp_retire();
 +  if (fg_inl_busy) { uint64_t d = fg_scanout_stamps.fence-fg_submit_time; fg_inl_lat += d; fg_inl_lat_n++; if (d > fg_inl_latmax) fg_inl_latmax = d; }
 +  if (fg_scanout_requested && !fg_scanout_verify()) {
 +   fg_fail("scanout pixel mismatch", 0x604);
@@ -780,7 +811,7 @@
   t->wait += mach_absolute_time()-fg_submit_time;
   return drained ? -1 : -2;
  }
-@@ -475,41 +777,99 @@
+@@ -475,41 +808,105 @@
      unsigned pitch, unsigned sx, unsigned sy, unsigned dx, unsigned dy,
      unsigned width, unsigned height, struct fg_times *t)
  {
@@ -811,11 +842,11 @@
   uint64_t start = mach_absolute_time();
 - fg_clean(source, pitch, sx, sy, width, height);
 + /* Skip the source clean when the slot is mapped write-back inner-shareable (coherent-import self-test
-+  * bit 64 passed in wb mode) or the caller pre-cleaned (bit 20) while no coherence was active. A slot
++  * bit 64 passed in wb mode and bit 20 is off) or the caller pre-cleaned it (bit 20, NC slot). A slot
 +  * mapped NC before the probe passed keeps AttrIndx 0 and is still cleaned. The destination stays NC. */
 + unsigned coh = fg_abi_coh == 1 && fg_abi_coh_wb;
 + if (fg_src_wb[slot]) fg_src_n_wb++;
-+ else if (fg_scanout_preclean && !coh) fg_src_n_nc++;
++ else if (fg_scanout_preclean) fg_src_n_nc++; /* NC slot, whole source cleaned by SweetSurface */
 + else { fg_src_n_ncstale += coh; fg_clean(source, pitch, sx, sy, width, height); }
 + if (!((fg_src_n_wb+fg_src_n_nc+fg_src_n_ncstale) % 600)) printf("FUXI GPU: copy source wb_skip %u pre_cleaned %u cleaned_after_coh %u\n", fg_src_n_wb, fg_src_n_nc, fg_src_n_ncstale);
   t->clean += mach_absolute_time()-start;
@@ -837,6 +868,9 @@
 +  if (fg_scanout_back_ready && !fg_scanout_triple_requested) { fg_scanout_back_ready = 0; fg_scanout_ready_drops++; }
 +  fg_scanout_copy = fg_scanout_target();
 + }
++ g_wr(G3_FENCE_PA, FG_CP_STAMP, 0); g_wr(G3_FENCE_PA, FG_CP_STAMP+8, 0); g_wr(G3_FENCE_PA, FG_CP_STAMP+16, 0);
++ fg_cp_pitch = pitch; fg_cp_rects = stride < height ? stride : height;
++ g4_wfi(); fg_cp_stamp(FG_CP_STAMP);
   g4_setup();
   for (unsigned y = 0; y < stride && y < height; y++)
 -  fg_rect(FG_SOURCE_VA+slot*FG_SOURCE_BYTES+(source&4095)+(sy+y)*pitch+sx*4,
@@ -845,12 +879,15 @@
 +      (inl ? FG_INL_FB_VA : G4_FB_VA)+(fg_scanout_double_active ? fg_scanout_copy*0xa00000u : 0)+(dy+y)*4320+dx*4, pitch, width, (height-1-y)/stride+1, stride);
   unsigned magic = ++fg_seq;
   if (!magic) magic = ++fg_seq;
++ fg_cp_stamp(FG_CP_STAMP+8); /* fg_rect ends with a WFI: every blit is done */
   g4_end(G3_FENCE_VA+64, magic);
++ fg_cp_stamp(FG_CP_STAMP+16);
   g3_wptr &= 8191;
   __asm__ volatile("dsb sy" ::: "memory");
   fg_deadline = rsr("cntpct_el0") + rsr("cntfrq_el0")/10; /* six ticks */
 - if (!g3_gw(0x807, g3_wptr)) err = 0x602;
 + fg_dcvs_kick();
++ fg_cp_submit_lo = g3_gr(0x980);
 + if (!fg_ring_doorbell()) err = 0x602;
   if (fg_force == 2) err = 0x6ff;
   t->submit += mach_absolute_time()-start;
@@ -1599,7 +1636,7 @@
 +  if (fg_scanout_preclean) printf("FUXI SCANOUT: preclean=1 copy source cleaned before the ring reservation\n");
 + }
 +}
-+int fuxi_gpu_scanout_preclean(void) { return fg_scanout_preclean && !(fg_abi_coh == 1 && fg_abi_coh_wb); } /* moot once copy sources are mapped write-back */
++int fuxi_gpu_scanout_preclean(void) { return fg_scanout_preclean; }
 +void fuxi_gpu_scanout_stamps(struct fg_present_times *times)
 +{
 + FG_GUARD;

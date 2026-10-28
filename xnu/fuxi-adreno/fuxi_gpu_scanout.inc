@@ -126,7 +126,7 @@ void fuxi_gpu_scanout_configure(uintptr_t pixels, unsigned enabled, unsigned che
   if (fg_scanout_preclean) printf("FUXI SCANOUT: preclean=1 copy source cleaned before the ring reservation\n");
  }
 }
-int fuxi_gpu_scanout_preclean(void) { return fg_scanout_preclean && !(fg_abi_coh == 1 && fg_abi_coh_wb); } /* moot once copy sources are mapped write-back */
+int fuxi_gpu_scanout_preclean(void) { return fg_scanout_preclean; }
 void fuxi_gpu_scanout_stamps(struct fg_present_times *times)
 {
  FG_GUARD;
