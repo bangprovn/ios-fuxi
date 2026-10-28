@@ -34,5 +34,6 @@ public:
  }
  template<class Release> void clear(Release release){for(auto &e:entries)release(e.object);entries.clear();bytes=0;}
  size_t count() const{return entries.size();}
+ size_t totalBytes() const{return bytes;}
 };
 }

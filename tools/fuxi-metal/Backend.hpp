@@ -8,6 +8,9 @@
 #include <deque>
 #include <array>
 #include <map>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <cerrno>
 #include <cstdlib>
 #include <cfloat>
 #include <cmath>
@@ -101,7 +104,7 @@ struct VariantKey {
  explicit VariantKey(const DrawInput &input){for(unsigned i=0;i<resourceSlots;++i){auto *w=&words[i*8];w[0]=input.formats[i];w[1]=input.filters[i];memcpy(w+2,&input.lodMin[i],4);memcpy(w+3,&input.lodMax[i],4);for(unsigned stage=0;stage<2;++stage){w[4+stage*2]=input.buffers[stage][i].length!=0;w[5+stage*2]=input.buffers[stage][i].bytes;}}}
  bool operator==(const VariantKey &other) const {return words==other.words;}
 };
-struct Pipeline {uint32_t id{},fragInstr{},fragSamples{},fragLoops{},fragKills{};ShadowWindow shadowWindows[2][resourceSlots]{};std::array<uint32_t,resourceSlots> textureTypes{};size_t references=1,retainedBytes=0;void *translation{};CompileOptions options{};uint32_t fetchMask{};bool orderedColorAccess=false;std::vector<std::pair<uint32_t,VkRenderPass>> renders;VkPipeline pipeline{},stripPipeline{};std::array<VkPipeline,2> linePipelines{};Translation recipe{};VkPipelineLayout layout{};VkRenderPass render{};uint32_t pushOffset{},pushSize{},pushStages{};uint8_t pushBytes[128]{};VkDescriptorSetLayout setLayout{};VkSampler bakedSamplers[16]{};BakedSampler bakedSamplerInfo[16]{};MipAccess mipAccess[2];uint32_t readOnlyStorage[2]{};std::vector<Descriptor> descriptors;std::vector<Buffer *> constantBlobs;std::vector<std::array<uint8_t,32>> blobHashes;std::vector<std::pair<VariantKey,Pipeline *>> variants;
+struct Pipeline {uint32_t id{},fragInstr{},fragSamples{},fragLoops{},fragKills{};ShadowWindow shadowWindows[2][resourceSlots]{};std::array<uint32_t,resourceSlots> textureTypes{};size_t references=1,retainedBytes=0;void *translation{};CompileOptions options{};uint32_t fetchMask{};bool orderedColorAccess=false;std::vector<std::pair<uint32_t,VkRenderPass>> renders;VkPipeline pipeline{},stripPipeline{};std::array<VkPipeline,2> linePipelines{};Translation recipe{};VkPipelineLayout layout{};VkRenderPass render{};uint32_t pushOffset{},pushSize{},pushStages{};uint8_t pushBytes[128]{};VkDescriptorSetLayout setLayout{};VkSampler bakedSamplers[16]{};BakedSampler bakedSamplerInfo[16]{};MipAccess mipAccess[2];uint32_t readOnlyStorage[2]{};std::vector<Descriptor> descriptors;std::vector<Buffer *> constantBlobs;std::vector<std::string> blobKeys;std::vector<std::array<uint8_t,32>> blobHashes;std::vector<std::pair<VariantKey,Pipeline *>> variants;
 };
 struct BufferBind {Buffer *buffer{};uint64_t offset{};bool bytes=false;uint32_t end{};
  uint64_t length() const{return end?end:buffer?buffer->length:0;}};
@@ -179,11 +182,12 @@ class Backend {
    checkpoint=true;cacheCheckpoint=CacheClock::now();
   }
   artifactCache.report();
-  fprintf(stderr,"FUXI MTL: cache period driver hits=%llu misses=%llu unknown=%llu objects hits=%llu misses=%llu live=%zu evictions=%zu\n",
+  fprintf(stderr,"FUXI MTL: cache period driver hits=%llu misses=%llu unknown=%llu objects hits=%llu misses=%llu live=%zu evictions=%zu bytes=%zu blobs=%zu blob_shared=%llu mesa_cache=%s\n",
    (unsigned long long)driverHits,(unsigned long long)driverMisses,(unsigned long long)driverUnknown,
-   (unsigned long long)objectHits,(unsigned long long)objectMisses,objects.count(),objects.evictions);
+   (unsigned long long)objectHits,(unsigned long long)objectMisses,objects.count(),objects.evictions,objects.totalBytes(),blobShare.size(),(unsigned long long)blobSharedHits,mesaStatus[0]?mesaStatus:"off");
   driverHits=driverMisses=driverUnknown=objectHits=objectMisses=0;return checkpoint;
  }
+ char mesaStatus[96]{};std::map<std::string,std::pair<Buffer *,size_t>> blobShare;uint64_t blobSharedHits=0;
  // 256 pipelines: the old 32-entry LRU evicted every prewarmed pipeline before its first draw
  ObjectCache<Pipeline,256,64u*1024*1024> objects;ResourceLimits limits;DrawPlanCache<Pipeline> drawPlans;
  TransientMemory<VkDeviceMemory> textureMemory;SlabMemory<VkDeviceMemory> slabMemory;
@@ -329,9 +333,11 @@ public:
  explicit Backend(const char *client="unknown") {
   setenv("TU_DARWIN_SERVICE","NativeAdrenoGpuPublished",1);
   setenv("TU_DARWIN_OPEN_TYPE","0",1);setupTurnip();
-  {const char *mesa=getenv("FUXI_MTL_MESA_DISK_CACHE"); // experiment: let Mesa/Turnip keep its own shader cache under the root-owned fuxi-metal directory
-   if(mesa && !strcmp(mesa,"1") && geteuid()==0){::mkdir("/private/var/db/fuxi-metal",0755);::mkdir("/private/var/db/fuxi-metal/mesa-cache",0700);
-    setenv("MESA_SHADER_CACHE_DIR","/private/var/db/fuxi-metal/mesa-cache",0);setenv("MESA_SHADER_CACHE_MAX_SIZE","64M",0);fprintf(stderr,"FUXI MTL: mesa disk cache dir set (MESA_SHADER_CACHE_DIR)\n");}}setenv("MESA_LOG_LEVEL","warning",0);  // info logs a line per submit; env may raise it
+  {const char *mesa=getenv("FUXI_MTL_MESA_DISK_CACHE"); // experiment: let Mesa/Turnip keep its own shader cache under the fuxi-metal directory (any uid; status is repeated in the cache period line because boot-time lines can be lost)
+   if(mesa && !strcmp(mesa,"1")){int a=::mkdir("/private/var/db/fuxi-metal",0755),ae=a?errno:0,c=::mkdir("/private/var/db/fuxi-metal/mesa-cache",0700),ce=c?errno:0;struct stat st{};int ok=!stat("/private/var/db/fuxi-metal/mesa-cache",&st) && access("/private/var/db/fuxi-metal/mesa-cache",W_OK)==0;
+    unsetenv("MESA_SHADER_CACHE_DISABLE");unsetenv("MESA_GLSL_CACHE_DISABLE");
+    if(ok){setenv("MESA_SHADER_CACHE_DIR","/private/var/db/fuxi-metal/mesa-cache",1);setenv("MESA_GLSL_CACHE_DIR","/private/var/db/fuxi-metal/mesa-cache",1);setenv("MESA_SHADER_CACHE_MAX_SIZE","64M",0);}
+    snprintf(mesaStatus,sizeof mesaStatus,"dir_ok=%d uid=%d mkdir_parent=%d/%d mkdir_cache=%d/%d",ok,int(geteuid()),a,ae,c,ce);fprintf(stderr,"FUXI MTL: mesa disk cache %s\n",mesaStatus);}}setenv("MESA_LOG_LEVEL","warning",0);  // info logs a line per submit; env may raise it
   try {
    library=dlopen(FUXI_MTL_ICD,RTLD_NOW|RTLD_LOCAL);
    if(!library) throw std::runtime_error("dlopen Turnip failed");
@@ -812,7 +818,7 @@ public:
    if(p->layout)DestroyPipelineLayout(device,p->layout,nullptr);
    if(p->setLayout)DestroyDescriptorSetLayout(device,p->setLayout,nullptr);
    for(auto sampler:p->bakedSamplers)if(sampler)DestroySampler(device,sampler,nullptr);
-   for(auto *b:p->constantBlobs)destroyUnlocked(b);
+   for(size_t i=0;i<p->constantBlobs.size();++i){auto *b=p->constantBlobs[i];if(i<p->blobKeys.size()){auto it=blobShare.find(p->blobKeys[i]);if(it!=blobShare.end() && it->second.first==b){if(--it->second.second==0){blobShare.erase(it);destroyUnlocked(b);}continue;}}destroyUnlocked(b);}
    for(auto entry:p->renders)if(auto render=entry.second){clearFrames(nullptr,render);DestroyRenderPass(device,render,nullptr);}
   }
   if(p->translation)Translator::get().free(p->translation);delete p;
@@ -944,7 +950,7 @@ public:
    fprintf(stderr,"FUXI MTL: pipeline cache HIT %.3f ms\n",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count());return cached;
   }
   ++pipelineMisses;++objectMisses;lastCompileWasHit=0;
-  {static std::atomic<unsigned> reasons{0};if(reasons.fetch_add(1)<10)fprintf(stderr,"FUXI MTL: pipeline miss reason=%s input=%02x%02x%02x%02x product=%02x%02x%02x%02x objects=%zu evictions=%zu prewarm=%d\n",objects.wasEvicted(inputKey)?"lru-evicted-rebuild":"first-sight-or-key-differs",
+  {static std::atomic<unsigned> reasons{0};if(auto rn=reasons.fetch_add(1);rn<10||rn%25==0)fprintf(stderr,"FUXI MTL: pipeline miss reason=%s input=%02x%02x%02x%02x product=%02x%02x%02x%02x objects=%zu evictions=%zu prewarm=%d\n",objects.wasEvicted(inputKey)?"lru-evicted-rebuild":"first-sight-or-key-differs",
    (unsigned)(uint8_t)inputKey[0],(unsigned)(uint8_t)inputKey[1],(unsigned)(uint8_t)inputKey[2],(unsigned)(uint8_t)inputKey[3],(unsigned)(uint8_t)productKey[32],(unsigned)(uint8_t)productKey[33],(unsigned)(uint8_t)productKey[34],(unsigned)(uint8_t)productKey[35],objects.count(),objects.evictions,int(prewarmWorker));}
   struct Unlock {Unlock(){unlockForCompile=true;}~Unlock(){unlockForCompile=false;}} unlockScope;
   auto *p=createPipeline(translated,enabledOptions);timing.create=timing.lap();timing.result="miss";
@@ -999,7 +1005,6 @@ public:
   auto cleanup=[&]{if(translated.handle)tr.free(translated.handle);};
   try {
    p->retainedBytes=sizeof(Pipeline)+(translated.vertexCount+translated.fragmentCount)*4;
-   for(unsigned i=0;i<translated.blobCount && i<2;++i)p->retainedBytes+=translated.blobs[i].length;
    if(!validFetchContract(orderedColorAccess,translated.orderedColorAccess,translated.fetchMask))throw std::runtime_error("ordered framebuffer fetch plan/device mismatch");
    uint32_t presentMask=0;for(unsigned i=0;i<options.colorCount && i<8;++i)if(options.color(i).format)presentMask|=1u<<i;
    if(translated.fetchMask&~presentMask)throw std::runtime_error("fetch references absent color attachment");
@@ -1017,8 +1022,12 @@ public:
    if(translated.blobCount>2)throw std::runtime_error("constant blob count");
    for(unsigned i=0;i<translated.blobCount;++i){const auto &blob=translated.blobs[i];
     if(!blob.bytes || !blob.length || blob.length>4*1024*1024)throw std::runtime_error("constant blob bounds");
-    auto *buffer=allocateUnlocked((blob.length+15)&~size_t(15));p->constantBlobs.push_back(buffer);
-    memcpy(buffer->contents,blob.bytes,blob.length);
+    // Identical constant tables (same content hash and length) are shared across pipelines: they are immutable, and a 3 MB table per pipeline capped the object cache at about 20 entries.
+    std::string bkey((const char *)blob.hash,32);bkey.append((const char *)&blob.length,sizeof(blob.length));
+    auto shared=blobShare.find(bkey);Buffer *buffer;
+    if(shared!=blobShare.end() && memcmp(shared->second.first->contents,blob.bytes,blob.length)==0){buffer=shared->second.first;++shared->second.second;++blobSharedHits;}
+    else{buffer=allocateUnlocked((blob.length+15)&~size_t(15));memcpy(buffer->contents,blob.bytes,blob.length);if(shared==blobShare.end())blobShare[bkey]={buffer,1};p->retainedBytes+=blob.length;}
+    p->blobKeys.push_back(bkey);p->constantBlobs.push_back(buffer);
     std::array<uint8_t,32> hash{};std::copy(blob.hash,blob.hash+32,hash.begin());p->blobHashes.push_back(hash);
    }
    if(translated.descriptorCount>16)throw std::runtime_error("descriptor count>16");
@@ -1122,7 +1131,7 @@ public:
     if(poisoned){if(rc==VK_SUCCESS && result)DestroyPipeline(device,result,nullptr);throw std::runtime_error("backend poisoned during pipeline compile");}
    }else rc=CreateGraphicsPipelines(device,cache,1,&gi,nullptr,&result);
    if(rc==VK_SUCCESS){static std::atomic<unsigned> diag{0};unsigned n=diag.fetch_add(1);
-    if(n<10){size_t cacheBytes=0;if(cache)GetPipelineCacheData(device,cache,&cacheBytes,nullptr);
+    if(n<10||n%25==0){size_t cacheBytes=0;if(cache)GetPipelineCacheData(device,cache,&cacheBytes,nullptr);
      fprintf(stderr,"FUXI MTL: pipeline create diag n=%u topology=%d ms=%.2f feedback_valid=%d cache_hit=%d stage_ms=%.2f/%.2f stage_hit=%d/%d cache_bytes=%zu flags=0x%x\n",n,int(topology),std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-createStart).count(),
       int(!!(feedback.flags&VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT)),int(!!(feedback.flags&VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT)),stageFeedback[0].duration/1e6,stageFeedback[1].duration/1e6,
       int(!!(stageFeedback[0].flags&VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT)),int(!!(stageFeedback[1].flags&VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT)),cacheBytes,unsigned(gi.flags));}
@@ -1307,11 +1316,26 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
   ops.swap(out);
  }
 
+ // Why an op is not a reorderable plain draw (nullptr when it is one). Also used to explain blocked hoists.
+ static const char *barrierWhy(const Operation &op) {
+  if(!op.texture)return op.src||op.dst?"copy":"no-target";if(!op.pipeline)return "no-pipeline";if(op.clearOnly)return "clear-only";if(op.upload)return "upload";if(op.generateMips)return "mips";
+  if(op.src||op.dst)return "copy";if(!op.encoderID)return "no-encoder";if(op.pipeline->fetchMask)return "framebuffer-fetch";
+  for(const auto &d:op.pipeline->descriptors)if(d.type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER||d.type==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE||d.type==VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER)return "storage-resource";else if(d.type==VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT)return "input-attachment";
+  return nullptr;
+ }
+ // Which dependency makes a and b unorderable (mirrors groupsConflict), nullptr when independent.
+ static const char *conflictWhy(const PassGroup &a,const PassGroup &b) {
+  auto writes=[](const PassGroup &w,const PassGroup &r,const char *tt,const char *ts,const char *tb)->const char * {
+   for(auto *t:w.targets){if(!t)continue;
+    for(auto *u:r.targets)if(u && textureTouch(t,u))return tt;
+    for(auto *s:r.samples){if(textureTouch(t,s))return ts;if(s->shadow && s->backingBuffer && bufferTouchesTexture(s->backingBuffer,t))return ts;}
+    for(auto *x:r.buffers)if(bufferTouchesTexture(x,t))return tb;}
+   return nullptr;};
+  if(auto *r=writes(a,b,"target-vs-target","earlier-writes-what-later-samples","earlier-writes-memory-of-later-buffer"))return r;
+  return writes(b,a,"target-vs-target","later-writes-what-earlier-samples","later-writes-memory-of-earlier-buffer");
+ }
  bool buildGroups(const std::vector<Operation> &ops,std::vector<PassGroup> &groups) {
-  auto plainDraw=[](const Operation &op){
-   if(!op.texture || !op.pipeline || op.clearOnly || op.upload || op.generateMips || op.src || op.dst || !op.encoderID || op.pipeline->fetchMask)return false;
-   for(const auto &d:op.pipeline->descriptors)if(d.type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || d.type==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || d.type==VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER || d.type==VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT)return false;
-   return true;};
+  auto plainDraw=[](const Operation &op){return barrierWhy(op)==nullptr;};
   for(size_t i=0;i<ops.size();++i){const auto &op=ops[i];PassGroup g{i,i,!plainDraw(op),op.colorCount,op.colorMask,{},{},{},{}};
    if(!g.barrier){if(op.colorCount>8)return false;for(unsigned k=0;k<op.colorCount;++k){auto c=op.color(k);g.targets[k]=c.texture;g.levels[k]=c.level;}}
    if(!g.barrier && !groups.empty() && groups.back().sameTargets(g)){groups.back().last=i;}else groups.push_back(std::move(g));
@@ -1329,7 +1353,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
  // copies from the main target never moves above its writer.
  struct RenameImage {Texture *t;uint32_t w,h,format,usage;uint64_t used;};
  std::vector<RenameImage> renamePool;uint64_t rtRenamed=0,rtHoisted=0,rtMergedMain=0,rtMainBefore=0,rtMainAfter=0,rtRenameSubmits=0;
- bool smallOffscreen(Texture *t) {return t && t->tiling==VK_IMAGE_TILING_OPTIMAL && !t->imported && !t->backingBuffer && !t->shadow && !t->rtTarget && !t->mapped && !t->borrowedMemory && t->textureType==2 && t->levels==1 && t->depth==1 && !(t->usage&VK_IMAGE_USAGE_STORAGE_BIT) && uint64_t(t->width)*t->height<=(1u<<20);}
+ bool smallOffscreen(Texture *t) {return t && t->tiling==VK_IMAGE_TILING_OPTIMAL && !t->imported && !t->backingBuffer && !t->shadow && !t->rtTarget && !t->mapped && !t->borrowedMemory && t->textureType==2 && t->levels==1 && t->depth==1 && !(t->usage&VK_IMAGE_USAGE_STORAGE_BIT) && uint64_t(t->width)*t->height<=(2u<<20);}
  Texture *renameAcquire(Texture *like,std::vector<Texture *> &held) {
   uint32_t usage=(like->usage&VK_IMAGE_USAGE_SAMPLED_BIT?1u:0u)|(like->usage&VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT?4u:0u);if(!usage)return nullptr;
   for(auto &e:renamePool)if(e.t->references==1 && e.used!=rtRenameSubmits && e.w==like->width && e.h==like->height && e.format==like->format && e.usage==usage){e.used=rtRenameSubmits;++e.t->references;held.push_back(e.t);return e.t;}
@@ -1362,12 +1386,20 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
     ++rtRenamed;}
   }
  }
+ unsigned hoistLogged=0;
  void hoistOffscreen(std::vector<Operation> &ops) {
   std::vector<PassGroup> groups;if(!buildGroups(ops,groups))return;
-  std::vector<size_t> order;order.reserve(groups.size());unsigned moved=0;
+  std::vector<size_t> order;order.reserve(groups.size());unsigned moved=0,offs=0;std::map<std::string,unsigned> reasons;std::map<std::string,std::string> examples;
+  struct HoistLog {Backend &b;std::vector<PassGroup> &groups;unsigned &offs;unsigned &moved;std::map<std::string,unsigned> &reasons;std::map<std::string,std::string> &examples;
+   ~HoistLog(){if(b.hoistLogged>=20 || !offs)return;++b.hoistLogged;std::string line;for(auto &r:reasons){line+=" "+r.first+"="+std::to_string(r.second);auto e=examples.find(r.first);if(e!=examples.end())line+="["+e->second+"]";}
+    fprintf(stderr,"FUXI MTL: rt hoist n=%u groups=%zu offscreen=%u moved=%u reasons:%s\n",b.hoistLogged,groups.size(),offs,moved,line.c_str());}} hoistLog{*this,groups,offs,moved,reasons,examples};
   for(size_t gi=0;gi<groups.size();++gi){auto &g=groups[gi];size_t insertAt=order.size();
    bool offscreen=!g.barrier;if(offscreen)for(auto *t:g.targets)if(t && !smallOffscreen(t))offscreen=false;
-   if(offscreen){size_t scanned=0;for(size_t k=order.size();k-->0 && scanned<256;++scanned){auto &o=groups[order[k]];if(o.barrier || groupsConflict(o,g))break;insertAt=k;}}
+   if(offscreen){++offs;size_t scanned=0;const char *why=nullptr;bool stoppedAtEnd=false;const PassGroup *blocker=nullptr;
+    for(size_t k=order.size();k-->0 && scanned<256;++scanned){auto &o=groups[order[k]];if(o.barrier){why=barrierWhy(ops[o.first]);blocker=&o;break;}if(auto *c=conflictWhy(o,g)){why=c;blocker=&o;break;}insertAt=k;}
+    if(!why)stoppedAtEnd=true;
+    if(insertAt==order.size()){const char *key=why?why:"nothing-before";reasons[key]++;if(blocker&&examples.find(key)==examples.end()&&g.targets[0])examples[key]=(blocker->targets[0]?std::to_string(blocker->targets[0]->width)+"x"+std::to_string(blocker->targets[0]->height):std::string("barrier-op"))+"->"+std::to_string(g.targets[0]->width)+"x"+std::to_string(g.targets[0]->height);}
+    else if(stoppedAtEnd)reasons["moved-to-start"]++;else reasons["moved-partly"]++;}
    if(insertAt!=order.size())++moved;
    order.insert(order.begin()+insertAt,gi);}
   if(!moved)return;

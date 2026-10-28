@@ -44,7 +44,7 @@ static void rtShadowReadback(Backend &b){
 static void renameReplay(Backend &b){
  const bool on=getenv("FUXI_MTL_RT_RENAME") && !strcmp(getenv("FUXI_MTL_RT_RENAME"),"1");
  CompileOptions options;options.format=30;auto *pipeline=b.compilePipeline(nullptr,"control",nullptr,"control",options);auto *sampler=b.allocateSampler(false,false);
- auto *main=b.allocateTexture(30,5,1100,1000),*x=b.allocateTexture(30,5,16,16),*y=b.allocateTexture(30,5,16,16),*s1=b.allocateTexture(30,5,16,16),*s2=b.allocateTexture(30,5,16,16);
+ auto *main=b.allocateTexture(30,5,1600,1400),*x=b.allocateTexture(30,5,16,16),*y=b.allocateTexture(30,5,16,16),*s1=b.allocateTexture(30,5,16,16),*s2=b.allocateTexture(30,5,16,16);
  auto *out=b.allocate(16*16*2);uint64_t encoder=0;
  auto clear=[&](Texture *t,float r,float g,float bl){Operation c{};c.texture=t;c.clearOnly=true;c.load=2;c.clear[0]=r;c.clear[1]=g;c.clear[2]=bl;c.clear[3]=1;return c;};
  auto draw=[&](Texture *target,Texture *src,uint32_t load,int32_t x0,uint32_t w){Operation d{};d.texture=target;d.pipeline=pipeline;d.samples[0]=src;d.samplers[0]=sampler;d.viewport={0,16,16,-16,0,1};d.scissor={{x0,0},{w,16}};d.load=load;d.encoderID=++encoder;return d;};
