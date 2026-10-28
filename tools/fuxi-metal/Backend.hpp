@@ -48,6 +48,7 @@
 #include "CompileBoost.hpp"
 #include "PipelineCache.hpp"
 #include "ArtifactCache.hpp"
+#include "SpirvRelax.hpp"
 #include "PrewarmStore.hpp"
 #include "BackboardGate.hpp"
 #include "FramebufferFetch.hpp"
@@ -1104,8 +1105,12 @@ public:
   auto cleanup=[&]{for(auto m:modules)if(m)DestroyShaderModule(device,m,nullptr);};
   try {
    const uint32_t *words[]={translated.vertex,translated.fragment};size_t counts[]={translated.vertexCount,translated.fragmentCount};
+   std::vector<uint32_t> relaxedFragment;
    for(unsigned i=0;i<2;++i) {
     if(!words[i] || counts[i]<5 || counts[i]>1024*1024 || words[i][0]!=0x07230203)throw std::runtime_error("invalid translator SPIR-V");
+    if(i==1 && systemTranslationPolicy().fragRelaxed){unsigned marked=0,quantized=0; // FUXI_MTL_FRAG_RELAXED: f16-quantized chains may run in half precision ALUs
+     if(relaxQuantizedChains(words[i],counts[i],relaxedFragment,marked,quantized)){words[i]=relaxedFragment.data();counts[i]=relaxedFragment.size();++relaxedPipelines;relaxedMarks+=marked;}
+     static std::atomic<unsigned> lines{0};if(lines.fetch_add(1)<20 || lines.load()%50==0)fprintf(stderr,"FUXI MTL: frag relaxed pipe=%06x quantize_sites=%u marked=%u words=%zu->%zu pipelines=%llu total_marked=%llu\n",p->id,quantized,marked,size_t(translated.fragmentCount),counts[i],(unsigned long long)relaxedPipelines,(unsigned long long)relaxedMarks);}
     VkShaderModuleCreateInfo mi{};mi.sType=VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;mi.codeSize=counts[i]*4;mi.pCode=words[i];check(CreateShaderModule(device,&mi,nullptr,&modules[i]));
    }
    if(translated.specCount>32 || translated.specSize>256)throw std::runtime_error("specialization bounds");
@@ -1418,7 +1423,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
     ++rtRenamed;}
   }
  }
- unsigned hoistLogged=0;
+ unsigned hoistLogged=0;std::atomic<uint64_t> relaxedPipelines{0},relaxedMarks{0};
  void hoistOffscreen(std::vector<Operation> &ops) {
   std::vector<PassGroup> groups;if(!buildGroups(ops,groups,true))return;
   std::vector<size_t> order;order.reserve(groups.size());unsigned moved=0,offs=0;std::map<std::string,unsigned> reasons;std::map<std::string,std::string> examples;
@@ -2135,7 +2140,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
       }
       if(set!=boundSet || op.pipeline->layout!=boundLayout){CmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,op.pipeline->layout,0,1,&set,0,nullptr);boundSet=set;boundLayout=op.pipeline->layout;}
      }
-     DrawInfo di{};
+     DrawInfo di{};di.scW=op.scissor.extent.width;di.scH=op.scissor.extent.height;
      if(currentFrame || drawQ){const auto &po=op.pipeline->options;di.pipeline=op.pipeline->id;di.count=draw.count;di.blend=po.blend;di.srcRGB=po.srcRGB;di.dstRGB=po.dstRGB;di.srcAlpha=po.srcAlpha;di.dstAlpha=po.dstAlpha;di.mask=po.mask;di.instr=op.pipeline->fragInstr;di.samples=op.pipeline->fragSamples;di.loops=op.pipeline->fragLoops;di.kills=op.pipeline->fragKills;
       for(unsigned i=0;i<draw.descriptorCount;++i){const auto &d=draw.descriptors[i];if(d.source || (d.type!=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && d.type!=VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) || d.slot>=resourceSlots)continue;
        auto *t=d.slot==0 && !op.samples[0]?op.sourceTexture:op.samples[d.slot];if(!t)continue;uint8_t kind=t->tiling==VK_IMAGE_TILING_LINEAR?1:t->shadow?2:0;uint64_t bytes=uint64_t(t->width)*t->height*texelBytes(t->format);
