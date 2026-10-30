@@ -114,7 +114,7 @@ static const char *loader_boot(void)
      (p->virt_base & (0x2000000-1)) || (p->kernel_end & (PAGE_16K-1)) ||
      p->kernel_end < p->virt_base ||
      p->kernel_end - p->virt_base > p->mem_size - 2*PAGE_16K ||
-     !p->adt_size || p->adt_size > PAGE_16K || (p->adt_off & 7) ||
+     !p->adt_size || p->adt_size > 4*PAGE_16K || (p->adt_off & 7) ||
      p->adt_off > length || p->adt_size > length-p->adt_off ||
      p->cmdline[BOOT_LINE_LENGTH-1])
   return "unsafe Fuxi memory layout";

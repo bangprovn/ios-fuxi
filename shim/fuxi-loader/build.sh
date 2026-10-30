@@ -40,7 +40,7 @@ reserved = True  # Both supported windows exclude top-of-bank scratch.
 pinned = {
  "gpu": "1a2a419c39046d3141fc5fed5aa7f971de2db40cc7a1d89693c3e26fad64dd98",
  "sqe": "6d38046654333a6a5a4ee77ab67abc24e3c0c5c68237513afe98e94da8fc9fcc",
- "zap": "86e4c3f61d4ddbe581405f4cc496182cf385bee39aaefec61639a31d3619fd35",
+ "zap": "0c2c2013835603ff0f93d9b21eba55e37d42a82189690ae0d579eac819842176",
 }
 lines = ['.section .gpu_fw,"a"']
 for src, name in ((gmu, 'gpu'), (sqe, 'sqe'), (zap, 'zap')):
