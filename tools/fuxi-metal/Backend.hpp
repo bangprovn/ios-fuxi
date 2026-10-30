@@ -8,6 +8,8 @@
 #include <deque>
 #include <array>
 #include <map>
+#include <set>
+#include <tuple>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <cerrno>
@@ -50,6 +52,8 @@
 #include "ArtifactCache.hpp"
 #include "SpirvRelax.hpp"
 #include "SpirvLoops.hpp"
+#include "SpirvEval.hpp"
+#include "OcclusionProof.hpp"
 #include "PrewarmStore.hpp"
 #include "BackboardGate.hpp"
 #include "FramebufferFetch.hpp"
@@ -262,7 +266,7 @@ private:
   if(GetQueryPoolResults(device,pool,0,uint32_t(ticks.size()),ticks.size()*sizeof(uint64_t),ticks.data(),sizeof(uint64_t),VK_QUERY_RESULT_64_BIT)!=VK_SUCCESS)return;
   uint64_t mask=timestampBits>=64?UINT64_MAX:(uint64_t(1)<<timestampBits)-1;
   for(size_t i=0;i<infos.size();++i)delta[i]=uint64_t(double((ticks[i+1]-ticks[i])&mask)*timestampPeriod);
-  reportDraws(stderr,infos,delta);
+  reportDraws(stderr,infos,delta);if(systemTranslationPolicy().occlude)occNoteDrawTimes(infos,delta);
  }
  void readPassTimes(VkQueryPool pool,const std::vector<PassInfo> &infos,uint64_t whole){
   if(!pool || infos.empty())return;std::vector<uint64_t> ticks(infos.size()+1),delta(infos.size());
@@ -1256,13 +1260,163 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
  // Shadows are keyed by the linear memory (the backing buffer's host key), not by the texture object: CA recreates the drawable texture around the same IOSurface.
  struct RtEntry {Texture *s;uint32_t w,h,format,sampled;size_t offset,row;uint64_t used;bool clean;};
  std::unordered_map<const void *,RtEntry> rtShadows;std::unordered_set<const void *> rtRefused;
+ // FUXI_MTL_OCCLUDE (default off). A draw D is skipped only when a LATER kept draw C of the same Metal encoder and target provably paints every pixel D can touch: D's footprint is bounded by its scissor (no geometry needed),
+ // C's coverage is proven from its real vertex positions (CPU evaluation of the translated vertex shader, SpirvEval + OcclusionProof). C must be dst-independent (no blend or zero dst factors on a unorm target), write every
+ // channel D writes, have no discard and no fb-fetch/storage side effects. Anything between D and C that could observe D's pixels (sampling or fetching the target, storage writers, non-draw ops) forgets the coverers.
+ // Culled draws stay in `ops` (pass load/store semantics untouched) and are only not recorded. Load elision turns LOAD into DONT_CARE when a kept dst-independent coverer paints the whole render area and nothing before it reads the target.
+ struct OccPlan {std::vector<uint8_t> culled,hasCover,reads,mask;std::vector<Cover> cover;};
+ std::atomic<uint64_t> occSubmits{0},occVictims{0},occCoverTries{0},occCoverOk{0},occCulled{0},occElided{0},occEvalNs{0},occEstNs{0},occUnpriced{0},occCulledKpx{0};
+ std::mutex occMutex;std::map<std::string,uint64_t> occWhy;std::unordered_map<uint32_t,double> occRate;double occRateAll=0;std::vector<uint8_t> occZero;struct OccEval {bool ok=false;std::string why;std::vector<std::array<float,4>> pos;};std::map<std::array<uint64_t,2>,OccEval> occEvalCache;std::atomic<uint64_t> occEvalHits{0};
+ void occFail(const std::string &why){std::lock_guard<std::mutex> g(occMutex);++occWhy[why.substr(0,40)];}
+ void occNoteDrawTimes(const std::vector<DrawInfo> &infos,const std::vector<uint64_t> &ns){
+  std::lock_guard<std::mutex> g(occMutex);
+  for(size_t i=0;i<infos.size() && i<ns.size();++i){auto &d=infos[i];uint64_t px=uint64_t(d.scW)*d.scH;if(d.begin || !d.pipeline || px<1024)continue;double rate=double(ns[i])/(double(px)/1000.0);
+   auto it=occRate.find(d.pipeline);if(it==occRate.end())occRate[d.pipeline]=rate;else it->second=it->second*0.8+rate*0.2;occRateAll=occRateAll?occRateAll*0.9+rate*0.1:rate;}
+ }
+ static IRect occFoot(const Operation &o){
+  int64_t W=o.texture->levelWidth(o.dstLevel),H=o.texture->levelHeight(o.dstLevel);int64_t aw=o.areaWidth?std::min<int64_t>(o.areaWidth,W):W,ah=o.areaHeight?std::min<int64_t>(o.areaHeight,H):H;
+  int64_t x0=std::max<int64_t>(0,o.scissor.offset.x),y0=std::max<int64_t>(0,o.scissor.offset.y),x1=std::min<int64_t>(aw,int64_t(o.scissor.offset.x)+o.scissor.extent.width),y1=std::min<int64_t>(ah,int64_t(o.scissor.offset.y)+o.scissor.extent.height);
+  if(x1<=x0 || y1<=y0)return {};return {int32_t(x0),int32_t(y0),int32_t(x1),int32_t(y1)};
+ }
+ bool occVertices(const Operation &op,const DrawOutput &draw,const std::vector<Texture *> &targets,std::vector<std::array<float,4>> &pos,std::string &why){
+  auto &r=op.pipeline->recipe;
+  if(!r.vertex || r.vertexCount<5 || !r.vertexEntry){why="no vertex spirv";return false;}
+  if(draw.count<3 || draw.count>96){why="vertex count";return false;}
+  auto touches=[&](const Buffer *b){for(auto *t:targets)if(bufferTouchesTexture(b,t))return true;return false;};
+  VsInputs in;
+  for(uint32_t i=0;i<r.specCount && i<32;++i){auto e=r.specs[i];if(e.offset>r.specSize || e.size>r.specSize-e.offset){why="spec";return false;}uint32_t v=0;memcpy(&v,r.specData+e.offset,std::min<uint32_t>(e.size,4));in.spec[e.id]=v;}
+  for(uint32_t i=0;i<draw.descriptorCount;++i){const auto &d=draw.descriptors[i];
+   if(!(d.stages&1) || (d.type!=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && d.type!=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER))continue;
+   VsInputs::Region reg{};
+   if(d.source==2){if(d.offset || d.range>(1u<<20)){why="neutral buffer";return false;}if(occZero.size()<d.range)occZero.assign(size_t(d.range),0);reg={occZero.data(),size_t(d.range)};}
+   else if(d.source==1){if(d.slot>=op.pipeline->constantBlobs.size() || d.offset){why="constant blob";return false;}auto *b=op.pipeline->constantBlobs[d.slot];if(!b || !b->contents || d.range>b->length){why="constant blob";return false;}reg={(const uint8_t *)b->contents,size_t(d.range)};}
+   else {if(d.slot>=resourceSlots){why="buffer slot";return false;}auto b=op.buffers[d.stages==1?0:1][d.slot];if(!b.buffer || !b.buffer->contents || touches(b.buffer)){why="vertex buffer";return false;}
+    if(d.offset>=b.buffer->length){why="buffer range";return false;}reg={(const uint8_t *)b.buffer->contents+d.offset,size_t(std::min<uint64_t>(d.range,b.buffer->length-d.offset))};}
+   in.buffers[{d.set,d.binding}]=reg;
+  }
+  for(uint32_t i=0;i<draw.pushCount && i<2;++i){const auto &w=draw.pushes[i];if(!(w.stages&1))continue;if(w.offset>128 || w.size>128-w.offset){why="push range";return false;}memcpy(in.push+w.offset,w.bytes,w.size);in.pushSize=std::max(in.pushSize,w.offset+w.size);}
+  auto fetchAttr=[&](uint32_t loc,uint32_t vi,uint32_t out[4])->bool {
+   const VertexAttribute *a=nullptr;for(uint32_t i=0;i<r.attributeCount && i<8;++i)if(r.attributes[i].location==loc)a=&r.attributes[i];if(!a)return false;
+   int k=-1;for(uint32_t i=0;i<draw.vertexCount && i<4;++i)if(draw.vertexBindings[i]==a->binding)k=int(i);if(k<0)return false;
+   uint32_t stride=0;bool found=false;for(uint32_t i=0;i<r.bindingCount && i<4;++i)if(r.bindings[i].binding==a->binding){stride=r.bindings[i].stride;found=true;}if(!found)return false;
+   auto slot=draw.vertexSlots[k];if(slot>=resourceSlots)return false;auto *buf=op.buffers[0][slot].buffer;if(!buf || !buf->contents || touches(buf))return false;
+   uint64_t addr=draw.vertexOffsets[k]+uint64_t(vi)*stride+a->offset;if(addr>=buf->length)return false;
+   return decodeAttribute(a->format,(const uint8_t *)buf->contents+addr,size_t(buf->length-addr),out);};
+  std::vector<uint32_t> index;
+  if(draw.indexed){auto *ib=op.indices;if(!ib || !ib->contents || touches(ib) || (op.indexWidth!=2 && op.indexWidth!=4)){why="index buffer";return false;}
+   for(uint32_t i=0;i<draw.count;++i){uint64_t at=draw.indexOffset+uint64_t(draw.first+i)*op.indexWidth;if(at+op.indexWidth>ib->length){why="index range";return false;}
+    uint32_t v=0;memcpy(&v,(const uint8_t *)ib->contents+at,op.indexWidth);if(v==(op.indexWidth==2?0xffffu:0xffffffffu)){why="primitive restart";return false;}index.push_back(v);}}
+  else for(uint32_t i=0;i<draw.count;++i)index.push_back(draw.first+i);
+  // Attributes are decoded up front so the whole input can be hashed: CA redraws mostly identical vertex streams every frame, and the evaluation result is a pure function of these inputs.
+  std::map<std::pair<uint32_t,uint32_t>,std::array<uint32_t,4>> attrs;
+  for(uint32_t ai=0;ai<r.attributeCount && ai<8;++ai)for(uint32_t vi:index){std::array<uint32_t,4> lane{};if(fetchAttr(r.attributes[ai].location,vi,lane.data()))attrs[{r.attributes[ai].location,vi}]=lane;}
+  in.attribute=[&](uint32_t loc,uint32_t vi,uint32_t out[4])->bool {auto it=attrs.find({loc,vi});if(it==attrs.end())return false;memcpy(out,it->second.data(),16);return true;};
+  uint64_t h1=0xcbf29ce484222325ull,h2=0x84222325cbf29ce4ull;
+  auto mix=[&](const void *q,size_t n){auto *b=(const uint8_t *)q;for(size_t i=0;i<n;++i){h1=(h1^b[i])*0x100000001b3ull;h2=(h2+b[i]+1)*0x9e3779b97f4a7c15ull;h2^=h2>>29;}};
+  auto mix64=[&](uint64_t v){mix(&v,8);};
+  mix64(op.pipeline->id);mix64(r.vertexCount);mix64(index.size());for(auto v:index)mix64(v);
+  for(auto &e:in.spec){mix64(e.first);mix64(e.second);}
+  for(auto &e:in.buffers){if(e.second.size>(1u<<16)){why="uniform range too large";return false;}mix64(e.first.first);mix64(e.first.second);mix64(e.second.size);mix(e.second.data,e.second.size);}
+  mix64(in.pushSize);mix(in.push,in.pushSize);
+  for(auto &e:attrs){mix64(e.first.first);mix64(e.first.second);mix(e.second.data(),16);}
+  std::array<uint64_t,2> key{h1,h2};
+  auto hit=occEvalCache.find(key);
+  if(hit!=occEvalCache.end()){++occEvalHits;if(!hit->second.ok){why=hit->second.why;return false;}pos=hit->second.pos;return true;}
+  auto t0=std::chrono::steady_clock::now();SpirvEval ev(r.vertex,r.vertexCount);auto res=ev.run(r.vertexEntry,in,index);
+  occEvalNs+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-t0).count());
+  if(occEvalCache.size()>=256)occEvalCache.clear();
+  auto &slot=occEvalCache[key];slot.ok=res.ok && res.position.size()==index.size();slot.why=res.ok?"eval size":"eval:"+res.why;if(slot.ok)slot.pos=res.position;
+  if(!slot.ok){why=slot.why;return false;}
+  pos=std::move(res.position);return true;
+ }
+ static bool occUnorm(VkFormat f){return f==VK_FORMAT_B8G8R8A8_UNORM || f==VK_FORMAT_R8G8B8A8_UNORM || f==VK_FORMAT_B8G8R8A8_SRGB || f==VK_FORMAT_R8G8B8A8_SRGB || f==VK_FORMAT_A2B10G10R10_UNORM_PACK32 || f==VK_FORMAT_R8_UNORM || f==VK_FORMAT_R8G8_UNORM;}
+ void occludeAnalyze(const std::vector<Operation> &ops,const std::vector<DrawOutput> &draws,OccPlan &plan){
+  const size_t N=ops.size();if(occSubmits%600==599)reportOcclude();plan.culled.assign(N,0);plan.hasCover.assign(N,0);plan.reads.assign(N,0);plan.mask.assign(N,0);plan.cover.assign(N,Cover{});++occSubmits;
+  const uint64_t minPx=systemTranslationPolicy().occludeMinPx;
+  std::vector<Texture *> targets;for(auto &o:ops)for(unsigned i=0;i<o.colorCount;++i)if(auto *t=o.color(i).texture)targets.push_back(t);
+  auto plain=[&](const Operation &o){return o.texture && o.pipeline && !o.clearOnly && !o.upload && !o.generateMips && !o.src && !o.dst;};
+  auto storageWriter=[&](size_t n){auto &o=ops[n];if(o.pipeline->writesStorage)return true;
+   for(unsigned j=0;j<draws[n].descriptorCount;++j){auto &d=draws[n].descriptors[j];if(d.type==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || d.type==VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER)return true;
+    if(d.type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)for(unsigned stage=0;stage<2;++stage)if((d.stages&(stage?16u:1u)) && (d.binding>=16 || !(o.pipeline->readOnlyStorage[stage]&(1u<<d.binding))))return true;}
+   return false;};
+  auto readsTexture=[&](const Operation &o,const Texture *t){
+   for(unsigned slot=0;slot<resourceSlots;++slot){auto *s=o.samples[slot];if(!slot && !s)s=o.sourceTexture;if(!s)continue;if(textureTouch(s,t))return true;if(s->shadow && s->backingBuffer && bufferTouchesTexture(s->backingBuffer,t))return true;}
+   for(auto &stage:o.buffers)for(auto &b:stage)if(b.buffer && bufferTouchesTexture(b.buffer,t))return true;
+   if(o.indices && bufferTouchesTexture(o.indices,t))return true;
+   return false;};
+  auto key=[&](const Operation &o){return std::make_tuple(o.texture,o.dstLevel,o.encoderID);};
+  auto victimOk=[&](size_t n){auto &o=ops[n];return plain(o) && o.colorCount==1 && o.encoderID && !o.pipeline->fetchMask && !storageWriter(n) && occFoot(o).area()>=minPx;};
+  std::vector<uint8_t> gate(N,0);
+  {std::set<std::tuple<Texture *,uint32_t,uint64_t>> victims,loads;
+   for(size_t n=0;n<N;++n){auto &o=ops[n];if(!plain(o) || o.colorCount!=1 || !o.encoderID)continue;auto k=key(o);if(o.load==1)loads.insert(k);gate[n]=victims.count(k) || loads.count(k);if(victimOk(n))victims.insert(k);}}
+  struct Entry {Texture *tex;uint32_t level;uint64_t enc;std::vector<std::pair<uint32_t,const Cover *>> covers;};
+  std::vector<Entry> st;unsigned evals=0;
+  for(size_t n=N;n-->0;){
+   auto &o=ops[n];
+   if(!plain(o)){st.clear();continue;}
+   Entry *own=nullptr;for(auto &e:st)if(e.tex==o.texture && e.level==o.dstLevel && e.enc==o.encoderID)own=&e;
+   if(own && !own->covers.empty() && victimOk(n)){
+    ++occVictims;uint32_t dm=o.pipeline->recipe.colors[0].mask&15;IRect R=occFoot(o);std::vector<const Cover *> use;std::vector<IRect> rects;
+    for(auto &c:own->covers)if((c.first&dm)==dm){use.push_back(c.second);rects.insert(rects.end(),c.second->rects.begin(),c.second->rects.end());}
+    if(use.empty())occFail("victim:mask not covered");
+    else {bool ok=coveredByUnion(R,rects);for(auto *c:use)if(!ok && c->covers(R))ok=true;
+     if(!ok)occFail("victim:footprint not covered");
+     else {plan.culled[n]=1;++occCulled;double kpx=double(R.area())/1000.0,rate=0;{std::lock_guard<std::mutex> g(occMutex);auto it=occRate.find(o.pipeline->id);rate=it!=occRate.end()?it->second:occRateAll;}
+      occCulledKpx+=uint64_t(kpx);if(rate>0)occEstNs+=uint64_t(kpx*rate);else ++occUnpriced;continue;}}
+   }
+   // kept draw: forget coverers whose pixels it can observe
+   bool storage=storageWriter(n),fetch=o.pipeline->fetchMask!=0,multi=o.colorCount!=1;
+   for(size_t i=0;i<st.size();){auto &e=st[i];bool rd=storage || fetch || multi || readsTexture(o,e.tex);
+    if(!rd)for(unsigned k=0;k<o.colorCount;++k){auto *t=o.color(k).texture;if(t && t!=o.texture && textureTouch(t,e.tex))rd=true;}
+    if(rd)st.erase(st.begin()+i);else ++i;}
+   plan.reads[n]=storage || fetch || multi || readsTexture(o,o.texture);
+   if(multi || fetch || storage || !o.encoderID || !gate[n] || plan.reads[n])continue;
+   auto &p=o.pipeline;auto c=p->recipe.colors[0];uint32_t mask=c.mask&15;
+   IRect clip=occFoot(o);
+   if(o.pipeline->fragKills){occFail("cover:discard");continue;}
+   if(!mask){continue;}
+   if(!blendDstIndependent(c.blend,c.factors)){occFail("cover:dst-dependent blend");continue;}
+   if(c.blend && !occUnorm(o.texture->vkFormat)){occFail("cover:blend on non-unorm");continue;}
+   if(o.topology!=Topology::Triangle && o.topology!=Topology::TriangleStrip){occFail("cover:topology");continue;}
+   {const auto &vp=o.viewport;double ax=std::min<double>(vp.x,double(vp.x)+vp.width),bx=std::max<double>(vp.x,double(vp.x)+vp.width),ay=std::min<double>(vp.y,double(vp.y)+vp.height),by=std::max<double>(vp.y,double(vp.y)+vp.height);
+    if(!(std::fabs(ax)<1e7 && std::fabs(bx)<1e7 && std::fabs(ay)<1e7 && std::fabs(by)<1e7)){occFail("cover:viewport");continue;}
+    clip=intersect(clip,{int32_t(std::ceil(ax)),int32_t(std::ceil(ay)),int32_t(std::floor(bx)),int32_t(std::floor(by))});}
+   if(clip.area()<minPx)continue;
+   if(evals>=64){occFail("cover:eval cap");continue;}
+   ++evals;++occCoverTries;
+   std::vector<std::array<float,4>> pos;std::string why;
+   if(!occVertices(o,draws[n],targets,pos,why)){occFail("cover:"+why);continue;}
+   ViewportF vf{o.viewport.x,o.viewport.y,o.viewport.width,o.viewport.height};
+   if(!buildCover(pos,o.topology==Topology::Triangle?0:1,vf,clip,plan.cover[n],why)){occFail("cover:"+why);continue;}
+   ++occCoverOk;plan.hasCover[n]=1;plan.mask[n]=uint8_t(mask);
+   Entry *dst=nullptr;for(auto &e:st)if(e.tex==o.texture && e.level==o.dstLevel)dst=&e;
+   if(dst && dst->enc!=o.encoderID){dst->enc=o.encoderID;dst->covers.clear();}
+   if(!dst){st.push_back({o.texture,o.dstLevel,o.encoderID,{}});dst=&st.back();}
+   dst->covers.push_back({mask,&plan.cover[n]});
+  }
+ }
+ // The pass [from,to] may skip loading its attachment when a kept coverer paints the whole render area and no kept draw before it can read the old contents.
+ bool occElide(const std::vector<Operation> &ops,const OccPlan &plan,size_t from,size_t to,uint32_t aw,uint32_t ah) const {
+  auto &first=ops[from];if(first.colorCount!=1 || first.load!=1 || !first.texture || !aw || !ah)return false;IRect area{0,0,int32_t(aw),int32_t(ah)};
+  for(size_t k=from;k<=to && k<ops.size();++k){auto &o=ops[k];
+   if(!(o.texture==first.texture && o.dstLevel==first.dstLevel && o.pipeline && !o.clearOnly && !o.upload && !o.generateMips && !o.src && !o.dst && o.colorCount==1))return false;
+   if(plan.culled[k])continue;
+   if(plan.hasCover[k] && plan.mask[k]==15 && plan.cover[k].covers(area))return true;
+   if(plan.reads[k])return false;}
+  return false;
+ }
  const void *rtKey(Texture *t) {return t->backingBuffer?(const void *)t->backingBuffer->shadowKey():(const void *)t;}
  Texture *rtShadowOf(Texture *t) {auto i=rtShadows.find(rtKey(t));return i==rtShadows.end()?nullptr:i->second.s;}
  void rtForget(const void *key) {auto i=rtShadows.find(key);if(i!=rtShadows.end())i->second.clean=false;} // the linear memory is going away or changing hands: the shadow no longer provably matches
  void rtForget(Texture *t) {rtForget((const void *)t);}
  void releaseRtShadows() {for(auto &e:rtShadows)destroyTextureUnlocked(e.second.s);rtShadows.clear();rtRefused.clear();}
+ void reportOcclude() {
+  {std::string why;{std::lock_guard<std::mutex> g(occMutex);std::vector<std::pair<uint64_t,std::string>> v;for(auto &e:occWhy)v.push_back({e.second,e.first});std::sort(v.rbegin(),v.rend());for(size_t i=0;i<v.size() && i<10;++i)why+=" "+v[i].second+"="+std::to_string(v[i].first);}
+   fprintf(stderr,"FUXI MTL: occlude submits=%llu victims=%llu cover_tries=%llu cover_ok=%llu culled=%llu culled_kpx=%llu culled_est_ms=%.3f unpriced=%llu loads_elided=%llu eval_ms=%.3f eval_cache_hits=%llu min_px=%u why:%s\n",(unsigned long long)occSubmits,(unsigned long long)occVictims,(unsigned long long)occCoverTries,(unsigned long long)occCoverOk,(unsigned long long)occCulled,(unsigned long long)occCulledKpx,double(occEstNs)/1e6,(unsigned long long)occUnpriced,(unsigned long long)occElided,double(occEvalNs)/1e6,(unsigned long long)occEvalHits,systemTranslationPolicy().occludeMinPx,why.c_str());}
+ }
  void reportRtCounters() {
   {uint64_t n=submitEntered,s=submits;if(n && s)fprintf(stderr,"FUXI MTL: submit pipeline submits=%llu encode_ms=%.3f slot_wait_ms=%.3f blocked_pct=%.1f blocked_full=%llu blocked_drain=%llu blocked_conflict=%llu gpu_latency_ms=%.3f retire_host_ms=%.3f (per submit; encode includes slot waits; gpu_latency is queue submit to fence)\n",(unsigned long long)n,submitPrepareNanos/1e6/n,submitSlotWaitNanos/1e6/n,100.0*submitBlocked/n,(unsigned long long)submitBlockedFull,(unsigned long long)submitBlockedDrain,(unsigned long long)submitBlockedConflict,submitWaitNanos/1e6/s,submitRetireNanos/1e6/s);}
+  if(systemTranslationPolicy().occlude)reportOcclude();
   if(systemTranslationPolicy().sampleShadow)fprintf(stderr,"FUXI MTL: sample shadow min_px=%u created=%llu created_mb=%.2f reused=%llu capped=%llu evicted=%llu live=%zu live_mb=%.2f refused=%llu copies=%llu hits=%llu stale_invalidations=%llu copied_mb=%.1f hashed_mb=%.1f hash_ms=%.2f\n",systemTranslationPolicy().sampleMinPx,(unsigned long long)sampleShadowCreated,sampleShadowBytes/1048576.0,(unsigned long long)sampleShadowReused,(unsigned long long)sampleShadowCapped,(unsigned long long)sampleShadowEvicted,sampleShadows.size(),sampleShadowLiveBytes()/1048576.0,(unsigned long long)sampleShadowRefused,(unsigned long long)sampleCopies,(unsigned long long)sampleHits,(unsigned long long)sampleInvalidations,sampleCopiedBytes/1048576.0,sampleHashedBytes/1048576.0,sampleHashNs/1e6);
   if(systemTranslationPolicy().rtRename){uint64_t mb=0;for(auto &e:renamePool)mb+=uint64_t(e.w)*e.h*texelBytes(e.format);
    fprintf(stderr,"FUXI MTL: rt rename submits=%llu renamed=%llu hoisted=%llu merged_main_passes=%llu main_runs_before=%llu main_runs_after=%llu pool_images=%zu pool_mb=%.2f\n",(unsigned long long)rtRenameSubmits,(unsigned long long)rtRenamed,(unsigned long long)rtHoisted,(unsigned long long)rtMergedMain,(unsigned long long)rtMainBefore,(unsigned long long)rtMainAfter,renamePool.size(),double(mb)/1048576.0);}
@@ -1799,6 +1953,8 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
      for(auto &stage:op.buffers)for(auto &bound:stage)if(bound.buffer==ops[previous].dst)throw std::runtime_error("GPU-written draw buffer requires separate submission");
     }
    }
+   std::optional<OccPlan> occPlan;
+   if(systemTranslationPolicy().occlude){occPlan.emplace();try{occludeAnalyze(ops,draws,*occPlan);}catch(const std::exception &e){occFail(std::string("analysis:")+e.what());occPlan.reset();}}
    // Plan only after runtime variants, access proofs and skipped draws are final.
    // Every admitted shader writes attachments only. Storage buffers require
    // a NonWritable contract in every referencing stage; unknown writers split.
@@ -2049,7 +2205,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
    VkPipeline boundPipeline{};VkPipelineLayout boundLayout{};VkDescriptorSet boundSet{};
    VkViewport boundViewport{};VkRect2D boundScissor{};bool dynamicBound=false;
    for(size_t opIndex=0;opIndex<ops.size();++opIndex) {diagnosticOp=opIndex;const auto &op=ops[opIndex];const auto &draw=draws[opIndex];
-    size_t passEnd=mergeEnds.empty()?opIndex:mergeEnds[opIndex];
+    size_t passEnd=mergeEnds.empty()?opIndex:mergeEnds[opIndex];const bool culledOp=occPlan && occPlan->culled[opIndex];
     bool continuation=opIndex && !mergeEnds.empty() && mergeEnds[opIndex-1]>=opIndex;
     if(!continuation){boundPipeline={};boundLayout={};boundSet={};dynamicBound=false;refreshed.clear();for(size_t i=opIndex;i<=passEnd;++i)refreshImages(i);
      // One transfer-destination barrier for every shadow in the run, then the copies.
@@ -2069,9 +2225,12 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
      std::array<Texture *,8> targets{};std::array<uint32_t,8> levels{};VkImageView targetViews[8]{},compactViews[8]{};VkClearValue clears[8]{};unsigned used=0;
      for(unsigned i=0;i<op.colorCount;++i){auto c=op.color(i);if(!c.texture)continue;if(c.load==1 && !c.texture->isDefined(c.level))throw std::runtime_error("load undefined attachment["+std::to_string(i)+"]");
       c.texture->setDefined(c.level,c.store!=0);targets[i]=c.texture;levels[i]=c.level;targetViews[i]=attachmentView(c.texture,c.level);compactViews[used]=targetViews[i];memcpy(clears[used++].color.float32,c.clear,sizeof(c.clear));}
+     bool loadElided=false;
      if(!continuation){
      std::optional<Operation> passOp;
      if(passEnd>opIndex){passOp=op;for(unsigned i=0;i<op.colorCount;++i){auto c=passOp->color(i);if(!c.texture)continue;c.store=ops[passEnd].color(i).store;passOp->setColor(i,c);}}
+     if(occPlan){uint32_t aw=boundaryPerf && passEnd>opIndex?mergeAreas[opIndex].width:(op.areaWidth?op.areaWidth:op.texture->levelWidth(op.dstLevel)),ah=boundaryPerf && passEnd>opIndex?mergeAreas[opIndex].height:(op.areaHeight?op.areaHeight:op.texture->levelHeight(op.dstLevel));
+      if(occElide(ops,*occPlan,opIndex,passEnd,aw,ah)){if(!passOp)passOp=op;auto c=passOp->color(0);c.load=0;passOp->setColor(0,c);loadElided=true;++occElided;}}
      if(passQ || systemTranslationPolicy().rtShadow || systemTranslationPolicy().pipeStats){auto *t=op.texture;uint8_t tl=t->rtTarget?2:t->tiling==VK_IMAGE_TILING_LINEAR?1:0;
       uint64_t key=0xcbf29ce484222325ull;for(uint64_t x:{uint64_t(t->width),uint64_t(t->height),uint64_t(t->format),uint64_t(tl),uint64_t(t->backingBuffer && t->backingBuffer->imported),uint64_t(t->usage)})key=(key^x)*0x100000001b3ull;
       if(targetLogged.insert(key).second){
@@ -2094,7 +2253,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
        // a CLEAR or DONT_CARE load covers the whole attachment in Metal, and LOAD+STORE leaves untouched pixels as they were, so a smaller area is exact.
       uint64_t fullPixels=uint64_t(ri.renderArea.extent.width)*ri.renderArea.extent.height;bool shrunk=false;
       if(systemTranslationPolicy().renderArea && used){
-       bool allLoad=true;for(unsigned i=0;i<op.colorCount;++i){auto c=op.color(i);if(c.texture && c.load!=1)allLoad=false;}
+       bool allLoad=!loadElided;for(unsigned i=0;i<op.colorCount;++i){auto c=op.color(i);if(c.texture && c.load!=1)allLoad=false;}
        uint64_t x0=UINT64_MAX,y0=UINT64_MAX,x1=0,y1=0;
        if(allLoad)for(size_t i=opIndex;i<=passEnd;++i){const auto &r=ops[i].scissor;if(!r.extent.width || !r.extent.height || r.offset.x<0 || r.offset.y<0)continue;
         x0=std::min<uint64_t>(x0,uint64_t(r.offset.x));y0=std::min<uint64_t>(y0,uint64_t(r.offset.y));x1=std::max<uint64_t>(x1,uint64_t(r.offset.x)+r.extent.width);y1=std::max<uint64_t>(y1,uint64_t(r.offset.y)+r.extent.height);}
@@ -2107,6 +2266,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
      if(currentFrame)++currentFrame->passes;{PhaseTimer phase(SubPhase::passes);CmdBeginRenderPass(cmd,&ri,VK_SUBPASS_CONTENTS_INLINE);}
      if(drawQ && drawInfos.size()<passStampLimit){DrawInfo m{};m.begin=true;m.passW=ri.renderArea.extent.width;m.passH=ri.renderArea.extent.height;drawInfos.push_back(m);CmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,drawQ,uint32_t(drawInfos.size()));}
      }else if(currentFrame)++currentFrame->mergedDraws;
+     if(!culledOp){
      auto pipeline=topologyPipeline(op.pipeline,op.topology);
      if(pipeline!=boundPipeline){CmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline);boundPipeline=pipeline;}
      if(currentFrame)++currentFrame->draws;++cur.draws;
@@ -2175,6 +2335,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
      for(unsigned i=0;i<draw.vertexCount;++i){auto b=op.buffers[0][draw.vertexSlots[i]].buffer;VkDeviceSize offset=draw.vertexOffsets[i];CmdBindVertexBuffers(cmd,draw.vertexBindings[i],1,&b->buffer,&offset);}
      if(draw.indexed){CmdBindIndexBuffer(cmd,op.indices->buffer,draw.indexOffset,op.indexWidth==2?VK_INDEX_TYPE_UINT16:VK_INDEX_TYPE_UINT32);CmdDrawIndexed(cmd,draw.count,1,draw.first,0,0);}else CmdDraw(cmd,draw.count,1,draw.first,0);}
      if(drawQ && drawInfos.size()<passStampLimit){drawInfos.push_back(di);CmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,drawQ,uint32_t(drawInfos.size()));}
+     }
      if(opIndex==passEnd){PhaseTimer phase(SubPhase::passes);CmdEndRenderPass(cmd);}
     } else if(op.texture && op.clearOnly && ((op.areaWidth && op.areaWidth!=op.texture->levelWidth(op.dstLevel)) || (op.areaHeight && op.areaHeight!=op.texture->levelHeight(op.dstLevel)))) {
      // Empty partial passes still execute Metal load/store over the chosen area.
