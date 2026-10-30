@@ -1,0 +1,87 @@
+{
+  "IOBufferMemoryDescriptor.iig": {
+    "source_sha256": "688feb80ce5f2438a7f2789ecf10544aa9c107d2d17fd21ee759ee90191e5983",
+    "header_sha256": "f94c44c193e2848a7a60cfb243416edce67f01db73dba26fbfc06371e07701db",
+    "impl_sha256": "a14c4d43c184983e4183bb4d4f16b7d4d88bbb0a28e164807e6f8b9a23e8c06e"
+  },
+  "IODMACommand.iig": {
+    "source_sha256": "0f0e3e01d07ef058e4e97226b0657d1acb36ce74ec9e31b34c2b6dbee05fdaf1",
+    "header_sha256": "c804b3b30a13918511955dc205ad585cda8a118dd2aefbd740c381450d2df54a",
+    "impl_sha256": "2351c21daca4610f63d49fe54b6ea91a7644644f0bcb92f52b98eea268241811"
+  },
+  "IODataQueueDispatchSource.iig": {
+    "source_sha256": "0d1479c4843867a12ac84494624f8ef5dcd06ffa4482165b55425cb6e31ba701",
+    "header_sha256": "f84db5be8cbf03eedce846f4b7e10a1744e58e8c3ef4659ebc8690af37551395",
+    "impl_sha256": "2bef90bde88317f889ab3478dca484cc715608b36fb04837075048bec088a7d3"
+  },
+  "IODispatchQueue.iig": {
+    "source_sha256": "c117da6edd587b9bd43fe65ddf1c21a7bb3db40ef5d6ce96f767c4dcd5df271a",
+    "header_sha256": "298474017874d3ce1765fda41cd2f17a9a0c61ecb3ba5b5206447647687c5d5f",
+    "impl_sha256": "80e4b8d869ec9fd0af8dda43cca8c0cb0ee17c911e2d2db284c8984fc6a1aa1d"
+  },
+  "IODispatchSource.iig": {
+    "source_sha256": "b8e7c08fc4817e4e124bcf85cfd0fe6c53486037850582cdd385462a9fda31f0",
+    "header_sha256": "d86775bc417d5b74c7f75042a6e83ae41c936efa758e66d50d76dc871cdc15ad",
+    "impl_sha256": "162e168307f38c61c6a3eac2df46237e38aabc61d5c71c1587053cdeed0752cb"
+  },
+  "IOEventLink.iig": {
+    "source_sha256": "972a0b8a6675155cbd03fca24f39a1a0a0a15a4bc8499e9c184329dbe518507d",
+    "header_sha256": "01d1b3eb769540155765bbcbb02079903245622b0fed22700d2faeec3cda5183",
+    "impl_sha256": "af4deff16d35da9e5caac9b494cffac550f7ca91ee2d9bae8a98e03ebf82ef56"
+  },
+  "IOInterruptDispatchSource.iig": {
+    "source_sha256": "fa110ff11ff90c6d0639d11101631510283440976bf76d84cc76fcfed238f9a8",
+    "header_sha256": "32f5b3d8be2ef1f5ee9a7f48a0cba9e800ab7a58a9ee2565b300f7c24531a01f",
+    "impl_sha256": "d5f8cba42cb5a45c09c9bedd7834de7cae3a81c100ba9adae96b606caa51e581"
+  },
+  "IOMemoryDescriptor.iig": {
+    "source_sha256": "4ed4ed39fcfa89f9ff70b7a7a7889f457cd9cf98054d2a0cf54e0c8446bd3fdd",
+    "header_sha256": "6d87c158c7b76bd4141c929a34e9f35134428c29472ba67c6bee862a5b5495b1",
+    "impl_sha256": "cb4dbfb347ae8d15f39165b091dc8d5d9254f6dcfaba93a45ada1ec773d89050"
+  },
+  "IOMemoryMap.iig": {
+    "source_sha256": "335655b5e7d7b160cc9be9494279911a89ce73f9d35257381815caddad98a6fc",
+    "header_sha256": "911177c8c7f526e327dd887f319840616e36af773676c31a0288a19d4f284701",
+    "impl_sha256": "44bd983386bcfcb40a3f7196552bc0fed2ea5032dab54be5f4ea1265e2bdbf20"
+  },
+  "IOService.iig": {
+    "source_sha256": "d8756d78a1be18561e999949e9508a4f5ed700b99359d4efe3cd88fe1470f621",
+    "header_sha256": "06e993982da992aede4522c7f6efd5bb642b7f73259ed7ef5ce60eaec97647c3",
+    "impl_sha256": "477a5838fcd25ff1a22a5f741ccd64bae4b674a32a6eaa2b17e11bb6086a83c1"
+  },
+  "IOServiceNotificationDispatchSource.iig": {
+    "source_sha256": "d4d443fb1b75a26c2e2d6da92d875d5317dff5759d94e18dac065a2a84eae643",
+    "header_sha256": "c5b472d0baa8b07f819aa734100e94888aec2a9c2031d2543e4107d71ad18727",
+    "impl_sha256": "0547933aa762cd3ce020c5c43963c5518ca6513ecfb0b3b5241a6074dc69280e"
+  },
+  "IOServiceStateNotificationDispatchSource.iig": {
+    "source_sha256": "6bff4922ed765ea3fb11ec742d86e1ee220b715254a37551729628684cb78163",
+    "header_sha256": "674cd650178af900d274065e3f8b0290e1f2d2b89a519b527d4235d1a1705463",
+    "impl_sha256": "fe7dfae9d192cb8c889bc2b1c0bd3563ccaad9fdf7f51262cf07b793d918099c"
+  },
+  "IOUserClient.iig": {
+    "source_sha256": "313e814c5203bcb7c7390e87ae00845d45765039204ff628be9c98a3f6ee5a7f",
+    "header_sha256": "1eaf8c0193d1afbad122a364fbd8b59c0f700e5479f44b09c6000256fa8a9eac",
+    "impl_sha256": "23782308a084e27b259c2b7f44bbc7a01e6846747ed30d6eb0b9191735861e18"
+  },
+  "IOUserServer.iig": {
+    "source_sha256": "94e6842addf0097f46a9deb8810b5642d90a0afb0d790e00a208f26c16b8df04",
+    "header_sha256": "82724343555ba818aa235f45af1327eb1e5ffc5334decc7f26637e774ffef04b",
+    "impl_sha256": "91627dc11f9601da392084235b9da1cb3f423d2519fa78ef2f1308c0ee055d7c"
+  },
+  "IOWorkGroup.iig": {
+    "source_sha256": "afe77e23460b87de542227172f528774f82911bbdd5eb10da8443d50ad849e77",
+    "header_sha256": "8aa44276089a7d10c439076bc748c92f5382c580d71054c25dc3099044d2c2c7",
+    "impl_sha256": "c6a4520be1dce3436ffe24dfafe8f507e11e73910d87a5b5407056e31c29c4b3"
+  },
+  "OSAction.iig": {
+    "source_sha256": "d1f61a6e9db58d34a3a77880e6262d92e514968d4b1f60be736fe830b90f4f2e",
+    "header_sha256": "3f5397b49d7b5ea6ed1954d09e588cc58a8a8c6adf586a6e3b888bcc7f7f4f83",
+    "impl_sha256": "1280e478ec11e68a8c7ddf3550bd97ac03cbfd699ccb21260b6b593b6d50426b"
+  },
+  "OSObject.iig": {
+    "source_sha256": "2e7f15edaf527123f7366980f838e8c368f16cd0f2478cc6ef3f4d105f3678d3",
+    "header_sha256": "9b3913d3b77fdc225cbf740153e541e5963f7e2242ad9689b075d78697b0b4db",
+    "impl_sha256": "f00c5ba0ebc075c1a5a4e88697b0191af87e47418500335d993ea7112ccf1185"
+  }
+}
