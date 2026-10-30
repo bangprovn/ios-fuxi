@@ -13,6 +13,8 @@ Caches: deps/ci-downloads/; isolated build directories: deps/ci-work-TARGET/
 Requires a Mac with preinstalled Xcode 15.4 (kernel) or a selected full Xcode
 (userspace), Homebrew (prefix only; nothing is brew-installed), and rustup (metal). Kernel setup may install its KDK.
 --dry-run validates arguments and prints the plan on Linux without side effects.
+FUXI_IIG_MODE (kernel): xcode (default; Xcode 15 iig), capture (Xcode 15 iig, also
+emit iig-pregen/), replay (any Xcode; replay FUXI_IIG_CACHE or xnu/iig-pregen/).
 HELP
 }
 die() { echo "fuxi-ci: $*" >&2; exit 2; }
@@ -44,8 +46,11 @@ if [[ $# == 1 && $1 == --dry-run ]]; then dry=true; shift; fi
 [[ $# == 0 ]] || die 'unexpected arguments'
 # shellcheck source=tools/ci/pins.env
 source "$root/tools/ci/pins.env"
+iig_mode=${FUXI_IIG_MODE:-xcode}
+case "$iig_mode" in xcode|capture|replay) ;; *) die "unknown FUXI_IIG_MODE: $iig_mode" ;; esac
 if $dry; then
     printf 'target=%s\nartifact=fuxi-%s\noutput=tools/out/ci/%s\n' "$target" "$target" "$target"
+    [[ $target != kernel-* ]] || printf 'iig=%s cache=%s\n' "$iig_mode" "${FUXI_IIG_CACHE:-xnu/iig-pregen}"
     printf 'pins: dxb=%s mesa=%s metal2vulkan=%s rust=%s\n' "$DXB_SHA" "$MESA_SHA" "$M2V_SHA" "$RUST_VERSION"
     echo 'No downloads, builds, signing or packing in dry-run mode.'
     exit 0
@@ -176,8 +181,20 @@ setup() {
     xcodebuild -version
     xcrun --sdk iphoneos --show-sdk-path
     if [[ $target == kernel-* ]]; then
-        [[ $(xcodebuild -version | head -1) == 'Xcode 15.'* ]] || die 'XNU requires Xcode 15 iig'
-        xcrun --find iig
+        echo "IIG mode: $iig_mode"
+        if [[ $iig_mode == replay ]]; then
+            # Newer iig emits an IORPC ABI XNU 8796 lacks: never run it, replay
+            # hash-checked outputs of Xcode 15 iig from the same .iig inputs.
+            iig_cache=$(cd "${FUXI_IIG_CACHE:-$root/xnu/iig-pregen}" && pwd) || die 'replay needs FUXI_IIG_CACHE or xnu/iig-pregen'
+            [[ -f $iig_cache/manifest.json ]] || die "no IIG manifest in $iig_cache"
+            export IIG=$root/tools/xnu-iig-cache.py XNU_IIG_CACHE=$iig_cache
+            [[ -x $IIG ]] || die 'IIG replay script is not executable'
+            echo "IIG replay cache: $iig_cache"
+            (cd "$iig_cache" && shasum -a 256 manifest.json)
+        else
+            [[ $(xcodebuild -version | head -1) == 'Xcode 15.'* ]] || die 'XNU requires Xcode 15 iig (or FUXI_IIG_MODE=replay)'
+            xcrun --find iig
+        fi
         # The pinned builder tests xcodes even with Xcode preinstalled. Its
         # clean PATH includes this Homebrew prefix; no authentication needed.
         if ! command -v xcodes >/dev/null; then
@@ -189,6 +206,7 @@ setup() {
 
 kernel() {
     local dxb=$work/dxb variant=${target#kernel-}
+    python3 tools/test-fuxi-iig-cache.py
     python3 tools/test-fuxi-backlight.py
     python3 tools/test-fuxi-prof.py
     python3 tools/test-fuxi-regtrace.py
@@ -234,6 +252,16 @@ kernel() {
     # MakeInc.kernel installs the raw linked kernel into SYMROOT *without* an
     # .unstripped suffix; give it the local packer's conventional output name.
     cp "$dxb/build/xnu.sym/kernel.development.fuxi" "$out/kernel.development.fuxi.unstripped"
+    if [[ $iig_mode != xcode ]]; then
+        # XNU-derived (APSL) generated source only: what every build directory
+        # compiled, deduplicated and checked against this build's .iig inputs.
+        python3 tools/xnu-iig-cache.py --prepare "$dxb/xnu" "$dxb/build" "$out/iig-pregen"
+        python3 tools/xnu-iig-cache.py --verify "$dxb/xnu" "$out/iig-pregen"
+        if [[ $iig_mode == replay ]]; then
+            cmp "$XNU_IIG_CACHE/manifest.json" "$out/iig-pregen/manifest.json" || die 'replayed IIG outputs differ from the cache'
+        fi
+        (cd "$out/iig-pregen" && shasum -a 256 manifest.json)
+    fi
     python3 tools/ci/kernel-inputs.py --variant "$variant" --out "$out"
 }
 

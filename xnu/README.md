@@ -25,7 +25,7 @@ glslang) from checksum-pinned sources in `tools/ci/pins.env` (macOS 14 has no
 Homebrew bottles any more, so nothing is brew-installed), requires a full preinstalled Xcode, and uses ignored `deps/` and
 `tools/out/` directories. Existing target work/output directories must be moved
 aside before another build. `--dry-run` and `--plan` work on Linux without
-downloading anything. Kernel builds require Xcode 15.x; set `DEVELOPER_DIR` for
+downloading anything. Kernel builds require Xcode 15.x unless `FUXI_IIG_MODE=replay`; set `DEVELOPER_DIR` for
 another installed Xcode 15 location. The workflow explicitly selects Xcode 15.4
 on `macos-14`, preserving XNU 8796's compatible **iig**. Xcode 16 iig emits an
 incompatible IORPC ABI. This uses the pinned blacktop builder
@@ -33,13 +33,66 @@ incompatible IORPC ABI. This uses the pinned blacktop builder
 `DEVELOPMENT ARM64 FUXI`, and KDK 13.5 / 22G74 (installed on the runner when
 absent). The shared staging scripts are adapted for FUXI, firehose includes
 plain arm64, and failure to apply any repository patch fails the build.
-The native local builder's IIG cache is unnecessary with this Xcode 15 setup.
+The default needs no IIG cache; the replay mode below uses the same tool as
+the native local builder (`tools/xnu-iig-cache.py`).
 
-**Runner lifetime:** GitHub lists macos-14 as fully unsupported from
-November 2, 2026. This restores the previously working environment while that
-image is available; a later migration needs an explicit compatible iig plan,
-rather than silently changing the runner to macos-latest.
-See [the runner image inventory](https://github.com/actions/runner-images/blob/main/images/macos/macos-14-Readme.md).
+### Runner migration: iig pregen (macos-14 is unsupported from 2026-11-02)
+
+Facts (runner-image READMEs, 2026-10-30): macos-14 ships Xcode 15.0.1-15.4 and
+16.1/16.2; **macos-15 ships only Xcode 16.0-16.4 and 26.0.1-26.3; macos-26 only
+26.x**. No supported image keeps Xcode 15, Apple's downloads need an Apple ID
+(so `xcodes` cannot fetch it in CI), and caching an Xcode/iig binary would put an
+Apple tool into CI storage. Only `iig` is version-bound: it turns XNU's 17
+`iokit/DriverKit/*.iig` inputs into `*.h` + `*.iig.cpp`, and Xcode 16+ iig
+(DriverKit-4xx) emits a newer IORPC layout (`IORPC.kernelContent`) than XNU 8796
+expects. Newer clang/ld already compile 8796 with `xnu/patches` (the native
+builder builds it with Xcode 27.1 plus IIG replay; a hosted Xcode 16 build is
+still to be proven by the runs below).
+
+The workflow therefore has opt-in inputs; defaults keep the existing path:
+
+| Input | Default | Meaning |
+| --- | --- | --- |
+| `runner` | `macos-14` | `macos-14`, `macos-15` or `macos-26` |
+| `xcode` | `15.4` | `DEVELOPER_DIR=/Applications/Xcode_<xcode>.app`; a missing Xcode fails the job before building |
+| `iig_mode` | `xcode` | `xcode`: run Xcode 15 iig (fails on any other Xcode). `capture`: the same, then archive the iig outputs. `replay`: never run iig; install pregenerated outputs (any Xcode) |
+| `iig_run` | empty | replay source: a capture run's ID (`fuxi-iig-pregen-*` artifacts, kept 90 days); empty means a committed `xnu/iig-pregen/` |
+
+`capture`/`replay` add `iig-pregen/` (17 header/implementation pairs plus
+`manifest.json` with SHA-256 of each `.iig` input and output) to the kernel
+artifact, plus a separate `fuxi-iig-pregen-<target>` artifact. `--prepare`
+collects the outputs from every build directory and refuses differing copies;
+`--verify` requires the cache to cover exactly this tree's `.iig` inputs with
+matching hashes. During replay, make's `$(IIG)` is the replay script, which
+refuses an edited, new or unknown `.iig` and any output whose hash differs;
+after the build the outputs are re-collected and their manifest must equal the
+cache's byte for byte. Patches never touch `iokit/DriverKit`; if one ever does,
+regenerate on an Xcode 15 host (none remains hosted) rather than editing outputs.
+`python3 tools/test-fuxi-iig-cache.py` covers these refusals on synthetic input.
+
+Licence: the outputs are mechanical expansions of XNU's APSL-2.0 `.iig` files
+and reproduce their APSL notices verbatim; they contain no tool binary, SDK
+header or Apple data beyond the APSL source. APSL 2.0 section 2.1 permits
+redistributing such covered source with its notices and a copy of the licence,
+so committing them under `xnu/iig-pregen/` (with the APSL text) is licence-
+compatible. They are **not committed** here because this repository keeps Apple
+source out of git; the 90-day artifact is the default store. Committing them,
+or attaching the capture artifact to a release, is the owner's call.
+
+Validation order (all on the same commit; macos-14 steps must finish before
+2026-11-02):
+
+1. `runner=macos-14 xcode=15.4 iig_mode=capture`: reference kernel K1 and the pregen.
+2. `runner=macos-14 xcode=15.4 iig_mode=replay iig_run=<run 1>`: K2 must be
+   byte-identical to K1 (proves replay changes nothing).
+3. `runner=macos-14 xcode=16.2 iig_mode=replay iig_run=<run 1>`: Xcode 16 clang/ld K3
+   (expected to differ from K1; must build).
+4. `runner=macos-15 xcode=16.2 iig_mode=replay iig_run=<run 1>`: K4 must be
+   byte-identical to K3 (Xcode 16.2 16C5032a is on both images).
+
+Then boot K3/K4 before switching the defaults to `macos-15`/`16.2`/`replay`.
+The userspace targets (`metal`, `mesa`, `tools`) are independent of iig but
+have only been built with Xcode 15.4 here; check them separately on the new runner.
 
 | Artifact | Contents in addition to `SHA256SUMS` and `logs/build.log` | Estimated cold runtime |
 | --- | --- | --- |

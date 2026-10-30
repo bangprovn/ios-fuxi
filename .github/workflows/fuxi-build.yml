@@ -24,6 +24,24 @@ on:
         description: Signed Vulkan probe/smoke and GPU ABI test
         type: boolean
         default: false
+      runner:
+        description: Hosted macOS image (macos-14 is unsupported from 2026-11-02)
+        type: choice
+        options: [macos-14, macos-15, macos-26]
+        default: macos-14
+      xcode:
+        description: Preinstalled Xcode version (/Applications/Xcode_VERSION.app); 15.x only on macos-14
+        type: string
+        default: '15.4'
+      iig_mode:
+        description: Kernel iig - xcode (Xcode 15 iig), capture (also archive iig-pregen), replay (pregenerated outputs, any Xcode)
+        type: choice
+        options: [xcode, capture, replay]
+        default: xcode
+      iig_run:
+        description: replay - ID of a capture run with fuxi-iig-pregen-* artifacts (empty uses committed xnu/iig-pregen/)
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -52,15 +70,21 @@ jobs:
     needs: plan
     name: ${{ matrix.target }}
     # Xcode 15 iig matches XNU 8796's IORPC ABI; never silently use Xcode 16.
-    # macos-14 retirement is tracked in xnu/README.md.
-    runs-on: macos-14
+    # Newer runners need iig_mode=replay; see xnu/README.md (macos-14 retirement).
+    runs-on: ${{ inputs.runner }}
+    permissions:
+      contents: read
+      actions: read
     timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     env:
       TARGET: ${{ matrix.target }}
-      DEVELOPER_DIR: /Applications/Xcode_15.4.app/Contents/Developer
+      DEVELOPER_DIR: /Applications/Xcode_${{ inputs.xcode }}.app/Contents/Developer
+      FUXI_IIG_MODE: ${{ inputs.iig_mode }}
+      XCODE_VERSION: ${{ inputs.xcode }}
+      IIG_RUN: ${{ inputs.iig_run }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -77,6 +101,28 @@ jobs:
           path: |
             ~/.cargo/registry
           key: fuxi-cargo-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/ci/pins.env', 'tools/fuxi-metal2vulkan-bridge.rs', 'tools/build-fuxi-metal-translator.sh', 'tools/build-fuxi-nativemetal.py', 'tools/patches/nativemetal-fuxi-*.patch', 'tools/patches/metal2vulkan-adrenometal-*.patch') }}
+      - name: Select Xcode (fails loudly when absent)
+        run: |
+          ls -d /Applications/Xcode*.app
+          [[ -d $DEVELOPER_DIR ]] || { echo "::error::Xcode $XCODE_VERSION is not installed on $ImageOS"; exit 1; }
+          [[ -z $IIG_RUN || $FUXI_IIG_MODE == replay ]] || { echo '::error::iig_run needs iig_mode=replay'; exit 1; }
+          [[ $TARGET != kernel-* || $FUXI_IIG_MODE == replay || $(xcodebuild -version | head -1) == 'Xcode 15.'* ]] ||
+            { echo "::error::kernel iig_mode=$FUXI_IIG_MODE needs Xcode 15; use iig_mode=replay"; exit 1; }
+      # Only XNU-derived iig outputs (APSL source text, hash manifest); no tool binaries.
+      - uses: actions/download-artifact@v4
+        if: startsWith(matrix.target, 'kernel-') && inputs.iig_mode == 'replay' && inputs.iig_run != ''
+        with:
+          pattern: fuxi-iig-pregen-*
+          path: deps/iig-pregen-download
+          run-id: ${{ inputs.iig_run }}
+          github-token: ${{ github.token }}
+      - name: Choose pregenerated iig outputs
+        if: startsWith(matrix.target, 'kernel-') && inputs.iig_mode == 'replay' && inputs.iig_run != ''
+        run: |
+          set -- deps/iig-pregen-download/*/
+          [[ -f $1/manifest.json ]] || { echo "::error::run $IIG_RUN has no fuxi-iig-pregen-* artifact"; exit 1; }
+          for d; do diff -r "$1" "$d"; done
+          echo "FUXI_IIG_CACHE=$PWD/$1" >> "$GITHUB_ENV"
       - name: Build selected target (no boot-image packing)
         run: bash tools/ci/build.sh "$TARGET"
       - name: Upload target outputs and logs
@@ -87,3 +133,10 @@ jobs:
           path: tools/out/ci/${{ matrix.target }}/
           if-no-files-found: error
           retention-days: 7
+      - uses: actions/upload-artifact@v4
+        if: startsWith(matrix.target, 'kernel-') && inputs.iig_mode != 'xcode'
+        with:
+          name: fuxi-iig-pregen-${{ matrix.target }}
+          path: tools/out/ci/${{ matrix.target }}/iig-pregen/
+          if-no-files-found: error
+          retention-days: 90
