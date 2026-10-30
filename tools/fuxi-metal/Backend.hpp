@@ -334,6 +334,8 @@ public:
  // CPU cost of submit(): entry to QueueSubmit (incl. the lock), the fence wait, and retirement.
  static inline std::atomic<uint64_t> submits{0},submitPrepareNanos{0},submitWaitNanos{0},submitRetireNanos{0},submitSlotWaitNanos{0},submitBlocked{0},submitBlockedFull{0},submitBlockedDrain{0},submitBlockedConflict{0},submitEntered{0};
  static inline std::atomic<uint64_t> submitObjectsNanos{0},submitDescriptorsNanos{0},submitRecordNanos{0},shadowCopyNanos{0},submitFlushNanos{0},submitInvalidateNanos{0};
+ // Async retirement: backend mutex wait after the fence (the next encode holds it), and FUXI_MTL_EARLY_RELEASE's fenced hook.
+ static inline std::atomic<uint64_t> retireLockCount{0},retireLockNanos{0},retireLockMax{0},retireLockOver1ms{0},earlyReleases{0},earlyReleaseNanos{0},earlyRefused{0},retireWindow{0};
  static inline std::atomic<uint64_t> flushCalls{0},invalidateCalls{0},emptySubmits{0},submitObjectCreates{0},submitPoolCreates{0},submitFrameCreates{0},submitViewCreates{0};
  std::map<std::array<uint64_t,7>,Texture *> imports;
  struct ReuseCounts {uint64_t commandPools{},commandBuffers{},fences{},queries{},descriptors{},frames{},views{};} reuseCounts;
@@ -1478,6 +1480,13 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
   {std::string why;{std::lock_guard<std::mutex> g(occMutex);std::vector<std::pair<uint64_t,std::string>> v;for(auto &e:occWhy)v.push_back({e.second,e.first});std::sort(v.rbegin(),v.rend());for(size_t i=0;i<v.size() && i<10;++i)why+=" "+v[i].second+"="+std::to_string(v[i].first);}
    fprintf(stderr,"FUXI MTL: occlude submits=%llu victims=%llu cover_tries=%llu cover_ok=%llu culled=%llu culled_kpx=%llu culled_est_ms=%.3f unpriced=%llu loads_elided=%llu eval_ms=%.3f eval_cache_hits=%llu min_px=%u skipped_submits=%llu why:%s\n",(unsigned long long)occSubmits,(unsigned long long)occVictims,(unsigned long long)occCoverTries,(unsigned long long)occCoverOk,(unsigned long long)occCulled,(unsigned long long)occCulledKpx,double(occEstNs)/1e6,(unsigned long long)occUnpriced,(unsigned long long)occElided,double(occEvalNs)/1e6,(unsigned long long)occEvalHits,systemTranslationPolicy().occludeMinPx,(unsigned long long)occSkipped,why.c_str());}
  }
+ // Caller holds mutex. One line per 600 async retirements; the window counters restart after it.
+ static void noteRetireLock(uint64_t ns,bool early) {
+  ++retireLockCount;retireLockNanos+=ns;if(ns>retireLockMax)retireLockMax=ns;if(ns>1000000)++retireLockOver1ms;
+  if(++retireWindow<600)return;uint64_t n=retireLockCount,e=earlyReleases;
+  fprintf(stderr,"FUXI MTL: retire lock retirements=%llu wait_ms avg=%.3f max=%.3f over_1ms=%llu early_release=%d early=%llu refused=%llu release_ms avg=%.3f\n",(unsigned long long)n,n?double(retireLockNanos)/n/1e6:0.0,double(retireLockMax)/1e6,(unsigned long long)retireLockOver1ms.load(),int(early),(unsigned long long)e,(unsigned long long)earlyRefused.load(),e?double(earlyReleaseNanos)/e/1e6:0.0);
+  retireWindow=0;retireLockCount=0;retireLockNanos=0;retireLockMax=0;retireLockOver1ms=0;earlyReleases=0;earlyReleaseNanos=0;earlyRefused=0;
+ }
  void reportRtCounters() {
   {uint64_t n=submitEntered,s=submits;if(n && s)fprintf(stderr,"FUXI MTL: submit pipeline submits=%llu encode_ms=%.3f slot_wait_ms=%.3f blocked_pct=%.1f blocked_full=%llu blocked_drain=%llu blocked_conflict=%llu gpu_latency_ms=%.3f retire_host_ms=%.3f (per submit; encode includes slot waits; gpu_latency is queue submit to fence)\n",(unsigned long long)n,submitPrepareNanos/1e6/n,submitSlotWaitNanos/1e6/n,100.0*submitBlocked/n,(unsigned long long)submitBlockedFull,(unsigned long long)submitBlockedDrain,(unsigned long long)submitBlockedConflict,submitWaitNanos/1e6/s,submitRetireNanos/1e6/s);}
   if(systemTranslationPolicy().occlude)reportOcclude();
@@ -1708,7 +1717,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
   for(auto gi:order)for(size_t i=groups[gi].first;i<=groups[gi].last;++i)sorted.push_back(ops[i]);
   ops.swap(sorted);if(currentFrame)currentFrame->passReorders+=hops;
  }
- void submit(std::vector<Operation> ops,const std::function<void()> &scheduled={},std::function<void()> *retirement=nullptr,const std::function<void()> &prepare={},const std::vector<PrepareWrite> *prepareWrites=nullptr) {
+ void submit(std::vector<Operation> ops,const std::function<void()> &scheduled={},std::function<void()> *retirement=nullptr,const std::function<void()> &prepare={},const std::vector<PrepareWrite> *prepareWrites=nullptr,const std::function<void()> &fenced={}) {
   struct InSubmit {bool &f;explicit InSubmit(bool &x):f(x){f=true;}~InSubmit(){f=false;}} inSubmitScope(inSubmit);
   PhaseTimer submitPhase(SubPhase::other);
   auto submitStart=std::chrono::steady_clock::now();auto submitQueued=submitStart;
@@ -2564,7 +2573,9 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
    for(const auto &op:ops){if(op.pipeline && std::find(pinnedPipelines.begin(),pinnedPipelines.end(),op.pipeline)==pinnedPipelines.end())pinnedPipelines.push_back(op.pipeline);
     auto add=[&](Sampler *s){if(s && std::find(pinnedSamplers.begin(),pinnedSamplers.end(),s)==pinnedSamplers.end())pinnedSamplers.push_back(s);};add(op.sampler);for(auto *s:op.samplers)add(s);}
    pinPhase.reset();auto retired=std::make_shared<bool>(false);
-   std::function<void()> finish=[this,&slot,fence,timestamps,passQ,passInfos,drawQ,drawInfos,pinnedBuffers,pinnedTextures,pinnedPipelines,pinnedSamplers,sampleViews,frames,emptyRenders,aliasBuffer,neutralBuffer,submitQueued,retired] {
+   // A mapped non-coherent texture is invalidated under the mutex; its surface stays leased until then.
+   bool earlyOk=bool(fenced);for(auto *t:pinnedTextures)if(t->mapped && !coherent(t->memoryType))earlyOk=false;
+   std::function<void()> finish=[this,&slot,fence,timestamps,passQ,passInfos,drawQ,drawInfos,pinnedBuffers,pinnedTextures,pinnedPipelines,pinnedSamplers,sampleViews,frames,emptyRenders,aliasBuffer,neutralBuffer,submitQueued,retired,fenced,earlyOk] {
     // Fence waits never hold the device/recording mutex. One owner retires each ticket.
     if(*retired)return;*retired=true;
     auto waitStart=FrameClock::now();VkResult result;
@@ -2574,8 +2585,10 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
     {PhaseTimer phase(SubPhase::fence);result=WaitForFences(device,1,&fence,VK_TRUE,2000000000ULL);}
 #endif
     if(currentFrame)currentFrame->gpuWait+=frameNanos(waitStart);
+    // Signaled fence, live device: the GPU is done, so the surface leases may go before the next encode releases the mutex.
+    if(fenced){if(earlyOk && result==VK_SUCCESS && !poisoned){auto t=FrameClock::now();fenced();earlyReleaseNanos+=frameNanos(t);++earlyReleases;}else ++earlyRefused;}
     auto lockStart=FrameClock::now();std::lock_guard<std::mutex> lock(mutex);
-    if(currentFrame)currentFrame->retireLock+=frameNanos(lockStart);
+    {auto ns=frameNanos(lockStart);if(currentFrame)currentFrame->retireLock+=ns;noteRetireLock(ns,fenced!=nullptr);}
     auto releaseSlot=[&]{slot.hostUses.clear();slot.writes.clear();slot.uses.clear();slot.busy=false;submitWake.notify_all();};
     try {
      if(result!=VK_SUCCESS){poisoned=true;check(result);}

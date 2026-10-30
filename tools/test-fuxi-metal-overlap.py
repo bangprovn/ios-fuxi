@@ -40,7 +40,8 @@ def main():
         subprocess.run(common+sanitized+['-DFUXI_MTL_HOST_TEST', '-DFUXI_MTL_ICD="'+str(d/'proxy.so')+'"',
             str(ROOT/'tools/fuxi-metal/OverlapTests.cpp'), '-ldl', '-pthread', '-o', str(d/'overlap')], check=True)
         for extra in ({}, {'LOST': '1'}, {'TIMEOUT': '1'}, {'NONCOHERENT': '1'}):
-            p = subprocess.run([str(d/'overlap')]+(['host' if 'NONCOHERENT' in extra else 'fault'] if extra else []), env=dict(env, SOFTWARE_ICD=str(a.icd), **extra), text=True, capture_output=True, timeout=60)
+            # Dedicated allocations: the pin test counts memory objects (slabs would keep them).
+            p = subprocess.run([str(d/'overlap')]+(['host' if 'NONCOHERENT' in extra else 'fault'] if extra else []), env=dict(env, SOFTWARE_ICD=str(a.icd), FUXI_MTL_TEST_BOOTARGS='fuxigpuframetrace=1 fuxigpunoslab=1', **extra), text=True, capture_output=True, timeout=60)
             assert p.returncode == 0, p.stderr
             assert 'AddressSanitizer' not in p.stderr and 'runtime error:' not in p.stderr, p.stderr
             print(p.stdout, end='')
