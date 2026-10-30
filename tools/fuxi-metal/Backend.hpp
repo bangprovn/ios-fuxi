@@ -53,6 +53,7 @@
 #include "ArtifactCache.hpp"
 #include "SpirvRelax.hpp"
 #include "SpirvUnroll.hpp"
+#include "SpirvHalfRound.hpp"
 #include "SpirvLoops.hpp"
 #include "SpirvEval.hpp"
 #include "OcclusionProof.hpp"
@@ -1129,9 +1130,10 @@ public:
   auto cleanup=[&]{for(auto m:modules)if(m)DestroyShaderModule(device,m,nullptr);};
   try {
    const uint32_t *words[]={translated.vertex,translated.fragment};size_t counts[]={translated.vertexCount,translated.fragmentCount};
-   std::vector<uint32_t> relaxedFragment,unrolledFragment;UnrollStats unrollStats{};
+   std::vector<uint32_t> relaxedFragment,unrolledFragment,halfFragment;UnrollStats unrollStats{};HalfRoundStats halfStats{};const bool halfLossy=halfRoundLossy(systemTranslationPolicy(),p->fragHash);bool halfDone=false;
    for(unsigned i=0;i<2;++i) {
     if(!words[i] || counts[i]<5 || counts[i]>1024*1024 || words[i][0]!=0x07230203)throw std::runtime_error("invalid translator SPIR-V");
+    if(i==1 && systemTranslationPolicy().halfRound && simplifyHalfRounding(words[i],counts[i],halfFragment,halfStats,systemTranslationPolicy().halfRound,halfLossy)){words[i]=halfFragment.data();counts[i]=halfFragment.size();halfDone=true;} // FUXI_MTL_HALF_ROUND
     if(i==1 && systemTranslationPolicy().fragRelaxed){unsigned marked=0,quantized=0; // FUXI_MTL_FRAG_RELAXED: f16-quantized chains may run in half precision ALUs
      if(relaxQuantizedChains(words[i],counts[i],relaxedFragment,marked,quantized)){words[i]=relaxedFragment.data();counts[i]=relaxedFragment.size();++relaxedPipelines;relaxedMarks+=marked;}
      static std::atomic<unsigned> lines{0};if(lines.fetch_add(1)<20 || lines.load()%50==0)fprintf(stderr,"FUXI MTL: frag relaxed pipe=%06x quantize_sites=%u marked=%u words=%zu->%zu pipelines=%llu total_marked=%llu\n",p->id,quantized,marked,size_t(translated.fragmentCount),counts[i],(unsigned long long)relaxedPipelines,(unsigned long long)relaxedMarks);}
@@ -1193,6 +1195,10 @@ public:
    if(rc==VK_SUCCESS && systemTranslationPolicy().frameTrace)++frameCounts.pipelines;
    if(systemTranslationPolicy().spirvUnroll && topology==Topology::Triangle && !nofetch && (unrollStats.flipped || unrollStats.keptSampling)){p->unrolled=unrollStats.flipped+unrollStats.nested;unrolledPipelines+=unrollStats.flipped?1:0;unrolledLoops+=unrollStats.flipped+unrollStats.nested;
     static std::atomic<unsigned> lines{0};if(lines.fetch_add(1)<200 || lines.load()%50==0)fprintf(stderr,"FUXI MTL: spirv unroll pipe=%06x fh=%08x mode=%u loops=%u dont_unroll=%u flipped=%u nested=%u kept_sampling=%u create_ms=%.2f rc=%d pipelines=%llu loops_total=%llu\n",p->id,p->fragHash,systemTranslationPolicy().spirvUnroll,unrollStats.loops,unrollStats.dontUnroll,unrollStats.flipped,unrollStats.nested,unrollStats.keptSampling,std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-createStart).count(),int(rc),(unsigned long long)unrolledPipelines.load(),(unsigned long long)unrolledLoops.load());}
+   if(systemTranslationPolicy().halfRound && topology==Topology::Triangle && !nofetch && halfStats.quantize){if(halfDone){++halfPipelines;halfSites+=halfStats.exact+halfStats.exactBare+halfStats.flushed+halfStats.dropped+halfStats.droppedBare;}
+    static std::atomic<unsigned> lines{0};if(lines.fetch_add(1)<200 || lines.load()%50==0)fprintf(stderr,"FUXI MTL: half round pipe=%06x fh=%08x mode=%u lossy=%d quantize=%u idioms=%u->%u quantize_live=%u->%u bare=%u exact=%u exact_bare=%u flushed=%u dropped=%u dropped_bare=%u words=%zu->%zu create_ms=%.2f rc=%d pipelines=%llu sites_total=%llu\n",
+     p->id,p->fragHash,systemTranslationPolicy().halfRound,int(halfLossy),halfStats.quantize,halfStats.idioms,halfStats.afterIdioms(),halfStats.quantize,halfStats.afterQuantize(),halfStats.bare,halfStats.exact,halfStats.exactBare,halfStats.flushed,halfStats.dropped,halfStats.droppedBare,
+     size_t(translated.fragmentCount),halfDone?halfFragment.size():size_t(translated.fragmentCount),std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-createStart).count(),int(rc),(unsigned long long)halfPipelines.load(),(unsigned long long)halfSites.load());}
    if(rc!=VK_SUCCESS){if(result)DestroyPipeline(device,result,nullptr);check(rc);}
    if(systemTranslationPolicy().pipeStats && topology==Topology::Triangle)logPipelineStats(p,translated,result);
    if(cacheMode==CacheMode::persistent){
@@ -1680,7 +1686,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
  bool evictIdleSampleShadow(uint64_t idle) {auto best=sampleShadows.end();for(auto i=sampleShadows.begin();i!=sampleShadows.end();++i)if(i->second.t->references==1 && submits-i->second.used>=idle && (best==sampleShadows.end() || i->second.used<best->second.used))best=i;if(best==sampleShadows.end())return false;auto *t=best->second.t;sampleShadows.erase(best);destroyTextureUnlocked(t);++sampleShadowEvicted;return true;}
  void expireSampleShadows(uint64_t idle) {if(sampleShadows.empty())return;for(;;){bool any=false;for(auto &e:sampleShadows)if(e.second.t->references==1 && submits-e.second.used>=idle*5){any=true;break;}if(!any || !evictIdleSampleShadow(idle*5))return;}}
  void releaseSampleShadows() {auto all=std::move(sampleShadows);sampleShadows.clear();for(auto &e:all)destroyTextureUnlocked(e.second.t);}
- std::atomic<uint64_t> sampleShadowReused{0},sampleShadowCapped{0},sampleShadowEvicted{0},sampleShadowCreated{0},sampleShadowRefused{0},sampleShadowBytes{0},sampleHits{0},sampleCopies{0},sampleInvalidations{0},sampleHashedBytes{0},sampleCopiedBytes{0},sampleHashNs{0};unsigned hoistLogged=0;std::atomic<uint64_t> relaxedPipelines{0},relaxedMarks{0},unrolledPipelines{0},unrolledLoops{0};
+ std::atomic<uint64_t> sampleShadowReused{0},sampleShadowCapped{0},sampleShadowEvicted{0},sampleShadowCreated{0},sampleShadowRefused{0},sampleShadowBytes{0},sampleHits{0},sampleCopies{0},sampleInvalidations{0},sampleHashedBytes{0},sampleCopiedBytes{0},sampleHashNs{0};unsigned hoistLogged=0;std::atomic<uint64_t> relaxedPipelines{0},relaxedMarks{0},unrolledPipelines{0},unrolledLoops{0},halfPipelines{0},halfSites{0};
  void hoistOffscreen(std::vector<Operation> &ops) {
   std::vector<PassGroup> groups;if(!buildGroups(ops,groups,true))return;
   std::vector<size_t> order;order.reserve(groups.size());unsigned moved=0,offs=0;std::map<std::string,unsigned> reasons;std::map<std::string,std::string> examples;

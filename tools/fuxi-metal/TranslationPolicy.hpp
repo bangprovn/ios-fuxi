@@ -1,6 +1,7 @@
 /* Original opt-in translation policy; duplicate/malformed boot keys disable. */
 #pragma once
 #include "ClientGate.hpp"
+#include <cstdint>
 #include <cstdlib>
 namespace fuxi {
 inline bool translationOption(const char *args,const char *key,bool *present=nullptr) {
@@ -23,7 +24,7 @@ inline unsigned translationLevel(const char *args,const char *key,unsigned maxim
 }
 inline unsigned translationPerf(const char *args){return translationLevel(args,"fuxigpuperf=",7);}
 inline unsigned translationFrameTrace(const char *args){return translationLevel(args,"fuxigpuframetrace=",2);}
-struct TranslationPolicy {bool stages=false,trace=false,async=false,compileBoost=false,frameTrace=false,pipelined=false,skipSampling=false,allowFeedback=false,overlap=false,submitFast=false,gmem=false,merge=false;unsigned perf=0;bool frameCPU=false,noSlab=false,shadowRename=false,shadowHash=true,passTimes=false,renderArea=true,reorder=true,drawTimes=false,linearShadow=false,pipeStats=false,f16=false,robust=false,rtShadow=false,rtReuse=false,rtRename=false,fragRelaxed=false,sampleShadow=false,occlude=false,orderFetchOnly=false,nofetchRp=false;unsigned sampleMinPx=65536,occludeMinPx=4096;bool drawArea=false;unsigned drawAreaMinPx=1u<<20,drawAreaMargin=16,drawAreaBudgetUs=1000;bool earlyRelease=false;unsigned spirvUnroll=0;};
+struct TranslationPolicy {bool stages=false,trace=false,async=false,compileBoost=false,frameTrace=false,pipelined=false,skipSampling=false,allowFeedback=false,overlap=false,submitFast=false,gmem=false,merge=false;unsigned perf=0;bool frameCPU=false,noSlab=false,shadowRename=false,shadowHash=true,passTimes=false,renderArea=true,reorder=true,drawTimes=false,linearShadow=false,pipeStats=false,f16=false,robust=false,rtShadow=false,rtReuse=false,rtRename=false,fragRelaxed=false,sampleShadow=false,occlude=false,orderFetchOnly=false,nofetchRp=false;unsigned sampleMinPx=65536,occludeMinPx=4096;bool drawArea=false;unsigned drawAreaMinPx=1u<<20,drawAreaMargin=16,drawAreaBudgetUs=1000;bool earlyRelease=false;unsigned spirvUnroll=0,halfRound=0,halfPipeCount=0;bool halfPipesSet=false;uint32_t halfPipes[16]{};};
 inline TranslationPolicy translationPolicy(const char *args) {
  return {translationOption(args,"fuxigpustages="),translationOption(args,"fuxigputrace="),translationOption(args,"fuxigpuasync="),translationOption(args,"fuxicompileboost="),translationFrameTrace(args)!=0,translationOption(args,"fuxigpupipelined="),translationOption(args,"fuxigpuskip="),translationOption(args,"fuxigpufeedback="),translationOption(args,"fuxigpuoverlap="),translationOption(args,"fuxigpusubmit="),translationOption(args,"fuxigpugmem="),translationOption(args,"fuxigpumerge="),translationPerf(args),translationFrameTrace(args)==2};
 }
@@ -51,9 +52,17 @@ inline TranslationPolicy systemTranslationPolicy() {
    const char *v=getenv("FUXI_MTL_DRAW_AREA");p.drawArea=v && !strcmp(v,"1");num("FUXI_MTL_DRAW_AREA_MIN_PX",1,1u<<26,p.drawAreaMinPx);num("FUXI_MTL_DRAW_AREA_MARGIN",0,256,p.drawAreaMargin);num("FUXI_MTL_DRAW_AREA_BUDGET_US",0,100000,p.drawAreaBudgetUs);
    fprintf(stderr,"FUXI MTL: policy draw_area=%d draw_area_min_px=%u draw_area_margin=%u draw_area_budget_us=%u\n",int(p.drawArea),p.drawAreaMinPx,p.drawAreaMargin,p.drawAreaBudgetUs);}
   {const char *v=getenv("FUXI_MTL_EARLY_RELEASE");p.earlyRelease=v && !strcmp(v,"1");fprintf(stderr,"FUXI MTL: policy early_release=%d\n",int(p.earlyRelease));}
+  {const char *v=getenv("FUXI_MTL_HALF_ROUND");p.halfRound=v && v[0]>='1' && v[0]<='3' && !v[1]?unsigned(v[0]-'0'):0; // FUXI_MTL_HALF_ROUND_PIPES: comma-separated fh= hashes that may take a lossy mode (unset: all)
+   v=getenv("FUXI_MTL_HALF_ROUND_PIPES");char list[16*9+1]="";p.halfPipesSet=v && *v;
+   if(p.halfPipesSet)for(const char *q=v;*q && p.halfPipeCount<16;){char *end=nullptr;unsigned long h=strtoul(q,&end,16);if(end==q)break;p.halfPipes[p.halfPipeCount++]=uint32_t(h);q=end;while(*q==',' || *q==' ')++q;}
+   for(unsigned i=0;i<p.halfPipeCount;++i)snprintf(list+strlen(list),sizeof list-strlen(list),"%s%08x",i?",":"",p.halfPipes[i]);
+   fprintf(stderr,"FUXI MTL: policy half_round=%u half_round_pipes=%s%s\n",p.halfRound,p.halfPipesSet?"":"all",list);}
   {const char *v=getenv("FUXI_MTL_SPIRV_UNROLL");p.spirvUnroll=v && (!strcmp(v,"1") || !strcmp(v,"2"))?unsigned(v[0]-'0'):0;fprintf(stderr,"FUXI MTL: policy spirv_unroll=%u\n",p.spirvUnroll);}
   fprintf(stderr,"FUXI MTL: policy shadow_rename=%d source=%s\n",int(p.shadowRename),renameKey?"boot":renameEnv?"env":"none");
   return p;
  }();return policy;
 }
+// Lossy FUXI_MTL_HALF_ROUND modes (2, 3) apply to every pipeline, or with FUXI_MTL_HALF_ROUND_PIPES only to the listed fragment hashes (others get mode 1; a malformed
+// entry ends the list, so it never widens lossy to every pipeline).
+inline bool halfRoundLossy(const TranslationPolicy &p,uint32_t fragHash){if(!p.halfPipesSet)return true;for(unsigned i=0;i<p.halfPipeCount;++i)if(p.halfPipes[i]==fragHash)return true;return false;}
 }
