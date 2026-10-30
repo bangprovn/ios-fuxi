@@ -1805,14 +1805,20 @@ FG_GUARD. Every step logs a `FUXI SCANOUT: dpu stage2 ...` line.
      because they are beyond the 32-bit SRC0. Placement is up to the VM
      allocator: memory above 4 GiB cannot be requested.
 4. Install:
-   - TTBR0 = table, TCR2 = PASize from IDR2.OAS (other bits kept: S224 gives
-     0x61). Sheng uses 48-bit (5); here PASize equals the reported OAS.
+   - TTBR0 = table, TCR2 = PASize from IDR2.OAS plus SEP = 7 (UPSTREAM),
+     other bits kept. S224 gives 0x38061. Sheng uses 48-bit (5); here PASize
+     equals the reported OAS. SEP was 0 in X229 and caused its fault (see
+     below). The readback must show both PASize and SEP, or the install is
+     undone before SCTLR is touched.
    - TCR = 0x800020 (T0SZ 32, 4 KiB granule, non-cacheable walks, EPD1), MAIR0 = 0x44.
    - The values are read back, then a bank TLBIALL and TLBSYNC follow.
    - SCTLR = (old & ~CFCFG) | M|CFRE|CFIE, which is 0x61. A fault then
      terminates instead of stalling.
-   - Logged as `enabled sctlr=0xe0->0x61 ttbr0= tcr=0x800020 tcr2=0x61
+   - Logged as `enabled sctlr=0xe0->0x61 ttbr0= tcr=0x800020 tcr2=0x38061
      mair0=0x44 tlbi=bank`.
+   - Right before the first START, the bank is read back again:
+     `live sctlr= ttbr0= tcr= tcr2= sep= pasize= mair0= fsr= l1[0]= l1[2]=
+     l1[3]=`. The last three are the table entries in memory.
 5. `identity starts=60 fsr= cur= xfer_us avg= max=`: 60 STARTs on A through
    the identity block. Each one waits a period plus 2 ms, then polls (up to
    100 ms) for START clear and the write line idle, then checks FSR.
@@ -1841,7 +1847,17 @@ FG_GUARD. Every step logs a `FUXI SCANOUT: dpu stage2 ...` line.
     normal path continues (double or triple setup, copies).
 
 On a fault, an MMIO failure or a register that ignores writes, the log has
-`fault step= reason= starts= fsr= far= fsynr0=`. The undo then runs:
+`fault step= reason= starts= fsr= far= fsynr0=`. If translation was on, a
+`walk far= plvl= wnr= pnu= ind= ptwf= afr= fsynr0_hi= tcr2= sep= ... sign=
+l0[i]= l1[i]= l2[i]= l3[i]=` line follows. It holds:
+
+- the FSYNR0 fields;
+- the bit that TCR2.SEP sign-extends at, and whether FAR has it set;
+- the entries for FAR that a level-0-start walk and the T0SZ-32 level-1-start
+  walk read from the table in memory. `(not ours)` marks a descriptor that
+  points outside the table.
+
+The undo then runs:
 
 - A's geometry is rewritten (with a flush).
 - The driver waits for idle.
@@ -1881,7 +1897,16 @@ TF on a failed walk. The test proves:
   byte-identical to before, and so are the VIG0 registers.
 - Faults at identity START 6 (with SS, so RESUME), at the flip and during the
   hold are undone; the restore is exact, A is shown again and the memory is freed.
-- A bank that ignores the table is undone with no START.
+- A bank that ignores the table, or whose TCR2 drops SEP, is undone with no
+  START.
+- The walk model follows SMMUv2 AArch64 stage 1: the TCR2.SEP sign extension
+  with EPD1, the start level from T0SZ (level 1 with 2 index bits for T0SZ
+  32), the PASize limit on table addresses, and AF on leaves. A replay on the
+  first translated START checks the installed table under the X229 TCR2
+  (0x61): it faults at level 0 for 0xb8000100. Under 0x38061 it maps
+  identically through the level-1 block, and the empty window faults at level 3.
+- A real walk fault (a window level-3 entry cleared under the flip) logs FAR,
+  PLVL 3 and the entries `l1[0] l2[128] l3[20]=0`.
 - A stuck flip transfer keeps translation and memory and stops the scanout.
 - Each refusal writes nothing: translation already on, a recorded fault, the
   CBAR type, streams on two banks, a pending flush, a source that is not A,
@@ -1901,17 +1926,102 @@ Risks (none of this is observed yet):
 - A walk or terminate fault gives one garbage or black frame. CFCFG is
   cleared, so the display should not stall. That is a GUESS, but it matches
   the SMMUv2 rule.
-- Sheng i564 recorded a level-0 start for T0SZ 32, so the one-page L0-L2
-  layout is kept.
+- Sheng i564 recorded a level-0 fault for T0SZ 32, so the one-page L0-L2
+  layout is kept. It works whether the walk starts at level 0 or level 1.
+  The X229 decode below suggests that level 0 was the sign-extension fault,
+  not a level-0 start.
 - The 3 s lock hold at boot. The SRC_IMG_SIZE/SRC_XY requirements and the
   x-alignment above.
 
 Expected lines with bits 22+23 on a good run, in order: the stage-1 `dpu smmu`
 lines, `begin`, `bank cb=3 smr3 s2cr=0x3 cbar=0x1f000 cba2r=0x1 saved
 sctlr=0xe0 tcr2=0x60 ttbr0=0 tcr=0 mair0=0 fsr=0x400 oas_bits=36`, `memory`,
-`enabled sctlr=0xe0->0x61 ... tcr=0x800020 tcr2=0x61 mair0=0x44`, `identity
+`enabled sctlr=0xe0->0x61 ... tcr=0x800020 tcr2=0x38061 mair0=0x44`, `live
+sctlr=0x61 ... tcr2=0x38061 sep=7 pasize=1 mair0=0x44 fsr=0x400`, `identity
 starts=60`, `mapped`, `flip ... latched=1`, `hold_ms=2000`, `restored A`,
 `bank restored exact=1 sctlr=0xe0 tcr2=0x60 ttbr0=0 tcr=0 mair0=0 fsr=0x400`,
 `done result=ok`. The panel should show the bars with a white frame and no red
 edge for about 2 s, then the boot image again. Stage 3 (bit 24) would
 remap CA surfaces per frame using the same window.
+
+#### X229 result (kernel 9565b45, fuxigpuncimport=15531592) and the SEP fix
+
+Observed:
+
+```
+dpu stage2 bank cb=3 smr3 s2cr=0x3 cbar=0x1f000 cba2r=0x1 saved sctlr=0xe0 tcr2=0x60 ttbr0=0 tcr=0 mair0=0 fsr=0x400 oas_bits=36
+dpu stage2 memory tables=0x8c59e8000 surface 1125x2436 stride=4608 pages=2741 above4g=2741 runs=686 first=0x9b44f8000 last=0x9b3444000
+dpu stage2 enabled sctlr=0xe0->0x61 ttbr0=0x8c59e8000 tcr=0x800020 tcr2=0x61 mair0=0x44 tlbi=bank
+dpu stage2 fault step=identity reason=fault starts=0 fsr=0x402 far=0xb8000100 fsynr0=0x630020
+dpu stage2 bank restored exact=1 ... fsr=0x400
+dpu stage2 undone step=identity start=1 xfer_us=11355 cur=0xb8000000
+dpu stage2 done result=fault step=identity identity_starts=0 flip_latched=0 hold_ms=0 exact=1
+```
+
+The undo worked: the bank was restored exactly, A was shown again, and the boot
+went on normally.
+
+Decode, using the SMMUv2 field layout:
+
+- FSR 0x402 is TF (translation fault) with FORMAT 2.
+- FSYNR0 0x630020:
+  - PLVL is 0, so the fault was at level 0.
+  - WNR 0 (a read), PNU 1 (unprivileged), IND 0 (data), PTWF 0 (no external
+    abort on the table fetch), AFR 0.
+  - Bits 23:16 hold 0x63. That is S1CBNDX, which is only meaningful for a
+    nested stage-2 fault. GUESS: an implementation value; it is not bank 3.
+- FAR 0xb8000100 is A plus 0x100, the first fetch.
+
+Cause (the conclusion; not yet confirmed on device):
+
+- TCR2.SEP (bits 17:15) was 0, kept from the bootloader's 0x60.
+- In the SMMUv2 AArch64 format, SEP 0 means the input address is
+  sign-extended from bit 31. Every display address with bit 31 set, which
+  means all of 0x80000000-0xffffffff and so A, B and C, therefore becomes an
+  upper-half address.
+- That address goes to TTBR1, which TCR.EPD1 disables. The result is a
+  translation fault at level 0, before any table entry is read. That is
+  exactly PLVL 0 with PTWF 0.
+- The table itself was never involved, so the self-referencing page did not
+  help.
+- Linux arm-smmu writes SEP = UPSTREAM (7) in every AArch64 context bank for
+  this reason.
+- Sheng's i564 used TCR2 5, which also has SEP 0, and saw the same level-0
+  fault. Its self-referencing page fixes a level-0 start, not this.
+- The window at 0x10000000 has bit 31 clear and would have walked.
+
+Candidates ruled out by the decode:
+
+- Walk start level: a wrong start level would read the table, and the entry
+  for FAR would be a valid descriptor.
+- TCR IRGN/ORGN and the cache clean, and the table placement above 4 GiB
+  (0x8c59e8000 < 2^36 = PASize 36): either would show as PTWF, an external or
+  address size fault, or a fault at level 1 or deeper, not at level 0 with no
+  walk.
+- TTBR0 ASID (0) and CBA2R VA64 (1, so the AArch64 format applies, and SEP
+  with it).
+- TLBI ordering: TLBIALL plus TLBSYNC run after every table register write
+  and before M.
+- The L1 block format: 0x80000441 is block, AF, AP[1] and AttrIndx 0 at
+  level 1, which the 4K granule allows. It is never read in this fault.
+- Tables below 4 GiB are not needed.
+
+Fix:
+
+- TCR2 = (old & ~(SEP|PASize)) | SEP 7 | PASize, which is 0x38061 on S224.
+- The readback checks both fields. A bank that drops SEP is undone before
+  SCTLR, with no START.
+
+New diagnostics:
+
+- the `live` line, read back right before the first START;
+- the `walk` line after a translated fault: FSYNR0 fields, SEP sign bit,
+  and the L0/L1/L2/L3 entries for FAR.
+
+Same boot value, 15531592. The expected lines on a good run are listed above.
+If it still faults, the `walk` line tells the cases apart:
+
+- `sign=0` with `plvl=0` would point at the walk start or TTBR;
+- `plvl=1` with `l1[2]=0x80000441` would point at block support or
+  attributes, and the next try would be level-2 2 MiB blocks;
+- PTWF 1 would point at the table memory or cacheability.

@@ -61,7 +61,7 @@ static int fuxi_gpu_ready(void) {return ready;}
 // bits are write-one-to-clear and FORMAT (10:9) read only; RESUME, TLBIALL and TLBSYNC are write only (counted, not stored).
 #define FG_DPU_SMMU_SIZE 0x100000u
 static uint32_t smmu[0x100000/4];
-static unsigned smmuMapped,smmuMaps,smmuFailMap,smmuFault=~0u,smmuReads,smmuWrites,smmuRwMaps,smmuBank=~0u,smmuIgnore,smmuTlbi,smmuResume;
+static unsigned smmuMapped,smmuMaps,smmuFailMap,smmuFault=~0u,smmuReads,smmuWrites,smmuRwMaps,smmuBank=~0u,smmuIgnore,smmuTlbi,smmuResume,smmuSepRaz;
 static int fg_dpu_smmu_map(unsigned map) {if(!map){smmuMapped=0;return 1;}smmuMaps++;if(smmuFailMap)return 0;smmuMapped=map;smmuRwMaps+=map==2;return 1;}
 static int fg_dpu_smmu_read(unsigned off,unsigned *v) {
  assert(smmuMapped);if(off>=sizeof(smmu) || (off&3) || off==smmuFault)return 0;smmuReads++;*v=smmu[off/4];return 1;
@@ -73,6 +73,7 @@ static int fg_dpu_smmu_write(unsigned off,unsigned v) {
  if(r==0x8){smmuResume++;return 1;}
  if(r==0x58){smmu[off/4]&=~(v&0xc00001feu);return 1;}
  if(smmuIgnore && r!=0)return 1;
+ if(r==0x10 && smmuSepRaz)v&=~(7u<<15);   // a bank without TCR2.SEP
  smmu[off/4]=v;return 1;
 }
 // Stage-2 memory model: allocations get fake physical addresses; the table pool is contiguous, the surface scattered (16 pages below
@@ -180,7 +181,7 @@ static unsigned fg_scanout_owned_for_model(void) {return fg_scanout_owned;}
 static unsigned fg_scanout_double_for_model(void) {return fg_scanout_double_active;}
 static void reset(void) {
  memset(sspp,0,sizeof(sspp));sspp[0x14/4]=0xb8000000u;modelNc=fg_scanout_preclean=fg_scanout_dpu_dump=0;ssppLog[0]=dpuLog[0]=0;smmuMapped=smmuMaps=smmuFailMap=smmuReads=0;smmuFault=~0u;
- smmuWrites=smmuRwMaps=smmuIgnore=smmuTlbi=smmuResume=0;smmuBank=~0u;startHook=0;probeScript=0;fg_scanout_dpu_stage2=0;
+ smmuWrites=smmuRwMaps=smmuIgnore=smmuTlbi=smmuResume=smmuSepRaz=0;smmuBank=~0u;startHook=0;probeScript=0;fg_scanout_dpu_stage2=0;
  for(unsigned i=0;i<dpuAllocCount;i++)free(dpuAllocs[i].host);
  dpuAllocCount=dpuFrees=dpuAllocFail=dpuPageFail=dpuCleans=0;
  fg_scanout_double_requested=fg_scanout_double_active=fg_scanout_double_initialized=fg_scanout_front=0;
@@ -241,20 +242,34 @@ static uint64_t *dpuTable(uint64_t pa) {
   if(a->host && a->contiguous && pa>=0x880000000ull && pa+4096<=0x880000000ull+a->bytes && !(pa&4095))return (uint64_t *)(a->host+(pa-0x880000000ull));}
  return 0;
 }
-static int dpu_walk(uint32_t va,uint64_t *pa) {
+// SMMUv2 AArch64 stage 1 (CBA2R.VA64), 4 KiB granule, as the X229 fault (far 0xb8000100, FSR TF, FSYNR0 0x630020 = PLVL 0, PNU) showed
+// it: the 32-bit display address is sign-extended at the TCR2.SEP bit (0 -> bit 31; 7 UPSTREAM -> none), so with SEP 0 an address with
+// bit 31 set falls in the TTBR1 half, which TCR.EPD1 disables: translation fault at level 0. Otherwise the walk starts at the level
+// T0SZ gives (T0SZ 32: level 1, 2 index bits), table addresses beyond TCR2.PASize fault, and block/page leaves need AF.
+// Returns 1 with *pa, or 0 with the fault level in *lvl.
+static int dpu_walk_at(uint32_t va,uint64_t *pa,unsigned *lvl) {
+ static const unsigned sepbit[8]={31,35,39,41,43,47,0,0},paw[8]={32,36,40,42,44,48,48,48};
  uint64_t ttbr=((uint64_t)smmu[(DPU_CB+0x24)/4]<<32)|smmu[(DPU_CB+0x20)/4];
- if((smmu[(DPU_CB+0x30)/4]&63)!=32 || (smmu[(DPU_CB+0x30)/4]&0xc000) || smmu[(DPU_CB+0x38)/4]!=0x44)return 0;
- uint64_t *t=dpuTable(ttbr&0xffffffff000ull);unsigned sh=30;
- for(unsigned level=1;level<=3;level++,sh-=9){
+ unsigned tcr=smmu[(DPU_CB+0x30)/4],tcr2=smmu[(DPU_CB+0x10)/4],sep=(tcr2>>15)&7,t0sz=tcr&63,bits=64-t0sz,levels=(bits-12+8)/9,level=4-levels;
+ *lvl=0;
+ if(sep<6 && ((uint64_t)va>>sepbit[sep]&1))return 0;        // upper half: TTBR1, EPD1 set
+ if(t0sz<16 || t0sz>39 || (bits<64 && ((uint64_t)va>>bits)) || (tcr&0xc000) || smmu[(DPU_CB+0x38)/4]!=0x44)return 0;
+ uint64_t limit=1ull<<paw[tcr2&7],a=ttbr&0xffffffff000ull;
+ for(unsigned first=level;level<=3;level++){
+  unsigned sh=12+9*(3-level),mask=level==first?(1u<<(bits-12-9*(levels-1)))-1:511;
+  uint64_t *t=a<limit?dpuTable(a):0;
+  *lvl=level;
   if(!t)return 0;
-  uint64_t d=t[(va>>sh)&(level==1?3:511)];
-  if((d&3)==1 && level<3){if(!(d&(1u<<10)))return 0;uint64_t m=(1ull<<sh)-1;*pa=(d&0xfffffffff000ull&~m)|(va&m);return 1;}
+  uint64_t d=t[((uint64_t)va>>sh)&mask];
+  if((d&3)==1 && level<3 && level>0){if(!(d&(1u<<10)))return 0;uint64_t m=(1ull<<sh)-1;*pa=(d&0xfffffffff000ull&~m)|(va&m);return 1;}
   if((d&3)!=3)return 0;
   if(level==3){if(!(d&(1u<<10)))return 0;*pa=(d&0xfffffffff000ull)|(va&4095);return 1;}
-  t=dpuTable(d&0xfffffffff000ull);
+  a=d&0xfffffffff000ull;
  }
  return 0;
 }
+static unsigned dpuWalkLevel,dpuLeafLevel;
+static int dpu_walk(uint32_t va,uint64_t *pa) {unsigned l;int ok=dpu_walk_at(va,pa,&l);if(ok)dpuLeafLevel=l>dpuLeafLevel?l:dpuLeafLevel;else dpuWalkLevel=l;return ok;}
 static uint8_t *dpuSurfaceHost(uint64_t pa) {
  for(unsigned i=0;i<dpuAllocCount;i++){struct dpuAlloc *a=&dpuAllocs[i];unsigned n=(a->bytes+4095)/4096;
   if(!a->host || a->contiguous)continue;
@@ -272,13 +287,37 @@ static void dpu_fetch(void) {
  if(src==0x10000000u){if(!on)dpuBadFetch++;else dpuWindowFetches++;}
  for(unsigned y=0;y<2400 && !fault;y++)for(unsigned k=0;k<3 && !fault;k++){
   unsigned x=k==0?0:k==1?540:1079;uint32_t va=src+(sy+y)*stride+(sx+x)*4;uint64_t pa=va;
-  if(on && !dpu_walk(va,&pa)){fault=1;break;}
+  if(on && !dpu_walk(va,&pa)){fault=1;smmu[(DPU_CB+0x60)/4]=va;smmu[(DPU_CB+0x68)/4]=dpuWalkLevel|0x20u;break;}
   if(src==0x10000000u){
    unsigned off=va-src;uint8_t *h=dpuSurfaceHost(pa);
    if(pa!=dpuSurfacePa(off/4096,2741)+(off&4095) || !h || *(uint32_t *)h!=fg_dpu_pattern(sx+x,sy+y))dpuBadFetch++;else dpuPixelChecks++;
   } else if(pa!=va || src!=0xb8000000u)dpuBadFetch++;
  }
+ if(fault && dpuFaultAt==dpuFetches){smmu[(DPU_CB+0x60)/4]=src+0x100;smmu[(DPU_CB+0x68)/4]=0x20u;}
  if(fault)smmu[(DPU_CB+0x58)/4]|=dpuFaultSs?0x40000002u:2u;
+}
+// X229 replay, checked on the first translated START with the table as installed: TCR2 0x61 (SEP 0, what X229 ran) faults
+// 0xb8000100 at level 0; TCR2 0x38061 (SEP UPSTREAM, what stage 2 now writes) maps it identically through the level-1 block, and the
+// empty window faults at level 3.
+static unsigned dpuX229;
+static void dpu_fetch_x229(void) {
+ if(smmu[DPU_CB/4]&1 && !dpuX229++){
+  uint64_t pa=0;unsigned l=9,tcr2=smmu[(DPU_CB+0x10)/4];
+  assert(tcr2==0x38061u);
+  smmu[(DPU_CB+0x10)/4]=0x61u;assert(!dpu_walk_at(0xb8000100u,&pa,&l) && l==0);
+  assert(!dpu_walk_at(0x10000000u,&pa,&l) && l==3);           // bit 31 clear: TTBR0 even with SEP 0; window leaves still empty
+  smmu[(DPU_CB+0x10)/4]=tcr2;
+  assert(dpu_walk_at(0xb8000100u,&pa,&l) && pa==0xb8000100u && l==1);
+  assert(dpu_walk_at(0xffffff00u,&pa,&l) && pa==0xffffff00u && l==1);
+  assert(!dpu_walk_at(0x10000000u,&pa,&l) && l==3);
+  assert(!dpu_walk_at(0x40000000u,&pa,&l) && l==1);           // level 1 [1] is empty
+ }
+ dpu_fetch();
+}
+// Clears the window's level-3 entry of the flip's first fetched row (offset 18*4608+22*4 = 0x14458, page 20) when the flip START comes.
+static void dpu_fetch_hole(void) {
+ if(ctl[0x18/4]&1 && sspp[0x14/4]==0x10000000u){uint64_t *t=dpuTable(0x880000000ull+4096);assert(t);t[20]=0;}
+ dpu_fetch();
 }
 static void hold_fault(void) {if(sspp[0xa4/4]==0x10000000u && ++holdCalls==holdFault)smmu[(DPU_CB+0x58)/4]|=2u;}
 static void dpu_setup(uint8_t *panel,unsigned bits) {
@@ -292,12 +331,14 @@ static void dpu_setup(uint8_t *panel,unsigned bits) {
  sspp[0]=sspp[0x0c/4]=0x09600438u;sspp[0x24/4]=4320;sspp[0x30/4]=0x237ff;sspp[0x34/4]=0x3020001;sspp[0xa4/4]=0xb8000000u;
  smmuBank=DPU_CB;startHook=dpu_fetch;
  dpuFetches=dpuTranslated=dpuWindowFetches=dpuBadFetch=dpuPixelChecks=dpuFaultAt=dpuFaultSs=dpuStuck=holdCalls=holdFault=0;
+ dpuX229=dpuWalkLevel=dpuLeafLevel=0;
  fuxi_gpu_scanout_configure((uintptr_t)panel,1,0);
  memcpy(smmuSnap,smmu,sizeof(smmu));
  assert(!fuxi_gpu_scanout_acquire() && !smmuWrites); // takeover: AR off, bit-22 survey (read only)
  memcpy(ssppSnap,sspp,sizeof(sspp));ticks+=20000;
 }
 static void dpu_restored(void) {
+ for(unsigned r=0x60;r<=0x68;r+=4)smmu[(DPU_CB+r)/4]=smmuSnap[(DPU_CB+r)/4]; // FAR/FSYNR0 keep the last fault
  assert(!memcmp(smmu,smmuSnap,sizeof(smmu)));                 // byte-exact bank, and nothing else in apps_smmu changed
  assert(!memcmp(sspp,ssppSnap,sizeof(sspp)));                 // A geometry, source and CURRENT_SRC0
  assert(!dpuBadFetch && !(ctl[0x18/4]&1) && !ctl[0x1c/4]);
@@ -305,13 +346,14 @@ static void dpu_restored(void) {
 }
 static void dpu_stage2_tests(uint8_t *panel) {
  // Success: identity STARTs, translated flip of the scattered surface, hold, restore; every bank write in bank 3, three bank TLBIALLs.
- dpu_setup(panel,0xc00000u);
+ dpu_setup(panel,0xc00000u);startHook=dpu_fetch_x229;
  assert(fg_scanout_dpu_stage2 && strstr(dpuLog,"dpu stage2 requested"));
  assert(!fuxi_gpu_scanout_acquire());
  assert(strstr(dpuLog,"dpu stage2 begin img=0 xy=0 ystride0=0x10e0 src0=0xb8000000 cur=0xb8000000 flush=0 start=0 line=0\n"));
  assert(strstr(dpuLog,"dpu stage2 bank cb=3 smr3 s2cr=0x3 cbar=0x1f000 cba2r=0x1 saved sctlr=0xe0 tcr2=0x60 ttbr0=0 tcr=0 mair0=0 fsr=0x400 oas_bits=36\n"));
  assert(strstr(dpuLog,"dpu stage2 memory tables=0x880000000 surface 1125x2436 stride=4608 pages=2741 above4g=2725 runs=2726 first=0xa0000000 last=0x900000000\n"));
- assert(strstr(dpuLog,"dpu stage2 enabled sctlr=0xe0->0x61 ttbr0=0x880000000 tcr=0x800020 tcr2=0x61 mair0=0x44 tlbi=bank\n"));
+ assert(strstr(dpuLog,"dpu stage2 enabled sctlr=0xe0->0x61 ttbr0=0x880000000 tcr=0x800020 tcr2=0x38061 mair0=0x44 tlbi=bank\n"));
+ assert(strstr(dpuLog,"dpu stage2 live sctlr=0x61 ttbr0=0x880000000 tcr=0x800020 tcr2=0x38061 sep=7 pasize=1 mair0=0x44 fsr=0x400 l1[0]=0x880000003 l1[2]=0x80000441 l1[3]=0xc0000441\n"));
  assert(strstr(dpuLog,"dpu stage2 identity starts=60 fsr=0x400 cur=0xb8000000 xfer_us avg=18667 max=18667\n"));
  assert(strstr(dpuLog,"dpu stage2 mapped iova=0x10000000 pages=2741 window=0x2000000 tlbi=bank\n"));
  assert(strstr(dpuLog,"dpu stage2 flip src0=0x10000000 img=0x9840465 xy=0x120016 ystride0=0x1200 xfer_us=18667 fsr=0x400 cur=0x10000000 latched=1\n"));
@@ -321,6 +363,7 @@ static void dpu_stage2_tests(uint8_t *panel) {
  assert(strstr(dpuLog,"dpu stage2 done result=ok step=restore identity_starts=60 flip_latched=1 hold_ms=2000 exact=1\n"));
  assert(!strstr(dpuLog,"fault step") && !strstr(dpuLog,"memory kept"));
  assert(starts==62 && dpuTranslated==62 && dpuWindowFetches==1 && dpuPixelChecks==3*2400 && smmuTlbi==3 && !smmuResume && smmuRwMaps==1);
+  assert(dpuX229==62 && dpuLeafLevel==3);                      // identity through level-1 blocks, the window through level-3 pages
  assert(dpuAllocCount==2 && dpuCleans==3 && !fg_scanout_dpu_stage2);
  dpu_restored();
  // The normal gates resume: one floor wait from the last START, then the ordinary writable/publish path; stage 2 never repeats.
@@ -342,6 +385,9 @@ static void dpu_stage2_tests(uint8_t *panel) {
       "fault step=hold reason=fault starts=60 fsr=0x402"));
   assert(strstr(dpuLog,"bank restored exact=1") && strstr(dpuLog,"result=fault"));
   assert(strstr(dpuLog,c==0?"undone step=identity start=1":c==1?"undone step=flip start=1":"undone step=hold start=1"));
+  assert(strstr(dpuLog,c==0?"walk far=0xb8000100 plvl=0 wnr=0 pnu=1 ind=0 ptwf=0 afr=0 fsynr0_hi=0 tcr2=0x38061 sep=7 upstream bit=0 sign=0 l0[0]=0x880000003 l1[2]=0x80000441 l2[448]=0 l3[0]=0\n":
+      c==1?"walk far=0x10000100 plvl=0 wnr=0 pnu=1 ind=0 ptwf=0 afr=0 fsynr0_hi=0 tcr2=0x38061 sep=7 upstream bit=0 sign=0 l0[0]=0x880000003 l1[0]=0x880000003 l2[128]=0x880001003 l3[0]=0xa0000443\n":
+      "fault step=hold"));
   assert(smmuResume==(c==0) && starts==(c==0?7u:62u) && dpuTranslated==(c==0?6u:61u) && sspp[0xa4/4]==0xb8000000u);
   assert(!strstr(dpuLog,"hold_ms=2000 fsr") && !fg_scanout_failed);
   dpu_restored();
@@ -349,6 +395,16 @@ static void dpu_stage2_tests(uint8_t *panel) {
  // The bank ignores the table: undone before translation is enabled, no START at all.
  dpu_setup(panel,0xc00000u);smmuIgnore=1;assert(!fuxi_gpu_scanout_acquire());smmuIgnore=0;
  assert(strstr(dpuLog,"fault step=install reason=bank ignored the table") && strstr(dpuLog,"exact=1") && !starts && !strstr(dpuLog,"undone"));
+ dpu_restored();
+ // A bank whose TCR2 has no SEP field (reads 0, the X229 setting): refused at the readback, before translation, no START.
+ dpu_setup(panel,0xc00000u);smmuSepRaz=1;assert(!fuxi_gpu_scanout_acquire());smmuSepRaz=0;
+ assert(strstr(dpuLog,"fault step=install reason=bank ignored the table") && strstr(dpuLog,"exact=1") && !starts && !strstr(dpuLog,"walk far"));
+ dpu_restored();
+ // A real walk fault (not injected): the window's level-3 entry of the first row is cleared under the display; FAR, PLVL 3, entries.
+ dpu_setup(panel,0xc00000u);startHook=dpu_fetch_hole;assert(!fuxi_gpu_scanout_acquire());
+ assert(strstr(dpuLog,"fault step=flip reason=fault starts=60 fsr=0x402 far=0x10014458 fsynr0=0x23\n"));
+ assert(strstr(dpuLog,"walk far=0x10014458 plvl=3 wnr=0 pnu=1 ind=0 ptwf=0 afr=0 fsynr0_hi=0 tcr2=0x38061 sep=7 upstream bit=0 sign=0 l0[0]=0x880000003 l1[0]=0x880000003 l2[128]=0x880001003 l3[20]=0\n"));
+ assert(strstr(dpuLog,"undone step=flip start=1") && strstr(dpuLog,"bank restored exact=1") && !dpuBadFetch);
  dpu_restored();
  // A flip transfer that never finishes: translation stays on (identity + window), the memory is kept and the scanout stops.
  dpu_setup(panel,0xc00000u);dpuStuck=61;assert(fuxi_gpu_scanout_acquire()==-1 && fg_scanout_failed);
@@ -375,7 +431,7 @@ static void dpu_stage2_tests(uint8_t *panel) {
   ctl[0x18/4]=0;dpuAllocFail=dpuPageFail=0;
  }
  reset();
- puts("PASS: dpu stage 2 (bits 22+23): bank-3-only writes, byte-exact restore, bank TLBI only, identity + scattered-window walk model, fault/stall/timeout undo, refusals write nothing, bits clear inert");
+ puts("PASS: dpu stage 2 (bits 22+23): bank-3-only writes, byte-exact restore, bank TLBI only, identity + scattered-window SMMUv2 walk model (TCR2.SEP, T0SZ start level, X229 replay), walk/fault-entry log, fault/stall/timeout undo, refusals write nothing, bits clear inert");
 }
 static void panel120_tests(uint8_t *panel) {
  // Exact boot-arg admission; no ownership means no DSI read, write, or command.
