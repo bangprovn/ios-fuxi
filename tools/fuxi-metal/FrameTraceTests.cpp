@@ -80,6 +80,13 @@ int main(){
   const char *first=strstr(buffer,"top1 ");assert(first && strstr(first,"pass 1080x2400 colors=1 load=L store=S") && strstr(first,"draws=40.0") && strstr(first,"avg_ms=2.000"));
   const char *second=strstr(buffer,"top2 ");assert(second && strstr(second,"pass 64x16 colors=1 load=C store=S") && strstr(second,"n/submit=2.00") && strstr(second,"copies=1.0") && strstr(second,"avg_ms=0.125"));
   assert(strstr(buffer,"top3 op 0x0") && !strstr(buffer,"top4 ") && times.submitCount()==0);
+  assert(!strstr(buffer,"draw area per submit")); // only with FUXI_MTL_DRAW_AREA classes present
+  PassInfo shr=big;shr.areaClass=2;shr.areaW=1080;shr.areaH=600;PassInfo kept=big;kept.areaClass=1;kept.areaW=1080;kept.areaH=2400;
+  for(int i=0;i<2;++i)times.add({shr,kept,small},{500000,2000000,100000},3000000);
+  char b2[4096]{};o=fmemopen(b2,sizeof b2,"w");times.report(o);fclose(o);
+  const char *da=strstr(b2,"FUXI MTL: gpu pass draw area per submit: shrunk passes=1.00 ms=0.500 avg_ms=0.500 area_pct=25.0 | eligible not shrunk passes=1.00 ms=2.000 avg_ms=2.000 area_pct=100.0 | not eligible passes=1.00 ms=0.100");
+  assert(da);
+  times.add({big},{1000},1000);char b3[4096]{};o=fmemopen(b3,sizeof b3,"w");times.report(o);fclose(o);assert(!strstr(b3,"draw area per submit")); // window reset
  }
  { // per-draw GPU times: the pass with the largest draw sum wins, draws ranked, begin markers skipped; SPIR-V statistics
   std::vector<DrawInfo> infos;std::vector<uint64_t> ns;

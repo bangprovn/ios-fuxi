@@ -27,4 +27,20 @@ int main(int argc,char **argv){
  {VsInputs v2=vi;v2.buffers.clear();SpirvEval ev(w.data(),w.size());auto r=ev.run("main",v2,{0});assert(!r.ok);} // missing uniform bytes must fail, not read zeros
  {SpirvEval ev(w.data(),w.size());auto r=ev.run("nope",vi,{0});assert(!r.ok);}
  {SpirvEval ev(w.data(),8);auto r=ev.run("main",vi,{0});assert(!r.ok);}
+ // one evaluator reused across runs (FUXI_MTL_DRAW_AREA keeps one per pipeline): results match fresh evaluators, inputs and spec constants change between runs, failures do not stick
+ {SpirvEval ev(w.data(),w.size());SpirvEval fresh(w.data(),w.size());auto a=fresh.run("main",vi,{0,1,2,3,4,5});
+  for(int k=0;k<3;++k){auto r=ev.run("main",vi,{0,1,2,3,4,5});assert(r.ok && r.position==a.position);}
+  VsInputs v2=vi;v2.spec[3]=1;auto r=ev.run("main",v2,{6});assert(r.ok && r.position[0][3]==-1.0f);
+  VsInputs v3=vi;v3.buffers.clear();r=ev.run("main",v3,{0});assert(!r.ok);
+  r=ev.run("main",vi,{0,1,2,3,4,5});assert(r.ok && r.position==a.position);
+  for(int k=0;k<300;++k){r=ev.run("main",vi,{0,1,2,3,4,5});assert(r.ok);} // step limit is per run
+  r=ev.run("nope",vi,{0});assert(!r.ok);r=ev.run("main",vi,{4});assert(r.ok && r.position[0]==a.position[4]);}
+ // OpTypeRuntimeArray + OpArrayLength (argv[2]): length = whole elements in the bound range after the member offset
+ if(argc>2){std::ifstream in2(argv[2],std::ios::binary);std::vector<char> raw2((std::istreambuf_iterator<char>(in2)),{});assert(raw2.size()%4==0 && raw2.size()>20);
+  std::vector<uint32_t> w2(raw2.size()/4);memcpy(w2.data(),raw2.data(),raw2.size());
+  float data[4+12]={2,3,0,0, .1f,.2f, .3f,.4f, .5f,.6f, .7f,.8f, .9f,1.f, 0,0};
+  for(size_t bytes:{size_t(16+8*5),size_t(16+8*5+4),size_t(16+8*6)}){VsInputs r2;r2.buffers[{0,2}]={(const uint8_t *)data,bytes};SpirvEval ev(w2.data(),w2.size());auto r=ev.run("main",r2,{0,3,7});
+   assert(r.ok);uint32_t n=uint32_t((bytes-16)/8);assert(r.position[0][2]==float(n));assert(std::fabs(r.position[1][0]-data[4+2*3]*2)<1e-6 && std::fabs(r.position[1][1]-data[5+2*3]*3)<1e-6);
+   assert(std::fabs(r.position[2][0]-data[4+2*(7%n)]*2)<1e-6);}
+  VsInputs r2;r2.buffers[{0,2}]={(const uint8_t *)data,12};SpirvEval ev(w2.data(),w2.size());auto r=ev.run("main",r2,{0});assert(!r.ok);} // header out of range, length 0 -> modulo by zero read fails
  (void)F;puts("SpirvEvalTests ok");return 0;}

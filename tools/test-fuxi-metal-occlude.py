@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""FUXI_MTL_OCCLUDE: CPU vertex evaluator and proof unit tests, then lavapipe pixels with the knob off and on (byte-for-byte equal), no downloads."""
+"""FUXI_MTL_OCCLUDE / FUXI_MTL_NOFETCH_RP / FUXI_MTL_DRAW_AREA: CPU vertex evaluator and proof unit tests, then lavapipe pixels with each knob off and on (byte-for-byte equal), no downloads."""
 import argparse
 import os
 from pathlib import Path
@@ -37,6 +37,10 @@ void main(){
  gl_Position=q;
 }
 '''
+EVAL_RT = '''#version 450
+layout(std430,set=0,binding=2) readonly buffer B {vec4 head;vec2 pts[];} b;
+void main(){int n=b.pts.length();vec2 p=b.pts[gl_VertexIndex%n];gl_Position=vec4(p*b.head.xy,float(n),1.0);}
+'''
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
@@ -60,7 +64,7 @@ def main():
         for name in ('OcclusionProofTests', 'SpirvEvalTests'):
             subprocess.run(common+[str(ROOT/'tools/fuxi-metal'/(name+'.cpp')), '-o', str(d/name)], check=True)
         subprocess.run([str(d/'OcclusionProofTests')], env=env, check=True, timeout=30)
-        subprocess.run([str(d/'SpirvEvalTests'), str(glsl('eval', EVAL, 'vert'))], env=env, check=True, timeout=30)
+        subprocess.run([str(d/'SpirvEvalTests'), str(glsl('eval', EVAL, 'vert')), str(glsl('eval-rt', EVAL_RT, 'vert'))], env=env, check=True, timeout=60)
         if not a.icd:
             print('SKIP: lavapipe pixels require --icd')
             return
@@ -72,6 +76,8 @@ def main():
         subprocess.run(common+['-shared', '-fPIC', str(ROOT/'tools/fuxi-metal/OcclusionBridge.cpp'), '-o', str(d/'bridge.so')], check=True)
         subprocess.run(common+['-DFUXI_MTL_HOST_TEST', '-DFUXI_MTL_ICD="'+str(a.icd.resolve())+'"', '-DFUXI_MTL_TRANSLATOR="'+str(d/'bridge.so')+'"',
                                str(ROOT/'tools/fuxi-metal/OcclusionTests.cpp'), '-ldl', '-pthread', '-o', str(d/'pixels')], check=True)
+        subprocess.run(common+['-DFUXI_MTL_HOST_TEST', '-DFUXI_MTL_ICD="'+str(a.icd.resolve())+'"', '-DFUXI_MTL_TRANSLATOR="'+str(d/'bridge.so')+'"',
+                               str(ROOT/'tools/fuxi-metal/DrawAreaTests.cpp'), '-ldl', '-pthread', '-o', str(d/'draw-area')], check=True)
         def run(args, occlude, nofetch=False):
             p = subprocess.run([str(d/'pixels')], env=dict(env, FUXI_MTL_OCCLUDE='1' if occlude else '0', FUXI_MTL_NOFETCH_RP='1' if nofetch else '0', FUXI_MTL_OCCLUDE_MIN_PX='1', FUXI_MTL_TEST_BOOTARGS='fuxigpuframetrace=1 '+args),
                                text=True, capture_output=True, timeout=240)
@@ -92,6 +98,42 @@ def main():
             built = sum(1 for l in nf.stderr.splitlines() if 'nofetch render pass pipeline' in l)
             assert built > 0, 'FUXI_MTL_NOFETCH_RP=1 never used a no-input-attachment render pass'
             print('  nofetch rp: pixels identical (alone and with occlude), %d variant pipelines built' % built)
+        # FUXI_MTL_DRAW_AREA: knob off is the reference; margins 0 and 16 must shrink (asserted per scenario in DrawAreaTests.cpp), a zero CPU budget must never shrink,
+        # and the knob composes with OCCLUDE and GPU pass times. Every run's PIXELS/STATE lines must equal the reference.
+        def area(args, extra):
+            e = dict(env, FUXI_MTL_DRAW_AREA_MIN_PX='1', FUXI_MTL_OCCLUDE_MIN_PX='1', FUXI_MTL_TEST_BOOTARGS='fuxigpuframetrace=1 '+args, **extra)
+            p = subprocess.run([str(d/'draw-area')], env=e, text=True, capture_output=True, timeout=400)
+            assert p.returncode == 0, (args, extra, p.stdout[-2000:], p.stderr[-4000:])
+            assert 'AddressSanitizer' not in p.stderr and 'runtime error:' not in p.stderr, p.stderr
+            return p
+        for args in ('', 'fuxigpuoverlap=1 fuxigpusubmit=1', 'fuxigpumerge=1 fuxigpuperf=7', 'fuxigpumerge=1 fuxigpuoverlap=1 fuxigpusubmit=1 fuxigpuperf=7'):
+            ref = area(args, {'FUXI_MTL_DRAW_AREA': '0'})
+            r = keep(ref.stdout)
+            assert len(r) > 100, ref.stdout[-2000:]
+            assert 'draw_area=0' in ref.stderr and 'FUXI MTL: draw area submits=0 ' in ref.stderr
+            # sanitized evaluation is ~30x slower than on device, so the scenario runs lift the per-submit CPU budget; 'default-budget' keeps 1000 us (pixels only)
+            big = {'FUXI_MTL_DRAW_AREA': '1', 'FUXI_MTL_DRAW_AREA_BUDGET_US': '100000'}
+            variants = [('margin0', dict(big, FUXI_MTL_DRAW_AREA_MARGIN='0')), ('margin16', big)]
+            if not args:
+                variants += [('budget0', {'FUXI_MTL_DRAW_AREA': '1', 'FUXI_MTL_DRAW_AREA_BUDGET_US': '0'}), ('occlude', dict(big, FUXI_MTL_OCCLUDE='1', FUXI_MTL_DRAW_AREA_MARGIN='0')),
+                             ('pass-times', dict(big, FUXI_MTL_GPU_PASS_TIMES='1')), ('render-area-off', dict(big, FUXI_MTL_RENDER_AREA='0')), ('default-budget', {'FUXI_MTL_DRAW_AREA': '1', 'FUXI_MTL_DRAW_AREA_EXPECT': 'any'})]
+            for name, extra in variants:
+                p = area(args, extra)
+                if keep(p.stdout) != r:
+                    bad = [(x, y) for x, y in zip(r, keep(p.stdout)) if x != y][:3]
+                    raise AssertionError('pixels differ with FUXI_MTL_DRAW_AREA %s for %r: %r' % (name, args, bad))
+                total = [l for l in p.stdout.splitlines() if l.startswith('DA totals') or l.startswith('DA fuzz')]
+                line = [l for l in p.stderr.splitlines() if l.startswith('FUXI MTL: draw area submits=')][-1]
+                assert 'FUXI MTL: policy draw_area=1 draw_area_min_px=1 ' in p.stderr, name
+                if name in ('budget0', 'render-area-off'):
+                    assert ' shrunk=0 ' in line, line
+                else:
+                    assert ' shrunk=0 ' not in line, line
+                print('draw area %s args=%r: %d pixel lines identical; %s' % (name, args, len(r), ' '.join(l[3:] for l in total)))
+                print('  ' + line[:400])
+                if name == 'pass-times':
+                    rows = [l for l in p.stderr.splitlines() if 'gpu pass draw area per submit' in l]
+                    print('  ' + (rows[-1] if rows else 'no gpu pass draw area line (no pass timestamps on this ICD)'))
         print('PASS: occlusion proofs and pixels')
 
 if __name__ == '__main__':

@@ -45,4 +45,24 @@ int main(){
  // a diagonal that is not shared (overlapping triangles) is not an exact rect
  std::vector<P> bad={P{-1,-1,.5f,1},P{1,-1,.5f,1},P{-1,1,.5f,1},P{-1,-1,.5f,1},P{-1,1,.5f,1},P{1,1,.5f,1}};
  assert(buildCover(bad,0,vp,clip,c,why) && c.rects.empty());
+ // FUXI_MTL_DRAW_AREA outer bounds: every pixel whose center a triangle covers (brute force, in double, perspective-correct screen positions) lies inside the box,
+ // with margin 0, for random triangles with w in [0.25,4], fractional edges, flipped and offset viewports; the box is also tight (within 1 px of the hull).
+ {uint64_t seed=0x2545f4914f6cdd1dull;auto rnd=[&](){seed^=seed<<13;seed^=seed>>7;seed^=seed<<17;return double(seed%1000003)/1000003.0;};
+  const ViewportF vps[]={{0,100,100,-100},{0,0,100,100},{7.5,3.25,80,90},{-20,120,140,-130}};
+  for(int iter=0;iter<4000;++iter){const ViewportF &v=vps[iter%4];std::vector<P> t(3);double sx[3],sy[3];
+   for(int k=0;k<3;++k){double w=0.25+rnd()*3.75,nx=rnd()*2.6-1.3,ny=rnd()*2.6-1.3;t[k]={float(nx*w),float(ny*w),float(.5*w),float(w)};
+    sx[k]=v.x+(double(t[k][0])/t[k][3]*0.5+0.5)*v.w;sy[k]=v.y+(double(t[k][1])/t[k][3]*0.5+0.5)*v.h;}
+   IRect box;assert(outerBounds(t,v,0,box,why));
+   double area=(sx[1]-sx[0])*(sy[2]-sy[0])-(sx[2]-sx[0])*(sy[1]-sy[0]);
+   for(int py=-30;py<140;++py)for(int px=-30;px<140;++px){double cx=px+.5,cy=py+.5;bool in=true;
+    for(int e=0;e<3 && in;++e){int a_=e,b_=(e+1)%3;double d=(sx[b_]-sx[a_])*(cy-sy[a_])-(sy[b_]-sy[a_])*(cx-sx[a_]);if(area>0?d<0:d>0)in=false;}
+    if(in && std::fabs(area)>0)assert(px>=box.x0 && px<box.x1 && py>=box.y0 && py<box.y1);}
+   double mnx=std::min({sx[0],sx[1],sx[2]}),mxx=std::max({sx[0],sx[1],sx[2]});assert(box.x0>=mnx-1.001 && box.x1<=mxx+1.001);}
+  IRect box;std::vector<P> q=quad(-.5f,-.5f,.5f,.5f);
+  assert(outerBounds(q,vp,0,box,why) && box.x0==25 && box.x1==75 && box.y0==25 && box.y1==75);
+  assert(outerBounds(q,vp,16,box,why) && box.x0==9 && box.x1==91 && box.y0==9 && box.y1==91);
+  q[4][3]=0;assert(!outerBounds(q,vp,0,box,why) && why=="w<=0");q[4][3]=-2;assert(!outerBounds(q,vp,0,box,why) && why=="w<=0");
+  q=quad(-.5f,-.5f,.5f,.5f);q[0][1]=INFINITY;assert(!outerBounds(q,vp,0,box,why) && why=="non-finite position");
+  q=quad(-.5f,-.5f,.5f,.5f);assert(!outerBounds(q,ViewportF{0,0,0,100},0,box,why) && why=="viewport");
+  q.resize(2);assert(!outerBounds(q,vp,0,box,why));}
  puts("OcclusionProofTests ok");return 0;}

@@ -137,4 +137,19 @@ inline bool buildCover(const std::vector<std::array<float,4>> &clipPos,int topol
  if(out.rects.empty() && out.tris.empty()){why="no geometry";return false;}
  return true;
 }
+// FUXI_MTL_DRAW_AREA: a pixel rect that contains every fragment a triangle draw can produce. With w>0 at every vertex the screen image of each triangle is the triangle of the
+// projected vertices (z/clip-distance clipping only removes parts), so the projected bounding box, rounded outward and widened by `margin` px (GPU snapping, fp16 slop), is a superset.
+// Any w<=0, non-finite value or bad viewport fails: the caller then uses the scissor. The result is NOT clipped to the scissor or target.
+inline bool outerBounds(const std::vector<std::array<float,4>> &clipPos,const ViewportF &vp,int32_t margin,IRect &out,std::string &why){
+ if(!std::isfinite(vp.x) || !std::isfinite(vp.y) || !std::isfinite(vp.w) || !std::isfinite(vp.h) || !(std::fabs(vp.w)>0) || !(std::fabs(vp.h)>0)){why="viewport";return false;}
+ if(clipPos.size()<3){why="vertex count";return false;}
+ double x0=1e300,y0=1e300,x1=-1e300,y1=-1e300;
+ for(auto &c:clipPos){for(int k=0;k<4;++k)if(!std::isfinite(c[k])){why="non-finite position";return false;}
+  double w=c[3];if(!(w>1e-20)){why="w<=0";return false;}
+  double sx=vp.x+(c[0]/w*0.5+0.5)*vp.w,sy=vp.y+(c[1]/w*0.5+0.5)*vp.h;if(!(std::fabs(sx)<1e8 && std::fabs(sy)<1e8)){why="guard band";return false;}
+  x0=std::min(x0,sx);x1=std::max(x1,sx);y0=std::min(y0,sy);y1=std::max(y1,sy);}
+ double m=double(std::max<int32_t>(margin,0));
+ out={int32_t(std::floor(x0)-m),int32_t(std::floor(y0)-m),int32_t(std::ceil(x1)+m),int32_t(std::ceil(y1)+m)};
+ return true;
+}
 }

@@ -9,6 +9,7 @@
 #include <array>
 #include <map>
 #include <set>
+#include <unordered_set>
 #include <tuple>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -93,7 +94,7 @@ inline void importCheck(VkResult r,int line=__builtin_LINE()) {
  X(CreatePipelineLayout) X(DestroyPipelineLayout) X(CreateGraphicsPipelines) X(DestroyPipeline) \
  X(CreatePipelineCache) X(DestroyPipelineCache) X(GetPipelineCacheData) \
  X(CmdBindVertexBuffers) X(CmdBindIndexBuffer) X(CmdDrawIndexed) X(CmdSetViewport) X(CmdSetScissor) X(CmdPushConstants) X(CmdBeginRenderPass) X(CmdEndRenderPass) X(CmdBindPipeline) X(CmdDraw) X(CmdCopyImageToBuffer) X(CmdPipelineBarrier) X(CreateFence) X(DestroyFence) X(QueueSubmit) X(WaitForFences)
-struct Buffer { VkBuffer buffer{}; VkDeviceMemory memory{}; void *contents{};void *key{};Buffer *spare{};void *shadowKey() const{return key?key:contents;}bool shadowBacking=false,directUse=false,spareFailed=false,aliased=false; size_t length{}, allocated{},charged{},memoryBytes{},memoryOffset{},references=1;uint32_t memoryType{};bool imported=false,upload=false,poolable=false,gpuWritten=false; };
+struct Buffer { VkBuffer buffer{}; VkDeviceMemory memory{}; void *contents{};void *key{};Buffer *spare{};void *shadowKey() const{return key?key:contents;}bool shadowBacking=false,directUse=false,spareFailed=false,aliased=false; size_t length{}, allocated{},charged{},memoryBytes{},memoryOffset{},references=1;uint32_t memoryType{};bool imported=false,upload=false,poolable=false,gpuWritten=false,daWritten=false; };
 // Host ranges a submit's prepare callback will write; absent means unknown (full drain).
 struct PrepareWrite {Buffer *buffer;uint64_t offset,bytes;};
 struct Texture : TextureLevels {VkImage image{};VkDeviceMemory memory{};VkImageView view{};size_t allocated{},charged{},memoryBytes{},references=1;
@@ -1288,11 +1289,12 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
   int64_t x0=std::max<int64_t>(0,o.scissor.offset.x),y0=std::max<int64_t>(0,o.scissor.offset.y),x1=std::min<int64_t>(aw,int64_t(o.scissor.offset.x)+o.scissor.extent.width),y1=std::min<int64_t>(ah,int64_t(o.scissor.offset.y)+o.scissor.extent.height);
   if(x1<=x0 || y1<=y0)return {};return {int32_t(x0),int32_t(y0),int32_t(x1),int32_t(y1)};
  }
- bool occVertices(const Operation &op,const DrawOutput &draw,const std::vector<Texture *> &targets,std::vector<std::array<float,4>> &pos,std::string &why){
+ // bounds (FUXI_MTL_DRAW_AREA): up to 1024 vertices, and inputs too large to hash are evaluated without the cache instead of refused.
+ bool occVertices(const Operation &op,const DrawOutput &draw,const std::vector<Texture *> &targets,std::vector<std::array<float,4>> &pos,std::string &why,bool bounds=false){
   auto &r=op.pipeline->recipe;
   if(!r.vertex || r.vertexCount<5 || !r.vertexEntry){why="no vertex spirv";return false;}
-  if(draw.count<3 || draw.count>96){why="vertex count";return false;}
-  auto touches=[&](const Buffer *b){for(auto *t:targets)if(bufferTouchesTexture(b,t))return true;return false;};
+  if(draw.count<3 || draw.count>(bounds?1024u:96u)){why="vertex count";return false;}
+  auto touches=[&](const Buffer *b){if(bounds && b->daWritten)return true;for(auto *t:targets)if(bufferTouchesTexture(b,t))return true;return false;};
   VsInputs in;
   for(uint32_t i=0;i<r.specCount && i<32;++i){auto e=r.specs[i];if(e.offset>r.specSize || e.size>r.specSize-e.offset){why="spec";return false;}uint32_t v=0;memcpy(&v,r.specData+e.offset,std::min<uint32_t>(e.size,4));in.spec[e.id]=v;}
   for(uint32_t i=0;i<draw.descriptorCount;++i){const auto &d=draw.descriptors[i];
@@ -1326,17 +1328,19 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
   auto mix64=[&](uint64_t v){mix(&v,8);};
   mix64(op.pipeline->id);mix64(r.vertexCount);mix64(index.size());for(auto v:index)mix64(v);
   for(auto &e:in.spec){mix64(e.first);mix64(e.second);}
-  for(auto &e:in.buffers){if(e.second.size>(1u<<16)){why="uniform range too large";return false;}mix64(e.first.first);mix64(e.first.second);mix64(e.second.size);mix(e.second.data,e.second.size);}
+  bool uncached=false;size_t inBytes=0;for(auto &e:in.buffers){inBytes+=e.second.size;if(e.second.size>(1u<<16)){if(!bounds){why="uniform range too large";return false;}uncached=true;}}
+  if(bounds && inBytes>4096)uncached=true; // hashing large uniform ranges costs more than evaluating a few vertices
+  if(!uncached)for(auto &e:in.buffers){mix64(e.first.first);mix64(e.first.second);mix64(e.second.size);mix(e.second.data,e.second.size);}
   mix64(in.pushSize);mix(in.push,in.pushSize);
   for(auto &e:attrs){mix64(e.first.first);mix64(e.first.second);mix(e.second.data(),16);}
   std::array<uint64_t,2> key{h1,h2};
-  auto hit=occEvalCache.find(key);
+  auto hit=uncached?occEvalCache.end():occEvalCache.find(key);
   if(hit!=occEvalCache.end()){++occEvalHits;if(!hit->second.ok){why=hit->second.why;return false;}pos=hit->second.pos;return true;}
-  auto t0=std::chrono::steady_clock::now();SpirvEval ev(r.vertex,r.vertexCount);auto res=ev.run(r.vertexEntry,in,index);
+  auto t0=std::chrono::steady_clock::now();SpirvEval fresh(r.vertex,r.vertexCount);SpirvEval &ev=bounds?daEvaluator(op.pipeline):fresh;auto res=ev.run(r.vertexEntry,in,index);
   occEvalNs+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-t0).count());
-  if(occEvalCache.size()>=256)occEvalCache.clear();
-  auto &slot=occEvalCache[key];slot.ok=res.ok && res.position.size()==index.size();slot.why=res.ok?"eval size":"eval:"+res.why;if(slot.ok)slot.pos=res.position;
-  if(!slot.ok){why=slot.why;return false;}
+  bool ok=res.ok && res.position.size()==index.size();std::string bad=res.ok?"eval size":"eval:"+res.why;
+  if(!uncached){if(occEvalCache.size()>=256)occEvalCache.clear();auto &slot=occEvalCache[key];slot.ok=ok;slot.why=bad;if(ok)slot.pos=res.position;}
+  if(!ok){why=bad;return false;}
   pos=std::move(res.position);return true;
  }
  static bool occUnorm(VkFormat f){return f==VK_FORMAT_B8G8R8A8_UNORM || f==VK_FORMAT_R8G8B8A8_UNORM || f==VK_FORMAT_B8G8R8A8_SRGB || f==VK_FORMAT_R8G8B8A8_SRGB || f==VK_FORMAT_A2B10G10R10_UNORM_PACK32 || f==VK_FORMAT_R8_UNORM || f==VK_FORMAT_R8G8_UNORM;}
@@ -1415,6 +1419,56 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
    if(plan.reads[k])return false;}
   return false;
  }
+ // FUXI_MTL_DRAW_AREA=1: a LOAD pass on a large target gets the render area of what its draws can write, not of their scissors. Each draw's footprint is its scissor
+ // intersected with the outward-rounded box of its CPU-evaluated clip positions (SpirvEval, the OCCLUDE evaluator) plus a margin; a draw that cannot be bounded keeps its
+ // scissor. LOAD+STORE leaves pixels outside the area untouched, so the result is byte-identical while Turnip loads and resolves only the tiles inside it.
+ // Refused inputs: buffers aliasing a target of the submit or written by the GPU (transfer destinations, writable storage, buffer-backed render targets: sticky
+ // Buffer::daWritten), storage writers anywhere in the submit, non-triangle topologies. Structural evaluator failures retire the pipeline; a per-submit CPU budget caps cost.
+ std::atomic<uint64_t> daSubmits{0},daPasses{0},daShrunk{0},daTries{0},daBounded{0},daFailed{0},daBudget{0},daRetired{0},daFullPx{0},daScissorPx{0},daAreaPx{0},daEvalNs{0},daStopped{0};
+ std::mutex daMutex;std::map<std::string,uint64_t> daWhy;std::unordered_set<uint32_t> daBadPipes;std::unordered_map<uint64_t,std::unique_ptr<SpirvEval>> daEvaluators;
+ void daFail(const std::string &why){std::lock_guard<std::mutex> g(daMutex);++daWhy[why.substr(0,40)];}
+ static bool daStructural(const std::string &w){for(const char *k:{"no vertex spirv","eval:opcode","eval:GLSL","eval:relaxed","eval:conversion","eval:input builtin","eval:non-32-bit","eval:wide","eval:type","eval:entry","eval:module","eval:unsized","eval:runtime array value"})if(!w.compare(0,strlen(k),k))return true;return false;}
+ SpirvEval &daEvaluator(const Pipeline *p){
+  uint64_t key=(uint64_t(p->id)<<32)^uint64_t(p->recipe.vertexCount);auto it=daEvaluators.find(key);
+  if(it==daEvaluators.end()){if(daEvaluators.size()>=64)daEvaluators.clear();it=daEvaluators.emplace(key,std::make_unique<SpirvEval>(p->recipe.vertex,p->recipe.vertexCount)).first;}
+  return *it->second;
+ }
+ // Marks buffers the GPU may have written by the end of this submit; their CPU contents are not what a later vertex shader reads.
+ void daMarkWrites(const std::vector<Operation> &ops,const std::vector<DrawOutput> &draws){
+  for(size_t n=0;n<ops.size();++n){auto &o=ops[n];if(o.dst)o.dst->daWritten=true;
+   for(unsigned i=0;i<o.colorCount;++i)if(auto *t=o.color(i).texture)if(t->backingBuffer)t->backingBuffer->daWritten=true;
+   if(o.texture && !o.pipeline && o.texture->backingBuffer && (o.upload || o.sourceTexture || o.generateMips || o.clearOnly))o.texture->backingBuffer->daWritten=true;
+   if(!o.pipeline)continue;
+   for(unsigned j=0;j<draws[n].descriptorCount;++j){auto &d=draws[n].descriptors[j];if(d.type!=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || d.source)continue;
+    for(unsigned stage=0;stage<2;++stage)if((d.stages&(stage?16u:1u)) && (d.binding>=16 || !(o.pipeline->readOnlyStorage[stage]&(1u<<d.binding))) && d.slot<resourceSlots)if(auto *b=o.buffers[d.stages==1?0:1][d.slot].buffer)b->daWritten=true;}}
+ }
+ bool daStorageWriter(const Operation &o,const DrawOutput &draw) const {
+  if(o.pipeline->writesStorage)return true;
+  for(unsigned j=0;j<draw.descriptorCount;++j){auto &d=draw.descriptors[j];if(d.type==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || d.type==VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER)return true;
+   if(d.type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)for(unsigned stage=0;stage<2;++stage)if((d.stages&(stage?16u:1u)) && (d.binding>=16 || !(o.pipeline->readOnlyStorage[stage]&(1u<<d.binding))))return true;}
+  return false;
+ }
+ // Pixel rect (unclipped) that contains every fragment draw n can produce, or false with a reason.
+ bool daBound(const std::vector<Operation> &ops,const std::vector<DrawOutput> &draws,const std::vector<Texture *> &targets,size_t n,uint64_t &spentNs,IRect &out,std::string &why){
+  auto &o=ops[n];
+  if(o.topology!=Topology::Triangle && o.topology!=Topology::TriangleStrip){why="topology";return false;}
+  {std::lock_guard<std::mutex> g(daMutex);if(daBadPipes.count(o.pipeline->id)){why="retired pipeline";return false;}}
+  if(spentNs>=uint64_t(systemTranslationPolicy().drawAreaBudgetUs)*1000){++daBudget;why="budget";return false;}
+  ++daTries;auto t0=std::chrono::steady_clock::now();std::vector<std::array<float,4>> pos;
+  bool ok=o.pipeline->recipe.vertex && o.pipeline->recipe.vertexCount>=5 && o.pipeline->recipe.vertexEntry;
+  if(!ok)why="no vertex spirv";else ok=occVertices(o,draws[n],targets,pos,why,true);
+  uint64_t ns=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-t0).count());spentNs+=ns;daEvalNs+=ns;
+  if(ok){ViewportF vf{o.viewport.x,o.viewport.y,o.viewport.width,o.viewport.height};ok=outerBounds(pos,vf,int32_t(systemTranslationPolicy().drawAreaMargin),out,why);}
+  if(!ok && daStructural(why)){std::lock_guard<std::mutex> g(daMutex);if(daBadPipes.insert(o.pipeline->id).second)++daRetired;}
+  return ok;
+ }
+ void reportDrawArea() {
+  std::string why;{std::lock_guard<std::mutex> g(daMutex);std::vector<std::pair<uint64_t,std::string>> v;for(auto &e:daWhy)v.push_back({e.second,e.first});std::sort(v.rbegin(),v.rend());for(size_t i=0;i<v.size() && i<8;++i)why+=" "+v[i].second+"="+std::to_string(v[i].first);}
+  double n=double(std::max<uint64_t>(1,daSubmits)),full=double(std::max<uint64_t>(1,daFullPx));
+  fprintf(stderr,"FUXI MTL: draw area submits=%llu passes=%llu shrunk=%llu stopped=%llu tries=%llu bounded=%llu failed=%llu budget_skips=%llu retired_pipes=%llu area_pct=%.1f scissor_area_pct=%.1f saved_mpx/submit=%.3f eval_ms/submit=%.3f why:%s\n",
+   (unsigned long long)daSubmits,(unsigned long long)daPasses,(unsigned long long)daShrunk,(unsigned long long)daStopped,(unsigned long long)daTries,(unsigned long long)daBounded,(unsigned long long)daFailed,(unsigned long long)daBudget,(unsigned long long)daRetired,
+   100.0*double(daAreaPx)/full,100.0*double(daScissorPx)/full,double(daScissorPx-std::min<uint64_t>(daScissorPx,daAreaPx))/n/1e6,double(daEvalNs)/n/1e6,why.c_str());
+ }
  const void *rtKey(Texture *t) {return t->backingBuffer?(const void *)t->backingBuffer->shadowKey():(const void *)t;}
  Texture *rtShadowOf(Texture *t) {auto i=rtShadows.find(rtKey(t));return i==rtShadows.end()?nullptr:i->second.s;}
  void rtForget(const void *key) {auto i=rtShadows.find(key);if(i!=rtShadows.end())i->second.clean=false;} // the linear memory is going away or changing hands: the shadow no longer provably matches
@@ -1427,6 +1481,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
  void reportRtCounters() {
   {uint64_t n=submitEntered,s=submits;if(n && s)fprintf(stderr,"FUXI MTL: submit pipeline submits=%llu encode_ms=%.3f slot_wait_ms=%.3f blocked_pct=%.1f blocked_full=%llu blocked_drain=%llu blocked_conflict=%llu gpu_latency_ms=%.3f retire_host_ms=%.3f (per submit; encode includes slot waits; gpu_latency is queue submit to fence)\n",(unsigned long long)n,submitPrepareNanos/1e6/n,submitSlotWaitNanos/1e6/n,100.0*submitBlocked/n,(unsigned long long)submitBlockedFull,(unsigned long long)submitBlockedDrain,(unsigned long long)submitBlockedConflict,submitWaitNanos/1e6/s,submitRetireNanos/1e6/s);}
   if(systemTranslationPolicy().occlude)reportOcclude();
+  if(systemTranslationPolicy().drawArea)reportDrawArea();
   if(systemTranslationPolicy().sampleShadow)fprintf(stderr,"FUXI MTL: sample shadow min_px=%u created=%llu created_mb=%.2f reused=%llu capped=%llu evicted=%llu live=%zu live_mb=%.2f refused=%llu copies=%llu hits=%llu stale_invalidations=%llu copied_mb=%.1f hashed_mb=%.1f hash_ms=%.2f\n",systemTranslationPolicy().sampleMinPx,(unsigned long long)sampleShadowCreated,sampleShadowBytes/1048576.0,(unsigned long long)sampleShadowReused,(unsigned long long)sampleShadowCapped,(unsigned long long)sampleShadowEvicted,sampleShadows.size(),sampleShadowLiveBytes()/1048576.0,(unsigned long long)sampleShadowRefused,(unsigned long long)sampleCopies,(unsigned long long)sampleHits,(unsigned long long)sampleInvalidations,sampleCopiedBytes/1048576.0,sampleHashedBytes/1048576.0,sampleHashNs/1e6);
   if(systemTranslationPolicy().rtRename){uint64_t mb=0;for(auto &e:renamePool)mb+=uint64_t(e.w)*e.h*texelBytes(e.format);
    fprintf(stderr,"FUXI MTL: rt rename submits=%llu renamed=%llu hoisted=%llu merged_main_passes=%llu main_runs_before=%llu main_runs_after=%llu pool_images=%zu pool_mb=%.2f\n",(unsigned long long)rtRenameSubmits,(unsigned long long)rtRenamed,(unsigned long long)rtHoisted,(unsigned long long)rtMergedMain,(unsigned long long)rtMainBefore,(unsigned long long)rtMainAfter,renamePool.size(),double(mb)/1048576.0);}
@@ -2212,6 +2267,10 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
     if(op.texture && !op.pipeline && !op.clearOnly)transition(op.texture,VK_IMAGE_LAYOUT_GENERAL,op.generateMips?op.mipBase:(!op.upload && !op.sourceTexture?op.srcLevel:op.dstLevel),op.generateMips?op.mipCount:1);
     if(op.pipeline || op.clearOnly)for(unsigned i=0;i<op.colorCount;++i){auto c=op.color(i);if(c.texture)transition(c.texture,VK_IMAGE_LAYOUT_GENERAL,c.level,1);}
    };
+   // FUXI_MTL_DRAW_AREA: targets and GPU writers of this submit, CPU time spent bounding draws
+   const bool daOn=systemTranslationPolicy().drawArea && systemTranslationPolicy().renderArea;uint64_t daSpentNs=0;std::vector<Texture *> daTargets;bool daBlocked=false;
+   if(daOn){++daSubmits;for(size_t n=0;n<ops.size();++n){auto &o=ops[n];for(unsigned i=0;i<o.colorCount;++i)if(auto *t=o.color(i).texture)daTargets.push_back(t);if(o.pipeline && daStorageWriter(o,draws[n]))daBlocked=true;}
+    daMarkWrites(ops,draws);}
    VkPipeline boundPipeline{};VkPipelineLayout boundLayout{};VkDescriptorSet boundSet{};bool passNoFetch=false;uint32_t passFetchDraws=0;
    VkViewport boundViewport{};VkRect2D boundScissor{};bool dynamicBound=false;
    for(size_t opIndex=0;opIndex<ops.size();++opIndex) {diagnosticOp=opIndex;const auto &op=ops[opIndex];const auto &draw=draws[opIndex];
@@ -2268,10 +2327,29 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
       if(systemTranslationPolicy().renderArea && used){
        bool allLoad=!loadElided;for(unsigned i=0;i<op.colorCount;++i){auto c=op.color(i);if(c.texture && c.load!=1)allLoad=false;}
        uint64_t x0=UINT64_MAX,y0=UINT64_MAX,x1=0,y1=0;
+       // FUXI_MTL_DRAW_AREA: a draw's footprint is its scissor cut down to its proven geometry box; culled draws are never recorded. Bounding stops once the union covers the area.
+       const bool da=daOn && allLoad && !daBlocked && fullPixels>=systemTranslationPolicy().drawAreaMinPx;uint64_t sx0=UINT64_MAX,sy0=UINT64_MAX,sx1=0,sy1=0;bool stop=false;
+       const int64_t AW=ri.renderArea.extent.width,AH=ri.renderArea.extent.height;
        if(allLoad)for(size_t i=opIndex;i<=passEnd;++i){const auto &r=ops[i].scissor;if(!r.extent.width || !r.extent.height || r.offset.x<0 || r.offset.y<0)continue;
-        x0=std::min<uint64_t>(x0,uint64_t(r.offset.x));y0=std::min<uint64_t>(y0,uint64_t(r.offset.y));x1=std::max<uint64_t>(x1,uint64_t(r.offset.x)+r.extent.width);y1=std::max<uint64_t>(y1,uint64_t(r.offset.y)+r.extent.height);}
+        uint64_t rx0=uint64_t(r.offset.x),ry0=uint64_t(r.offset.y),rx1=uint64_t(r.offset.x)+r.extent.width,ry1=uint64_t(r.offset.y)+r.extent.height;
+        if(da){sx0=std::min(sx0,rx0);sy0=std::min(sy0,ry0);sx1=std::max(sx1,rx1);sy1=std::max(sy1,ry1);
+         if(occPlan && occPlan->culled[i])continue;
+         IRect b;std::string why;
+         if(!stop && ops[i].pipeline && !ops[i].clearOnly && daBound(ops,draws,daTargets,i,daSpentNs,b,why)){++daBounded;
+          int64_t bx0=std::max<int64_t>(int64_t(rx0),b.x0),by0=std::max<int64_t>(int64_t(ry0),b.y0),bx1=std::min<int64_t>(int64_t(rx1),b.x1),by1=std::min<int64_t>(int64_t(ry1),b.y1);
+          bx1=std::min<int64_t>(bx1,AW);by1=std::min<int64_t>(by1,AH);if(bx0>=bx1 || by0>=by1)continue; // nothing of this draw lands in the area
+          rx0=uint64_t(bx0);ry0=uint64_t(by0);rx1=uint64_t(bx1);ry1=uint64_t(by1);}
+         else if(!stop){++daFailed;daFail(ops[i].pipeline && !ops[i].clearOnly?why:"non-draw");}}
+        x0=std::min<uint64_t>(x0,rx0);y0=std::min<uint64_t>(y0,ry0);x1=std::max<uint64_t>(x1,rx1);y1=std::max<uint64_t>(y1,ry1);
+        if(da && !stop && x0==0 && y0==0 && x1>=uint64_t(AW) && y1>=uint64_t(AH)){stop=true;++daStopped;}}
        x1=std::min<uint64_t>(x1,ri.renderArea.extent.width);y1=std::min<uint64_t>(y1,ri.renderArea.extent.height);
+       if(da && x0<x1 && y0<y1){ // align outward to 32x16 so Turnip keeps its aligned load/resolve path
+        x0&=~uint64_t(31);y0&=~uint64_t(15);x1=std::min<uint64_t>((x1+31)&~uint64_t(31),uint64_t(AW));y1=std::min<uint64_t>((y1+15)&~uint64_t(15),uint64_t(AH));}
        if(allLoad && x0<x1 && y0<y1 && (x1-x0)*(y1-y0)<fullPixels){ri.renderArea={{int32_t(x0),int32_t(y0)},{uint32_t(x1-x0),uint32_t(y1-y0)}};shrunk=true;}
+       if(da){++daPasses;daFullPx+=fullPixels;sx1=std::min<uint64_t>(sx1,uint64_t(AW));sy1=std::min<uint64_t>(sy1,uint64_t(AH));daScissorPx+=sx0<sx1 && sy0<sy1?(sx1-sx0)*(sy1-sy0):0;
+        daAreaPx+=uint64_t(ri.renderArea.extent.width)*ri.renderArea.extent.height;
+        if(shrunk && !(sx0<sx1 && sy0<sy1 && uint64_t(ri.renderArea.extent.width)*ri.renderArea.extent.height>=(sx1-sx0)*(sy1-sy0)))++daShrunk;}
+       if(passQ)cur.areaClass=da?(shrunk?2:1):0;
       }
       if(currentFrame){++currentFrame->renderAreaPasses;currentFrame->renderAreaFullPixels+=fullPixels;currentFrame->renderAreaPixels+=uint64_t(ri.renderArea.extent.width)*ri.renderArea.extent.height;if(shrunk)++currentFrame->renderAreaShrunk;}
       if(passQ){cur.areaW=ri.renderArea.extent.width;cur.areaH=ri.renderArea.extent.height;}
