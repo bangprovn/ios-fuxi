@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / 'xnu/fuxi-unixnu'
 PRESENT_TIMES = re.search(r'struct fg_present_times \{.*?\};',
     (ROOT / 'xnu/fuxi-adreno/fuxi_adreno.h').read_text(), re.S)[0] + '\n' + re.search(r'struct fg_copy_stamps \{.*?\};',
+    (ROOT / 'xnu/fuxi-adreno/fuxi_adreno.h').read_text(), re.S)[0] + '\n' + re.search(r'enum \{ FG_DD_GEOMETRY.*?\n#define FG_DD_SLOT_PAGES[^\n]*\n',
     (ROOT / 'xnu/fuxi-adreno/fuxi_adreno.h').read_text(), re.S)[0]
 TE_OBSERVER = re.search(r'struct fg_te_observer \{.*?\};',
     (ROOT / 'xnu/fuxi-adreno/fuxi_adreno.h').read_text(), re.S)[0]
@@ -404,6 +405,10 @@ static int sweet_console_muted=1;
 static unsigned surfaceCopies;
 static void (*duringCopy)();
 static int sweet_surface_gpu_copy(SweetSurface *,uintptr_t,int,int,int,int,int,int){surfaceCopies++;if(duringCopy)duringCopy();if(gpuMode==2){scanTimes.submitted=mach_absolute_time();scanTimes.fence=0;}return gpuMode;}
+static int directMode,directOnStub;static unsigned directCalls,directLayerRefusals;
+static int sweet_surface_direct(SweetSurface *,uintptr_t,unsigned,unsigned,unsigned,unsigned){directCalls++;return directMode;}
+static int fuxi_gpu_scanout_direct_on(){return directOnStub;}
+static void fuxi_gpu_scanout_direct_refused(unsigned why){directLayerRefusals+=why==FG_DD_LAYERS;}
 static int sweet_surface_gpu_poll(uint64_t *elapsed) {*elapsed=42;if(pollMode==1)scanTimes.fence=mach_absolute_time();return pollMode;}
 struct fg_times {uint64_t pin,lookup,map,clean,submit,wait,unmap,cpu;unsigned attempts,hits,misses,sleeps,blocks,groups;};
 static void fuxi_gpu_import_stats(uint64_t *cleaned,uint64_t *skipped,uint64_t *invalidated,

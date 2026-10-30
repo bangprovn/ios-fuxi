@@ -1496,7 +1496,7 @@
  			OSSafeReleaseNULL(s);
  			continue;
  		}
-@@ -500,35 +1274,216 @@
+@@ -500,35 +1274,222 @@
  		if (src != 0 && bpe == 4) {
  			int copied = 0;
  #if defined(FUXI)
@@ -1511,6 +1511,12 @@
  			uint64_t copyStart = mach_absolute_time();
  			/* CA's composed frame has one layer. Preserve the CPU path for
  			 * multi-layer records rather than submit multiple fences per frame. */
++            /* fuxigpuncimport bit 24: VIG0 fetches the surface itself through a display IOVA slot; any refusal copies. */
++            if (fScanout && (mask & (mask-1)) == 0) {
++             int direct = sweet_surface_direct(s, src, sx, sy, w, h);
++             if (direct == 3) { fStageBlocks[2]++; fScanoutDefers++; s->release(); return false; }
++             if (direct == 2) { fShadowValid = false; s->release(); continue; }
++            } else if (fScanout && fuxi_gpu_scanout_direct_on()) fuxi_gpu_scanout_direct_refused(FG_DD_LAYERS);
  			if ((mask & (mask-1)) == 0)
  				copied = sweet_surface_gpu_copy(s, src, sx, sy, dx, dy, w, h);
 +            if (copied == 3 || (copied < 0 && fScanout)) {
@@ -1721,7 +1727,7 @@
  	fStatCopy += took;
  	fStatCopyMax = took > fStatCopyMax ? took : fStatCopyMax;
  	if (++fStatFrames >= 600) {
-@@ -538,15 +1493,33 @@
+@@ -538,15 +1499,33 @@
  		absolutetime_to_nanoseconds(t1 - fStatStart, &span_ns);
  		IOLockLock(fLock);
  		uint32_t swaps = fStatSwaps, dropped = fStatDropped;
@@ -1757,7 +1763,7 @@
  		sweet_surface_gpu_stats(&split);
  		uint64_t ticks[] = {split.pin, split.lookup, split.map, split.clean,
  		    split.submit, split.wait, split.unmap, split.cpu};
-@@ -559,11 +1532,19 @@
+@@ -559,11 +1538,19 @@
  		}
  		IOLog("FUXI GPU: presents GPU %u CPU %u, GPU retire avg %llu us CPU avg %llu us, "
  		    "split pin %llu lookup %llu map+TLB %llu clean %llu submit %llu wait %llu unmap %llu us, "
@@ -1779,7 +1785,7 @@
  		fGpuBusyTicks = fGpuFailed = 0;
  		fGpuFrames = fCpuFrames = 0;
  		fGpuTime = fCpuTime = 0;
-@@ -571,6 +1552,33 @@
+@@ -571,6 +1558,33 @@
  		fStatCopy = fStatCopyMax = 0;
  		fStatStart = t1;
  	}
@@ -1813,7 +1819,7 @@
  #endif
  }
  
-@@ -620,6 +1628,7 @@
+@@ -620,6 +1634,7 @@
  	IOLockLock(fFB->fLock);
  	old = fPort;
  	fPort = port;
@@ -1821,7 +1827,7 @@
  	IOLockUnlock(fFB->fLock);
  	if (old != MACH_PORT_NULL) {
  		releaseNotificationPort(old);
-@@ -643,6 +1652,40 @@
+@@ -643,6 +1658,40 @@
  }
  
  static uint64_t sweet_fb_logged;        /* selectors already logged (< 64) */
@@ -1862,7 +1868,7 @@
  
  IOReturn
  IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
-@@ -660,7 +1703,7 @@
+@@ -660,7 +1709,7 @@
  		break;
  	case kSweetFBSwapBegin:
  		IOLockLock(fFB->fLock);
@@ -1871,7 +1877,7 @@
  		IOLockUnlock(fFB->fLock);
  		outCount = 1;
  		break;
-@@ -672,7 +1715,7 @@
+@@ -672,7 +1721,7 @@
  			break;
  		}
  		memcpy(rec, args->structureInput, sizeof(rec));
@@ -1880,7 +1886,7 @@
  		break;
  	}
  	case kSweetFBGetID:
-@@ -698,6 +1741,7 @@
+@@ -698,6 +1747,7 @@
  			IOLockLock(fFB->fLock);
  			fFunc[type] = args->scalarInput[0];
  			fRefcon[type] = args->scalarInput[1];
@@ -1888,7 +1894,7 @@
  			IOLockUnlock(fFB->fLock);
  			char name[32];
  			proc_selfname(name, sizeof(name));
-@@ -707,19 +1751,13 @@
+@@ -707,19 +1757,13 @@
  		break;
  	case kSweetFBRequestPowerChange:
  		if (args->scalarInputCount >= 1) {

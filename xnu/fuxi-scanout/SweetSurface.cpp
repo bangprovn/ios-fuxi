@@ -142,6 +142,12 @@ static uint64_t sweet_gpu_begin;
 /* fuxigpuncimport bit 20: pre-cleans, skips (no writer since the last clean) and the zero-copy
  * class of each submitted frame (sweet_surface_scanout_class), logged with the 600-frame split. */
 static unsigned sweet_gpu_precleans, sweet_gpu_preclean_skips, sweet_gpu_zc[8];
+/* fuxigpuncimport bit 24: the surfaces in the display's direct-scanout slots, strong while slotted (index = kernel slot; table under
+ * sweet_writer_lock, changed under sweet_gpu_lock too). A writer of a slotted surface waits while the kernel reports the slot busy. */
+struct sweet_direct_slot { SweetSurface *surface; IOMemoryDescriptor *memory; uint64_t preparation, key; };
+static sweet_direct_slot sweet_direct_slots[FG_DD_SLOTS_N];
+static uint64_t sweet_direct_key, sweet_direct_pages[FG_DD_SLOT_PAGES];
+static unsigned sweet_direct_held;
 static bool sweet_gpu_init(void)
 {
  if (!sweet_gpu_lock) {
@@ -344,6 +350,24 @@ static bool sweet_surface_present_reading(SweetSurface *s)
  for (unsigned i = 0; i < sweet_present_count; i++) if (sweet_present_readers[i] == s) return true;
  return false;
 }
+/* Under sweet_writer_lock: s sits in a direct slot the display may still read. A wait longer than 100 ms is counted and ends. */
+static bool sweet_direct_reading(SweetSurface *s, uint64_t *since)
+{
+ unsigned k = 0;
+ while (k < FG_DD_SLOTS_N && sweet_direct_slots[k].surface != s) k++;
+ if (k == FG_DD_SLOTS_N || !(fuxi_gpu_scanout_direct_busy() & (1u << k))) return false;
+ uint64_t now = mach_absolute_time(), bound = 0;
+ nanoseconds_to_absolutetime(100000000ull, &bound);
+ if (!*since) *since = now;
+ else if (now - *since > bound) { fuxi_gpu_scanout_direct_refused(FG_DD_WHY); return false; }
+ return true;
+}
+static void sweet_direct_nap(void)
+{
+ uint64_t deadline = 0;
+ nanoseconds_to_absolutetime(250000ull, &deadline);
+ (void)IOLockSleepDeadline(sweet_writer_lock, &sweet_gpu_inflight, mach_absolute_time() + deadline, THREAD_UNINT);
+}
 /* AvoidSync reserves a pending producer without waiting; it must take a
  * normal writer lease before touching pixels. Display reads never sleep. */
 static bool sweet_gpu_writer(SweetSurface *s, bool lock, bool pending = false)
@@ -356,17 +380,104 @@ static bool sweet_gpu_writer(SweetSurface *s, bool lock, bool pending = false)
   s->gpuWriterSerial++;
   /* Pending-to-active conversion stays in the outstanding writer epoch. */
   if (!s->gpuWriters) s->gpuWriterEpoch++;
-  while (!pending && (sweet_gpu_submitting == s || sweet_gpu_inflight == s || sweet_surface_present_reading(s)))
-   IOLockSleep(sweet_writer_lock, &sweet_gpu_inflight, THREAD_UNINT);
+  uint64_t since = 0; /* bit 24: the display may still fetch the surface itself; no wakeup comes for that, so nap */
+  while (!pending && (sweet_gpu_submitting == s || sweet_gpu_inflight == s || sweet_surface_present_reading(s) || sweet_direct_reading(s, &since))) {
+   if (since) sweet_direct_nap(); else IOLockSleep(sweet_writer_lock, &sweet_gpu_inflight, THREAD_UNINT);
+  }
   if (s->gpuWriters == ~0u) { s->gpuQuarantined = true; sweet_surface_display_poison(s); }
-  if (!s->gpuQuarantined) { s->gpuWriters++; fuxi_gpu_present_writer(s->id, !pending); } /* bit 16: lock-free, no GPU lock */
+  if (!s->gpuQuarantined) {
+   s->gpuWriters++; fuxi_gpu_present_writer(s->id, !pending); /* bit 16: lock-free, no GPU lock */
+   if (!pending) s->gpuLockSeq = fuxi_gpu_abi_seq();
+  }
  } else if (s->gpuWriters && !--s->gpuWriters && !s->gpuQuarantined) {
   s->gpuReadyTime = mach_absolute_time();
+  s->gpuWriterFence = fuxi_gpu_abi_seq() != s->gpuLockSeq ? s->gpuLockSeq + 1 : 0; /* bit 24: the writer job's fence, as copy priority */
   if (sweet_present_wake) sweet_present_wake(sweet_present_context);
  }
  bool ok = !s->gpuQuarantined;
  IOLockUnlock(sweet_writer_lock);
  return ok;
+}
+/* fuxigpuncimport bit 24: the display scans the surface out itself (fuxi_gpu_scanout_direct_*). The display path calls this between
+ * present_begin and present_end (no writer holds s) for a one-layer frame cropped to the panel. Eligible: BGRA8 1125x2436, stride 4608,
+ * crop 22,18 1080x2400, page-aligned offset, wired IOBuffer backing. A miss maps the surface's 4 KiB pages into the slot the kernel
+ * chose and releases the surface that slot held (the kernel never picks a slot on screen, fetched, pending or queued). The pixels
+ * are cleaned to PoC unless no writer came since the last clean (as bit 20). 2 queued, 3 retry, 0 copy. */
+int sweet_surface_direct(SweetSurface *s, uintptr_t src, unsigned sx, unsigned sy, unsigned width, unsigned height)
+{
+ SweetSurface *drop[FG_DD_SLOTS_N] = {};
+ unsigned drops = 0, why = FG_DD_WHY, have = FG_DD_SLOTS_N, slot = 0, n = 0;
+ if (!sweet_gpu_init()) return 0;
+ if (!fuxi_gpu_scanout_direct_on()) {
+  /* Off (fault, or never armed): give back the slotted surfaces the display no longer reads. */
+  if (!__atomic_load_n(&sweet_direct_held, __ATOMIC_RELAXED)) return 0;
+  unsigned busy = fuxi_gpu_scanout_direct_busy();
+  IOLockLock(sweet_gpu_lock); IOLockLock(sweet_writer_lock);
+  for (unsigned k = 0; k < FG_DD_SLOTS_N; k++) if (sweet_direct_slots[k].surface && !(busy & (1u << k))) {
+   drop[drops++] = sweet_direct_slots[k].surface; bzero(&sweet_direct_slots[k], sizeof(sweet_direct_slots[k])); sweet_direct_held--;
+  }
+  IOLockUnlock(sweet_writer_lock); IOLockUnlock(sweet_gpu_lock);
+  for (unsigned i = 0; i < drops; i++) drop[i]->release();
+  return 0;
+ }
+ IOBufferMemoryDescriptor *buffer = OSDynamicCast(IOBufferMemoryDescriptor, s->memory);
+ uint64_t bytes = s->height ? (uint64_t)(s->height - 1)*s->bytesPerRow + (uint64_t)s->width*4 : 0;
+ unsigned c = sweet_surface_scanout_class(s, s->offset, bytes);
+ if (c == 2) why = FG_DD_FORMAT;
+ else if (c == 3 || s->bytesPerRow != 4608) why = FG_DD_STRIDE;
+ else if (c == 5 || !c || !buffer || !src) why = FG_DD_BACKING;
+ else if (s->width != 1125 || s->height != 2436 || sx != 22 || sy != 18 || width != 1080 || height != 2400) why = FG_DD_GEOMETRY;
+ else if (s->offset & 4095) why = FG_DD_OFFSET;
+ if (why != FG_DD_WHY) { fuxi_gpu_scanout_direct_refused(why); return 0; }
+ uint64_t preparation = s->memory->getPreparationID(), key = 0;
+ IOLockLock(sweet_gpu_lock);
+ if (sweet_gpu_inflight) { IOLockUnlock(sweet_gpu_lock); fuxi_gpu_scanout_direct_refused(FG_DD_STATE); return 0; }
+ IOLockLock(sweet_writer_lock);
+ bool writer = s->gpuWriters || s->gpuQuarantined;
+ uint32_t fence = s->gpuWriterFence;
+ uint64_t serial = s->gpuWriterSerial, epoch = s->gpuWriterEpoch;
+ bool clean = !s->gpuCleanValid || s->gpuCleanSerial != serial || s->gpuCleanEpoch != epoch;
+ for (unsigned k = 0; k < FG_DD_SLOTS_N; k++) if (sweet_direct_slots[k].surface == s) have = k;
+ if (have < FG_DD_SLOTS_N) {
+  sweet_direct_slot &d = sweet_direct_slots[have];
+  if (d.memory == s->memory && d.preparation == preparation) key = d.key;
+ } else key = ++sweet_direct_key;
+ IOLockUnlock(sweet_writer_lock);
+ if (writer) { IOLockUnlock(sweet_gpu_lock); return 3; }
+ if (!key) { IOLockUnlock(sweet_gpu_lock); fuxi_gpu_scanout_direct_refused(FG_DD_BACKING); return 0; } /* new physical list while slotted */
+ uint64_t old = 0;
+ int r = fuxi_gpu_scanout_direct_slot(key, &slot, &old), q = 0;
+ if (r == 1 && sweet_direct_slots[slot].surface != s) { r = 0; fuxi_gpu_scanout_direct_refused(FG_DD_STATE); }
+ if (r == 2) {
+  /* The kernel emptied the slot: its surface (if any) is no longer read. */
+  IOLockLock(sweet_writer_lock);
+  if (sweet_direct_slots[slot].surface) { drop[drops++] = sweet_direct_slots[slot].surface; sweet_direct_held--; }
+  bzero(&sweet_direct_slots[slot], sizeof(sweet_direct_slots[slot]));
+  IOLockUnlock(sweet_writer_lock);
+  uint64_t off = s->offset & ~4095ull, end = s->offset + bytes;
+  for (; off < end && n < FG_DD_SLOT_PAGES; off += 4096) {
+   IOByteCount length = 0;
+   addr64_t pa = buffer->getPhysicalSegment(off, &length, kIOMemoryMapperNone);
+   sweet_direct_pages[n++] = length >= 4096 ? pa : 0; /* the kernel refuses 0 and unaligned pages */
+  }
+  if (off < end) n = 0;
+ }
+ if (r) {
+  if (clean) {
+   fuxi_gpu_clean_source(src + s->offset, bytes);
+   IOLockLock(sweet_writer_lock); s->gpuCleanSerial = serial; s->gpuCleanEpoch = epoch; s->gpuCleanValid = true; IOLockUnlock(sweet_writer_lock);
+  }
+  q = fuxi_gpu_scanout_direct_queue(slot, key, r == 2 ? sweet_direct_pages : NULL, n, src + s->offset, fence);
+  if (q == 1 && r == 2) {
+   s->retain();
+   IOLockLock(sweet_writer_lock);
+   sweet_direct_slots[slot] = sweet_direct_slot{s, s->memory, preparation, key}; sweet_direct_held++;
+   IOLockUnlock(sweet_writer_lock);
+  }
+ }
+ IOLockUnlock(sweet_gpu_lock);
+ for (unsigned i = 0; i < drops; i++) drop[i]->release(); /* free() takes the cache lock */
+ return q == 1 ? 2 : 0;
 }
 uint64_t sweet_surface_writer_serial(SweetSurface *s, uint64_t *epoch)
 {

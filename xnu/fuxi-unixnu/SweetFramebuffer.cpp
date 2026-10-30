@@ -1285,6 +1285,12 @@ AppleCLCD::present(const SwapRecord &record)
 			uint64_t copyStart = mach_absolute_time();
 			/* CA's composed frame has one layer. Preserve the CPU path for
 			 * multi-layer records rather than submit multiple fences per frame. */
+            /* fuxigpuncimport bit 24: VIG0 fetches the surface itself through a display IOVA slot; any refusal copies. */
+            if (fScanout && (mask & (mask-1)) == 0) {
+             int direct = sweet_surface_direct(s, src, sx, sy, w, h);
+             if (direct == 3) { fStageBlocks[2]++; fScanoutDefers++; s->release(); return false; }
+             if (direct == 2) { fShadowValid = false; s->release(); continue; }
+            } else if (fScanout && fuxi_gpu_scanout_direct_on()) fuxi_gpu_scanout_direct_refused(FG_DD_LAYERS);
 			if ((mask & (mask-1)) == 0)
 				copied = sweet_surface_gpu_copy(s, src, sx, sy, dx, dy, w, h);
             if (copied == 3 || (copied < 0 && fScanout)) {

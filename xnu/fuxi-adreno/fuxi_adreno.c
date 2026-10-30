@@ -173,6 +173,8 @@ static IOLock *fg_ring_lock;
 struct fg_guard { IOLock *lock; };
 static void fg_guard_exit(struct fg_guard *g) { if (g->lock) IOLockUnlock(g->lock); }
 #define FG_GUARD struct fg_guard guard __attribute__((cleanup(fg_guard_exit))) = {fg_ring_lock}; if (guard.lock) IOLockLock(guard.lock)
+/* Never waits: callers holding another lock (SweetSurface writer lock) run fail instead when the ring lock is taken. */
+#define FG_TRY_GUARD(fail) struct fg_guard guard __attribute__((cleanup(fg_guard_exit))) = {fg_ring_lock}; if (guard.lock && !IOLockTryLock(guard.lock)) { guard.lock = 0; fail; }
 #define FUXI_GPU_XNU 1
 #define G_PTR(pa) fg_pointer(pa)
 #define G_PTR_RANGE(pa, bytes) fg_pointer_range(pa, bytes)

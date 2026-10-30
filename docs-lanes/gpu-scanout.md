@@ -2025,3 +2025,150 @@ If it still faults, the `walk` line tells the cases apart:
 - `plvl=1` with `l1[2]=0x80000441` would point at block support or
   attributes, and the next try would be level-2 2 MiB blocks;
 - PTWF 1 would point at the table memory or cacheability.
+
+### Direct-DPU-scanout stage 3: per-frame direct scanout of CA surfaces (`fuxigpuncimport` bits 22+23+24)
+
+Stage 2 worked on device (X232, observed): 60 identity STARTs, the scattered
+2741-page surface at IOVA 0x10000000, flip latched, 2 s hold, exact restore.
+Stage 3 keeps that translation for the boot and lets VIG0 fetch the
+CoreAnimation surface itself, with no GPU copy. Everything below is host-tested
+only; no device effect has been observed yet.
+
+Boot value: the current base 472710776 plus bits 22 (4194304), 23 (8388608)
+and 24 (16777216) is `fuxigpuncimport=502070904` (9 digits). Bit 24 without
+22+23 logs `dpu stage3 ignored: bit 24 needs bits 22+23`. Stage 3 also needs
+`fuxiscantriple=1` and no autorefresh scanout (bit 131072). Otherwise stage 2
+runs alone as before and logs `dpu stage3 not armed reason=...`.
+
+Arming (`fg_scanout_dpu_stage2_run`):
+
+- The window grows to 4 slots of 16 MiB (64 MiB, 32 level-3 tables). Slot k
+  is scanout buffer 3+k at IOVA 0x10000000 + k*16 MiB. Stage 2's test surface
+  uses slot 0. The hold is 100 ms.
+- After A is latched again, the bank is not restored. The test surface's
+  leaves are cleared (bank TLBIALL) and the surface is freed. The table, the
+  identity 1 GiB blocks and the apps_smmu mapping stay. A, B, C and the boot
+  framebuffer still scan out 1:1.
+
+Per present (`SweetFramebuffer.cpp` present, then `sweet_surface_direct` in
+`SweetSurface.cpp`, then `fuxi_gpu_scanout_direct_*`):
+
+1. Eligibility:
+   - one layer;
+   - `sweet_surface_scanout_class` BGRA8 with wired IOBuffer backing;
+   - 1125x2436, stride 4608, crop 22,18 1080x2400;
+   - page-aligned offset.
+
+   A failure is counted under its reason and that frame is copied.
+2. Active writer: 3, the record is kept and retried, as a busy ring is.
+3. Slot choice (`direct_slot`): the slot already holding the surface (a hit:
+   no page list, no map, no TLBI). On a miss, the least recently queued slot
+   that is not the front, fetched, pending (ready) or queued. Its leaves are
+   emptied (bank TLBIALL, `slot_evicts`) and SweetSurface drops its reference
+   to the old surface.
+4. A miss maps every 4 KiB page of the surface (2741 for this geometry) into
+   the slot's leaves. Pages that are 0, unaligned or beyond OAS are refused,
+   and so is a count below 2741 or above 4096. Then a bank TLBIALL. The pixels
+   are cleaned to PoC unless no writer came since the last clean (as bit 20).
+   SweetSurface holds one reference per slotted surface.
+5. `direct_queue` sets `fg_scanout_copy = 3+slot`, records the writer fence
+   and returns. The offer (`fuxi_gpu_scanout_publish`), the START gates, the
+   TE spin thread and retry then run unchanged.
+6. A slot START writes SRC_IMG_SIZE 0x9840465, SRC_XY 0x120016, YSTRIDE0
+   (A's high half | 4608) and SRC0 = the slot IOVA, then FLUSH and START,
+   exactly like the stage-2 flip. The first A/B/C START after a slot writes
+   A's saved geometry back with the address (`fg_scanout_address`).
+7. Writer fence: the ABI sequence at the writer's lock plus 1. This is the
+   job submitted under the lock, the same convention as copy priority's
+   wfence; it is 0 when no job was submitted. Publish returns 2 (retry) until
+   the fence memory reaches it (`fence_polls`, `fence_wait_us`).
+
+Release of the on-screen surface. CA alternates two surfaces, so holding one
+until the next present would throttle it. The display stops reading a slot
+(its fetch ends) at whichever comes first:
+
+- `release_on_time`: the write line was seen active after the START's TE and
+  is now idle with START clear. The spin thread sees this, or a busy poll
+  from a waiting writer does.
+- the next START (counted late);
+- 3 TEs or 3 periods after its START, with START clear and the line idle
+  (counted late).
+
+A writer of a slotted surface that the display may still read naps in 250 us
+steps, because no wakeup comes for a display read. The wait is bounded at
+100 ms and counted as `wait_forced`.
+
+A command-mode panel keeps the image in its own RAM, so the front slot is not
+read after its transfer. It is still never evicted.
+
+Fault policy: FSR is read before every START, in busy polls and in every slot
+or queue call. Any fault bit, or an unreadable FSR, causes all of this:
+
+- `dpu direct fault where=...` with FAR/FSYNR0 and the walk line;
+- RESUME for a stalled transaction and the FSR fault bits cleared;
+- a bank TLBIALL;
+- a pending slot frame dropped;
+- the front moved to a buffer that is neither ready nor being copied, with
+  A's geometry (`dpu direct fallback A geometry ...`);
+- the identity translation kept;
+- GPU copies for the rest of the boot;
+- slotted surfaces given back once the display no longer reads them.
+
+Expected log lines on a good run (values from the host model; device
+addresses differ):
+
+```
+FUXI SCANOUT: dpu stage3 requested: stage2 keeps the translation, CA surfaces scan out through 4 IOVA slots
+FUXI SCANOUT: dpu stage2 mapped iova=0x10000000 pages=2741 window=0x4000000 tlbi=bank
+FUXI SCANOUT: dpu stage2 hold_ms=100 fsr=0x400
+FUXI SCANOUT: dpu stage2 restored A img=... xy=... ystride0=0x10e0 src0=0xb8000000 ...
+FUXI SCANOUT: dpu stage3 armed slots=4 iova=0x10000000 slot_bytes=0x1000000 tables=0x... bank=cb3 fsr=0x400 A img=... xy=... ystride0=0x10e0
+FUXI SCANOUT: dpu stage2 done result=ok step=arm identity_starts=60 flip_latched=1 hold_ms=100 translation=kept
+FUXI SCANOUT: dpu direct map slot=0 iova=0x10000000 pages=2741 above4g=... runs=... first=0x... tlbi=bank      (first 8 maps)
+FUXI SCANOUT: dpu direct flip slot=0 src0=0x10000000 img=0x9840465 xy=0x120016 ystride0=0x...1200 te=...    (first 8 flips)
+FUXI SCANOUT: dpu direct flips= copies= refused(geometry/stride/offset/format/backing/layers/pages/slots/state)=a/b/c/d/e/f/g/h/i maps= remaps= hits= tlbi= fsr= slot_evicts= release_late= release_on_time= wait_forced= fence_polls= fence_wait_us avg= max= on=1 dead=0 busy=0x..   (every 600 offers)
+```
+
+The first 8 map lines and the first 8 flip lines share one budget, so a log
+holds 8 of these lines in total.
+
+Host tests:
+
+- `tools/test-fuxi-gpu-scanout.py`, `dpu_stage3_tests`, on the stage-2
+  SMMUv2 walk and MDSS fetch model:
+  - armed state and kept translation;
+  - per flip, every fetched row walks to that surface's own scattered pages
+    at the slot IOVA, with slot geometry, and A/B/C fetches have A geometry;
+  - hits with no maps or TLBI;
+  - on-time and late release;
+  - LRU never takes the front, fetched, pending or queued slot, and all four
+    busy is refused;
+  - page refusals;
+  - the fence holds START;
+  - the 600-offer line;
+  - a fault on a slot fetch or with a pending slot frame leads to copies with
+    A geometry and identity kept;
+  - stage 3 needs triple;
+  - bits off are inert.
+- The production `sweet_surface_direct` and writer nap are compiled into the
+  cache model.
+- The framebuffer test covers present: direct 2 is offered with no copy and no
+  CPU guard, 3 keeps the record, and 0 copies.
+
+Risks (guesses, none observed):
+
+- **TLBIALL while a slot is fetched.** It is bank-local and only empties
+  leaves the display is not reading, but it does flush the identity walk
+  caches mid-transfer.
+- **The fence convention.** "Lock sequence + 1" assumes the writer's job is
+  the next ABI submission after the lock. A misattributed fence could START a
+  half-written frame (tearing, not corruption of other memory).
+- **Release timing** relies on START and write-line semantics observed for
+  copies. If the line is idle between rows, an on-time release could come
+  early and a writer could overwrite pixels still being sent (tearing on one
+  frame).
+- **Throttling.** With only two CA surfaces, a writer waits for the fetch to
+  end, at most about one transfer. The forced bound is 100 ms.
+- **Park interplay** (bit 27): unchanged. A direct frame never queues a copy,
+  so there is nothing to park.
+- **After a fault,** the panel keeps the faulted frame until the next copy.

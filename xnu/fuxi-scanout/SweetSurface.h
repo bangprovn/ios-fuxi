@@ -39,6 +39,9 @@ public:
  uint64_t gpuCleanSerial, gpuCleanEpoch;
  bool gpuCleanValid;
  uint8_t scanoutClass;
+ /* fuxigpuncimport bit 24: ABI sequence when the writer epoch opened, and the writer fence when it closed (lock sequence + 1 when a
+  * submit followed the lock, else 0). */
+ uint32_t gpuLockSeq, gpuWriterFence;
 #endif
 	uint32_t width, height, bytesPerRow, offset, pixelFormat, allocSize;
 	uint16_t bytesPerElement;
@@ -69,6 +72,8 @@ void sweet_surface_gpu_stats(struct fg_times *);
 void sweet_surface_display_poison(SweetSurface *);
 uint64_t sweet_surface_writer_serial(SweetSurface *, uint64_t *epoch = NULL);
 unsigned sweet_surface_scanout_class(SweetSurface *, uint64_t offset, uint64_t bytes);
+/* fuxigpuncimport bit 24: 2 queued for direct scanout (no copy), 3 retry, 0 copy. */
+int sweet_surface_direct(SweetSurface *, uintptr_t src, unsigned sx, unsigned sy, unsigned width, unsigned height);
 #endif
 
 /* Retained surface for an id, or NULL. */

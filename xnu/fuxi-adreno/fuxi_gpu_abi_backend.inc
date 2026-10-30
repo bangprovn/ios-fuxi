@@ -887,6 +887,9 @@ static uint64_t fg_pk_since, fg_pk_retired, fg_pk_sum, fg_pk_max, fg_pk_idle_sum
 static void fg_pk_stats_reset(void) { fg_pk_idle_n=0; fg_pk_sum=fg_pk_max=fg_pk_idle_sum=fg_pk_idle_max=0; memset(fg_pk_stats,0,sizeof(fg_pk_stats)); }
 static void fg_pk_reset(void) { fg_pk_n=fg_pk_fence=fg_pk_wfence=fg_pk_gen=0; fg_pk_since=fg_pk_retired=0; fg_pk_stats_reset(); }
 static int fg_pk_written(uint32_t fence) { uint32_t f=g3_read(G3_FENCE_PA+FG_ABI_FENCE_OFF+4); return !fg_access_failed && (int32_t)(f-fence)>=0; }
+/* Direct scanout (bit 24): a writer's fence and the submitted sequence, lock-free (the fence page is always mapped once ready). */
+uint32_t fuxi_gpu_abi_seq(void) { return FG_CF_LD(fg_abi_seq); }
+int fuxi_gpu_abi_fence_passed(uint32_t fence) { return !fence || (fuxi_gpu_ready() && fg_pk_written(fence)); }
 /* Under the GPU lock: ring the parked job (GPU order: after whatever was written since it was parked, i.e. the due copy). 0 or a fault. */
 static int fg_pk_flush(unsigned why)
 {

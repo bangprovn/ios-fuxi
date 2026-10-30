@@ -65,6 +65,22 @@ int fuxi_gpu_scanout_reserve(void);
 int fuxi_gpu_scanout_preclean(void);
 void fuxi_gpu_clean_source(uintptr_t source, uint64_t length);
 void fuxi_gpu_scanout_release(void);
+/* fuxigpuncimport bits 22+23+24 (direct scanout stage 3, default off): VIG0 fetches a CA surface through the display bank's IOVA slots
+ * instead of a GPU copy. on: armed and no fault (lock-free). slot: 1 key mapped in *slot, 2 miss (*slot chosen and emptied, *old its
+ * previous key, 0 none), 0 refused (copy). queue: map (pages, n 4 KiB pages; NULL on a hit), queue the slot for the next offer; va is
+ * the surface's kernel address for a CPU fallback, fence the writer's ABI fence (0 none); 1 queued, 0 refused, -1 fault (copy for
+ * the boot). busy: slots the display may still read (transfer, pending START, queued), lock-free try. refused: SweetSurface/framebuffer
+ * refusal reasons. abi_seq: submitted ABI sequence, lock-free; abi_fence_passed: fence memory reached fence (0 always). */
+enum { FG_DD_GEOMETRY, FG_DD_STRIDE, FG_DD_OFFSET, FG_DD_FORMAT, FG_DD_BACKING, FG_DD_LAYERS, FG_DD_PAGES, FG_DD_SLOTS, FG_DD_STATE, FG_DD_WHY };
+#define FG_DD_SLOTS_N 4u
+#define FG_DD_SLOT_PAGES 4096u /* 16 MiB of 4 KiB pages per slot */
+int fuxi_gpu_scanout_direct_on(void);
+int fuxi_gpu_scanout_direct_slot(uint64_t key, unsigned *slot, uint64_t *old);
+int fuxi_gpu_scanout_direct_queue(unsigned slot, uint64_t key, const uint64_t *pages, unsigned n, uintptr_t va, uint32_t fence);
+unsigned fuxi_gpu_scanout_direct_busy(void);
+void fuxi_gpu_scanout_direct_refused(unsigned why);
+uint32_t fuxi_gpu_abi_seq(void);
+int fuxi_gpu_abi_fence_passed(uint32_t fence);
 void fuxi_gpu_start(uint64_t framebuffer, unsigned width, unsigned height, unsigned pitch);
 int fuxi_gpu_map(unsigned slot, uint64_t generation, uintptr_t source,
     uint64_t length, struct fg_times *t);
