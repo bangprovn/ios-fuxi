@@ -80,6 +80,13 @@ int main(){
   const char *first=strstr(buffer,"top1 ");assert(first && strstr(first,"pass 1080x2400 colors=1 load=L store=S") && strstr(first,"draws=40.0") && strstr(first,"avg_ms=2.000"));
   const char *second=strstr(buffer,"top2 ");assert(second && strstr(second,"pass 64x16 colors=1 load=C store=S") && strstr(second,"n/submit=2.00") && strstr(second,"copies=1.0") && strstr(second,"avg_ms=0.125"));
   assert(strstr(buffer,"top3 op 0x0") && !strstr(buffer,"top4 ") && times.submitCount()==0);
+  assert(!strstr(buffer,"draw area per submit")); // only with FUXI_MTL_DRAW_AREA classes present
+  PassInfo shr=big;shr.areaClass=2;shr.areaW=1080;shr.areaH=600;PassInfo kept=big;kept.areaClass=1;kept.areaW=1080;kept.areaH=2400;
+  for(int i=0;i<2;++i)times.add({shr,kept,small},{500000,2000000,100000},3000000);
+  char b2[4096]{};o=fmemopen(b2,sizeof b2,"w");times.report(o);fclose(o);
+  const char *da=strstr(b2,"FUXI MTL: gpu pass draw area per submit: shrunk passes=1.00 ms=0.500 avg_ms=0.500 area_pct=25.0 | eligible not shrunk passes=1.00 ms=2.000 avg_ms=2.000 area_pct=100.0 | not eligible passes=1.00 ms=0.100");
+  assert(da);
+  times.add({big},{1000},1000);char b3[4096]{};o=fmemopen(b3,sizeof b3,"w");times.report(o);fclose(o);assert(!strstr(b3,"draw area per submit")); // window reset
  }
  { // per-draw GPU times: the pass with the largest draw sum wins, draws ranked, begin markers skipped; SPIR-V statistics
   std::vector<DrawInfo> infos;std::vector<uint64_t> ns;
@@ -91,7 +98,15 @@ int main(){
   assert(strstr(buffer,"[1125x2436 fmt=80 linear]") && strstr(buffer,"frag_instr=12") && !strstr(buffer,"pipe=000001"));
   uint32_t code[18]={0x07230203,0x10000,0,10,0};code[5]=(4u<<16)|21;code[9]=(5u<<16)|87;code[14]=(3u<<16)|246;code[17]=(1u<<16)|252;
   auto st=spirvStats(code,sizeof code/4);assert(st.instr==4 && st.samples==1 && st.loops==1 && st.kills==1);
-  std::vector<DrawInfo> none;std::vector<uint64_t> zero;char quiet[64]{};FILE *q=fmemopen(quiet,sizeof quiet,"w");reportDraws(q,none,zero);fclose(q);assert(!quiet[0]);
+  {std::vector<DrawInfo> in;std::vector<uint64_t> t;
+  auto begin=[&](){DrawInfo m{};m.begin=true;m.passW=1000;m.passH=2000;in.push_back(m);t.push_back(0);};
+  auto opq=[&](int x,int y,uint32_t w,uint32_t h,uint64_t ns,bool blend=false){DrawInfo d{};d.count=6;d.blend=blend;d.mask=15;d.scX=x;d.scY=y;d.scW=w;d.scH=h;in.push_back(d);t.push_back(ns);};
+  begin();opq(0,0,1000,2000,500,false);opq(100,100,300,300,200,false);opq(0,0,1000,2000,50,false);opq(100,100,10,10,7,true); // pass 1: the first two are hidden by the third; the blended one is not opaque
+  begin();opq(0,0,500,500,40,false);opq(500,0,500,500,60,false); // pass 2: disjoint, none hidden, first draw does not cover the pass
+  begin();opq(0,0,1000,2000,30,false);{DrawInfo k{};k.count=6;k.mask=15;k.kills=1;k.scW=1000;k.scH=2000;in.push_back(k);t.push_back(9);} // pass 3: a discarding draw never occludes
+  auto o=drawOcclusion(in,t);assert(o.passes==3 && o.draws==8 && o.candidates==2 && o.candidateNs==700 && o.totalNs==896 && o.loadElide==2);
+  auto m=drawOcclusion({},{});assert(!m.draws && !m.candidates);}
+ std::vector<DrawInfo> none;std::vector<uint64_t> zero;char quiet[64]{};FILE *q=fmemopen(quiet,sizeof quiet,"w");reportDraws(q,none,zero);fclose(q);assert(!quiet[0]);
  }
  puts("PASS: bounded frame percentiles/reset/overflow/max, log fields, CPU mask and thread-local attribution");
 }

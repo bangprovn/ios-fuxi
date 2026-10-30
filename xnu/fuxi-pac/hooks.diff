@@ -1,0 +1,101 @@
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -20,6 +20,13 @@
+ 
+ extern "C" void sweet_secondary_entry(void);
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
++#if defined(FUXI)
++/* osfmk/arm64/fuxi_pac.c (patch 0114): PAC self-test, fuxigpuncimport bit 25. No-ops when off. */
++extern "C" void fuxi_pac_probe_cpu(unsigned int cpu);
++extern "C" void fuxi_pac_log_begin(unsigned int cpu);
++extern "C" void fuxi_pac_log_cpu(unsigned int cpu);
++extern "C" void fuxi_pac_log_summary(unsigned int ncpu);
++#endif
+ 
+ class SweetCPU;
+ static SweetCPU *sweet_cpus[MAX_CPUS];
+@@ -154,6 +161,9 @@ SweetCPU::startAll(void *arg __unused, w
+ 	}
+ 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
+ 		SweetCPU *cpu = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
++#if defined(FUXI)
++		fuxi_pac_log_begin(i);
++#endif
+ 		kern_return_t kr = processor_start(cpu->machProcessor);
+ 		if (kr != KERN_SUCCESS) {
+ 			panic("SWEET CPU: cpu=%u processor_start failed: %d", i, kr);
+@@ -165,12 +175,18 @@ SweetCPU::startAll(void *arg __unused, w
+ 			if (mach_absolute_time() > deadline) {
+ 				IOLog("SWEET CPU: cpu=%u mpidr=0x%x NOT alive after 5s\n",
+ 				    i, topology->cpus[i].phys_id);
++#if defined(FUXI)
++				fuxi_pac_log_cpu(i);	/* incomplete step=NAME if the probe hung */
++#endif
+ 				panic("SWEET CPU: cpu=%u startup timeout (reset/MMU/GIC/SGI)", i);
+ 			}
+ 			IOSleep(1);
+ 		}
+ 		IOLog("SWEET CPU: cpu=%u mpidr=0x%x came alive; SGI1 OK\n",
+ 		    i, topology->cpus[i].phys_id);
++#if defined(FUXI)
++		fuxi_pac_log_cpu(i);
++#endif
+ 	}
+ 	/* Publish exactly once, after every selected CPU has completed initCPU(). */
+ 	ml_cpu_init_completed();
+@@ -179,6 +195,9 @@ SweetCPU::startAll(void *arg __unused, w
+ 	ml_set_max_cpus(topology->max_cpu_id + 1);
+ 	IOLog("SWEET CPU: %u/%u CPUs initialized, SGI1 verified\n",
+ 	    topology->num_cpus, topology->num_cpus);
++#if defined(FUXI)
++	fuxi_pac_log_summary(topology->num_cpus);
++#endif
+ 	thread_terminate(current_thread());
+ }
+ 
+@@ -207,6 +226,9 @@ SweetCPU::initCPU(bool boot)
+ 	kprintf("SWEET CPU: cpu=%u entered initCPU mpidr=0x%llx EL%llu IRQs=%u\n",
+ 	    getCPUNumber(), __builtin_arm_rsr64("MPIDR_EL1") & 0xffffULL,
+ 	    __builtin_arm_rsr64("CurrentEL") >> 2, ml_get_interrupts_enabled());
++#if defined(FUXI)
++	fuxi_pac_probe_cpu(getCPUNumber());	/* on this CPU, before startAll sees it initialized */
++#endif
+ 	__atomic_store_n(&initialized, 1, __ATOMIC_RELEASE);
+ }
+ 
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -260,6 +260,7 @@ extern unsigned int gFastIPI;
+ 
+ #if defined(FUXI)
+ extern void fuxi_idle_sgi(unsigned int intid);	/* osfmk/arm64/fuxi_idle.c (patch 0105) */
++extern int fuxi_pac_trap(uint64_t pc, uint32_t esr);	/* osfmk/arm64/fuxi_pac.c (patch 0114) */
+ #endif
+ 
+ static arm_saved_state64_t *original_faulting_state = NULL;
+@@ -619,6 +620,15 @@ sleh_synchronous(arm_context_t *context,
+ 
+ 	ASSERT_CONTEXT_SANITY(context);
+ 
++#if defined(FUXI)
++	/* fuxigpuncimport bit 25: a trapping PAC probe instruction (UNDEF, FPAC) is skipped, never anything else. */
++	if (PSR64_IS_KERNEL(get_saved_state_cpsr(state)) &&
++	    fuxi_pac_trap((uint64_t)get_saved_state_pc(state), esr)) {
++		add_saved_state_pc(state, 4);
++		return;
++	}
++#endif
++
+ 	task_vtimer_check(thread);
+ 
+ #if CONFIG_DTRACE
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -43,6 +43,7 @@ osfmk/arm/arm_init.c	optional config_pma
+ osfmk/arm64/arm_vm_init.c	optional config_pmap_ppl
+ osfmk/arm64/sweet_early.c	standard
+ osfmk/arm64/fuxi_idle.c	standard
++osfmk/arm64/fuxi_pac.c	standard
+ osfmk/arm64/arm64_hypercall.c	standard
+ osfmk/arm/io_map.c		standard
+ osfmk/arm64/loose_ends.c	standard

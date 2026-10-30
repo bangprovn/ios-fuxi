@@ -43,6 +43,15 @@ unsigned fuxi_gpu_abi_submit_wait_us(unsigned *kind); /* kind: 0 rest of a prese
 struct fuxi_gpu_clean_split;
 void fuxi_gpu_abi_clean_split(struct fuxi_gpu_clean_split *out);
 void fuxi_gpu_abi_publish(void);
+/* GPU fence interrupt (fuxigpuncimport bit 26, fuxi_gpu_irq.inc). setup attaches once and returns 1 while armed; sleep blocks up to us
+ * microseconds unless the interrupt count has moved past seq0: 1 woken, 0 timed out, -1 not armed, -2 fence value already written
+ * (the ring is draining; poll instead). */
+int fuxi_gpu_irq_setup(void);
+uint32_t fuxi_gpu_irq_seq(void);
+int fuxi_gpu_irq_sleep(uint32_t seq0, uint64_t fence, unsigned us);
+enum { FG_IRQ_N, FG_IRQ_EMPTY, FG_IRQ_FOREIGN, FG_IRQ_WAKES, FG_IRQ_TIMEOUTS, FG_IRQ_RACES, FG_IRQ_MASKFIX, FG_IRQ_WRITTEN, FG_IRQ_STATS };
+/* Counters and why it was masked (1 empty run, 2 burst, 3 isolation, 4 no delivery); returns 0 off, 1 armed, 2 attach failed, 3 masked, 4 attaching. */
+unsigned fuxi_gpu_irq_stats(uint64_t s[FG_IRQ_STATS], unsigned *why);
 #ifdef __cplusplus
 }
 #endif

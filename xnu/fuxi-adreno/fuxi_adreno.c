@@ -173,12 +173,15 @@ static IOLock *fg_ring_lock;
 struct fg_guard { IOLock *lock; };
 static void fg_guard_exit(struct fg_guard *g) { if (g->lock) IOLockUnlock(g->lock); }
 #define FG_GUARD struct fg_guard guard __attribute__((cleanup(fg_guard_exit))) = {fg_ring_lock}; if (guard.lock) IOLockLock(guard.lock)
+/* Never waits: callers holding another lock (SweetSurface writer lock) run fail instead when the ring lock is taken. */
+#define FG_TRY_GUARD(fail) struct fg_guard guard __attribute__((cleanup(fg_guard_exit))) = {fg_ring_lock}; if (guard.lock && !IOLockTryLock(guard.lock)) { guard.lock = 0; fail; }
 #define FUXI_GPU_XNU 1
 #define G_PTR(pa) fg_pointer(pa)
 #define G_PTR_RANGE(pa, bytes) fg_pointer_range(pa, bytes)
 #define G_RING_INDEX(w) ((w) & 8191u)
 static void fg_scm_call(uint64_t ret[4], unsigned slot, unsigned step,
     uint32_t fn, uint32_t info, uint64_t a, uint64_t b, uint64_t c);
+static void fg_irq_quiesce(void);
 #include "gpu.c"
 static unsigned fg_clock_measure;
 /* Startup diagnostics have their own fault result: an optional readback must
@@ -325,6 +328,13 @@ static uint32_t fg_inl_n, fg_inl_fb[FG_INL_REASONS], fg_inl_lat_n;
 static uint64_t fg_inl_lat, fg_inl_latmax;
 static void fg_inl_mirror(unsigned idx, uint64_t v);
 static int fg_inl_usable(void), fg_inl_to_present(void);
+static unsigned fg_abi_inflight(void); /* client jobs submitted, not retired (frame log: what an inline copy queues behind) */
+static void fg_cf_log(void); /* bit 16 copy priority counters, with the inline line */
+/* fuxigpuncimport bit 27 (134217728, needs 16): a client submit that copy priority would refuse is parked instead (built, not rung; see
+ * fg_pk_park) and goes into the ring right behind the due copy, or on one of these other releases. */
+enum { FG_PK_COPY, FG_PK_IDLE, FG_PK_CAP, FG_PK_SUBMIT, FG_PK_NOTDUE, FG_PK_OTHER, FG_PK_REASONS };
+static unsigned fg_pk_n; /* words of the parked job, 0 none */
+static int fg_pk_flush(unsigned why);
 #define FG_INL_SRC_VA 0x90000000u
 #define FG_INL_FB_VA 0xa0000000u
 /* One transient PFN list, serialized by the surface cache lock. Keep lookup
@@ -358,6 +368,7 @@ static void fg_fail(const char *reason, unsigned code)
  * pages still reachable by DMA; CPU fallback resumes with isolation asserted. */
 static int fg_isolate(void)
 {
+ fg_irq_quiesce();
  uint64_t v = 1;
  int good = !fg_access(GPU_REG_BASE + 0x3c45*4, &v, 1, 0);
  for (unsigned step = 1; step <= 2; step++) {
@@ -489,6 +500,70 @@ int fuxi_gpu_map(unsigned slot, uint64_t generation, uintptr_t source,
  t->misses++;
  return 1;
 }
+/* fuxigpuncimport bit 22 (scanout takeover survey): a temporary READ-only apps_smmu mapping, removed after the dump. Reads are
+ * fault-safe and never latch fg_access_failed (the hypervisor may protect a bank). map 1 = read only (bit 22); map 2 = read/write, only
+ * for the bits 22+23 stage-2 test (fg_scanout_dpu_stage2_run), whose writes go through fg_dpu_smmu_write to one bank page alone. */
+#define FG_DPU_SMMU_PA 0x15000000u
+#define FG_DPU_SMMU_SIZE 0x100000u
+static vm_offset_t fg_dpu_smmu_va;
+static unsigned fg_dpu_smmu_rw;
+static int fg_dpu_smmu_map(unsigned map)
+{
+ if (!map || fg_dpu_smmu_va) {
+  if (map) return map == 1 || fg_dpu_smmu_rw;
+  if (fg_dpu_smmu_va) {
+   pmap_remove(kernel_pmap, fg_dpu_smmu_va, fg_dpu_smmu_va + FG_DPU_SMMU_SIZE);
+   kmem_free(kernel_map, fg_dpu_smmu_va, FG_DPU_SMMU_SIZE);
+   fg_dpu_smmu_va = 0; fg_dpu_smmu_rw = 0;
+  }
+  return 1;
+ }
+ vm_offset_t va = 0;
+ vm_prot_t prot = map == 2 ? VM_PROT_READ | VM_PROT_WRITE : VM_PROT_READ;
+ if (kmem_alloc(kernel_map, &va, FG_DPU_SMMU_SIZE, KMA_VAONLY | KMA_KOBJECT | KMA_NOPAGEWAIT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) return 0;
+ for (vm_size_t off = 0; off < FG_DPU_SMMU_SIZE; off += PAGE_SIZE)
+  if (pmap_enter_options_addr(kernel_pmap, va + off, FG_DPU_SMMU_PA + off, prot, VM_PROT_NONE, VM_WIMG_IO, TRUE,
+      PMAP_OPTIONS_NOWAIT, NULL) != KERN_SUCCESS) {
+   pmap_remove(kernel_pmap, va, va + FG_DPU_SMMU_SIZE);
+   kmem_free(kernel_map, va, FG_DPU_SMMU_SIZE);
+   return 0;
+  }
+ fg_dpu_smmu_va = va; fg_dpu_smmu_rw = map == 2;
+ return 1;
+}
+static int fg_dpu_smmu_read(unsigned off, unsigned *value)
+{
+ uint64_t v = 0;
+ if (!fg_dpu_smmu_va || off >= FG_DPU_SMMU_SIZE || (off & 3) || fuxi_gpu_access(fg_dpu_smmu_va + off, &v, 0, 0)) return 0;
+ *value = (unsigned)v;
+ return 1;
+}
+static int fg_dpu_smmu_write(unsigned off, unsigned value)
+{
+ uint64_t v = value;
+ if (!fg_dpu_smmu_va || !fg_dpu_smmu_rw || off >= FG_DPU_SMMU_SIZE || (off & 3) || fuxi_gpu_access(fg_dpu_smmu_va + off, &v, 1, 0)) return 0;
+ __asm__ volatile("dsb sy" ::: "memory");
+ return 1;
+}
+/* Stage-2 memory: wired, zeroed kernel memory (physically contiguous for the page tables, scattered for the test surface), its 4 KiB
+ * page addresses and a clean to the point of coherency (the display bank walks and fetches non-cacheable). */
+static int fg_dpu_mem(unsigned bytes, unsigned contiguous, uintptr_t *va)
+{
+ vm_offset_t a = 0;
+ kern_return_t kr = contiguous ?
+     kmem_alloc_contig(kernel_map, &a, round_page(bytes), PAGE_MASK, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_NOPAGEWAIT, VM_KERN_MEMORY_IOKIT) :
+     kmem_alloc(kernel_map, &a, round_page(bytes), KMA_KOBJECT | KMA_ZERO | KMA_NOPAGEWAIT, VM_KERN_MEMORY_IOKIT);
+ if (kr != KERN_SUCCESS) return 0;
+ *va = a;
+ return 1;
+}
+static void fg_dpu_mem_free(uintptr_t va, unsigned bytes) { if (va) kmem_free(kernel_map, va, round_page(bytes)); }
+static uint64_t fg_dpu_page_pa(uintptr_t va)
+{
+ ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
+ return pn ? ptoa_64(pn) + (va & PAGE_MASK) : 0;
+}
+static void fg_dpu_clean(uintptr_t va, unsigned bytes) { CleanPoC_DcacheRegion_Force(va, bytes); }
 static int fg_abi_live_for_scanout(void);
 #include "fuxi_gpu_scanout.inc"
 static int fg_abi_init(void);
@@ -755,11 +830,12 @@ static void fg_cp_stamp(unsigned off)
 static void fg_cp_retire(void)
 {
  uint32_t s0 = g3_read(G3_FENCE_PA+FG_CP_STAMP), s1 = g3_read(G3_FENCE_PA+FG_CP_STAMP+8), s2 = g3_read(G3_FENCE_PA+FG_CP_STAMP+16), now = g3_gr(0x980);
- fg_cp_n++;
+ fg_cp_n++; fg_copy_log.s2s_us = fg_copy_log.blit_us = UINT32_MAX;
  if (fg_access_failed || !s0 || !s1 || !s2) fg_cp_bad++;
  else {
   uint32_t v[4] = {s0-fg_cp_submit_lo, s1-s0, s2-s1, now-s2};
   for (unsigned i = 0; i < 4; i++) { fg_cp_sum[i] += v[i]; if (v[i] > fg_cp_max[i]) fg_cp_max[i] = v[i]; }
+  fg_copy_log.s2s_us = (uint32_t)((uint64_t)v[0]*10/192); fg_copy_log.blit_us = (uint32_t)((uint64_t)v[1]*10/192);
  }
  if (!(fg_cp_n % 600)) {
   #define FG_US(t) ((unsigned long long)((t)*10/192))
@@ -894,6 +970,9 @@ int fuxi_gpu_copy(unsigned slot, uint64_t generation, uintptr_t source, uint64_t
  fg_scanout_stamps.submitted = fg_submit_time; fg_scanout_stamps.fence = 0;
  fg_busy = 1; fg_abi_present_wait = 0; /* the copy owns the GPU now; the client hold (bit 4096) ends */
  fg_inl_busy = inl;
+ fg_copy_log.ahead = inl ? fg_abi_inflight()-(fg_pk_n ? 1u : 0u) : 0; fg_copy_log.buffer = fg_scanout_double_active ? fg_scanout_copy : 0; /* a parked job follows the copy */
+ fg_copy_log.parked = inl && fg_pk_n;
+ if (inl && fg_pk_n) (void)fg_pk_flush(FG_PK_COPY); /* bit 27: the parked client job goes right behind this copy (a fault there takes the fault path, as a submit would) */
  if (inl) {
   fg_inl_n++;
   if (!(fg_inl_n % 600)) {
@@ -903,10 +982,12 @@ int fuxi_gpu_copy(unsigned slot, uint64_t generation, uintptr_t source, uint64_t
    printf("FUXI GPU: inline_copies %u fallback_copies %u (no_root %u window %u ring %u buffers %u client_busy %u switch %u) queue_to_retire avg %llu us max %llu us\n", fg_inl_n,
        fg_inl_fb[0]+fg_inl_fb[1]+fg_inl_fb[2]+fg_inl_fb[3]+fg_inl_fb[4]+fg_inl_fb[5], fg_inl_fb[0], fg_inl_fb[1], fg_inl_fb[2], fg_inl_fb[3], fg_inl_fb[4], fg_inl_fb[5], (unsigned long long)(ns/1000), (unsigned long long)(mx/1000));
    fg_inl_lat = fg_inl_latmax = 0; fg_inl_lat_n = 0;
+   fg_cf_log();
   }
  }
  FG_ABI_WAKE(); /* a held client submit re-checks: the hold ended, the GPU is busy with the copy */
  return 2; /* submitted; source is owned until poll retires this fence */
 }
 #include "fuxi_gpu_abi_backend.inc"
+#include "fuxi_gpu_irq.inc"
 #endif

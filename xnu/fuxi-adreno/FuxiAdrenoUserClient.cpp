@@ -83,6 +83,26 @@ static void abiPause() {
  if (waitPollUs) delay(waitPollUs); else IOSleep(1);
  abiStat(FG_ABI_STAT_SLEEP,mach_absolute_time()-t);
 }
+/* Fence pending time, submit to the wait that saw it retire, per 600 waits: <250 <500 <1000 <2000 <4000 <8000 <16000 <32000 us, more,
+ * untimed (not among the client's last 16 submits), ready (retired at the first poll, also binned). After NativeAdreno's
+ * native_adreno_fence_pending (MIT) and UniXNU-sheng's [gpu pending] boot-log line (BSD-2-Clause-Patent). Always on: a lock and two adds. */
+static uint64_t pendBins[11];
+static unsigned pendN;
+static void pendStat(uint64_t submitted, uint64_t retired, bool first) {
+ unsigned b=9, report=0, why=0;
+ if (submitted && retired>=submitted) { uint64_t ns; absolutetime_to_nanoseconds(retired-submitted,&ns); for (b=0; b<8 && ns>=(250000ULL<<b); b++) {} }
+ uint64_t bins[11], irq[FG_IRQ_STATS];
+ IOLockLock(openLock);
+ ++pendBins[b]; if (first) ++pendBins[10];
+ if (++pendN>=600) { memcpy(bins,pendBins,sizeof(bins)); bzero(pendBins,sizeof(pendBins)); pendN=0; report=1; }
+ IOLockUnlock(openLock);
+ if (!report) return;
+ unsigned state=fuxi_gpu_irq_stats(irq,&why);
+ IOLog("FUXI ABI: fence pending per 600 waits us <250 %llu <500 %llu <1000 %llu <2000 %llu <4000 %llu <8000 %llu <16000 %llu <32000 %llu more %llu untimed %llu ready %llu"
+     " irq state %u why %u n %llu empty %llu foreign %llu wakes %llu timeouts %llu races %llu written %llu maskfix %llu\n",
+     bins[0],bins[1],bins[2],bins[3],bins[4],bins[5],bins[6],bins[7],bins[8],bins[9],bins[10],state,why,irq[FG_IRQ_N],irq[FG_IRQ_EMPTY],
+     irq[FG_IRQ_FOREIGN],irq[FG_IRQ_WAKES],irq[FG_IRQ_TIMEOUTS],irq[FG_IRQ_RACES],irq[FG_IRQ_WRITTEN],irq[FG_IRQ_MASKFIX]);
+}
 static bool connected;
 /* A refused submit waits for the state change that admits it (a present copy submitted or retired, a client job retired) instead of
  * polling every 100 us: the backend calls abiWake through fuxi_gpu_abi_wake_hook. The waiter reads the sequence before its attempt, so a
@@ -196,7 +216,7 @@ class FuxiAdrenoUserClient : public IOUserClient {
    return;
   }
  }
- uint64_t nextHandle_ = 1, wired_ = 0, lastFence_ = 0, firstFence_ = 0;
+ uint64_t nextHandle_ = 1, wired_ = 0, lastFence_ = 0, firstFence_ = 0, submitAt_[16] = {};
  uint32_t nextToken_ = 1;
  bool queues_[8] = {true};
  Bo *find(uint64_t handle) {
@@ -205,29 +225,40 @@ class FuxiAdrenoUserClient : public IOUserClient {
  }
  IOReturn wait(uint64_t fence, uint64_t ns) {
   if (!fence || !firstFence_ || fence<firstFence_ || fence>lastFence_) return kIOReturnBadArgument;
-  return spin(fence,ns);
+  uint64_t retired; bool first;
+  return spin(fence,ns,&retired,&first);
  }
  /* Sleeps without lock_, so other threads can submit or allocate meanwhile;
   * only the fence number is used until the lock is retaken. */
  IOReturn waitUnlocked(uint64_t fence, uint64_t ns) {
   if (!fence || !firstFence_ || fence<firstFence_ || fence>lastFence_) return kIOReturnBadArgument;
+  uint64_t at=lastFence_-fence<16 ? submitAt_[fence&15] : 0, retired=0; bool first=false;
   IOLockUnlock(lock_);
-  IOReturn rc=spin(fence,ns);
+  IOReturn rc=spin(fence,ns,&retired,&first);
+  if (rc==kIOReturnSuccess) pendStat(at,retired,first);
   IOLockLock(lock_);
   return live_ ? rc : kIOReturnNotOpen;
  }
- IOReturn spin(uint64_t fence, uint64_t ns) {
+ /* fuxigpuncimport bit 26: while the fence value is unwritten, sleep on the GPU fence interrupt (at most 1 ms a slice, as
+  * UniXNU-sheng's waiters) instead of a waitPollUs poll; the interrupt count is read before each poll so one landing in between is
+  * not slept through. Written but not yet retired (ring draining), not armed or masked: poll as before. */
+ IOReturn spin(uint64_t fence, uint64_t ns, uint64_t *retired, bool *first) {
   /* The hardware watchdog is independent and always bounds ownership at
    * 100 ms. A shorter user timeout does not itself lose the context. */
   uint64_t ticks=0;
   nanoseconds_to_absolutetime(ns>1000000000ULL ? 1000000000ULL : ns,&ticks);
   uint64_t start=mach_absolute_time(), deadline=start+ticks, polls=0;
+  int irq=-1;
   for (;;) {
+   uint32_t seq=irq>0 ? fuxi_gpu_irq_seq() : 0;
    int s=fuxi_gpu_abi_poll(fence);
-   if (!s) { if (polls) waitStat(start,polls); return kIOReturnSuccess; }
+   if (!s) { *retired=mach_absolute_time(); *first=!polls; if (polls) waitStat(start,polls); return kIOReturnSuccess; }
    if (s<0) return (s==-3 || s==-4) ? kIOReturnTimeout : kIOReturnIOError;
    if (mach_absolute_time()>=deadline) return kIOReturnTimeout;
-   abiPause();
+   if (irq<0) { irq=fuxi_gpu_irq_setup(); if (irq>0) { ++polls; continue; } }
+   int w=-1;
+   if (irq>0) { uint64_t t=mach_absolute_time(); w=fuxi_gpu_irq_sleep(seq,fence,1000); if (w>=0) abiStat(FG_ABI_STAT_SLEEP,mach_absolute_time()-t); else if (w==-1) irq=0; }
+   if (w<0) abiPause();
    ++polls;
   }
  }
@@ -486,7 +517,7 @@ class FuxiAdrenoUserClient : public IOUserClient {
     int s=fuxi_gpu_abi_submit(iova,bytes,r.buffer_count,&fence);
     spBack+=mach_absolute_time()-b0; ++spAtt;
     if (!s) {
-     if (!firstFence_) firstFence_=fence; lastFence_=fence; static_cast<NativeAdrenoAbiSubmitReply *>(out)->fence=fence;
+     if (!firstFence_) firstFence_=fence; lastFence_=fence; submitAt_[fence&15]=mach_absolute_time(); static_cast<NativeAdrenoAbiSubmitReply *>(out)->fence=fence;
      uint64_t end=mach_absolute_time();
      abiSplit(FG_SPLIT_ARGS,spLook-sp0-spFence); abiSplit(FG_SPLIT_FENCE,spFence); abiSplit(FG_SPLIT_LOOKUP,spStart-spLook);
      abiSplit(FG_SPLIT_BACKEND,spBack); abiSplit(FG_SPLIT_SLEEP,spSleep); abiSplit(FG_SPLIT_TOTAL,end-sp0);

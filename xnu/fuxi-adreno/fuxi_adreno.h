@@ -27,6 +27,16 @@ int fuxi_gpu_scanout_owned(void);
 /* One copy/ready frame at a time; timestamps are mach absolute units. */
 struct fg_present_times { uint64_t submitted, fence, start, previous_start; };
 void fuxi_gpu_scanout_stamps(struct fg_present_times *times);
+/* Frame log detail (fuxigpuncimport bit 8): GPU always-on stamps of the last retired copy (doorbell to its start stamp at fence page
+ * +192, i.e. the wait behind earlier ring work, and its blits; UINT32_MAX without stamps), client jobs in flight ahead of it at
+ * submit (inline mode), its scanout buffer, the TE count read after the last START and the last transfer's done time in us. */
+struct fg_copy_stamps { uint32_t s2s_us, blit_us, ahead, buffer, te, xfer_us, parked; }; /* parked: a parked client job (bit 27) went in behind this copy */
+void fuxi_gpu_copy_stamps(struct fg_copy_stamps *stamps);
+/* Copy priority (fuxigpuncimport bit 16, inline mode only; lock-free, no GPU lock): present_due publishes the surface ids of the swaps
+ * whose present copy is not queued yet (callers serialize), present_writer the ABI sequence at a surface's writer lock (active 0: an
+ * AvoidSync reservation, sequence unknown). A client submit is refused while a due surface's writer job is already in the ring. */
+void fuxi_gpu_present_due(const uint32_t *ids, unsigned count);
+void fuxi_gpu_present_writer(uint32_t id, int active);
 /* Caller-owned, zero-initialized TE observer. Use from one serialized timer;
  * independent observers share no mutable estimator state. Healthy observation
  * takes no GPU lock or writes; double-mode MMIO failure stops/restores A.
@@ -40,6 +50,10 @@ int fuxi_gpu_scanout_te(struct fg_te_observer *te);
 int fuxi_gpu_scanout_acquire(void);
 int fuxi_gpu_scanout_publish(void);
 int fuxi_gpu_scanout_retry(void);
+/* Not-shown accounting: offer_fate is what became of the frame waiting at the last publish (0 none, 1 STARTed by the spin thread
+ * during the copy, 2 replaced unstarted); async_take returns 1 once when the spin thread STARTed the waiting frame unreported. */
+unsigned fuxi_gpu_scanout_offer_fate(void);
+int fuxi_gpu_scanout_async_take(void);
 int fuxi_gpu_scanout_pending(void);
 int fuxi_gpu_scanout_double(void);
 int fuxi_gpu_scanout_triple(void);
@@ -51,6 +65,22 @@ int fuxi_gpu_scanout_reserve(void);
 int fuxi_gpu_scanout_preclean(void);
 void fuxi_gpu_clean_source(uintptr_t source, uint64_t length);
 void fuxi_gpu_scanout_release(void);
+/* fuxigpuncimport bits 22+23+24 (direct scanout stage 3, default off): VIG0 fetches a CA surface through the display bank's IOVA slots
+ * instead of a GPU copy. on: armed and no fault (lock-free). slot: 1 key mapped in *slot, 2 miss (*slot chosen and emptied, *old its
+ * previous key, 0 none), 0 refused (copy). queue: map (pages, n 4 KiB pages; NULL on a hit), queue the slot for the next offer; va is
+ * the surface's kernel address for a CPU fallback, fence the writer's ABI fence (0 none); 1 queued, 0 refused, -1 fault (copy for
+ * the boot). busy: slots the display may still read (transfer, pending START, queued), lock-free try. refused: SweetSurface/framebuffer
+ * refusal reasons. abi_seq: submitted ABI sequence, lock-free; abi_fence_passed: fence memory reached fence (0 always). */
+enum { FG_DD_GEOMETRY, FG_DD_STRIDE, FG_DD_OFFSET, FG_DD_FORMAT, FG_DD_BACKING, FG_DD_LAYERS, FG_DD_PAGES, FG_DD_SLOTS, FG_DD_STATE, FG_DD_WHY };
+#define FG_DD_SLOTS_N 4u
+#define FG_DD_SLOT_PAGES 4096u /* 16 MiB of 4 KiB pages per slot */
+int fuxi_gpu_scanout_direct_on(void);
+int fuxi_gpu_scanout_direct_slot(uint64_t key, unsigned *slot, uint64_t *old);
+int fuxi_gpu_scanout_direct_queue(unsigned slot, uint64_t key, const uint64_t *pages, unsigned n, uintptr_t va, uint32_t fence);
+unsigned fuxi_gpu_scanout_direct_busy(void);
+void fuxi_gpu_scanout_direct_refused(unsigned why);
+uint32_t fuxi_gpu_abi_seq(void);
+int fuxi_gpu_abi_fence_passed(uint32_t fence);
 void fuxi_gpu_start(uint64_t framebuffer, unsigned width, unsigned height, unsigned pitch);
 int fuxi_gpu_map(unsigned slot, uint64_t generation, uintptr_t source,
     uint64_t length, struct fg_times *t);

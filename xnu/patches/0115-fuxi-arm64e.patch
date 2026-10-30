@@ -1,0 +1,315 @@
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -17,6 +17,7 @@
+ #include <kern/thread.h>
+ #include <mach/mach_time.h>
+ #include <pexpert/pexpert.h>
++#include <ptrauth.h>
+ 
+ extern "C" void sweet_secondary_entry(void);
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
+@@ -264,7 +265,8 @@
+ 	    __atomic_load_n(&initialized, __ATOMIC_ACQUIRE) != 0) {
+ 		panic("SWEET CPU: cpu=%u unsupported restart", getCPUNumber());
+ 	}
+-	vm_offset_t entry = ml_static_vtop((vm_offset_t)&sweet_secondary_entry);
++	/* arm64e (patch 0115): &fn is IA-signed; PSCI needs the raw address. No-op on arm64. */
++	vm_offset_t entry = ml_static_vtop((vm_offset_t)ptrauth_strip((void *)&sweet_secondary_entry, ptrauth_key_function_pointer));
+ 	IOLog("SWEET CPU: cpu=%u CPU_ON target=0x%x entry_pa=0x%llx context=%u\n",
+ 	    getCPUNumber(), cpu->phys_id, (uint64_t)entry, getCPUNumber());
+ 	__builtin_arm_dsb(DSB_SY);
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -63,7 +63,12 @@
+ MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837
+ MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8.2-a+crypto
+ # Reuse the generic ARM/SWEET providers with explicitly gated Fuxi hardware.
++ifeq ($(FUXI_ARM64E),1)
++# FUXI_ARM64E=1 (patch 0115, CI kernel=metal4e): arm64e with the cores' own PAuth (ARMv8.3 keys).
++MACHINE_FLAGS_ARM64_FUXI = -DARM64_BOARD_CONFIG_SWEET -DFUXI=1 -DFUXI_ARM64E=1 -march=armv8.3-a+crypto
++else
+ MACHINE_FLAGS_ARM64_FUXI = -DARM64_BOARD_CONFIG_SWEET -DFUXI=1       -march=armv8.2-a+crypto
++endif
+ 
+ 
+ #
+@@ -265,6 +270,9 @@
+ # sweet's Cortex-A76/A55 have no pointer authentication: stay plain arm64
+ ifeq ($(filter SWEET FUXI,$(CURRENT_MACHINE_CONFIG)),)
+ export ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG := arm64e
++else ifeq ($(CURRENT_MACHINE_CONFIG)-$(FUXI_ARM64E),FUXI-1)
++# Fuxi's SM8550 cores do have PAuth: opt-in arm64e (patch 0115).
++export ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG := arm64e
+ endif
+ endif
+ 
+@@ -833,9 +841,18 @@
+ # arm64e specific linker flags that should be used only when linking the kernel
+ # (and not the static kernel cache / kcgen)
+ #
++ifeq ($(CURRENT_MACHINE_CONFIG)-$(FUXI_ARM64E),FUXI-1)
++# FUXI arm64e (patch 0115, after UniXNU arm64e-threaded-starts.patch): no kernel
++# collection builder signs our pointers, so link a standalone MH_EXECUTE with
++# __TEXT,__thread_starts (ld-classic only); arm_init rebases and signs it.
++LDFLAGS_KERNEL_ONLY_SUBARCH_arm64e = \
++	-fuse-ld=$(shell $(XCRUN) -sdk $(SDKROOT) -find ld-classic) \
++	-Wl,-threaded_starts_section
++else
+ LDFLAGS_KERNEL_ONLY_SUBARCH_arm64e = \
+ 	-Wl,-add_split_seg_info \
+ 	-Wl,-kernel
++endif
+ 
+ LDFLAGS_KERNEL_ONLY_SUBARCH_x86_64 = \
+ 	-Wl,-add_split_seg_info \
+--- a/osfmk/arm64/machine_routines_asm.s
++++ b/osfmk/arm64/machine_routines_asm.s
+@@ -93,6 +93,11 @@
+ 	.align 2
+ 	.globl EXT(ml_enable_user_jop_key)
+ LEXT(ml_enable_user_jop_key)
++#if HAS_NATIVE_PAC
++	/* FUXI arm64e (patch 0115, after UniXNU native-pac-keys): one key set for the kernel and every process. */
++	mov		x0, #0
++	ret
++#endif /* HAS_NATIVE_PAC */
+ #if HAS_PARAVIRTUALIZED_PAC
+ 	mov 	x2, x0
+ 	MOV64	x0, VMAPPLE_PAC_SET_EL0_DIVERSIFIER_AT_EL1
+@@ -108,6 +113,9 @@
+ 	.align 2
+ 	.globl EXT(ml_disable_user_jop_key)
+ LEXT(ml_disable_user_jop_key)
++#if HAS_NATIVE_PAC
++	ret
++#endif /* HAS_NATIVE_PAC */
+ #if HAS_PARAVIRTUALIZED_PAC
+ 	mov 	x2, x1
+ 	MOV64	x0, VMAPPLE_PAC_SET_EL0_DIVERSIFIER_AT_EL1
+--- a/osfmk/arm64/pac_asm.h
++++ b/osfmk/arm64/pac_asm.h
+@@ -43,6 +43,24 @@
+ 
+ #if defined(HAS_APPLE_PAC)
+ 
++#if HAS_NATIVE_PAC
++/*
++ * FUXI arm64e (patch 0115). fuxi_native_pac (start.s), u64 words: the ten key
++ * halves in APIA, APIB, APDA, APDB, APGA Lo/Hi order, then the status words
++ * that osfmk/arm64/fuxi_pac.c prints (mirrored in fuxi_pac_logic.h FP_NATIVE_*).
++ */
++#define NATIVE_PAC_KEY_WORDS    10
++#define NATIVE_PAC_READY        10      /* 1: key set generated */
++#define NATIVE_PAC_MODE         11      /* 1 native: the first CPU read its keys back; 2 hyp: it did not (keys kept as found) */
++#define NATIVE_PAC_CPUS         12      /* passes through PAC_INIT_KEY_STATE, warm resets included */
++#define NATIVE_PAC_BAD          13      /* passes whose key readback differed */
++#define NATIVE_PAC_BAD_MPIDR    14
++#define NATIVE_PAC_GA_REF       15      /* PACGA of the first pass (0: no generic auth) */
++#define NATIVE_PAC_GA_BAD       16      /* passes with another PACGA: parked, never returned */
++#define NATIVE_PAC_GA_MPIDR     17
++#define NATIVE_PAC_WORDS        24      /* three 64-byte lines */
++#define NATIVE_PAC_MODIFIER     0x5eedfacecafe1234
++#endif /* HAS_NATIVE_PAC */
+ 
+ /* BEGIN IGNORE CODESTYLE */
+ 
+@@ -143,7 +161,150 @@
+  *   tmp - scratch register
+  *   tmp2 - scratch register
+  */
++#if HAS_NATIVE_PAC
++.macro NATIVE_PAC_CHECK key, off
++	mrs		x2, \key
++	ldr		x3, [x0, #(\off)]
++	eor		x2, x2, x3
++	orr		x7, x7, x2
++.endmacro
++
++.macro NATIVE_PAC_INC word, tmp
++	ldr		\tmp, [x0, #((\word) * 8)]
++	add		\tmp, \tmp, #1
++	str		\tmp, [x0, #((\word) * 8)]
++.endmacro
++
++.macro NATIVE_PAC_FLUSH
++	dc		civac, x0
++	add		x2, x0, #64
++	dc		civac, x2
++	add		x2, x0, #128
++	dc		civac, x2
++	dsb		sy
++.endmacro
++
++.macro NATIVE_PAC_STAGE stage
++#if defined(FUXI)
++	adrp	x16, EXT(fuxi_early_status)@page
++	add		x16, x16, EXT(fuxi_early_status)@pageoff
++	mov		x17, #(\stage)
++	str		x17, [x16]
++	dc		civac, x16
++	dsb		sy
++#endif
++.endmacro
++#endif /* HAS_NATIVE_PAC */
++
+ .macro PAC_INIT_KEY_STATE	tmp, tmp2
++#if HAS_NATIVE_PAC
++	/*
++	 * FUXI arm64e (patch 0115). Key generation and loading follow UniXNU's
++	 * native-pac-keys.patch (BSD-2-Clause-Patent, UniXNU contributors).
++	 * ARMv8.3 keys are shared by EL0 and EL1: the kernel and every process use
++	 * one key set per boot. The first pass derives it from CNTPCT_EL0 with
++	 * splitmix64; every later pass (secondaries, warm resets) loads the stored
++	 * set. Each pass reads the keys back (mismatch: counted; on the first pass,
++	 * mode 2 keeps whatever keys the hardware has) and computes PACGA: a CPU
++	 * whose PACGA differs from the first pass would fail every pointer signed
++	 * elsewhere, so it records itself and parks (fuxi_early_status 0x35).
++	 * CPUs come up one at a time, so plain loads/stores suffice. The MMU may be
++	 * off: stores go straight to memory, dc civac drops stale cached lines.
++	 * fuxi_early_status 0x30 while the keys are written, 0x31 after.
++	 * Uses x0-x7 (and x16/x17 for the stage word): common_start scratch only.
++	 */
++	adrp	x0, EXT(fuxi_native_pac)@page
++	add		x0, x0, EXT(fuxi_native_pac)@pageoff
++	ldr		x1, [x0, #(NATIVE_PAC_READY * 8)]
++	cbnz	x1, Lnative_pac_load\@
++	mrs		x1, CNTPCT_EL0
++	MOV64	x3, 0x9e3779b97f4a7c15
++	MOV64	x4, 0xbf58476d1ce4e5b9
++	MOV64	x5, 0x94d049bb133111eb
++	mov		x2, #0
++Lnative_pac_gen\@:
++	add		x1, x1, x3
++	eor		x6, x1, x1, lsr #30
++	mul		x6, x6, x4
++	eor		x6, x6, x6, lsr #27
++	mul		x6, x6, x5
++	eor		x6, x6, x6, lsr #31
++	str		x6, [x0, x2, lsl #3]
++	add		x2, x2, #1
++	cmp		x2, #(NATIVE_PAC_KEY_WORDS)
++	b.lo	Lnative_pac_gen\@
++	mov		x2, #1
++	str		x2, [x0, #(NATIVE_PAC_READY * 8)]
++	str		x2, [x0, #(NATIVE_PAC_MODE * 8)]
++	NATIVE_PAC_FLUSH
++Lnative_pac_load\@:
++	NATIVE_PAC_STAGE 0x30
++	ldp		x2, x3, [x0, #0]
++	msr		APIAKeyLo_EL1, x2
++	msr		APIAKeyHi_EL1, x3
++	ldp		x2, x3, [x0, #16]
++	msr		APIBKeyLo_EL1, x2
++	msr		APIBKeyHi_EL1, x3
++	ldp		x2, x3, [x0, #32]
++	msr		APDAKeyLo_EL1, x2
++	msr		APDAKeyHi_EL1, x3
++	ldp		x2, x3, [x0, #48]
++	msr		APDBKeyLo_EL1, x2
++	msr		APDBKeyHi_EL1, x3
++	ldp		x2, x3, [x0, #64]
++	msr		APGAKeyLo_EL1, x2
++	msr		APGAKeyHi_EL1, x3
++	isb		sy
++	mov		x7, #0
++	NATIVE_PAC_CHECK APIAKeyLo_EL1, 0
++	NATIVE_PAC_CHECK APIAKeyHi_EL1, 8
++	NATIVE_PAC_CHECK APIBKeyLo_EL1, 16
++	NATIVE_PAC_CHECK APIBKeyHi_EL1, 24
++	NATIVE_PAC_CHECK APDAKeyLo_EL1, 32
++	NATIVE_PAC_CHECK APDAKeyHi_EL1, 40
++	NATIVE_PAC_CHECK APDBKeyLo_EL1, 48
++	NATIVE_PAC_CHECK APDBKeyHi_EL1, 56
++	NATIVE_PAC_CHECK APGAKeyLo_EL1, 64
++	NATIVE_PAC_CHECK APGAKeyHi_EL1, 72
++	cbz		x7, Lnative_pac_ga\@
++	NATIVE_PAC_INC NATIVE_PAC_BAD, x2
++	mrs		x2, MPIDR_EL1
++	str		x2, [x0, #(NATIVE_PAC_BAD_MPIDR * 8)]
++	ldr		x2, [x0, #(NATIVE_PAC_CPUS * 8)]
++	cbnz	x2, Lnative_pac_ga\@
++	mov		x2, #2
++	str		x2, [x0, #(NATIVE_PAC_MODE * 8)]
++Lnative_pac_ga\@:
++	/* PACGA only when ID_AA64ISAR1 GPA/GPI or ID_AA64ISAR2 GPA3 say it exists. */
++	mrs		x2, ID_AA64ISAR1_EL1
++	ubfx	x3, x2, #24, #8
++	mrs		x2, S3_0_C0_C6_2
++	ubfx	x2, x2, #8, #4
++	orr		x3, x3, x2
++	cbz		x3, Lnative_pac_done\@
++	MOV64	x4, NATIVE_PAC_MODIFIER
++	pacga	x6, x0, x4
++	ldr		x2, [x0, #(NATIVE_PAC_CPUS * 8)]
++	cbnz	x2, Lnative_pac_cmp\@
++	str		x6, [x0, #(NATIVE_PAC_GA_REF * 8)]
++	b		Lnative_pac_done\@
++Lnative_pac_cmp\@:
++	ldr		x3, [x0, #(NATIVE_PAC_GA_REF * 8)]
++	cmp		x3, x6
++	b.eq	Lnative_pac_done\@
++	NATIVE_PAC_INC NATIVE_PAC_GA_BAD, x2
++	mrs		x2, MPIDR_EL1
++	str		x2, [x0, #(NATIVE_PAC_GA_MPIDR * 8)]
++	NATIVE_PAC_FLUSH
++	NATIVE_PAC_STAGE 0x35
++Lnative_pac_park\@:
++	wfe
++	b		Lnative_pac_park\@
++Lnative_pac_done\@:
++	NATIVE_PAC_INC NATIVE_PAC_CPUS, x2
++	NATIVE_PAC_FLUSH
++	NATIVE_PAC_STAGE 0x31
++#endif /* HAS_NATIVE_PAC */
+ #if HAS_PARAVIRTUALIZED_PAC
+ #if HIBERNATION
+ 	#error PAC_INIT_KEY_STATE is not implemented for HAS_PARAVIRTUALIZED_PAC && HIBERNATION
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -299,6 +299,10 @@
+ 	msr		VBAR_EL2, x1
+ 	/* No stage 2, AArch64 EL1, no EL2 interrupt or FP/debug traps. */
+ 	mov		x1, #(1 << 31)
++#if HAS_NATIVE_PAC
++	/* arm64e (patch 0115): HCR_EL2.API/APK, no PAC instruction or key register traps. */
++	orr		x1, x1, #(3 << 40)
++#endif
+ 	msr		HCR_EL2, x1
+ 	msr		VTTBR_EL2, xzr
+ 	msr		CPTR_EL2, xzr
+@@ -992,6 +996,15 @@
+ 	/* Return to arm_init() */
+ 	ret
+ 
++#if HAS_NATIVE_PAC
++/* FUXI arm64e (patch 0115): PAC_INIT_KEY_STATE key set and status words (layout in arm64/pac_asm.h). */
++	.section __DATA, __data
++	.align 6
++	.globl EXT(fuxi_native_pac)
++LEXT(fuxi_native_pac)
++	.space	NATIVE_PAC_WORDS * 8, 0
++#endif /* HAS_NATIVE_PAC */
++
+ //#include	"globals_asm.h"
+ 
+ /* vim: set ts=4: */
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -44,6 +44,17 @@
+ 
+ #define HAS_GIC_V3                1
+ 
++/*
++ * arm64e (FUXI_ARM64E=1, patch 0115): SM8550's cores have PAuth (QARMA5, FPAC)
++ * and take the architectural keys at EL1 (patch 0114 self-test). XNU's
++ * HAS_APPLE_PAC paths run on the standard key registers; start.s programs
++ * one key set per boot (HAS_NATIVE_PAC in arm64/pac_asm.h).
++ */
++#if defined(FUXI) && defined(__arm64e__)
++#define HAS_APPLE_PAC             1
++#define HAS_NATIVE_PAC            1
++#endif
++
+ #ifndef ASSEMBLER
+ #define PLATFORM_PANIC_LOG_DISABLED
+ #endif /* ! ASSEMBLER */

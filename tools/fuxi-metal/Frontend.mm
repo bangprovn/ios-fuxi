@@ -1468,8 +1468,10 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
    if(point.operation>begin){backend->submit(std::vector<fuxi::Operation>(_ops.begin()+begin,_ops.begin()+point.operation),scheduled,nullptr,prepare,declared);prepare={};declared=nullptr;begin=point.operation;}
    if(point.signal)[point.event setSignaledValue:point.value];else if(![point.event waitUntilSignaledValue:point.value timeoutMS:2000])throw std::runtime_error("process-local event wait timed out");
   }
-  if(_events.empty())backend->submit(_ops,scheduled,_overlap?&_retirement:nullptr,prepare,declared);
-  else if(begin<_ops.size())backend->submit(std::vector<fuxi::Operation>(_ops.begin()+begin,_ops.end()),scheduled,_overlap?&_retirement:nullptr,prepare,declared);
+  // FUXI_MTL_EARLY_RELEASE: on the retire queue, after a signaled fence and before the backend mutex (held by the next encode).
+  std::function<void()> fenced;if(_overlap && fuxi::systemTranslationPolicy().earlyRelease)fenced=[self]{bool failed;@synchronized(self){failed=_status==MTLCommandBufferStatusError;}if(!failed){_lease.reset();_pendingLease.reset();}};
+  if(_events.empty())backend->submit(_ops,scheduled,_overlap?&_retirement:nullptr,prepare,declared,fenced);
+  else if(begin<_ops.size())backend->submit(std::vector<fuxi::Operation>(_ops.begin()+begin,_ops.end()),scheduled,_overlap?&_retirement:nullptr,prepare,declared,fenced);
   else {if(prepare)backend->submit({},scheduled,nullptr,prepare,declared);else scheduled();}
   if(backboard){std::lock_guard<std::mutex> lock(backend->mutex);
    for(id r in _resources){if(![r isKindOfClass:[FuxiTexture class]] || ![(FuxiTexture *)r iosurface])continue;auto *texture=((FuxiTexture *)r)->_texture;if(!texture)continue;

@@ -66,6 +66,7 @@ static int lastSpinDepth=-1;
 static bool *spinKill;
 static void abiStat(unsigned slot,uint64_t) {assert(slot<FG_ABI_STATS);statCount[slot]++;}
 static void abiPause() {pauses++;}
+static unsigned pends;static void pendStat(uint64_t,uint64_t,bool) {pends++;}
 static void abiSplit(unsigned,uint64_t) {}
 static unsigned waitHint=100,eventWaits,lastWaitSeq;static uint32_t eventSeq;static bool eventWoke;
 static uint32_t abiEventSeq() {return eventSeq;}
@@ -181,7 +182,7 @@ int main() {
  assert(!descriptors && !c.wired_);
  // WaitFence and a submit-side wait sleep with the client lock released and refuse stale numbers.
  NativeAdrenoAbiWaitFence wf{3,1000};c.firstFence_=1;c.lastFence_=5;spins=0;
- assert(!call(c,6,&wf,nullptr) && spins==1 && lastSpinDepth==0 && lockDepth==0);
+ assert(!call(c,6,&wf,nullptr) && spins==1 && lastSpinDepth==0 && lockDepth==0 && pends==1);
  wf.fence=6;assert(call(c,6,&wf,nullptr)==kIOReturnBadArgument && spins==1);
  wf.fence=0;assert(call(c,6,&wf,nullptr)==kIOReturnBadArgument && spins==1);
  wf.fence=3;spinKill=&c.live_;assert(call(c,6,&wf,nullptr)==kIOReturnNotOpen && lockDepth==0);spinKill=nullptr;c.live_=true;
@@ -271,14 +272,14 @@ def main():
     find = source[source.index(' Bo *find('):source.index(' IOReturn wait(')]
     wait = source[source.index(' IOReturn wait('):source.index(' IOReturn spin(')]
     # The real waitUnlocked must release the client lock around the sleep loop.
-    wait += ' IOReturn spin(uint64_t,uint64_t) {spins++;waits++;lastSpinDepth=lockDepth;if(spinKill)*spinKill=false;return 0;}\n'
+    wait += ' IOReturn spin(uint64_t,uint64_t,uint64_t *,bool *) {spins++;waits++;lastSpinDepth=lockDepth;if(spinKill)*spinKill=false;return 0;}\n'
     prefix = prefix.replace('static void IOLockLock(int *){}','static int lockDepth;static void IOLockLock(int *){lockDepth++;}').replace('static void IOLockUnlock(int *){}','static void IOLockUnlock(int *){lockDepth--;}')
     model = prefix+EXTRA+HANDLE_STUBS+helper+'struct Client {\n'+bo+r'''
  /* The kernel allocates the table in initWithTask; the model owns it inline. */
  Bo storage_[MaxBos]={};
  Client(){bos_={storage_,storage_+MaxBos};assert(index_.allocate());}
  ~Client(){index_.release();}
- task_t task_=7;uint64_t nextHandle_=1,wired_=0,lastFence_=0,firstFence_=0;
+ task_t task_=7;uint64_t nextHandle_=1,wired_=0,lastFence_=0,firstFence_=0,submitAt_[16]={};
  uint32_t nextToken_=1;bool queues_[8]={true};
  int *lock_=&clientLock;bool live_=true;int pid_=0;
  void terminate(){} void result(){}

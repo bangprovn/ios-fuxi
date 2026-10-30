@@ -1378,3 +1378,797 @@ cheap alternative plus the survey. It needs `fuxigpuscanout=1`:
   exercise the present table's mapping.
 
 Not yet observed.
+
+## Inline-mode present ordering: frame log, copy priority, superseded skip (fuxigpuncimport 8/16/32)
+
+Inferred from the O220 log (inline mode, `fuxigpuncimport=2948672`): the panel
+runs at about 84 Hz and the client swaps about 1.75 times per shown frame.
+Copies complete in pairs within one TE, and START gaps are 62% one TE, 33% two
+and 5% three or more. In inline mode a present copy is queued only after its
+frame's writer lease ends in userland (writer retire, then `presentNext`). By
+then the next frame's client job is usually in the ring already, so copy N
+runs behind job N+1. The bit-4096 hold does not apply in inline mode. Three
+unused bits of the same boot argument (formerly reserved, see metal.md) add
+opt-in tools. With all three set, `2948672` becomes `2948728`. That value has
+the same number of digits, so the command line does not grow. Each bit is
+independent, and with none set the behavior is unchanged.
+
+- **8, frame log** (`SweetFramebuffer`). After 3000 warmup swaps it records
+  128 consecutive swaps, prints them once, then stops. Each line has the swap
+  id, the first surface, and these times: swap (us from frame 0), then ready
+  (writer retire), copy submit, copy fence and START (us after that swap).
+  It also has the GPU stamps of that copy: submit-to-copy-start from the
+  always-on counter at fence page +192 (taken after the copy's WFI, so it
+  includes every job ahead in the ring), and the blit time. Then come the
+  client jobs in flight when the copy was queued (`fg_abi_seq -
+  fg_abi_completed`), the target buffer, the TE count at publish, the last
+  transfer-done time, and the fate (`S` shown, `D` dropped, `P` replaced
+  while waiting for START, `-` open). The summary line counts
+  `copies_behind_client_job`, `submit_to_start_over_3ms`,
+  `fence_pairs_within_half_period` and `start_te_gaps 1/2/3+`, which confirm
+  or refute the pairing directly. The 10 KB log is heap-allocated only when
+  bit 8 is set, because kalloc_type limits the `AppleCLCD` object to 16 KB.
+  An inline array broke CI run 41046931721 with a static assertion.
+- **16, copy priority** (needs inline, 512|2097152; `fg_abi_copy_first`).
+  `SweetFramebuffer` publishes the surfaces of queued swaps whose copy is not
+  queued yet (`fuxi_gpu_present_due`, under its lock). `sweet_gpu_writer`
+  records `fg_abi_seq` at each active writer lock (`fuxi_gpu_present_writer`).
+  A pending AvoidSync reservation records "unknown" and never holds. A client
+  submit is refused (existing refuse/retry/wake path, wait kind 0) while a due
+  surface's recorded sequence differs from `fg_abi_seq`, meaning a submit
+  followed that lock and the writer job is in the ring. The hold is released
+  with a wake as soon as that surface leaves the due set (its copy is queued
+  or the swap is dropped). It is bounded to one panel period
+  (`fg_scanout_period_us`, or 16.7 ms when unknown) per due generation. Each
+  swap that adds a surface opens a new generation, and an expired generation
+  never holds again.
+- **32, skip superseded** (`SweetFramebuffer::presentNext`). When a newer
+  queued swap is already ready (no writer, not quarantined, epoch unchanged,
+  a racy probe that `sweet_surface_present_begin` re-checks), the older ready
+  swaps are dropped before their copy (about 0.56 ms of GPU each). Counted in
+  `SWEET FB: superseded_skips=` every 600 frames and in the frame-log summary.
+
+Why option A (hold client submits) and not option B (append the copy right
+after frame N's job): the kernel has no link between an ABI submit and an
+IOSurface. Option B would mean copying a surface whose writer lease is still
+active, which breaks the writer/reader invariant that keeps DSI from reading a
+half-written frame. Option A only delays client submits through the existing
+path. The copy path, the triple-buffer target choice (`fg_scanout_target`,
+never the front or the ready buffer), the single `fg_busy`/`fg_magic` fence
+and the ring are untouched.
+
+Log lines: `SWEET FB: frame_log= copy_first= skip_superseded= (fuxigpuncimport
+8/16/32)` at start; `SWEET FB: flog begin ...`, 128 `SWEET FB: flog N ...`,
+`SWEET FB: flog end shown= dropped= replaced_waiting_start= copied=
+copied_not_shown= copies_behind_client_job= submit_to_start_over_3ms=
+fence_pairs_within_half_period= start_te_gaps 1/2/3+= superseded_skips=`;
+`FUXI GPU: copy_first refused= episodes= released= expired= due_publishes=
+no_writer= bound_us=` next to the 600-inline-copies line.
+
+Risks:
+
+- If the thread that ends the writer lease is the one blocked in submit, the
+  hold lasts until its bound (`expired` counts this).
+- Frames with several submits, or unrelated clients submitting between the
+  lock and the frame's job, can be held. This is bounded and visible as
+  `refused`.
+- The GPU may idle between job N's end and copy N's submit. That is the
+  intended trade.
+- A stale due entry lasts until the next framebuffer publish.
+
+Tests: `tools/test-fuxi-metal.py` (copy priority),
+`tools/test-fuxi-unixnu.py` (frame log, due set, superseded skip),
+`tools/test-fuxi-adreno.py` (copy stamps),
+`tools/test-fuxi-gpu-scanout.py` (writer record). Not yet observed.
+
+## Copy priority park (fuxigpuncimport bit 27, value 134217728, default off)
+
+Measured with `tools/fuxi-flog.py` (host-only parser for the bit-8 frame log; it
+prints the per-stage percentiles, the swap-to-START split and a replay of every
+START gap longer than one period). Two device logs, both inline mode:
+Q222 (`fuxigpuncimport=2948680`, no copy priority) and R223 (`2948728`,
+frame log + copy priority 16 + superseded skip 32).
+
+| | Q222 | R223 |
+|---|---|---|
+| client swaps, p50 interval | 74.4 Hz, 8.24 ms | 43.3 Hz, 15.6 ms |
+| shown | 32.8 Hz (56/128, 72 `P`) | 38.9 Hz (114/128, 14 `P`) |
+| swap to ready (writer retire), p50 | 13.4 ms | 34.4 ms |
+| ready to copy submit, p50 / p90 | 0.69 / 0.73 ms | 0.06 / 0.73 ms |
+| copy submit to copy start, behind a client job | 88/128, p50 6.5 ms | 108/128, p50 8.1 ms |
+| copy submit to copy start, ring idle | 40/128, 2 us | 20/128, 2 us |
+| blit | 0.56 ms | 0.55 ms |
+| fence to START (shown), p50 / avg | 38 us / 2.15 ms | 32 us / 1.39 ms |
+| copies fenced in pairs (within half a period) | 38 | 5 |
+| START gaps longer than one period: copy late / display missed / client idle | 28 / 25 / 1 | 88 / 14 / 3 |
+| copy-late cases behind a client job | 26/28 | 87/88 |
+
+Where the time goes (Q222, shown frames, average of swap to START 19.8 ms):
+render (swap to ready) 68%, ready to submit 2%, queue behind a client job 16%,
+blit 4%, fence to START 11%. The ready-to-submit time has two clusters:
+about 50 us, and about 0.7 ms when the previous copy is still running. Once a
+copy is queued it waits behind one whole client job (about 6.5 ms) in two
+thirds of the frames. That job is frame N+1, already in the in-order ring
+before frame N's writer lease ends. The copy then finishes in the same TE as
+the next one (38 pairs), and one of the two is replaced while it waits for
+START (72 `P`).
+
+Why copy priority (16) did not help, and why `released=0` (R223: per 600
+copies `refused=781 episodes=398 released=0 expired=252`, and 640/297/1/253,
+621/321/0/200, 859/419/2/313). This is a design flaw, not a counter bug, read
+from the code:
+
+- FuxiMetal `Backend::submit` takes the backend `mutex` and holds it through
+  `QueueSubmit` (tools/fuxi-metal/Backend.hpp:1662 to 2442).
+- The kernel refusal sleeps inside that ioctl, so the refused submit of job
+  N+1 holds the mutex while it sleeps.
+- Job N's retirement closure waits for its fence without the mutex, then
+  takes it (Backend.hpp:2499). The surface lease ends only after that closure
+  returns (Frontend.mm `retireCommitted`, `_lease.reset()`).
+- So the writer unlock that queues copy N cannot happen until the refusal
+  times out (one period, `expired`). Then job N+1 enters the ring ahead of
+  copy N anyway: 108/128 copies still went behind a client job.
+- The client is throttled meanwhile. Swaps fell to 43 Hz, and swap-to-ready
+  rose from 13 to 34 ms.
+
+Park removes the wait instead of bounding it. With bit 27 (and 16; inline
+512|2097152), the submit that copy priority would refuse is fully built:
+frame words, TLB invalidate after a map, import clean, and fence
+`++fg_abi_seq`. It is not written to the ring, and the ioctl returns at once.
+The mutex is free, so job N retires, its lease ends, SweetFramebuffer queues
+copy N, and `fuxi_gpu_copy` writes the parked frame right after the copy's
+words, then rings the doorbell. At most one job is parked. The other release
+paths keep the client from stalling:
+
+- **idle:** 1.5 ms (`FG_PK_IDLE_US`) after the due writer job's fence is
+  written, with no copy. This covers several submits per frame or a deferred
+  present.
+- **cap:** two panel periods after parking.
+- **submit:** the next submit rings the parked job first, so order is kept.
+- **not_due:** the due surface leaves the set, for example a dropped swap.
+- **other:** a classic-copy root switch.
+
+An idle or cap release expires that due generation, as the hold's expiry did.
+A fault discards the parked job, and its fence fails with the client. The
+2 ms watchdog stays armed while a job is parked, and `fg_abi_observe` (every
+WaitFence poll) runs the release check. Ring room for the parked frame plus
+one copy is reserved at park time (`no_room` counts the jobs that ran
+unparked instead). The kernel has no link between a submit and a surface,
+so the writer record of bit 16 remains the only trigger: a submit that
+follows an active writer lock of a due surface whose job is in the ring.
+
+Expected effect (a guess, not yet observed):
+
+- `copies_behind_client_job` near 0, with ready-to-copy-start about 2 us
+  plus the blit.
+- Fewer fence pairs and `P` fates.
+- The client no longer throttled (swap interval back near 8.3 ms).
+- The GPU idles from job N's end to copy N's submit, about 0.2 ms of writer
+  retire plus 0.05 ms, or about 0.7 ms while the previous copy still runs
+  (Q222 clusters).
+- The display-side misses in Q222 (25 gaps with a newer copy fenced in
+  time, 12 of them with another copy in flight) are not addressed.
+
+Boot value: `2948728 + 134217728 = 137166456` (frame log, copy priority,
+superseded skip, park; 9 digits). Without the frame log and skip, use
+`2948680 + 16 + 134217728 = 137166424`.
+
+Log lines:
+
+- At init: `FUXI GPU: copy_first_park=1 idle_us=1500 cap=2 periods
+  (fuxigpuncimport 134217728 with 16, inline mode)`.
+- At start: `SWEET FB: frame_log= copy_first= skip_superseded= park=
+  flog_trigger= (fuxigpuncimport 8/16/32/134217728/268435456)`.
+- Every 600 inline copies, after the copy_first line: `FUXI GPU:
+  copy_first_park parked= released_by copy= idle= cap= submit= not_due=
+  other= no_room= writer_done_at_park= parked_us avg= max=
+  writer_done_to_release_us n= avg= max= idle_us=`.
+- Each frame-log line ends in ` pk=0|1` (the copy rang a parked job). The
+  `flog end` line adds `copies_releasing_parked_job=`.
+- `copy_first refused=` stays 0 with park on.
+
+Success criteria: `released_by copy` dominates, `idle + cap` are small, and
+`copies_behind_client_job` and `copy_late` fall.
+
+Risks:
+
+- If one frame makes several submits after its writer lock, each later
+  submit releases the parked job (`submit`) and parks itself. Only the last
+  one stays behind the copy.
+- A parked job delays the client's own next frame by up to 1.5 ms after its
+  writer job ends when no copy comes.
+- `fg_client_busy` and the 100 ms deadline are unchanged; the parked job
+  counts as in flight.
+
+Tests:
+
+- `tools/test-fuxi-metal.py` (park): needs 16, default off, no wait and no
+  refusal, copy words before the parked frame and one doorbell, idle at
+  1.5 ms then an expired generation, cap at two periods, next-submit order,
+  due surface leaving, a pending lock never parks, fault discard, counters.
+- `tools/test-fuxi-adreno.py`: a parked job is not counted ahead of the copy
+  and is flushed once after the copy's words.
+- `tools/test-fuxi-unixnu.py`: the `pk=` field and the end-line count.
+
+Not yet observed.
+
+## Not-shown paths and the not-shown frame-log trigger (fuxigpuncimport bit 28, value 268435456, default off)
+
+V227 (`137166456`): 801 of 11602 swaps (6.9%) were never shown. The known
+counters do not explain them: `superseded_skips` is 0-6 per window,
+`ready_skips` (cumulative) grows by about 2 per window and `fifo_overflow` is
+0, while about 50 per window are "not shown". In that build the only
+`fStatDropped` increment without a counter of its own was the `P` path in
+`completePresent`: a copy retires while the previous frame still waits for
+START. Its frame-log window (a light scene) had no drops at all.
+
+`P` mixed two different outcomes:
+
+1. **Replaced**. The waiting frame was still ready in the kernel when the
+   next copy was offered (`fg_scanout_back_ready`, counted again as the
+   kernel's `back_ready_drops`/`drops=`, about 27-29 per 600 STARTs in
+   V227). It was never STARTed.
+2. **STARTed by the TE spin thread during the next copy**. With hard spin
+   (bit 262144) the spin thread STARTs a waiting buffer while a copy into
+   another buffer is still open (`copy_open_but_started`, 330-410 per 600
+   in V227). The display path only learns of it through `retry`, and retry
+   does not run while a copy is in flight. So when that copy retired,
+   `completePresent` counted the frame as `P`. The panel had shown it, but
+   `SwapWait(flags 1)` still returned aborted to CA. The kernel's
+   `fuxi_gpu_scanout_publish` had already noticed this ("this offer
+   replaces its record"), but it did not report it. INFERRED: the gap of
+   about 20 per window between "not shown" and the kernel's drops is this
+   case. Not yet observed.
+
+The change has two parts. The kernel reports what happened to the waiting
+frame: `fuxi_gpu_scanout_async_take()` returns 1 once if the spin thread
+STARTed it and no retry has reported it, and `fuxi_gpu_scanout_offer_fate()`
+gives the fate seen by the last offer (0 nothing waiting, 1 STARTed, 2
+replaced unstarted). `completePresent` calls the take *before* the next
+offer, so the START stamps are still that frame's own. A frame that was
+STARTed is then counted shown through the normal `presentStats` path
+(status `Shown`, fate `S`, its stages, one shown frame). Only frames the
+kernel replaced, or lost, are counted not shown. This changes the "not
+shown" and "600 frames" figures compared with V227: the old "not shown"
+equals the new "not shown" plus `spin_started + spin_race`.
+
+Every way a queued swap ends without START, with its counter and the
+frame-log letter (`dp=`):
+
+| path | letter | where | in "not shown" |
+|---|---|---|---|
+| `stale` | s | `presentNext`: the writer epoch changed after the swap (record stale and unshown), also for a stale replay | yes |
+| `not_ready` | r | `presentNext`: an older queued swap was released because a later one could be read first (`present_begin` refused the older one) | yes |
+| `superseded` | u | `presentNext`, bit 32: older ready swaps dropped for a newer ready one | yes |
+| `failed_copy` | f | `presentNext`: a failed GPU copy's replay yielded to a newer swap | yes |
+| `fifo` | o | `swap`: a fourth swap pushed out the oldest queued one | yes |
+| `refused_full` | c | `presentNext`: `present` refused (busy ring or ownership) while the queue had refilled to 3 | yes |
+| `replaced` | p | `completePresent`: waiting for START, still ready in the kernel at the next offer (fate 2) | yes |
+| `lost` | l | `completePresent`: waiting for START, but the kernel had neither STARTed it nor kept it ready (fate 0) | yes |
+| `stop` | h | `stopRecords`: queued or waiting when scanout stopped | no |
+| `rejected` | (none) | `swap` returned no-resources (surface hold failed) | no (never queued) |
+| `spin_started` | a | `completePresent`: STARTed by the spin thread during the next copy, counted shown | no (shown) |
+| `spin_race` | A | the same, but STARTed between the take and the offer (offer fate 1). Its START stamp may be the next offer's | no (shown) |
+
+A copy refused while the queue has room (`present` returns false: busy ring
+`copied == 3`, a `cpu_acquire` refusal, or a quarantine) is not a drop. The
+record goes back to the head of the queue and is retried. A late copy or a
+late fence is not a drop either: the frame is shown one TE later.
+
+Log line (always on, every 600 shown frames, after the `superseded_skips`
+line, a handful of increments under `fLock` per drop):
+
+`SWEET FB: unshown paths stale= not_ready= superseded= failed_copy= fifo=
+refused_full= replaced= lost= sum= of N not shown; outside it stop=
+rejected=; counted shown spin_started= spin_race=`
+
+`sum` should equal N.
+
+**Bit 28** (needs bit 8, the frame log) changes when the one-shot 128-frame
+log starts. Without it, the log starts after 3000 warmup swaps. With it,
+the log starts at the first not-shown burst after a 300-swap floor: 3
+not-shown frames (paths up to `lost`) in a 60-swap window. A window that
+ends with fewer than 3 resets the count. The swap that sees the third drop
+becomes frame 0. `flog begin` prints `warmup_swaps=` (the swaps actually
+waited), `trigger=` and `trigger_drops=`. Each `flog N` line ends in
+` dp=<letter>` (`-` for none). `flog end` adds
+`drop_paths s/r/u/f/o/c/p/l/h/a/A=`. `tools/fuxi-flog.py` parses `dp=` and
+`trigger=`, prints a `drop_paths` line for the window and sums every
+`unshown paths` line in the log.
+
+Boot value: `137166456 + 67108864 (bit 26, fence IRQ) + 268435456 =
+472710776` (9 digits, so the command line grows by nothing).
+
+Tests: `tools/test-fuxi-unixnu.py` (one path per not-shown frame in the
+FIFO test, with the exact log line; replaced/lost/spin_started/spin_race in
+the frame-log block; trigger window reset and start; `h` at stop) and
+`tools/test-fuxi-gpu-scanout.py` (offer fate 0/2 in the triple test, fate 1
+and a single report after an overlapped spin START, async take). Not yet
+observed.
+
+### Direct-DPU-scanout stage 1: read-only display SMMU survey (`fuxigpuncimport` bit 22)
+
+Bit 22 (value 4194304, so 2948728 becomes 7143032, same length) needs
+`fuxigpuscanout=1`. Once, at takeover (after the bit-20 VIG0 line if bit 20 is also set), the driver
+maps apps_smmu (0x15000000, 1 MiB) read-only and temporarily. It reads through
+the fault-safe accessor, which does not latch `fg_access_failed`, and logs:
+
+- `FUXI SCANOUT: dpu smmu scr0= idr0= idr1= idr2= smrs= cbs= page= cb_base=`
+  (SMR count from IDR0, bank count, page size and bank base from IDR1).
+- Up to 4 lines `dpu smmu smr<n>= s2cr= cb= cbar= cba2r=`, one for each valid
+  SMR whose id/mask covers stream 0x1c00 or 0x1c02. The DT handoff is
+  `<0x1c00 0x2>`.
+- For each translating S2CR whose bank index is valid,
+  `dpu smmu cb<n> sctlr= ttbr0= tcr= tcr2= mair0= fsr=`. A bypass or fault
+  S2CR prints cbar/cba2r as 0xffffffff and has no bank line.
+- `dpu smmu vig0 size= img= xy= out_size= out_xy= ystride0= format= unpack=
+  src0= cur= flush= start=`. cur is CURRENT_SRC0 at +0xa4; flush and start are
+  CTL0 +0x18/+0x1c.
+- `dpu smmu done matches= faults= (read only)`. A register that cannot be read
+  prints 0xffffffff and is counted in faults.
+
+It writes nothing to the SMMU or MDSS. The host test checks this: the write
+trace is identical with and without bit 22, and the survey maps apps_smmu
+read-only (the model fails any SMMU write that is not made through the
+stage-2 read/write mapping). The decoding assumes SMMUv2 without EXID (sCR0
+bit 3 clear). Boot S224 observed the survey (EL1 reads work, `faults=0`); the
+values are decoded in the stage-2 section below.
+
+### Direct-DPU-scanout stage 2: one translated flip (`fuxigpuncimport` bits 22+23)
+
+Bits 22+23 (4194304 + 8388608), default off. From the current base 2948680 the
+boot value is **15531592** (7 to 8 digits). Bit 23 without bit 22 is ignored
+and logs `dpu stage2 ignored: bit 23 needs bit 22`. Bit 22 alone stays the
+read-only survey. The code is `fg_scanout_dpu_stage2_run` in
+`xnu/fuxi-adreno/fuxi_gpu_scanout.inc`, with the apps_smmu read/write map and
+memory helpers in `fuxi_adreno.c`. It is adapted from ShengUfs `NativeUfs.cpp`
+(f2d6a4a): `dpuEnable` (table layout, register values, the 50 ms FSR watch,
+undo), `dpuTlbFlush` and `native_ufs_dpu_map`. The 4 KiB page list comes from
+GopFramebuffer `NativeLegacyDisplay.cpp` (33e941a) `directSlot`. ShengUfs is
+SPDX BSD-2-Clause-Patent in its sources and BSD-2-Clause in its LICENSE file;
+GopFramebuffer is BSD-2-Clause-Patent. Both licenses ship next to the code as
+`LICENSE.ShengUfs` and `LICENSE.GopFramebuffer`, and the 0098 patch carries them.
+
+#### S224 survey, decoded (observed values; field names from the SMMUv2 layout)
+
+| Register | Value | Meaning |
+|---|---|---|
+| sCR0 | 0x2d0406 | CLIENTPD 0 (SMR matching active), GFRE/GFIE set, EXIDENABLE 0 (15-bit SMR ids, as the code assumes), USFCFG 1 (unmatched streams fault). The bits above 16 were not decoded. |
+| IDR0 | 0x4c017e69 | NUMSMRG 105; S1TS 1, S2TS 0 (EL1 sees no stage 2), SMS 1, ATOSNS 1 (no ATOS, so there is no translation self-check, as on sheng); NUMSIDB 15; CTTW and BTM set; NUMIRPT 1 |
+| IDR1 | 0x60000046 | 4 KiB register pages; NUMPAGENDXB 6, so banks start at 128 pages = 0x80000; NUMCB 70; NUMS2CB 0 |
+| IDR2 | 0x5111 | IAS 1 and OAS 1 (both 36 bits), UBS 1; 4 KiB and 64 KiB granules |
+| SMR3 | 0x80021c00 | valid, id 0x1c00, mask 0x2: both display streams 0x1c00 and 0x1c02 |
+| S2CR3 | 0x3 | type 0 (translate) into bank 3 |
+| CBAR3 | 0x1f000 | TYPE 1, meaning stage 1 with stage 2 bypass; VMID 0; bits 15:12 = 0xf (GUESS: bypass memory attributes), IRPTNDX 0 |
+| CBA2R3 | 0x1 | VA64: AArch64 descriptors |
+| bank 3 SCTLR | 0xe0 | M 0 (translation off, so the display fetches physical addresses); CFRE, CFIE, CFCFG set (with M set, a fault would stall) |
+| TTBR0/TCR/MAIR0 | 0 | never programmed |
+| TCR2 | 0x60 | PASize 0; bits 5-6 kept as found (GUESS: TBI0/TBI1) |
+| FSR | 0x400 | FORMAT (bits 10:9) = 2, AArch64; no fault bits |
+
+This is the same bank-3 / SCTLR 0xe0 handoff sheng recorded (its i562). An idle
+FSR is not 0, so every "FSR clean" check in stage 2 tests the fault bits
+(MULTI, SS, UUT..TF; mask 0xc00001fe), not FSR == 0.
+
+#### Geometry
+
+A/B/C (observed) are 1080x2400 BGRA with stride 4320 (YSTRIDE0 0x10e0), 10 MiB
+apart from 0xb8000000. VIG0 SRC_SIZE = OUT_SIZE = 0x09600438, SRC_IMG_SIZE 0,
+SRC_XY 0, OUT_XY 0, format 0x237ff, unpack 0x3020001.
+
+The test surface is CoreAnimation's logical size: 1125x2436, stride 4608. That
+is 11225088 bytes, or 2741 4 KiB pages. The panel shows the centred
+1080x2400 part, at the same origin SweetFramebuffer's copy uses (`fOffX` =
+(1125-1080)/2 = 22, `fOffY` = (2436-2400)/2 = 18). Stage 2 writes:
+
+| Register | A | Test surface |
+|---|---|---|
+| SRC_IMG_SIZE +0x04 | 0 | 0x09840465 (2436<<16 \| 1125) |
+| SRC_XY +0x08 | 0 | 0x00120016 (18<<16 \| 22) |
+| SRC_YSTRIDE0 +0x24 | 0x10e0 | 0x1200 (the high half is kept) |
+| SRC0 +0x14 | 0xb8000000 | 0x10000000 (IOVA) |
+| SRC_SIZE, OUT_SIZE, OUT_XY, format, unpack | | unchanged, so the output and DSC stay 1080x2400 |
+
+The first byte fetched is at offset 83032 (18 x 4608 + 22 x 4). The last is at
+11141943, inside the surface. Two things here are GUESSES: that this SSPP needs
+SRC_IMG_SIZE when SRC_XY is not 0, and that x = 22 has no alignment rule for a
+32-bit format. An SRC0 offset of 83032 was rejected for the same reason:
+the alignment rule is unknown.
+
+#### Sequence
+
+The sequence runs once. It starts at the first acquire after the inherited
+transfer has drained (after the floor, with START clear and the write line
+idle) and after the panel120 switch. It runs before B and C are set up, under
+FG_GUARD. Every step logs a `FUXI SCANOUT: dpu stage2 ...` line.
+
+1. `begin img= xy= ystride0= src0= cur= flush= start= line=`. The run is
+   refused unless START, the VIG0 flush bit and the write line are idle,
+   SRC0 = CURRENT_SRC0 = A, and the GPU ring is idle.
+2. apps_smmu is mapped read/write, and the bank is found by the stage-1 SMR
+   scan. Every SMR covering 0x1c00/0x1c02 must translate into one bank. CBAR
+   must be type 1 and CBA2R must be VA64. SCTLR.M must be clear and no fault
+   may be recorded. Logged as `bank cb= smrN s2cr= cbar= cba2r= saved sctlr=
+   tcr2= ttbr0= tcr= mair0= fsr= oas_bits=`.
+3. Memory, allocated before any SMMU write:
+   - The table is 17 pages, physically contiguous. Page 0 serves levels 0-2
+     (sheng's i564 layout): [0] points to itself, [2] and [3] are 1 GiB
+     identity blocks for 0x80000000-0xffffffff, and [128..143] point to the
+     window's 16 level-3 tables.
+   - The surface is wired, zeroed `kmem_alloc` memory with its pages scattered.
+   - The leaves are AF|AP[1], AttrIndx 0, not shareable. Every PA must be
+     below the OAS (36 bits).
+   - The pattern is red outside the crop, a 4-pixel white frame on the crop
+     edge, and 8 vertical bars. It is cleaned to the PoC.
+   - Logged as `memory tables= surface 1125x2436 stride=4608 pages=2741
+     above4g= runs= first= last=`. above4g counts pages that need the window
+     because they are beyond the 32-bit SRC0. Placement is up to the VM
+     allocator: memory above 4 GiB cannot be requested.
+4. Install:
+   - TTBR0 = table, TCR2 = PASize from IDR2.OAS plus SEP = 7 (UPSTREAM),
+     other bits kept. S224 gives 0x38061. Sheng uses 48-bit (5); here PASize
+     equals the reported OAS. SEP was 0 in X229 and caused its fault (see
+     below). The readback must show both PASize and SEP, or the install is
+     undone before SCTLR is touched.
+   - TCR = 0x800020 (T0SZ 32, 4 KiB granule, non-cacheable walks, EPD1), MAIR0 = 0x44.
+   - The values are read back, then a bank TLBIALL and TLBSYNC follow.
+   - SCTLR = (old & ~CFCFG) | M|CFRE|CFIE, which is 0x61. A fault then
+     terminates instead of stalling.
+   - Logged as `enabled sctlr=0xe0->0x61 ttbr0= tcr=0x800020 tcr2=0x38061
+     mair0=0x44 tlbi=bank`.
+   - Right before the first START, the bank is read back again:
+     `live sctlr= ttbr0= tcr= tcr2= sep= pasize= mair0= fsr= l1[0]= l1[2]=
+     l1[3]=`. The last three are the table entries in memory.
+5. `identity starts=60 fsr= cur= xfer_us avg= max=`: 60 STARTs on A through
+   the identity block. Each one waits a period plus 2 ms, then polls (up to
+   100 ms) for START clear and the write line idle, then checks FSR.
+6. `mapped iova=0x10000000 pages=2741 window=0x2000000 tlbi=bank`: the
+   window's leaves, which were empty until now (so a stray IOVA fetch would
+   fault), are written, cleaned and followed by a bank TLBIALL.
+7. `flip src0=0x10000000 img=0x9840465 xy=0x120016 ystride0=0x1200 xfer_us=
+   fsr= cur= latched=`: the geometry is written, then CTL0 FLUSH |= 1 and one
+   START. `latched=1` means CURRENT_SRC0 read back as the IOVA. 0 is only
+   logged, not treated as a failure.
+8. `hold_ms=2000 fsr=`: the panel keeps showing the frame from its own RAM.
+   FSR is read every 50 ms.
+9. `restored A img=0 xy=0 ystride0=0x10e0 src0=0xb8000000 xfer_us= fsr= cur=`:
+   A's geometry is written back, flushed and STARTed while translation is
+   still on (identity). CURRENT_SRC0 must be A again before translation goes
+   off.
+10. `bank restored exact= sctlr= tcr2= ttbr0= tcr= mair0= fsr=`:
+    - SCTLR is restored first, then TTBR0/TCR2/TCR/MAIR0. FSR fault bits are
+      cleared (write one to clear), RESUME is written for a stalled
+      transaction (SS), and a bank TLBIALL follows.
+    - `exact=1` means every register reads back exactly as saved, FSR included.
+    - The memory is freed only when `exact=1` and the source is A. Otherwise
+      `memory kept` is logged.
+11. `done result=ok|fault step= identity_starts= flip_latched= hold_ms= exact=`.
+    The START gates are then re-armed from the current TE count, and the
+    normal path continues (double or triple setup, copies).
+
+On a fault, an MMIO failure or a register that ignores writes, the log has
+`fault step= reason= starts= fsr= far= fsynr0=`. If translation was on, a
+`walk far= plvl= wnr= pnu= ind= ptwf= afr= fsynr0_hi= tcr2= sep= ... sign=
+l0[i]= l1[i]= l2[i]= l3[i]=` line follows. It holds:
+
+- the FSYNR0 fields;
+- the bit that TCR2.SEP sign-extends at, and whether FAR has it set;
+- the entries for FAR that a level-0-start walk and the T0SZ-32 level-1-start
+  walk read from the table in memory. `(not ours)` marks a descriptor that
+  points outside the table.
+
+The undo then runs:
+
+- A's geometry is rewritten (with a flush).
+- The driver waits for idle.
+- Step 10 runs.
+- If translation was on, one untranslated START on A follows:
+  `undone step= start= xfer_us= cur=`.
+
+If the transfer never goes idle, `undo incomplete: transfer not idle;
+translation kept on (identity + window), memory kept` is logged. The table
+stays live, because the latched source may still be the window, and the
+scanout stops. A refusal before any SMMU write logs `skipped step= reason=;
+nothing written`.
+
+Writes that never happen:
+
+- SMRs, S2CRs, CBAR/CBA2R, any GR0/GR1 register, and the global TLB
+  invalidates. apps_smmu also serves touch, WLAN and UFS.
+- `fg_dpu_cb_wr` accepts only the bank offsets SCTLR 0x0, RESUME 0x8, TCR2
+  0x10, TTBR0 0x20/0x24, TCR 0x30, MAIR0 0x38, FSR 0x58, TLBIALL 0x618 and
+  TLBSYNC 0x7f0.
+
+The FG_GUARD lock is held for about 3.2 s at 60 Hz (60 x 18.7 ms + 2 s hold),
+or about 2.7 s at 120 Hz. The GPU ring and presents wait for that time once
+per boot.
+
+Host test (`tools/test-fuxi-gpu-scanout.py`, `dpu_stage2_tests`). The model has
+apps_smmu with the S224 values plus another live bank for a different master,
+and an MDSS fetch model. At each START the fetch model latches SRC0 on a
+flush. When SCTLR.M is set, it walks the bank's table for three pixels of every
+row. It checks the physical address of each walk: identity for A, the exact
+scattered page for the window. It also checks the pattern pixels, and sets FSR
+TF on a failed walk. The test proves:
+
+- Every SMMU write lands in bank 3's page. So there are no SMR/S2CR/global
+  writes, and the only invalidate is the bank TLBIALL (3 on success).
+- After success and after every undo, the whole 1 MiB apps_smmu model is
+  byte-identical to before, and so are the VIG0 registers.
+- Faults at identity START 6 (with SS, so RESUME), at the flip and during the
+  hold are undone; the restore is exact, A is shown again and the memory is freed.
+- A bank that ignores the table, or whose TCR2 drops SEP, is undone with no
+  START.
+- The walk model follows SMMUv2 AArch64 stage 1: the TCR2.SEP sign extension
+  with EPD1, the start level from T0SZ (level 1 with 2 index bits for T0SZ
+  32), the PASize limit on table addresses, and AF on leaves. A replay on the
+  first translated START checks the installed table under the X229 TCR2
+  (0x61): it faults at level 0 for 0xb8000100. Under 0x38061 it maps
+  identically through the level-1 block, and the empty window faults at level 3.
+- A real walk fault (a window level-3 entry cleared under the flip) logs FAR,
+  PLVL 3 and the entries `l1[0] l2[128] l3[20]=0`.
+- A stuck flip transfer keeps translation and memory and stops the scanout.
+- Each refusal writes nothing: translation already on, a recorded fault, the
+  CBAR type, streams on two banks, a pending flush, a source that is not A,
+  either allocation failing, a page lookup failing.
+- Bits clear: none set, bit 22 alone or bit 23 alone causes no SMMU write,
+  START or allocation.
+
+`--xnu-buildtree` checks the kernel syntax of `fuxi_adreno.c`
+(`kmem_alloc_contig`, `CleanPoC_DcacheRegion_Force`).
+
+Risks (none of this is observed yet):
+
+- The hypervisor may ignore or abort EL1 writes to the bank. A fault-safe
+  write, or the readback check, turns that into an undo with no START.
+- The handoff SMR also routes 0x1c02. Any display fetch outside 2-4 GiB
+  (GUESS: none from the bootloader configuration) would fault and be undone.
+- A walk or terminate fault gives one garbage or black frame. CFCFG is
+  cleared, so the display should not stall. That is a GUESS, but it matches
+  the SMMUv2 rule.
+- Sheng i564 recorded a level-0 fault for T0SZ 32, so the one-page L0-L2
+  layout is kept. It works whether the walk starts at level 0 or level 1.
+  The X229 decode below suggests that level 0 was the sign-extension fault,
+  not a level-0 start.
+- The 3 s lock hold at boot. The SRC_IMG_SIZE/SRC_XY requirements and the
+  x-alignment above.
+
+Expected lines with bits 22+23 on a good run, in order: the stage-1 `dpu smmu`
+lines, `begin`, `bank cb=3 smr3 s2cr=0x3 cbar=0x1f000 cba2r=0x1 saved
+sctlr=0xe0 tcr2=0x60 ttbr0=0 tcr=0 mair0=0 fsr=0x400 oas_bits=36`, `memory`,
+`enabled sctlr=0xe0->0x61 ... tcr=0x800020 tcr2=0x38061 mair0=0x44`, `live
+sctlr=0x61 ... tcr2=0x38061 sep=7 pasize=1 mair0=0x44 fsr=0x400`, `identity
+starts=60`, `mapped`, `flip ... latched=1`, `hold_ms=2000`, `restored A`,
+`bank restored exact=1 sctlr=0xe0 tcr2=0x60 ttbr0=0 tcr=0 mair0=0 fsr=0x400`,
+`done result=ok`. The panel should show the bars with a white frame and no red
+edge for about 2 s, then the boot image again. Stage 3 (bit 24) would
+remap CA surfaces per frame using the same window.
+
+#### X229 result (kernel 9565b45, fuxigpuncimport=15531592) and the SEP fix
+
+Observed:
+
+```
+dpu stage2 bank cb=3 smr3 s2cr=0x3 cbar=0x1f000 cba2r=0x1 saved sctlr=0xe0 tcr2=0x60 ttbr0=0 tcr=0 mair0=0 fsr=0x400 oas_bits=36
+dpu stage2 memory tables=0x8c59e8000 surface 1125x2436 stride=4608 pages=2741 above4g=2741 runs=686 first=0x9b44f8000 last=0x9b3444000
+dpu stage2 enabled sctlr=0xe0->0x61 ttbr0=0x8c59e8000 tcr=0x800020 tcr2=0x61 mair0=0x44 tlbi=bank
+dpu stage2 fault step=identity reason=fault starts=0 fsr=0x402 far=0xb8000100 fsynr0=0x630020
+dpu stage2 bank restored exact=1 ... fsr=0x400
+dpu stage2 undone step=identity start=1 xfer_us=11355 cur=0xb8000000
+dpu stage2 done result=fault step=identity identity_starts=0 flip_latched=0 hold_ms=0 exact=1
+```
+
+The undo worked: the bank was restored exactly, A was shown again, and the boot
+went on normally.
+
+Decode, using the SMMUv2 field layout:
+
+- FSR 0x402 is TF (translation fault) with FORMAT 2.
+- FSYNR0 0x630020:
+  - PLVL is 0, so the fault was at level 0.
+  - WNR 0 (a read), PNU 1 (unprivileged), IND 0 (data), PTWF 0 (no external
+    abort on the table fetch), AFR 0.
+  - Bits 23:16 hold 0x63. That is S1CBNDX, which is only meaningful for a
+    nested stage-2 fault. GUESS: an implementation value; it is not bank 3.
+- FAR 0xb8000100 is A plus 0x100, the first fetch.
+
+Cause (the conclusion; not yet confirmed on device):
+
+- TCR2.SEP (bits 17:15) was 0, kept from the bootloader's 0x60.
+- In the SMMUv2 AArch64 format, SEP 0 means the input address is
+  sign-extended from bit 31. Every display address with bit 31 set, which
+  means all of 0x80000000-0xffffffff and so A, B and C, therefore becomes an
+  upper-half address.
+- That address goes to TTBR1, which TCR.EPD1 disables. The result is a
+  translation fault at level 0, before any table entry is read. That is
+  exactly PLVL 0 with PTWF 0.
+- The table itself was never involved, so the self-referencing page did not
+  help.
+- Linux arm-smmu writes SEP = UPSTREAM (7) in every AArch64 context bank for
+  this reason.
+- Sheng's i564 used TCR2 5, which also has SEP 0, and saw the same level-0
+  fault. Its self-referencing page fixes a level-0 start, not this.
+- The window at 0x10000000 has bit 31 clear and would have walked.
+
+Candidates ruled out by the decode:
+
+- Walk start level: a wrong start level would read the table, and the entry
+  for FAR would be a valid descriptor.
+- TCR IRGN/ORGN and the cache clean, and the table placement above 4 GiB
+  (0x8c59e8000 < 2^36 = PASize 36): either would show as PTWF, an external or
+  address size fault, or a fault at level 1 or deeper, not at level 0 with no
+  walk.
+- TTBR0 ASID (0) and CBA2R VA64 (1, so the AArch64 format applies, and SEP
+  with it).
+- TLBI ordering: TLBIALL plus TLBSYNC run after every table register write
+  and before M.
+- The L1 block format: 0x80000441 is block, AF, AP[1] and AttrIndx 0 at
+  level 1, which the 4K granule allows. It is never read in this fault.
+- Tables below 4 GiB are not needed.
+
+Fix:
+
+- TCR2 = (old & ~(SEP|PASize)) | SEP 7 | PASize, which is 0x38061 on S224.
+- The readback checks both fields. A bank that drops SEP is undone before
+  SCTLR, with no START.
+
+New diagnostics:
+
+- the `live` line, read back right before the first START;
+- the `walk` line after a translated fault: FSYNR0 fields, SEP sign bit,
+  and the L0/L1/L2/L3 entries for FAR.
+
+Same boot value, 15531592. The expected lines on a good run are listed above.
+If it still faults, the `walk` line tells the cases apart:
+
+- `sign=0` with `plvl=0` would point at the walk start or TTBR;
+- `plvl=1` with `l1[2]=0x80000441` would point at block support or
+  attributes, and the next try would be level-2 2 MiB blocks;
+- PTWF 1 would point at the table memory or cacheability.
+
+### Direct-DPU-scanout stage 3: per-frame direct scanout of CA surfaces (`fuxigpuncimport` bits 22+23+24)
+
+Stage 2 worked on device (X232, observed): 60 identity STARTs, the scattered
+2741-page surface at IOVA 0x10000000, flip latched, 2 s hold, exact restore.
+Stage 3 keeps that translation for the boot and lets VIG0 fetch the
+CoreAnimation surface itself, with no GPU copy. Everything below is host-tested
+only; no device effect has been observed yet.
+
+Boot value: the current base 472710776 plus bits 22 (4194304), 23 (8388608)
+and 24 (16777216) is `fuxigpuncimport=502070904` (9 digits). Bit 24 without
+22+23 logs `dpu stage3 ignored: bit 24 needs bits 22+23`. Stage 3 also needs
+`fuxiscantriple=1` and no autorefresh scanout (bit 131072). Otherwise stage 2
+runs alone as before and logs `dpu stage3 not armed reason=...`.
+
+Arming (`fg_scanout_dpu_stage2_run`):
+
+- The window grows to 4 slots of 16 MiB (64 MiB, 32 level-3 tables). Slot k
+  is scanout buffer 3+k at IOVA 0x10000000 + k*16 MiB. Stage 2's test surface
+  uses slot 0. The hold is 100 ms.
+- After A is latched again, the bank is not restored. The test surface's
+  leaves are cleared (bank TLBIALL) and the surface is freed. The table, the
+  identity 1 GiB blocks and the apps_smmu mapping stay. A, B, C and the boot
+  framebuffer still scan out 1:1.
+
+Per present (`SweetFramebuffer.cpp` present, then `sweet_surface_direct` in
+`SweetSurface.cpp`, then `fuxi_gpu_scanout_direct_*`):
+
+1. Eligibility:
+   - one layer;
+   - `sweet_surface_scanout_class` BGRA8 with wired IOBuffer backing;
+   - 1125x2436, stride 4608, crop 22,18 1080x2400;
+   - page-aligned offset.
+
+   A failure is counted under its reason and that frame is copied.
+2. Active writer: 3, the record is kept and retried, as a busy ring is.
+3. Slot choice (`direct_slot`): the slot already holding the surface (a hit:
+   no page list, no map, no TLBI). On a miss, the least recently queued slot
+   that is not the front, fetched, pending (ready) or queued. Its leaves are
+   emptied (bank TLBIALL, `slot_evicts`) and SweetSurface drops its reference
+   to the old surface.
+4. A miss maps every 4 KiB page of the surface (2741 for this geometry) into
+   the slot's leaves. Pages that are 0, unaligned or beyond OAS are refused,
+   and so is a count below 2741 or above 4096. Then a bank TLBIALL. The pixels
+   are cleaned to PoC unless no writer came since the last clean (as bit 20).
+   SweetSurface holds one reference per slotted surface.
+5. `direct_queue` sets `fg_scanout_copy = 3+slot`, records the writer fence
+   and returns. The offer (`fuxi_gpu_scanout_publish`), the START gates, the
+   TE spin thread and retry then run unchanged.
+6. A slot START writes SRC_IMG_SIZE 0x9840465, SRC_XY 0x120016, YSTRIDE0
+   (A's high half | 4608) and SRC0 = the slot IOVA, then FLUSH and START,
+   exactly like the stage-2 flip. The first A/B/C START after a slot writes
+   A's saved geometry back with the address (`fg_scanout_address`).
+7. Writer fence: the ABI sequence at the writer's lock plus 1. This is the
+   job submitted under the lock, the same convention as copy priority's
+   wfence; it is 0 when no job was submitted. Publish returns 2 (retry) until
+   the fence memory reaches it (`fence_polls`, `fence_wait_us`).
+
+Release of the on-screen surface. CA alternates two surfaces, so holding one
+until the next present would throttle it. The display stops reading a slot
+(its fetch ends) at whichever comes first:
+
+- `release_on_time`: the write line was seen active after the START's TE and
+  is now idle with START clear. The spin thread sees this, or a busy poll
+  from a waiting writer does.
+- the next START (counted late);
+- 3 TEs or 3 periods after its START, with START clear and the line idle
+  (counted late).
+
+A writer of a slotted surface that the display may still read naps in 250 us
+steps, because no wakeup comes for a display read. The wait is bounded at
+100 ms and counted as `wait_forced`.
+
+A command-mode panel keeps the image in its own RAM, so the front slot is not
+read after its transfer. It is still never evicted.
+
+Fault policy: FSR is read before every START, in busy polls and in every slot
+or queue call. Any fault bit, or an unreadable FSR, causes all of this:
+
+- `dpu direct fault where=...` with FAR/FSYNR0 and the walk line;
+- RESUME for a stalled transaction and the FSR fault bits cleared;
+- a bank TLBIALL;
+- a pending slot frame dropped;
+- the front moved to a buffer that is neither ready nor being copied, with
+  A's geometry (`dpu direct fallback A geometry ...`);
+- the identity translation kept;
+- GPU copies for the rest of the boot;
+- slotted surfaces given back once the display no longer reads them.
+
+Expected log lines on a good run (values from the host model; device
+addresses differ):
+
+```
+FUXI SCANOUT: dpu stage3 requested: stage2 keeps the translation, CA surfaces scan out through 4 IOVA slots
+FUXI SCANOUT: dpu stage2 mapped iova=0x10000000 pages=2741 window=0x4000000 tlbi=bank
+FUXI SCANOUT: dpu stage2 hold_ms=100 fsr=0x400
+FUXI SCANOUT: dpu stage2 restored A img=... xy=... ystride0=0x10e0 src0=0xb8000000 ...
+FUXI SCANOUT: dpu stage3 armed slots=4 iova=0x10000000 slot_bytes=0x1000000 tables=0x... bank=cb3 fsr=0x400 A img=... xy=... ystride0=0x10e0
+FUXI SCANOUT: dpu stage2 done result=ok step=arm identity_starts=60 flip_latched=1 hold_ms=100 translation=kept
+FUXI SCANOUT: dpu direct map slot=0 iova=0x10000000 pages=2741 above4g=... runs=... first=0x... tlbi=bank      (first 8 maps)
+FUXI SCANOUT: dpu direct flip slot=0 src0=0x10000000 img=0x9840465 xy=0x120016 ystride0=0x...1200 te=...    (first 8 flips)
+FUXI SCANOUT: dpu direct flips= copies= refused(geometry/stride/offset/format/backing/layers/pages/slots/state)=a/b/c/d/e/f/g/h/i maps= remaps= hits= tlbi= fsr= slot_evicts= release_late= release_on_time= wait_forced= fence_polls= fence_wait_us avg= max= on=1 dead=0 busy=0x..   (every 600 offers)
+```
+
+The first 8 map lines and the first 8 flip lines share one budget, so a log
+holds 8 of these lines in total.
+
+Host tests:
+
+- `tools/test-fuxi-gpu-scanout.py`, `dpu_stage3_tests`, on the stage-2
+  SMMUv2 walk and MDSS fetch model:
+  - armed state and kept translation;
+  - per flip, every fetched row walks to that surface's own scattered pages
+    at the slot IOVA, with slot geometry, and A/B/C fetches have A geometry;
+  - hits with no maps or TLBI;
+  - on-time and late release;
+  - LRU never takes the front, fetched, pending or queued slot, and all four
+    busy is refused;
+  - page refusals;
+  - the fence holds START;
+  - the 600-offer line;
+  - a fault on a slot fetch or with a pending slot frame leads to copies with
+    A geometry and identity kept;
+  - stage 3 needs triple;
+  - bits off are inert.
+- The production `sweet_surface_direct` and writer nap are compiled into the
+  cache model.
+- The framebuffer test covers present: direct 2 is offered with no copy and no
+  CPU guard, 3 keeps the record, and 0 copies.
+
+Risks (guesses, none observed):
+
+- **TLBIALL while a slot is fetched.** It is bank-local and only empties
+  leaves the display is not reading, but it does flush the identity walk
+  caches mid-transfer.
+- **The fence convention.** "Lock sequence + 1" assumes the writer's job is
+  the next ABI submission after the lock. A misattributed fence could START a
+  half-written frame (tearing, not corruption of other memory).
+- **Release timing** relies on START and write-line semantics observed for
+  copies. If the line is idle between rows, an on-time release could come
+  early and a writer could overwrite pixels still being sent (tearing on one
+  frame).
+- **Throttling.** With only two CA surfaces, a writer waits for the fetch to
+  end, at most about one transfer. The forced bound is 100 ms.
+- **Park interplay** (bit 27): unchanged. A direct frame never queues a copy,
+  so there is nothing to park.
+- **After a fault,** the panel keeps the faulted frame until the next copy.
