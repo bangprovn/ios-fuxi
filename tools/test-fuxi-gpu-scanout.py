@@ -30,11 +30,12 @@ static unsigned fg_abi_inline; static int fg_inl_usable(void) { return 0; }
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
-static char doubleStats[512],ssppLog[512];
+static char doubleStats[512],ssppLog[512],dpuLog[4096];
 static int scanout_printf(const char *format,...) {
  va_list args;va_start(args,format);
  if(strstr(format,"double=1 flips="))vsnprintf(doubleStats,sizeof(doubleStats),format,args);
  if(strstr(format,"sspp vig0"))vsnprintf(ssppLog,sizeof(ssppLog),format,args);
+ if(strstr(format,"dpu smmu")){size_t n=strlen(dpuLog);if(n<sizeof(dpuLog))vsnprintf(dpuLog+n,sizeof(dpuLog)-n,format,args);}
  va_end(args);return 0;
 }
 #define printf scanout_printf
@@ -55,6 +56,13 @@ static unsigned traceCount,dsiReads,dmaStarts,pendingDma,noDone,busyAfterDone,st
 static unsigned errorOnDone,tearReadbackMismatch;
 static volatile uint32_t *fuxi_ctl0=ctl,*fuxi_intf1=intf;
 static int fuxi_gpu_ready(void) {return ready;}
+// apps_smmu model: read only by construction (no write path), fault offset, map/unmap balance.
+static uint32_t smmu[0x100000/4];
+static unsigned smmuMapped,smmuMaps,smmuFailMap,smmuFault=~0u,smmuReads;
+static int fg_dpu_smmu_map(unsigned map) {if(!map){smmuMapped=0;return 1;}smmuMaps++;if(smmuFailMap)return 0;smmuMapped=1;return 1;}
+static int fg_dpu_smmu_read(unsigned off,unsigned *v) {
+ assert(smmuMapped);if(off>=sizeof(smmu) || (off&3) || off==smmuFault)return 0;smmuReads++;*v=smmu[off/4];return 1;
+}
 static unsigned modelDrain,modelTe,modelPanel120,modelDouble,modelTriple,parseDouble,parseTriple,modelNc;
 static uint8_t modelB[4320u*2400],modelC[4320u*2400];
 static unsigned failBMap,failCMap;
@@ -132,7 +140,7 @@ TEST = r'''
 static unsigned fg_scanout_owned_for_model(void) {return fg_scanout_owned;}
 static unsigned fg_scanout_double_for_model(void) {return fg_scanout_double_active;}
 static void reset(void) {
- memset(sspp,0,sizeof(sspp));sspp[0x14/4]=0xb8000000u;modelNc=fg_scanout_preclean=0;ssppLog[0]=0;
+ memset(sspp,0,sizeof(sspp));sspp[0x14/4]=0xb8000000u;modelNc=fg_scanout_preclean=fg_scanout_dpu_dump=0;ssppLog[0]=dpuLog[0]=0;smmuMapped=smmuMaps=smmuFailMap=smmuReads=0;smmuFault=~0u;
  fg_scanout_double_requested=fg_scanout_double_active=fg_scanout_double_initialized=fg_scanout_front=0;
  parseDouble=parseTriple=0;
  fg_scanout_triple_requested=modelTriple=failCMap=fg_scanout_ready=fg_scanout_copy=0;
@@ -923,6 +931,35 @@ int main(void) {
  reset();modelNc=327168|0x100000u;sspp[0]=0x09600438u;sspp[0x24/4]=4320;fuxi_gpu_scanout_configure((uintptr_t)panel,1,0);
  assert(fuxi_gpu_scanout_preclean() && !fuxi_gpu_scanout_acquire() && writes==1 && !starts);
  assert(strstr(ssppLog,"size=0x9600438 img=0 xy=0 ") && strstr(ssppLog,"src0=0xb8000000 ystride0=0x10e0 format=0 "));
+ // fuxigpuncimport bit 22: the read-only DPU survey adds no MMIO write and an identical write trace; SMMU is never written.
+ reset();modelNc=327168;fuxi_gpu_scanout_configure((uintptr_t)panel,1,0);assert(!fuxi_gpu_scanout_acquire());
+ unsigned baseWrites=writes,baseTrace=traceCount;assert(!dpuLog[0] && !smmuMaps);
+ reset();modelNc=327168|0x400000u;memset(smmu,0,sizeof(smmu));
+ smmu[0x20/4]=0x48000000u|64;smmu[0x24/4]=(6u<<28)|32; // 64 SMRs, 32 banks, 4K pages, CB base 128 pages
+ smmu[(0x800+4*5)/4]=0x80021c00u;smmu[(0xc00+4*5)/4]=3;   // DT handoff <0x1c00 0x2> -> translate bank 3
+ smmu[(0x800+4*6)/4]=0x80001c01u;                         // 0x1c01 matches neither display stream
+ smmu[(0x800+4*7)/4]=0x00001c02u;                         // invalid SMR
+ smmu[(0x800+4*9)/4]=0x80001c02u;smmu[(0xc00+4*9)/4]=0x10000u|3; // bypass S2CR: no bank read
+ smmu[(0x1000+4*3)/4]=0x10003u;smmu[(0x1800+4*3)/4]=1;
+ unsigned cb=0x80000+3*0x1000;smmu[cb/4]=0xe0;smmu[(cb+0x10)/4]=5;smmu[(cb+0x20)/4]=0x12345000u;smmu[(cb+0x24)/4]=0x30000u;
+ smmu[(cb+0x30)/4]=0x80003520u;smmu[(cb+0x38)/4]=0x44;smmu[(cb+0x58)/4]=0x2;
+ sspp[0xa4/4]=0xb8000000u;sspp[0x24/4]=4320;ctl[0x18/4]=0x40;
+ fuxi_gpu_scanout_configure((uintptr_t)panel,1,0);assert(fg_scanout_dpu_dump && !fuxi_gpu_scanout_preclean());
+ assert(!fuxi_gpu_scanout_acquire() && writes==baseWrites && traceCount==baseTrace && !smmuMapped && smmuMaps==1 && !fg_scanout_dpu_dump);
+ assert(strstr(dpuLog,"dpu smmu scr0=0 idr0=0x48000040 idr1=0x60000020 idr2=0 smrs=64 cbs=32 page=0x1000 cb_base=0x80000\n"));
+ assert(strstr(dpuLog,"dpu smmu smr5=0x80021c00 s2cr=0x3 cb=3 cbar=0x10003 cba2r=0x1\n"));
+ assert(strstr(dpuLog,"dpu smmu cb3 sctlr=0xe0 ttbr0=0x3000012345000 tcr=0x80003520 tcr2=0x5 mair0=0x44 fsr=0x2\n"));
+ assert(strstr(dpuLog,"dpu smmu smr9=0x80001c02 s2cr=0x10003 cb=3 cbar=0xffffffff cba2r=0xffffffff\n"));
+ assert(!strstr(dpuLog,"smr6=") && !strstr(dpuLog,"smr7="));
+ assert(strstr(dpuLog,"vig0 size=0 img=0 xy=0 out_size=0 out_xy=0 ystride0=0x10e0 format=0 unpack=0 src0=0xb8000000 cur=0xb8000000 flush=0x40 start=0"));
+ assert(strstr(dpuLog,"done matches=2 faults=0 (read only)"));
+ // Second takeover after a stop never repeats; a faulting bank read prints ~0 and is counted; a map failure still logs VIG0.
+ reset();modelNc=0x400000u|327168;smmuFault=cb+0x58;fuxi_gpu_scanout_configure((uintptr_t)panel,1,0);
+ assert(!fuxi_gpu_scanout_acquire() && strstr(dpuLog,"fsr=0xffffffff\n") && strstr(dpuLog,"matches=2 faults=1"));
+ reset();modelNc=0x400000u|327168;smmuFault=0x20;fuxi_gpu_scanout_configure((uintptr_t)panel,1,0);
+ assert(!fuxi_gpu_scanout_acquire() && strstr(dpuLog,"smrs=0 cbs=0") && strstr(dpuLog,"matches=0 faults=1"));
+ reset();modelNc=0x400000u|327168;smmuFailMap=1;fuxi_gpu_scanout_configure((uintptr_t)panel,1,0);
+ assert(!fuxi_gpu_scanout_acquire() && strstr(dpuLog,"dpu smmu map failed") && strstr(dpuLog,"vig0 size=") && writes==baseWrites);
  reset();
  // Only exact option value 1 activates the lane/checker.
  fuxi_gpu_scanout_configure((uintptr_t)panel,2,1);assert(!fg_scanout_requested && !fg_scanout_checks);

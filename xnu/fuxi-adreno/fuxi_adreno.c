@@ -491,6 +491,40 @@ int fuxi_gpu_map(unsigned slot, uint64_t generation, uintptr_t source,
  t->misses++;
  return 1;
 }
+/* fuxigpuncimport bit 22 (scanout takeover survey): a temporary READ-only apps_smmu mapping, removed after the dump. Reads are
+ * fault-safe and never latch fg_access_failed (the hypervisor may protect a bank); nothing is ever written through it. */
+#define FG_DPU_SMMU_PA 0x15000000u
+#define FG_DPU_SMMU_SIZE 0x100000u
+static vm_offset_t fg_dpu_smmu_va;
+static int fg_dpu_smmu_map(unsigned map)
+{
+ if (!map || fg_dpu_smmu_va) {
+  if (!map && fg_dpu_smmu_va) {
+   pmap_remove(kernel_pmap, fg_dpu_smmu_va, fg_dpu_smmu_va + FG_DPU_SMMU_SIZE);
+   kmem_free(kernel_map, fg_dpu_smmu_va, FG_DPU_SMMU_SIZE);
+   fg_dpu_smmu_va = 0;
+  }
+  return 1;
+ }
+ vm_offset_t va = 0;
+ if (kmem_alloc(kernel_map, &va, FG_DPU_SMMU_SIZE, KMA_VAONLY | KMA_KOBJECT | KMA_NOPAGEWAIT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) return 0;
+ for (vm_size_t off = 0; off < FG_DPU_SMMU_SIZE; off += PAGE_SIZE)
+  if (pmap_enter_options_addr(kernel_pmap, va + off, FG_DPU_SMMU_PA + off, VM_PROT_READ, VM_PROT_NONE, VM_WIMG_IO, TRUE,
+      PMAP_OPTIONS_NOWAIT, NULL) != KERN_SUCCESS) {
+   pmap_remove(kernel_pmap, va, va + FG_DPU_SMMU_SIZE);
+   kmem_free(kernel_map, va, FG_DPU_SMMU_SIZE);
+   return 0;
+  }
+ fg_dpu_smmu_va = va;
+ return 1;
+}
+static int fg_dpu_smmu_read(unsigned off, unsigned *value)
+{
+ uint64_t v = 0;
+ if (!fg_dpu_smmu_va || off >= FG_DPU_SMMU_SIZE || (off & 3) || fuxi_gpu_access(fg_dpu_smmu_va + off, &v, 0, 0)) return 0;
+ *value = (unsigned)v;
+ return 1;
+}
 static int fg_abi_live_for_scanout(void);
 #include "fuxi_gpu_scanout.inc"
 static int fg_abi_init(void);

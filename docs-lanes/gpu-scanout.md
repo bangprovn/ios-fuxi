@@ -1460,3 +1460,30 @@ Tests: `tools/test-fuxi-metal.py` (copy priority),
 `tools/test-fuxi-unixnu.py` (frame log, due set, superseded skip),
 `tools/test-fuxi-adreno.py` (copy stamps),
 `tools/test-fuxi-gpu-scanout.py` (writer record). Not yet observed.
+
+### Direct-DPU-scanout stage 1: read-only display SMMU survey (`fuxigpuncimport` bit 22)
+
+Bit 22 (value 4194304, so 2948728 becomes 7143032, same length) needs
+`fuxigpuscanout=1`. Once, at takeover (after the bit-20 VIG0 line if bit 20 is also set), the driver
+maps apps_smmu (0x15000000, 1 MiB) read-only and temporarily. It reads through
+the fault-safe accessor, which does not latch `fg_access_failed`, and logs:
+
+- `FUXI SCANOUT: dpu smmu scr0= idr0= idr1= idr2= smrs= cbs= page= cb_base=`
+  (SMR count from IDR0, bank count, page size and bank base from IDR1).
+- Up to 4 lines `dpu smmu smr<n>= s2cr= cb= cbar= cba2r=`, one for each valid
+  SMR whose id/mask covers stream 0x1c00 or 0x1c02. The DT handoff is
+  `<0x1c00 0x2>`.
+- For each translating S2CR whose bank index is valid,
+  `dpu smmu cb<n> sctlr= ttbr0= tcr= tcr2= mair0= fsr=`. A bypass or fault
+  S2CR prints cbar/cba2r as 0xffffffff and has no bank line.
+- `dpu smmu vig0 size= img= xy= out_size= out_xy= ystride0= format= unpack=
+  src0= cur= flush= start=`. cur is CURRENT_SRC0 at +0xa4; flush and start are
+  CTL0 +0x18/+0x1c.
+- `dpu smmu done matches= faults= (read only)`. A register that cannot be read
+  prints 0xffffffff and is counted in faults.
+
+It writes nothing to the SMMU or MDSS. The host test checks this: the write
+trace is identical with and without bit 22, and the model has no SMMU write
+path. The decoding assumes SMMUv2 without EXID (sCR0 bit 3 clear). The bank
+state, and whether the hypervisor lets EL1 read that bank, are not yet
+observed.

@@ -85,6 +85,7 @@ static uintptr_t fg_scanout_pixels_b, fg_scanout_pixels_c;
 static unsigned fg_scanout_ready, fg_scanout_copy, fg_scanout_buffer_flips[3];
 /* fuxigpuncimport bit 20: copy-source clean outside the ring hold (SweetSurface), SSPP survey. */
 static unsigned fg_scanout_preclean;
+static unsigned fg_scanout_dpu_dump; /* fuxigpuncimport bit 22: read-only DPU/apps_smmu survey at takeover (fg_scanout_dpu_survey) */
 static unsigned fg_scanout_target(void)
 {
  for (unsigned i = 0; i < (fg_scanout_triple_requested ? 3u : 2u); i++)
@@ -111,6 +112,7 @@ void fuxi_gpu_scanout_configure(uintptr_t pixels, unsigned enabled, unsigned che
 {
   unsigned drain = 0, te = 0, panel120 = 0, double_buffer = 0, triple_buffer = 0, nc = 0;
   fg_scanout_preclean = PE_parse_boot_argn("fuxigpuncimport", &nc, sizeof(nc)) && (nc & 0x100000u);
+  fg_scanout_dpu_dump = (nc & 0x400000u) != 0; /* bit 22: read-only DPU/SMMU survey at takeover */
   fg_scanout_double_requested = PE_parse_boot_argn("fuxiscandouble", &double_buffer, sizeof(double_buffer)) && double_buffer == 1;
   unsigned triple = PE_parse_boot_argn("fuxiscantriple", &triple_buffer, sizeof(triple_buffer)) && triple_buffer == 1;
   fg_scanout_triple_requested = fg_scanout_double_requested && triple;
@@ -125,6 +127,7 @@ void fuxi_gpu_scanout_configure(uintptr_t pixels, unsigned enabled, unsigned che
   printf("FUXI SCANOUT: requested, fence then manual transfer, drain_us=%u te_gate=%u check=%u\n",
       fg_scanout_drain_us, fg_scanout_te_mode, fg_scanout_checks);
   if (fg_scanout_preclean) printf("FUXI SCANOUT: preclean=1 copy source cleaned before the ring reservation\n");
+  if (fg_scanout_dpu_dump) printf("FUXI SCANOUT: dpu smmu survey requested (read only)\n");
  }
 }
 int fuxi_gpu_scanout_preclean(void) { return fg_scanout_preclean; }
@@ -763,6 +766,62 @@ static int fg_scanout_address(unsigned pa)
  __asm__ volatile("dsb sy" ::: "memory");
  return 1;
 }
+/* fuxigpuncimport bit 22 (direct-scanout stage 1), READ only, once at takeover: apps_smmu state for the display streams 0x1c00/0x1c02
+ * (DT handoff SMR <0x1c00 0x2>), then VIG0 geometry, current address and CTL0 flush/START. Writes nothing. Unreadable registers print
+ * ~0 (0xffffffff); cbar/cba2r are ~0 when S2CR is not a translating S2CR with a valid bank. SMMUv2 layout (no EXID): GR0 sCR0 0,
+ * IDR0-2 0x20-0x28, SMR 0x800+4n (valid 31, mask 30:16, id 14:0), S2CR 0xc00+4n (type 17:16, CBNDX 7:0); GR1 one page up: CBAR 4n,
+ * CBA2R 0x800+4n; bank n at 2^(NUMPAGENDXB+1)+n pages: SCTLR 0, TCR2 0x10, TTBR0 0x20, TCR 0x30, MAIR0 0x38, FSR 0x58. */
+static int fg_scanout_smr_dpu(unsigned smr)
+{
+ unsigned id = smr & 0x7fffu, mask = (smr >> 16) & 0x7fffu;
+ return (smr & 0x80000000u) && (!((0x1c00u ^ id) & ~mask) || !((0x1c02u ^ id) & ~mask));
+}
+static unsigned fg_scanout_smmu_rd(unsigned off, unsigned *faults)
+{
+ unsigned v;
+ if (fg_dpu_smmu_read(off, &v)) return v;
+ ++*faults;
+ return ~0u;
+}
+static void fg_scanout_dpu_survey(void)
+{
+ unsigned faults = 0, hits = 0;
+ if (!fg_dpu_smmu_map(1)) printf("FUXI SCANOUT: dpu smmu map failed\n");
+ else {
+  unsigned scr0 = fg_scanout_smmu_rd(0, &faults), id0 = fg_scanout_smmu_rd(0x20, &faults), id1 = fg_scanout_smmu_rd(0x24, &faults);
+  unsigned id2 = fg_scanout_smmu_rd(0x28, &faults), good = !faults;
+  unsigned smrs = good ? ((id0 & 0xffu) > 128 ? 128 : id0 & 0xffu) : 0, cbs = good ? id1 & 0xffu : 0, shift = id1 >> 31 ? 16 : 12;
+  unsigned gr1 = 1u << shift, cb_base = (1u << (((id1 >> 28) & 7) + 1)) << shift;
+  printf("FUXI SCANOUT: dpu smmu scr0=%#x idr0=%#x idr1=%#x idr2=%#x smrs=%u cbs=%u page=%#x cb_base=%#x\n",
+      scr0, id0, id1, id2, smrs, cbs, gr1, cb_base);
+  for (unsigned i = 0; i < smrs && hits < 4; i++) {
+   unsigned before = faults, smr = fg_scanout_smmu_rd(0x800 + 4*i, &faults);
+   if (faults != before) break;
+   if (!fg_scanout_smr_dpu(smr)) continue;
+   unsigned s2cr = fg_scanout_smmu_rd(0xc00 + 4*i, &faults), cb = s2cr & 0xffu;
+   unsigned bank = s2cr != ~0u && !((s2cr >> 16) & 3) && cb < cbs;
+   unsigned cbar = bank ? fg_scanout_smmu_rd(gr1 + 4*cb, &faults) : ~0u, cba2r = bank ? fg_scanout_smmu_rd(gr1 + 0x800 + 4*cb, &faults) : ~0u;
+   hits++;
+   printf("FUXI SCANOUT: dpu smmu smr%u=%#x s2cr=%#x cb=%u cbar=%#x cba2r=%#x\n", i, smr, s2cr, cb, cbar, cba2r);
+   if (!bank) continue;
+   unsigned c = cb_base + (cb << shift);
+   unsigned sctlr = fg_scanout_smmu_rd(c, &faults), tcr2 = fg_scanout_smmu_rd(c + 0x10, &faults);
+   unsigned lo = fg_scanout_smmu_rd(c + 0x20, &faults), hi = fg_scanout_smmu_rd(c + 0x24, &faults);
+   unsigned tcr = fg_scanout_smmu_rd(c + 0x30, &faults), mair0 = fg_scanout_smmu_rd(c + 0x38, &faults), fsr = fg_scanout_smmu_rd(c + 0x58, &faults);
+   printf("FUXI SCANOUT: dpu smmu cb%u sctlr=%#x ttbr0=%#llx tcr=%#x tcr2=%#x mair0=%#x fsr=%#x\n",
+       cb, sctlr, (unsigned long long)hi << 32 | lo, tcr, tcr2, mair0, fsr);
+  }
+  (void)fg_dpu_smmu_map(0);
+ }
+ /* VIG0 SRC_SIZE, SRC_IMG_SIZE, SRC_XY, OUT_SIZE, OUT_XY, YSTRIDE0, FORMAT, UNPACK, SRC0, CURRENT_SRC0; CTL0 FLUSH, START. */
+ static const unsigned reg[12] = {0xae05000, 0xae05004, 0xae05008, 0xae0500c, 0xae05010, 0xae05024, 0xae05030, 0xae05034,
+     0xae05014, 0xae050a4, FG_SCAN_CTL+0x18, FG_SCAN_CTL+0x1c};
+ unsigned v[12];
+ for (unsigned i = 0; i < 12; i++) if (!fg_scanout_read(reg[i], &v[i])) v[i] = ~0u;
+ printf("FUXI SCANOUT: dpu smmu vig0 size=%#x img=%#x xy=%#x out_size=%#x out_xy=%#x ystride0=%#x format=%#x unpack=%#x src0=%#x cur=%#x flush=%#x start=%#x\n",
+     v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11]);
+ printf("FUXI SCANOUT: dpu smmu done matches=%u faults=%u (read only)\n", hits, faults);
+}
 /* DO NOT ENABLE (G186): leave bit 131072 off. Count 0 does not repeat the transfer and count 1 only every second TE (60 Hz), so this can
  * never reach 120 Hz; and after an autorefresh disable the CTL START bit was seen stuck (start=0x1, write line 0), so the drain timed out
  * ("transfer drain timeout") and the scanout stopped for the boot. Kept only for reference.
@@ -1198,6 +1257,7 @@ static int fg_scanout_acquire(unsigned publication)
    printf("FUXI SCANOUT: sspp vig0 size=%#x img=%#x xy=%#x out_size=%#x out_xy=%#x src0=%#x ystride0=%#x format=%#x unpack=%#x op_mode=%#x\n",
        sv[0], sv[1], sv[2], sv[3], sv[4], sv[5], sv[6], sv[7], sv[8], sv[9]);
   }
+  if (fg_scanout_dpu_dump) { fg_scanout_dpu_dump = 0; fg_scanout_dpu_survey(); }
   return 0;
  }
  unsigned ar, line, start;
