@@ -1,0 +1,859 @@
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -20,6 +20,13 @@
+ 
+ extern "C" void sweet_secondary_entry(void);
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
++#if defined(FUXI)
++/* osfmk/arm64/fuxi_pac.c (patch 0114): PAC self-test, fuxigpuncimport bit 25. No-ops when off. */
++extern "C" void fuxi_pac_probe_cpu(unsigned int cpu);
++extern "C" void fuxi_pac_log_begin(unsigned int cpu);
++extern "C" void fuxi_pac_log_cpu(unsigned int cpu);
++extern "C" void fuxi_pac_log_summary(unsigned int ncpu);
++#endif
+ 
+ class SweetCPU;
+ static SweetCPU *sweet_cpus[MAX_CPUS];
+@@ -154,6 +161,9 @@ SweetCPU::startAll(void *arg __unused, w
+ 	}
+ 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
+ 		SweetCPU *cpu = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
++#if defined(FUXI)
++		fuxi_pac_log_begin(i);
++#endif
+ 		kern_return_t kr = processor_start(cpu->machProcessor);
+ 		if (kr != KERN_SUCCESS) {
+ 			panic("SWEET CPU: cpu=%u processor_start failed: %d", i, kr);
+@@ -165,12 +175,18 @@ SweetCPU::startAll(void *arg __unused, w
+ 			if (mach_absolute_time() > deadline) {
+ 				IOLog("SWEET CPU: cpu=%u mpidr=0x%x NOT alive after 5s\n",
+ 				    i, topology->cpus[i].phys_id);
++#if defined(FUXI)
++				fuxi_pac_log_cpu(i);	/* incomplete step=NAME if the probe hung */
++#endif
+ 				panic("SWEET CPU: cpu=%u startup timeout (reset/MMU/GIC/SGI)", i);
+ 			}
+ 			IOSleep(1);
+ 		}
+ 		IOLog("SWEET CPU: cpu=%u mpidr=0x%x came alive; SGI1 OK\n",
+ 		    i, topology->cpus[i].phys_id);
++#if defined(FUXI)
++		fuxi_pac_log_cpu(i);
++#endif
+ 	}
+ 	/* Publish exactly once, after every selected CPU has completed initCPU(). */
+ 	ml_cpu_init_completed();
+@@ -179,6 +195,9 @@ SweetCPU::startAll(void *arg __unused, w
+ 	ml_set_max_cpus(topology->max_cpu_id + 1);
+ 	IOLog("SWEET CPU: %u/%u CPUs initialized, SGI1 verified\n",
+ 	    topology->num_cpus, topology->num_cpus);
++#if defined(FUXI)
++	fuxi_pac_log_summary(topology->num_cpus);
++#endif
+ 	thread_terminate(current_thread());
+ }
+ 
+@@ -207,6 +226,9 @@ SweetCPU::initCPU(bool boot)
+ 	kprintf("SWEET CPU: cpu=%u entered initCPU mpidr=0x%llx EL%llu IRQs=%u\n",
+ 	    getCPUNumber(), __builtin_arm_rsr64("MPIDR_EL1") & 0xffffULL,
+ 	    __builtin_arm_rsr64("CurrentEL") >> 2, ml_get_interrupts_enabled());
++#if defined(FUXI)
++	fuxi_pac_probe_cpu(getCPUNumber());	/* on this CPU, before startAll sees it initialized */
++#endif
+ 	__atomic_store_n(&initialized, 1, __ATOMIC_RELEASE);
+ }
+ 
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -260,6 +260,7 @@ extern unsigned int gFastIPI;
+ 
+ #if defined(FUXI)
+ extern void fuxi_idle_sgi(unsigned int intid);	/* osfmk/arm64/fuxi_idle.c (patch 0105) */
++extern int fuxi_pac_trap(uint64_t pc, uint32_t esr);	/* osfmk/arm64/fuxi_pac.c (patch 0114) */
+ #endif
+ 
+ static arm_saved_state64_t *original_faulting_state = NULL;
+@@ -619,6 +620,15 @@ sleh_synchronous(arm_context_t *context,
+ 
+ 	ASSERT_CONTEXT_SANITY(context);
+ 
++#if defined(FUXI)
++	/* fuxigpuncimport bit 25: a trapping PAC probe instruction (UNDEF, FPAC) is skipped, never anything else. */
++	if (PSR64_IS_KERNEL(get_saved_state_cpsr(state)) &&
++	    fuxi_pac_trap((uint64_t)get_saved_state_pc(state), esr)) {
++		add_saved_state_pc(state, 4);
++		return;
++	}
++#endif
++
+ 	task_vtimer_check(thread);
+ 
+ #if CONFIG_DTRACE
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -43,6 +43,7 @@ osfmk/arm/arm_init.c	optional config_pma
+ osfmk/arm64/arm_vm_init.c	optional config_pmap_ppl
+ osfmk/arm64/sweet_early.c	standard
+ osfmk/arm64/fuxi_idle.c	standard
++osfmk/arm64/fuxi_pac.c	standard
+ osfmk/arm64/arm64_hypercall.c	standard
+ osfmk/arm/io_map.c		standard
+ osfmk/arm64/loose_ends.c	standard
+--- a/osfmk/arm64/fuxi_pac_logic.h
++++ b/osfmk/arm64/fuxi_pac_logic.h
+@@ -0,0 +1,363 @@
++/* Pure helpers of osfmk/arm64/fuxi_pac.c (patch 0114), shared with the host
++ * test tools/test-fuxi-pac.py. No kernel headers: integers in, text out.
++ */
++#ifndef FUXI_PAC_LOGIC_H
++#define FUXI_PAC_LOGIC_H
++
++#define FP_MAX_CPUS     8
++#define FP_ARG_BIT      0x2000000u      /* fuxigpuncimport bit 25 (value 33554432) */
++#define FP_NKEYS        10              /* APIA, APIB, APDA, APDB, APGA; Lo then Hi */
++#define FP_KEYS_ALL     0x3ffu
++#define FP_NAUTH        4               /* IA, IB, DA, DB */
++
++/* SCTLR_EL1 enables, in the order of the en= field: EnIA, EnIB, EnDA, EnDB. */
++#define FP_SCTLR_ENIA   (1ULL << 31)
++#define FP_SCTLR_ENIB   (1ULL << 30)
++#define FP_SCTLR_ENDA   (1ULL << 27)
++#define FP_SCTLR_ENDB   (1ULL << 13)
++#define FP_SCTLR_EN     (FP_SCTLR_ENIA | FP_SCTLR_ENIB | FP_SCTLR_ENDA | FP_SCTLR_ENDB)
++
++#define FP_EC_UNKNOWN   0x00u
++#define FP_EC_PAC_FAIL  0x1cu
++
++/* Steps, logged before each one runs, so a hang names the last step entered. */
++#define FP_STEP_NONE    0u
++#define FP_STEP_GUARD   1u      /* UDF under the trap guard: proves the sleh hook */
++#define FP_STEP_ID      2u      /* ID_AA64ISAR1/2, SCTLR */
++#define FP_STEP_KEYRD   3u      /* save the ten key halves */
++#define FP_STEP_KEYWR   4u      /* write test keys, read back */
++#define FP_STEP_SCTLR   5u      /* set EnIA/EnIB/EnDA/EnDB */
++#define FP_STEP_AUTH    6u      /* PAC/AUT round trips and tampered AUTs */
++#define FP_STEP_GA      7u      /* PACGA */
++#define FP_STEP_RESTORE 8u      /* original keys, SCTLR */
++#define FP_STEP_DONE    9u
++
++static inline const char *
++fp_step_name(unsigned step)
++{
++	static const char *const names[] = { "none", "guard", "id", "keyrd", "keywr", "sctlr", "auth", "ga", "restore", "done" };
++	return step <= FP_STEP_DONE ? names[step] : "?";
++}
++
++/* The probe runs only when fuxigpuncimport is present and has bit 25 set. */
++static inline int
++fp_arg_enabled(int present, unsigned bits)
++{
++	return present && (bits & FP_ARG_BIT) != 0;
++}
++
++static inline unsigned
++fp_field(uint64_t reg, unsigned shift)
++{
++	return (unsigned)((reg >> shift) & 0xfu);
++}
++
++/* ID_AA64ISAR1_EL1: APA [7:4], API [11:8], GPA [27:24], GPI [31:28]. ID_AA64ISAR2_EL1: GPA3 [11:8], APA3 [15:12]. */
++static inline unsigned fp_apa(uint64_t isar1) { return fp_field(isar1, 4); }
++static inline unsigned fp_api(uint64_t isar1) { return fp_field(isar1, 8); }
++static inline unsigned fp_gpa(uint64_t isar1) { return fp_field(isar1, 24); }
++static inline unsigned fp_gpi(uint64_t isar1) { return fp_field(isar1, 28); }
++static inline unsigned fp_gpa3(uint64_t isar2) { return fp_field(isar2, 8); }
++static inline unsigned fp_apa3(uint64_t isar2) { return fp_field(isar2, 12); }
++
++/* The implemented address-auth level: 1 PAuth, 2 EPAC, 3 PAuth2, 4 FPAC, 5 FPACCOMBINE (only one algorithm field is nonzero). */
++static inline unsigned
++fp_auth_level(uint64_t isar1, uint64_t isar2)
++{
++	unsigned a = fp_apa(isar1), b = fp_api(isar1), c = fp_apa3(isar2);
++	unsigned m = a > b ? a : b;
++	return m > c ? m : c;
++}
++
++static inline int
++fp_generic(uint64_t isar1, uint64_t isar2)
++{
++	return fp_gpa(isar1) || fp_gpi(isar1) || fp_gpa3(isar2);
++}
++
++/* 0 no FPAC (a failed AUT returns a poisoned pointer), 1 FPAC, 2 FPACCOMBINE (a failed AUT faults). */
++static inline unsigned
++fp_fpac(uint64_t isar1, uint64_t isar2)
++{
++	unsigned level = fp_auth_level(isar1, isar2);
++	return level >= 5 ? 2 : level == 4 ? 1 : 0;
++}
++
++/* The same test key on every CPU, so signatures must agree across cores. */
++static inline uint64_t
++fp_key_pattern(unsigned idx)
++{
++	return 0x0123456789abcdefULL ^ ((uint64_t)(idx + 1) * 0x9e3779b97f4a7c15ULL);
++}
++
++/* One CPU. Masks have one bit per key half in FP_NKEYS order. */
++struct fp_result {
++	unsigned done, step;
++	uint64_t midr, isar1, isar2, sctlr, sctlr_set;
++	unsigned guard;                 /* the UDF trapped and was skipped: probe faults are recoverable */
++	unsigned id_trap;               /* an ID or SCTLR read trapped */
++	unsigned key_rd, key_ok, key_ign, key_trap, key_back;   /* readable, test value read back, unchanged, trapped, restored */
++	unsigned sctlr_trap;            /* the SCTLR write trapped */
++	unsigned sctlr_back;            /* SCTLR read back equal to the original after the restore */
++	int auth[FP_NAUTH];             /* PAC then AUT of the test pointer: 1 ok, 0 failed, -1 not run */
++	char fail[FP_NAUTH];            /* tampered AUT: 'P' poisoned result, 'F' FPAC fault, 'E' other trap, 'X' accepted, '-' not run */
++	int ga;                         /* PACGA: 1 ok, 0 failed, -1 not run */
++	int key_used;                   /* PACIA differs between the test key and the original key: 1, 0, -1 not run */
++	uint64_t sig[FP_NAUTH + 1];     /* signed test pointer per key with the test keys, then PACGA */
++	unsigned traps, last_esr;
++};
++
++static inline const char *
++fp_keys_rw(const struct fp_result *r)
++{
++	if (r->key_trap) {
++		return "trap";
++	}
++	if (r->key_ok == FP_KEYS_ALL) {
++		return "ok";
++	}
++	if (r->key_ign == FP_KEYS_ALL) {
++		return "ignored";
++	}
++	return r->key_rd ? "partial" : "none";
++}
++
++static inline int
++fp_pac_ok(const struct fp_result *r)
++{
++	for (unsigned k = 0; k < FP_NAUTH; k++) {
++		if (r->auth[k] != 1) {
++			return 0;
++		}
++	}
++	return r->ga != 0;
++}
++
++/* 1 every tampered AUT was rejected, 0 one was accepted, -1 not run (FPAC without a working guard, or no PAC). */
++static inline int
++fp_auth_fail_ok(const struct fp_result *r)
++{
++	int ran = 0;
++	for (unsigned k = 0; k < FP_NAUTH; k++) {
++		if (r->fail[k] == 'X' || r->fail[k] == 'E') {
++			return 0;
++		}
++		ran |= r->fail[k] == 'P' || r->fail[k] == 'F';
++	}
++	return ran ? 1 : -1;
++}
++
++static inline int
++fp_restored(const struct fp_result *r)
++{
++	return r->key_back == r->key_rd && r->sctlr_back;
++}
++
++static inline void
++fp_append(char *buf, unsigned size, unsigned *at, const char *s)
++{
++	while (*s && *at + 1 < size) {
++		buf[(*at)++] = *s++;
++	}
++	buf[*at] = 0;
++}
++
++static inline void
++fp_append_u(char *buf, unsigned size, unsigned *at, uint64_t v)
++{
++	char tmp[24];
++	unsigned n = 0;
++	do {
++		tmp[n++] = (char)('0' + v % 10);
++		v /= 10;
++	} while (v);
++	while (n && *at + 1 < size) {
++		buf[(*at)++] = tmp[--n];
++	}
++	buf[*at] = 0;
++}
++
++static inline void
++fp_append_x(char *buf, unsigned size, unsigned *at, uint64_t v)
++{
++	char tmp[24];
++	unsigned n = 0;
++	do {
++		tmp[n++] = "0123456789abcdef"[v & 0xf];
++		v >>= 4;
++	} while (v);
++	fp_append(buf, size, at, "0x");
++	while (n && *at + 1 < size) {
++		buf[(*at)++] = tmp[--n];
++	}
++	buf[*at] = 0;
++}
++
++static inline void
++fp_append_i(char *buf, unsigned size, unsigned *at, int v)
++{
++	if (v < 0) {
++		fp_append(buf, size, at, "-");
++	} else {
++		fp_append_u(buf, size, at, (uint64_t)v);
++	}
++}
++
++static inline void
++fp_append_c(char *buf, unsigned size, unsigned *at, char c)
++{
++	char s[2] = { c, 0 };
++	fp_append(buf, size, at, s);
++}
++
++/*
++ * FUXI PAC: cpu=N midr= isar1= isar2= apa= api= apa3= gpa= gpi= gpa3= en=<EnIA EnIB EnDA EnDB> guard=
++ *   keys_rw=ok|ignored|trap|partial|none keys=<ok>/<rd>/<ign>/<trap> restored= pac_ok= auth=<IA IB DA DB GA>
++ *   key_used= auth_fail_ok= fail=<IA IB DA DB> fpac=0|1|2 sig= traps= esr=
++ * or "FUXI PAC: cpu=N incomplete step=NAME" when the probe has not finished.
++ * Returns the line length (the buffer is always terminated).
++ */
++static inline unsigned
++fp_format(char *buf, unsigned size, unsigned cpu, const struct fp_result *r)
++{
++	unsigned at = 0;
++	if (!size) {
++		return 0;
++	}
++	buf[0] = 0;
++	fp_append(buf, size, &at, "FUXI PAC: cpu=");
++	fp_append_u(buf, size, &at, cpu);
++	if (!r->done) {
++		fp_append(buf, size, &at, " incomplete step=");
++		fp_append(buf, size, &at, fp_step_name(r->step));
++		return at;
++	}
++	fp_append(buf, size, &at, " midr=");
++	fp_append_x(buf, size, &at, r->midr);
++	fp_append(buf, size, &at, " isar1=");
++	fp_append_x(buf, size, &at, r->isar1);
++	fp_append(buf, size, &at, " isar2=");
++	fp_append_x(buf, size, &at, r->isar2);
++	fp_append(buf, size, &at, " apa=");
++	fp_append_u(buf, size, &at, fp_apa(r->isar1));
++	fp_append(buf, size, &at, " api=");
++	fp_append_u(buf, size, &at, fp_api(r->isar1));
++	fp_append(buf, size, &at, " apa3=");
++	fp_append_u(buf, size, &at, fp_apa3(r->isar2));
++	fp_append(buf, size, &at, " gpa=");
++	fp_append_u(buf, size, &at, fp_gpa(r->isar1));
++	fp_append(buf, size, &at, " gpi=");
++	fp_append_u(buf, size, &at, fp_gpi(r->isar1));
++	fp_append(buf, size, &at, " gpa3=");
++	fp_append_u(buf, size, &at, fp_gpa3(r->isar2));
++	fp_append(buf, size, &at, " en=");
++	fp_append_c(buf, size, &at, (r->sctlr & FP_SCTLR_ENIA) ? '1' : '0');
++	fp_append_c(buf, size, &at, (r->sctlr & FP_SCTLR_ENIB) ? '1' : '0');
++	fp_append_c(buf, size, &at, (r->sctlr & FP_SCTLR_ENDA) ? '1' : '0');
++	fp_append_c(buf, size, &at, (r->sctlr & FP_SCTLR_ENDB) ? '1' : '0');
++	fp_append(buf, size, &at, " guard=");
++	fp_append_u(buf, size, &at, r->guard);
++	fp_append(buf, size, &at, " keys_rw=");
++	fp_append(buf, size, &at, fp_keys_rw(r));
++	fp_append(buf, size, &at, " keys=");
++	fp_append_x(buf, size, &at, r->key_ok);
++	fp_append(buf, size, &at, "/");
++	fp_append_x(buf, size, &at, r->key_rd);
++	fp_append(buf, size, &at, "/");
++	fp_append_x(buf, size, &at, r->key_ign);
++	fp_append(buf, size, &at, "/");
++	fp_append_x(buf, size, &at, r->key_trap);
++	fp_append(buf, size, &at, " restored=");
++	fp_append_u(buf, size, &at, (uint64_t)fp_restored(r));
++	fp_append(buf, size, &at, " pac_ok=");
++	fp_append_u(buf, size, &at, (uint64_t)fp_pac_ok(r));
++	fp_append(buf, size, &at, " auth=");
++	for (unsigned k = 0; k < FP_NAUTH; k++) {
++		fp_append_c(buf, size, &at, (char)(r->auth[k] < 0 ? '-' : '0' + r->auth[k]));
++	}
++	fp_append_c(buf, size, &at, (char)(r->ga < 0 ? '-' : '0' + r->ga));
++	fp_append(buf, size, &at, " key_used=");
++	fp_append_i(buf, size, &at, r->key_used);
++	fp_append(buf, size, &at, " auth_fail_ok=");
++	fp_append_i(buf, size, &at, fp_auth_fail_ok(r));
++	fp_append(buf, size, &at, " fail=");
++	for (unsigned k = 0; k < FP_NAUTH; k++) {
++		fp_append_c(buf, size, &at, r->fail[k]);
++	}
++	fp_append(buf, size, &at, " fpac=");
++	fp_append_u(buf, size, &at, fp_fpac(r->isar1, r->isar2));
++	fp_append(buf, size, &at, " sig=");
++	fp_append_x(buf, size, &at, r->sig[0]);
++	fp_append(buf, size, &at, " traps=");
++	fp_append_u(buf, size, &at, r->traps);
++	fp_append(buf, size, &at, " esr=");
++	fp_append_x(buf, size, &at, r->last_esr);
++	return at;
++}
++
++/*
++ * FUXI PAC: summary cpus= probed= pauth= keys_rw_ok= pac_ok= auth_fail_ok= fpac= restored= consistent= verdict=
++ * verdict: ready (every CPU: keys read back, all round trips, tampering rejected, state restored, identical
++ * signatures), else the first failing class: incomplete, no-pauth, keys, pac, auth, restore, mixed.
++ */
++static inline unsigned
++fp_format_summary(char *buf, unsigned size, const struct fp_result *r, unsigned ncpu)
++{
++	unsigned at = 0, probed = 0, pauth = 0, keys = 0, pac = 0, fail = 0, fpac = 0, back = 0, consistent = 1;
++	const struct fp_result *first = 0;
++	const char *verdict;
++	if (!size) {
++		return 0;
++	}
++	if (ncpu > FP_MAX_CPUS) {
++		ncpu = FP_MAX_CPUS;
++	}
++	for (unsigned c = 0; c < ncpu; c++) {
++		if (!r[c].done) {
++			continue;
++		}
++		probed++;
++		pauth += fp_auth_level(r[c].isar1, r[c].isar2) != 0;
++		keys += fp_keys_rw(&r[c])[0] == 'o';
++		pac += (unsigned)fp_pac_ok(&r[c]);
++		fail += fp_auth_fail_ok(&r[c]) == 1;
++		fpac += fp_fpac(r[c].isar1, r[c].isar2) != 0;
++		back += (unsigned)fp_restored(&r[c]);
++		if (!fp_pac_ok(&r[c]) || r[c].key_ok != FP_KEYS_ALL) {
++			continue;       /* signatures are comparable only under the test keys */
++		}
++		if (!first) {
++			first = &r[c];
++		} else {
++			for (unsigned k = 0; k <= FP_NAUTH; k++) {
++				consistent &= first->sig[k] == r[c].sig[k];
++			}
++		}
++	}
++	verdict = probed < ncpu || !ncpu ? "incomplete" : !pauth ? "no-pauth" : keys < ncpu ? "keys" : pac < ncpu ? "pac" :
++	    fail < ncpu ? "auth" : back < ncpu ? "restore" : !consistent ? "mixed" : "ready";
++	buf[0] = 0;
++	fp_append(buf, size, &at, "FUXI PAC: summary cpus=");
++	fp_append_u(buf, size, &at, ncpu);
++	fp_append(buf, size, &at, " probed=");
++	fp_append_u(buf, size, &at, probed);
++	fp_append(buf, size, &at, " pauth=");
++	fp_append_u(buf, size, &at, pauth);
++	fp_append(buf, size, &at, " keys_rw_ok=");
++	fp_append_u(buf, size, &at, keys);
++	fp_append(buf, size, &at, " pac_ok=");
++	fp_append_u(buf, size, &at, pac);
++	fp_append(buf, size, &at, " auth_fail_ok=");
++	fp_append_u(buf, size, &at, fail);
++	fp_append(buf, size, &at, " fpac=");
++	fp_append_u(buf, size, &at, fpac);
++	fp_append(buf, size, &at, " restored=");
++	fp_append_u(buf, size, &at, back);
++	fp_append(buf, size, &at, " consistent=");
++	fp_append_u(buf, size, &at, consistent);
++	fp_append(buf, size, &at, " verdict=");
++	fp_append(buf, size, &at, verdict);
++	return at;
++}
++
++#endif /* FUXI_PAC_LOGIC_H */
+--- a/osfmk/arm64/fuxi_pac.c
++++ b/osfmk/arm64/fuxi_pac.c
+@@ -0,0 +1,389 @@
++/* FUXI pointer-authentication self-test (patch 0114), stage 0 of arm64e. Off unless a boot-arg asks.
++ *
++ * fuxigpuncimport bit 25 (value 33554432; the other bits keep their GPU meaning, 22-24 are DPU scanout) runs, at EL1 on every CPU in
++ * SweetCPU::initCPU (the boot CPU and each secondary as it comes up, IRQ/FIQ masked):
++ *   - a UDF under the trap guard below: proves that a trapping probe instruction is skipped, not a panic;
++ *   - ID_AA64ISAR1_EL1, ID_AA64ISAR2_EL1, SCTLR_EL1;
++ *   - the ten APIA/APIB/APDA/APDB/APGA key halves: saved, written with a fixed test pattern, read back;
++ *   - EnIA/EnIB/EnDA/EnDB set, PAC then AUT of a kernel pointer with a modifier for IA, IB, DA and DB, and two
++ *     tampered AUTs each (other modifier, one PAC bit flipped), plus PACGA;
++ *   - the original keys and SCTLR_EL1 written back and read back, so the arm64 (non-e) kernel runs on unchanged.
++ * Every probe instruction is in one table (fuxi_pac_stub). While a CPU is armed, a synchronous exception at a
++ * table address (hypervisor-injected UNDEF for a trapped key register, FPAC fault of a tampered AUT) is skipped
++ * by sleh_synchronous and recorded; the C side checks the flag after each instruction. Each step is kprintf'd
++ * before it runs and kept per CPU; startAll prints one line per CPU and a summary (fuxi_pac_logic.h).
++ * Unset (or the bit clear): no register is touched, the sleh hook only compares the PC with an empty range.
++ */
++#include <pexpert/arm64/board_config.h>
++#if defined(FUXI)
++#include <stdint.h>
++#include <kern/cpu_number.h>
++#include <kern/misc_protos.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include "fuxi_pac_logic.h"
++
++/* Hooks (patch 0114): iokit/Kernel/arm/SweetCPU.cpp, osfmk/arm64/sleh.c */
++int fuxi_pac_enabled(void);
++void fuxi_pac_probe_cpu(unsigned int cpu);
++void fuxi_pac_log_begin(unsigned int cpu);
++void fuxi_pac_log_cpu(unsigned int cpu);
++void fuxi_pac_log_summary(unsigned int ncpu);
++int fuxi_pac_trap(uint64_t pc, uint32_t esr);
++
++/* op 0..33 runs table entry op (x1 = value or pointer, x2 = modifier) and returns x0 (reads) or x1 (PAC ops);
++ * op 34 returns the table start, op 35 its end. */
++uint64_t fuxi_pac_stub(uint64_t op, uint64_t a, uint64_t b);
++
++#define FP_OP_ISAR1     0u
++#define FP_OP_ISAR2     1u
++#define FP_OP_SCTLR_RD  2u
++#define FP_OP_SCTLR_WR  3u
++#define FP_OP_UDF       4u
++#define FP_OP_KEY_RD    5u      /* + key index */
++#define FP_OP_KEY_WR    15u     /* + key index */
++#define FP_OP_PAC       25u     /* + 2 * auth index: PAC, then + 1: AUT */
++#define FP_OP_PACGA     33u
++#define FP_OP_COUNT     34u
++_Static_assert(FP_OP_KEY_RD + FP_NKEYS == FP_OP_KEY_WR && FP_OP_KEY_WR + FP_NKEYS == FP_OP_PAC &&
++    FP_OP_PAC + 2 * FP_NAUTH == FP_OP_PACGA && FP_OP_PACGA + 1 == FP_OP_COUNT, "fuxi_pac_stub table layout");
++
++/* Raw encodings (no assembler pauth support needed). Keys: APIAKeyLo/Hi S3_0_C2_C1_0/1, APIBKey _2/_3,
++ * APDAKey S3_0_C2_C2_0/1, APDBKey _2/_3, APGAKey S3_0_C2_C3_0/1. PAC ops on x1 with modifier x2:
++ * PACIA 0xdac10041, AUTIA 0xdac11041, PACIB 0xdac10441, AUTIB 0xdac11441, PACDA 0xdac10841,
++ * AUTDA 0xdac11841, PACDB 0xdac10c41, AUTDB 0xdac11c41, PACGA x1, x1, x2 0x9ac23021. UDF #0 is 0. */
++__asm__(
++	"	.text\n"
++	"	.p2align 2\n"
++	"	.globl _fuxi_pac_stub\n"
++	"_fuxi_pac_stub:\n"
++	"	cmp	x0, #34\n"
++	"	b.hs	Lfp_range\n"
++	"	adr	x9, Lfp_tab\n"
++	"	add	x9, x9, x0, lsl #3\n"
++	"	br	x9\n"
++	"Lfp_range:\n"
++	"	cmp	x0, #34\n"
++	"	adr	x0, Lfp_tab\n"
++	"	b.eq	Lfp_ret\n"
++	"	adr	x0, Lfp_tab_end\n"
++	"Lfp_ret:\n"
++	"	ret\n"
++	"Lfp_isb:\n"
++	"	isb\n"
++	"	ret\n"
++	"Lfp_mov:\n"
++	"	mov	x0, x1\n"
++	"	ret\n"
++	"Lfp_tab:\n"
++	"	mrs	x0, S3_0_C0_C6_1\n	ret\n"
++	"	mrs	x0, S3_0_C0_C6_2\n	ret\n"
++	"	mrs	x0, S3_0_C1_C0_0\n	ret\n"
++	"	msr	S3_0_C1_C0_0, x1\n	b	Lfp_isb\n"
++	"	.inst	0x00000000\n	ret\n"
++	"	mrs	x0, S3_0_C2_C1_0\n	ret\n"
++	"	mrs	x0, S3_0_C2_C1_1\n	ret\n"
++	"	mrs	x0, S3_0_C2_C1_2\n	ret\n"
++	"	mrs	x0, S3_0_C2_C1_3\n	ret\n"
++	"	mrs	x0, S3_0_C2_C2_0\n	ret\n"
++	"	mrs	x0, S3_0_C2_C2_1\n	ret\n"
++	"	mrs	x0, S3_0_C2_C2_2\n	ret\n"
++	"	mrs	x0, S3_0_C2_C2_3\n	ret\n"
++	"	mrs	x0, S3_0_C2_C3_0\n	ret\n"
++	"	mrs	x0, S3_0_C2_C3_1\n	ret\n"
++	"	msr	S3_0_C2_C1_0, x1\n	b	Lfp_isb\n"
++	"	msr	S3_0_C2_C1_1, x1\n	b	Lfp_isb\n"
++	"	msr	S3_0_C2_C1_2, x1\n	b	Lfp_isb\n"
++	"	msr	S3_0_C2_C1_3, x1\n	b	Lfp_isb\n"
++	"	msr	S3_0_C2_C2_0, x1\n	b	Lfp_isb\n"
++	"	msr	S3_0_C2_C2_1, x1\n	b	Lfp_isb\n"
++	"	msr	S3_0_C2_C2_2, x1\n	b	Lfp_isb\n"
++	"	msr	S3_0_C2_C2_3, x1\n	b	Lfp_isb\n"
++	"	msr	S3_0_C2_C3_0, x1\n	b	Lfp_isb\n"
++	"	msr	S3_0_C2_C3_1, x1\n	b	Lfp_isb\n"
++	"	.inst	0xdac10041\n	b	Lfp_mov\n"
++	"	.inst	0xdac11041\n	b	Lfp_mov\n"
++	"	.inst	0xdac10441\n	b	Lfp_mov\n"
++	"	.inst	0xdac11441\n	b	Lfp_mov\n"
++	"	.inst	0xdac10841\n	b	Lfp_mov\n"
++	"	.inst	0xdac11841\n	b	Lfp_mov\n"
++	"	.inst	0xdac10c41\n	b	Lfp_mov\n"
++	"	.inst	0xdac11c41\n	b	Lfp_mov\n"
++	"	.inst	0x9ac23021\n	b	Lfp_mov\n"
++	"Lfp_tab_end:\n"
++	);
++
++#define FP_EC(esr)      (((esr) >> 26) & 0x3fu)
++#define FP_MODIFIER     0x5eedfacecafe1234ULL
++
++static unsigned fp_state;               /* 0 unparsed, 1 off, 2 on */
++static uint64_t fp_tab_begin, fp_tab_end;       /* stay 0 (empty) unless on */
++static unsigned fp_armed[FP_MAX_CPUS], fp_hit[FP_MAX_CPUS], fp_esr[FP_MAX_CPUS];
++static struct fp_result fp_res[FP_MAX_CPUS];
++
++int
++fuxi_pac_enabled(void)
++{
++	unsigned state = __atomic_load_n(&fp_state, __ATOMIC_ACQUIRE);
++	if (!state) {
++		unsigned bits = 0;
++		int present = PE_parse_boot_argn("fuxigpuncimport", &bits, sizeof(bits)) ? 1 : 0;
++		state = fp_arg_enabled(present, bits) ? 2 : 1;
++		if (state == 2) {
++			fp_tab_begin = fuxi_pac_stub(FP_OP_COUNT, 0, 0);
++			fp_tab_end = fuxi_pac_stub(FP_OP_COUNT + 1, 0, 0);
++		}
++		__atomic_store_n(&fp_state, state, __ATOMIC_RELEASE);
++	}
++	return state == 2;
++}
++
++/* sleh_synchronous, EL1 only: 1 = this CPU is armed and the PC is a probe instruction; the caller skips it. */
++int
++fuxi_pac_trap(uint64_t pc, uint32_t esr)
++{
++	int cpu;
++	if (pc < fp_tab_begin || pc >= fp_tab_end) {
++		return 0;
++	}
++	cpu = cpu_number();
++	if (cpu < 0 || cpu >= FP_MAX_CPUS || !__atomic_load_n(&fp_armed[cpu], __ATOMIC_RELAXED)) {
++		return 0;
++	}
++	fp_esr[cpu] = esr;
++	__atomic_store_n(&fp_hit[cpu], 1u, __ATOMIC_RELAXED);
++	return 1;
++}
++
++/* One table entry; 0 if it trapped (then nothing is stored). */
++static int
++fp_do(struct fp_result *r, unsigned cpu, unsigned op, uint64_t a, uint64_t b, uint64_t *out)
++{
++	uint64_t v;
++	__atomic_store_n(&fp_hit[cpu], 0u, __ATOMIC_RELAXED);
++	v = fuxi_pac_stub(op, a, b);
++	if (__atomic_load_n(&fp_hit[cpu], __ATOMIC_RELAXED)) {
++		r->traps++;
++		r->last_esr = fp_esr[cpu];
++		return 0;
++	}
++	if (out) {
++		*out = v;
++	}
++	return 1;
++}
++
++static void
++fp_step(struct fp_result *r, unsigned cpu, unsigned step)
++{
++	r->step = step;
++	kprintf("FUXI PAC: cpu=%u step=%s\n", cpu, fp_step_name(step));
++}
++
++/* A tampered AUT must not return the original pointer. */
++static char
++fp_tamper(struct fp_result *r, unsigned cpu, unsigned op, uint64_t s, uint64_t mod, uint64_t p)
++{
++	uint64_t t;
++	if (fp_do(r, cpu, op, s, mod, &t)) {
++		return t != p ? 'P' : 'X';
++	}
++	return FP_EC(r->last_esr) == FP_EC_PAC_FAIL ? 'F' : 'E';
++}
++
++static char
++fp_worse(char a, char b)
++{
++	static const char order[] = "PFEX";     /* best to worst */
++	unsigned ia = 0, ib = 0;
++	while (order[ia] && order[ia] != a) {
++		ia++;
++	}
++	while (order[ib] && order[ib] != b) {
++		ib++;
++	}
++	return ia >= ib ? a : b;
++}
++
++static void
++fp_auth(struct fp_result *r, unsigned cpu)
++{
++	uint64_t p = (uint64_t)(uintptr_t)&fp_res[0], s, t, d;
++	unsigned fpac = fp_fpac(r->isar1, r->isar2);
++	for (unsigned k = 0; k < FP_NAUTH; k++) {
++		unsigned op = FP_OP_PAC + 2 * k;
++		int ok = fp_do(r, cpu, op, p, FP_MODIFIER, &s) && s != p;
++		if (ok) {
++			r->sig[k] = s;
++			ok = fp_do(r, cpu, op + 1, s, FP_MODIFIER, &t) && t == p;
++		}
++		r->auth[k] = ok;
++		/* With FPAC a rejected AUT faults: run it only under a proven guard. */
++		if (ok && (r->guard || !fpac)) {
++			d = s ^ p;
++			r->fail[k] = fp_worse(fp_tamper(r, cpu, op + 1, s, FP_MODIFIER ^ 1, p),
++			    fp_tamper(r, cpu, op + 1, s ^ (d & (~d + 1)), FP_MODIFIER, p));
++		}
++	}
++}
++
++static void
++fp_generic_auth(struct fp_result *r, unsigned cpu)
++{
++	uint64_t p = (uint64_t)(uintptr_t)&fp_res[0], g1, g2, g3;
++	if (!fp_do(r, cpu, FP_OP_PACGA, p, FP_MODIFIER, &g1) || !fp_do(r, cpu, FP_OP_PACGA, p, FP_MODIFIER, &g2) ||
++	    !fp_do(r, cpu, FP_OP_PACGA, p, FP_MODIFIER ^ 1, &g3)) {
++		r->ga = 0;
++		return;
++	}
++	r->sig[FP_NAUTH] = g1;
++	r->ga = g1 == g2 && g1 != g3 && g1 != 0 && (g1 & 0xffffffffULL) == 0;
++}
++
++static void
++fp_probe(struct fp_result *r, unsigned cpu)
++{
++	uint64_t orig[FP_NKEYS], v;
++	unsigned level, wrote_sctlr = 0;
++
++	r->sctlr_back = 1;      /* nothing changed yet; the final SCTLR read decides */
++	fp_step(r, cpu, FP_STEP_GUARD);
++	r->guard = !fp_do(r, cpu, FP_OP_UDF, 0, 0, 0) && FP_EC(r->last_esr) == FP_EC_UNKNOWN;
++	if (!r->guard) {
++		return;
++	}
++	r->traps = 0;
++	r->last_esr = 0;
++
++	fp_step(r, cpu, FP_STEP_ID);
++	r->id_trap = !fp_do(r, cpu, FP_OP_ISAR1, 0, 0, &r->isar1);
++	r->id_trap |= !fp_do(r, cpu, FP_OP_ISAR2, 0, 0, &r->isar2);
++	if (!fp_do(r, cpu, FP_OP_SCTLR_RD, 0, 0, &r->sctlr)) {
++		r->id_trap = 1;
++		return;         /* nothing was changed */
++	}
++	level = fp_auth_level(r->isar1, r->isar2);
++	if (!level && !fp_generic(r->isar1, r->isar2)) {
++		return;
++	}
++
++	fp_step(r, cpu, FP_STEP_KEYRD);
++	for (unsigned i = 0; i < FP_NKEYS; i++) {
++		if (fp_do(r, cpu, FP_OP_KEY_RD + i, 0, 0, &orig[i])) {
++			r->key_rd |= 1u << i;
++		} else {
++			r->key_trap |= 1u << i;
++		}
++	}
++	fp_step(r, cpu, FP_STEP_KEYWR);
++	for (unsigned i = 0; i < FP_NKEYS; i++) {
++		if (!(r->key_rd & (1u << i))) {
++			continue;
++		}
++		if (!fp_do(r, cpu, FP_OP_KEY_WR + i, fp_key_pattern(i), 0, 0) || !fp_do(r, cpu, FP_OP_KEY_RD + i, 0, 0, &v)) {
++			r->key_trap |= 1u << i;
++		} else if (v == fp_key_pattern(i)) {
++			r->key_ok |= 1u << i;
++		} else if (v == orig[i]) {
++			r->key_ign |= 1u << i;
++		}
++	}
++
++	if (level) {
++		fp_step(r, cpu, FP_STEP_SCTLR);
++		if (!fp_do(r, cpu, FP_OP_SCTLR_WR, r->sctlr | FP_SCTLR_EN, 0, 0)) {
++			r->sctlr_trap = 1;
++		} else {
++			wrote_sctlr = 1;
++			(void)fp_do(r, cpu, FP_OP_SCTLR_RD, 0, 0, &r->sctlr_set);
++		}
++		if ((r->sctlr_set & FP_SCTLR_EN) == FP_SCTLR_EN) {
++			fp_step(r, cpu, FP_STEP_AUTH);
++			fp_auth(r, cpu);
++		} else {
++			for (unsigned k = 0; k < FP_NAUTH; k++) {
++				r->auth[k] = 0;
++			}
++		}
++	}
++	if (fp_generic(r->isar1, r->isar2)) {
++		fp_step(r, cpu, FP_STEP_GA);
++		fp_generic_auth(r, cpu);
++	}
++
++	fp_step(r, cpu, FP_STEP_RESTORE);
++	for (unsigned i = 0; i < FP_NKEYS; i++) {
++		if ((r->key_rd & (1u << i)) && fp_do(r, cpu, FP_OP_KEY_WR + i, orig[i], 0, 0) &&
++		    fp_do(r, cpu, FP_OP_KEY_RD + i, 0, 0, &v) && v == orig[i]) {
++			r->key_back |= 1u << i;
++		}
++	}
++	/* The test key must change the signature: the hardware uses the key that read back. */
++	if (r->key_ok == FP_KEYS_ALL && r->auth[0] == 1) {
++		r->key_used = fp_do(r, cpu, FP_OP_PAC, (uint64_t)(uintptr_t)&fp_res[0], FP_MODIFIER, &v) ? v != r->sig[0] : 0;
++	}
++	if (wrote_sctlr) {
++		(void)fp_do(r, cpu, FP_OP_SCTLR_WR, r->sctlr, 0, 0);
++	}
++	r->sctlr_back = fp_do(r, cpu, FP_OP_SCTLR_RD, 0, 0, &v) && v == r->sctlr;
++}
++
++/* SweetCPU::initCPU, on the CPU itself, once. */
++void
++fuxi_pac_probe_cpu(unsigned int cpu)
++{
++	struct fp_result *r;
++	boolean_t istate;
++
++	if (cpu >= FP_MAX_CPUS || !fuxi_pac_enabled() || __atomic_load_n(&fp_res[cpu].done, __ATOMIC_ACQUIRE)) {
++		return;
++	}
++	r = &fp_res[cpu];
++	for (unsigned k = 0; k < FP_NAUTH; k++) {
++		r->auth[k] = -1;
++		r->fail[k] = '-';
++	}
++	r->ga = -1;
++	r->key_used = -1;
++	istate = ml_set_interrupts_enabled(FALSE);
++	r->midr = __builtin_arm_rsr64("MIDR_EL1");
++	__atomic_store_n(&fp_armed[cpu], 1u, __ATOMIC_RELAXED);
++	fp_probe(r, cpu);
++	__atomic_store_n(&fp_armed[cpu], 0u, __ATOMIC_RELAXED);
++	r->step = FP_STEP_DONE;
++	__atomic_store_n(&r->done, 1u, __ATOMIC_RELEASE);
++	(void)ml_set_interrupts_enabled(istate);
++	kprintf("FUXI PAC: cpu=%u step=done\n", cpu);
++}
++
++void
++fuxi_pac_log_begin(unsigned int cpu)
++{
++	if (cpu < FP_MAX_CPUS && fuxi_pac_enabled()) {
++		printf("FUXI PAC: cpu=%u probe begin\n", cpu);
++	}
++}
++
++void
++fuxi_pac_log_cpu(unsigned int cpu)
++{
++	char line[400];
++	if (cpu >= FP_MAX_CPUS || !fuxi_pac_enabled()) {
++		return;
++	}
++	(void)__atomic_load_n(&fp_res[cpu].done, __ATOMIC_ACQUIRE);
++	(void)fp_format(line, (unsigned)sizeof(line), cpu, &fp_res[cpu]);
++	printf("%s\n", line);
++}
++
++void
++fuxi_pac_log_summary(unsigned int ncpu)
++{
++	char line[256];
++	if (!fuxi_pac_enabled()) {
++		return;
++	}
++	(void)fp_format_summary(line, (unsigned)sizeof(line), fp_res, ncpu);
++	printf("%s\n", line);
++}
++#endif /* FUXI */
