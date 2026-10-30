@@ -1888,14 +1888,26 @@ static void fg_scanout_refused(const char *where)
       fg_scanout_failed, fg_busy, fg_scanout_writable, fg_scanout_copy_open, fg_scanout_spin_stolen, fg_scanout_spin_busy, fg_scanout_back_ready, fg_scanout_starts);
  }
 }
+/* What became of the frame that was waiting when the last offer came (read by the display path right after fuxi_gpu_scanout_publish,
+ * for its not-shown accounting): 0 none waiting, 1 STARTed by the spin thread during the copy (shown), 2 replaced before any START. */
+static unsigned fg_scanout_offer_fate;
+unsigned fuxi_gpu_scanout_offer_fate(void) { return fg_scanout_offer_fate; }
+/* The spin thread STARTed the waiting frame and no retry has reported it yet (1, cleared): the display path then counts it shown. */
+int fuxi_gpu_scanout_async_take(void)
+{
+ FG_GUARD;
+ unsigned a = fg_scanout_async_published; fg_scanout_async_published = 0;
+ return a != 0;
+}
 int fuxi_gpu_scanout_publish(void)
 {
- if (!fuxi_gpu_scanout_owned()) return 0;
+ if (!fuxi_gpu_scanout_owned()) { fg_scanout_offer_fate = 0; return 0; }
  FG_GUARD;
  fg_scanout_copy_open = 0;
+ fg_scanout_offer_fate = fg_scanout_async_published ? 1 : fg_scanout_back_ready ? 2 : 0;
  fg_scanout_unsteal();
  if (fg_scanout_failed || fg_busy || !fg_scanout_writable) { fg_scanout_refused("publish"); return -1; }
- if (fg_abi_hard && fg_scanout_async_published) fg_scanout_async_published = 0; /* the waiting frame was STARTed during this copy: this offer replaces its record */
+ if (fg_scanout_async_published) fg_scanout_async_published = 0; /* the waiting frame was STARTed during this copy (fate 1): this offer replaces its record */
  if (fg_scanout_double_active) {
   if (fg_scanout_back_ready && fg_scanout_triple_requested) fg_scanout_ready_drops++;
   fg_scanout_ready = fg_scanout_triple_requested ? fg_scanout_copy : fg_scanout_front ^ 1u;

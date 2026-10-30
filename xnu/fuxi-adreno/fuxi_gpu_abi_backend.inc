@@ -46,7 +46,8 @@ static uint64_t fg_abi_map_work;
  * coherent); 128 ranged TLBIVAL for a small unmap; 256 map waits for an idle GPU first (the pre-N167 behaviour; default maps while a
  * job runs, see fg_abi_map_locked); 512 queue a submit behind a running job (see fg_abi_submit_locked). Parsed once in fg_abi_init. 1048576
  * (scanout copy-source pre-clean) is parsed by fuxi_gpu_scanout_configure. 67108864 (bit 26): WaitFence sleeps on the GPU fence interrupt (fuxi_gpu_irq.inc).
- * 134217728 (bit 27, needs 16): park the job copy priority would refuse and ring it behind the copy (fg_pk_park). */
+ * 134217728 (bit 27, needs 16): park the job copy priority would refuse and ring it behind the copy (fg_pk_park). 268435456 (bit 28, with 8):
+ * the frame log starts at the first burst of not-shown frames (parsed by SweetFramebuffer). */
 static unsigned fg_irq_want;
 static unsigned fg_abi_coh_wb; /* the passing variant mapped the data page cacheable write-back, inner-shareable: imports are then mapped that way */
 static unsigned fg_abi_coh, fg_abi_coh_tries; /* coh: 0 untested, 1 proven coherent, 2 refused */

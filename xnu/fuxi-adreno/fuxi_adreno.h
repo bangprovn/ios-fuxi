@@ -50,6 +50,10 @@ int fuxi_gpu_scanout_te(struct fg_te_observer *te);
 int fuxi_gpu_scanout_acquire(void);
 int fuxi_gpu_scanout_publish(void);
 int fuxi_gpu_scanout_retry(void);
+/* Not-shown accounting: offer_fate is what became of the frame waiting at the last publish (0 none, 1 STARTed by the spin thread
+ * during the copy, 2 replaced unstarted); async_take returns 1 once when the spin thread STARTed the waiting frame unreported. */
+unsigned fuxi_gpu_scanout_offer_fate(void);
+int fuxi_gpu_scanout_async_take(void);
 int fuxi_gpu_scanout_pending(void);
 int fuxi_gpu_scanout_double(void);
 int fuxi_gpu_scanout_triple(void);

@@ -1558,7 +1558,7 @@ Log lines:
 - At init: `FUXI GPU: copy_first_park=1 idle_us=1500 cap=2 periods
   (fuxigpuncimport 134217728 with 16, inline mode)`.
 - At start: `SWEET FB: frame_log= copy_first= skip_superseded= park=
-  (fuxigpuncimport 8/16/32/134217728)`.
+  flog_trigger= (fuxigpuncimport 8/16/32/134217728/268435456)`.
 - Every 600 inline copies, after the copy_first line: `FUXI GPU:
   copy_first_park parked= released_by copy= idle= cap= submit= not_due=
   other= no_room= writer_done_at_park= parked_us avg= max=
@@ -1591,6 +1591,100 @@ Tests:
 - `tools/test-fuxi-unixnu.py`: the `pk=` field and the end-line count.
 
 Not yet observed.
+
+## Not-shown paths and the not-shown frame-log trigger (fuxigpuncimport bit 28, value 268435456, default off)
+
+V227 (`137166456`): 801 of 11602 swaps (6.9%) were never shown. The known
+counters do not explain them: `superseded_skips` is 0-6 per window,
+`ready_skips` (cumulative) grows by about 2 per window and `fifo_overflow` is
+0, while about 50 per window are "not shown". In that build the only
+`fStatDropped` increment without a counter of its own was the `P` path in
+`completePresent`: a copy retires while the previous frame still waits for
+START. Its frame-log window (a light scene) had no drops at all.
+
+`P` mixed two different outcomes:
+
+1. **Replaced**. The waiting frame was still ready in the kernel when the
+   next copy was offered (`fg_scanout_back_ready`, counted again as the
+   kernel's `back_ready_drops`/`drops=`, about 27-29 per 600 STARTs in
+   V227). It was never STARTed.
+2. **STARTed by the TE spin thread during the next copy**. With hard spin
+   (bit 262144) the spin thread STARTs a waiting buffer while a copy into
+   another buffer is still open (`copy_open_but_started`, 330-410 per 600
+   in V227). The display path only learns of it through `retry`, and retry
+   does not run while a copy is in flight. So when that copy retired,
+   `completePresent` counted the frame as `P`. The panel had shown it, but
+   `SwapWait(flags 1)` still returned aborted to CA. The kernel's
+   `fuxi_gpu_scanout_publish` had already noticed this ("this offer
+   replaces its record"), but it did not report it. INFERRED: the gap of
+   about 20 per window between "not shown" and the kernel's drops is this
+   case. Not yet observed.
+
+The change has two parts. The kernel reports what happened to the waiting
+frame: `fuxi_gpu_scanout_async_take()` returns 1 once if the spin thread
+STARTed it and no retry has reported it, and `fuxi_gpu_scanout_offer_fate()`
+gives the fate seen by the last offer (0 nothing waiting, 1 STARTed, 2
+replaced unstarted). `completePresent` calls the take *before* the next
+offer, so the START stamps are still that frame's own. A frame that was
+STARTed is then counted shown through the normal `presentStats` path
+(status `Shown`, fate `S`, its stages, one shown frame). Only frames the
+kernel replaced, or lost, are counted not shown. This changes the "not
+shown" and "600 frames" figures compared with V227: the old "not shown"
+equals the new "not shown" plus `spin_started + spin_race`.
+
+Every way a queued swap ends without START, with its counter and the
+frame-log letter (`dp=`):
+
+| path | letter | where | in "not shown" |
+|---|---|---|---|
+| `stale` | s | `presentNext`: the writer epoch changed after the swap (record stale and unshown), also for a stale replay | yes |
+| `not_ready` | r | `presentNext`: an older queued swap was released because a later one could be read first (`present_begin` refused the older one) | yes |
+| `superseded` | u | `presentNext`, bit 32: older ready swaps dropped for a newer ready one | yes |
+| `failed_copy` | f | `presentNext`: a failed GPU copy's replay yielded to a newer swap | yes |
+| `fifo` | o | `swap`: a fourth swap pushed out the oldest queued one | yes |
+| `refused_full` | c | `presentNext`: `present` refused (busy ring or ownership) while the queue had refilled to 3 | yes |
+| `replaced` | p | `completePresent`: waiting for START, still ready in the kernel at the next offer (fate 2) | yes |
+| `lost` | l | `completePresent`: waiting for START, but the kernel had neither STARTed it nor kept it ready (fate 0) | yes |
+| `stop` | h | `stopRecords`: queued or waiting when scanout stopped | no |
+| `rejected` | (none) | `swap` returned no-resources (surface hold failed) | no (never queued) |
+| `spin_started` | a | `completePresent`: STARTed by the spin thread during the next copy, counted shown | no (shown) |
+| `spin_race` | A | the same, but STARTed between the take and the offer (offer fate 1). Its START stamp may be the next offer's | no (shown) |
+
+A copy refused while the queue has room (`present` returns false: busy ring
+`copied == 3`, a `cpu_acquire` refusal, or a quarantine) is not a drop. The
+record goes back to the head of the queue and is retried. A late copy or a
+late fence is not a drop either: the frame is shown one TE later.
+
+Log line (always on, every 600 shown frames, after the `superseded_skips`
+line, a handful of increments under `fLock` per drop):
+
+`SWEET FB: unshown paths stale= not_ready= superseded= failed_copy= fifo=
+refused_full= replaced= lost= sum= of N not shown; outside it stop=
+rejected=; counted shown spin_started= spin_race=`
+
+`sum` should equal N.
+
+**Bit 28** (needs bit 8, the frame log) changes when the one-shot 128-frame
+log starts. Without it, the log starts after 3000 warmup swaps. With it,
+the log starts at the first not-shown burst after a 300-swap floor: 3
+not-shown frames (paths up to `lost`) in a 60-swap window. A window that
+ends with fewer than 3 resets the count. The swap that sees the third drop
+becomes frame 0. `flog begin` prints `warmup_swaps=` (the swaps actually
+waited), `trigger=` and `trigger_drops=`. Each `flog N` line ends in
+` dp=<letter>` (`-` for none). `flog end` adds
+`drop_paths s/r/u/f/o/c/p/l/h/a/A=`. `tools/fuxi-flog.py` parses `dp=` and
+`trigger=`, prints a `drop_paths` line for the window and sums every
+`unshown paths` line in the log.
+
+Boot value: `137166456 + 67108864 (bit 26, fence IRQ) + 268435456 =
+472710776` (9 digits, so the command line grows by nothing).
+
+Tests: `tools/test-fuxi-unixnu.py` (one path per not-shown frame in the
+FIFO test, with the exact log line; replaced/lost/spin_started/spin_race in
+the frame-log block; trigger window reset and start; `h` at stop) and
+`tools/test-fuxi-gpu-scanout.py` (offer fate 0/2 in the triple test, fate 1
+and a single report after an overlapped spin START, async take). Not yet
+observed.
 
 ### Direct-DPU-scanout stage 1: read-only display SMMU survey (`fuxigpuncimport` bit 22)
 

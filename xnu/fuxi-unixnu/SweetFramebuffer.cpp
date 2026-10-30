@@ -99,6 +99,9 @@ enum {
 #define SWEET_FB_SWAP_HISTORY           64
 #define SWEET_FB_FLOG                   128     /* fuxigpuncimport bit 8: frames in the one-shot present event log */
 #define SWEET_FB_FLOG_WARMUP            3000    /* swaps before it starts */
+#define SWEET_FB_FLOG_TRIGGER_FLOOR     300     /* bit 28: swaps ignored before the not-shown trigger arms */
+#define SWEET_FB_FLOG_TRIGGER_SWAPS     60      /* bit 28: window of swaps... */
+#define SWEET_FB_FLOG_TRIGGER_DROPS     3       /* ...in which this many not-shown frames start the log */
 #define SWEET_FB_NOTIFY_TYPES           8
 #define SWEET_FB_NOTIFY_VSYNC           5
 #define SWEET_FB_VSYNC_US               16667
@@ -156,6 +159,12 @@ public:
  unsigned      fPendingCount;
  bool          fLastValid, fReplay;
  uint32_t      fQueuedDefers, fOverflowDrops, fReadySkips;
+ /* Every way a queued swap ends without START, per 600-shown window ('SWEET FB: unshown paths'). The first eight are the "not shown"
+  * count; stop and rejected are outside it (scanout stopped, swap refused); spin_started/spin_race are frames that were waiting for
+  * START when the next copy retired and that the TE spin thread had STARTed meanwhile, counted shown (they used to be counted 'P'). */
+ enum { UnStale, UnNotReady, UnSuperseded, UnFailedCopy, UnFifo, UnRefusedFull, UnReplaced, UnLost, UnStop, UnRejected, UnStarted, UnStartedRace, UnPaths };
+ uint32_t      fUnshown[UnPaths];
+ void unshown(unsigned path, uint32_t id) { fUnshown[path]++; unshownLog(path, id); }
 	bool          fDirty;
 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
 	bool          fPowerOff;      /* RequestPowerChange(0) */
@@ -188,18 +197,28 @@ public:
  uint64_t      fSwapLast, fSwapIdle;
  uint32_t      fSwapBins[7];   /* 0..4, 5+ (<100 ms), idle */
  /* fuxigpuncimport bit 8: one present event log of SWEET_FB_FLOG consecutive swaps after the warmup (state 0 off, 1 warmup, 2 recording,
-  * 3 printed); bit 16: the surfaces of swaps whose copy is not queued yet go to the kernel copy priority; bit 32: a ready swap with a
+  * 3 printed; with bit 268435456 it starts at the first not-shown burst instead of after the warmup); bit 16: the surfaces of swaps whose copy is not queued yet go to the kernel copy priority; bit 32: a ready swap with a
   * newer ready swap behind it is dropped before its copy (the newer one is copied instead). */
- struct FlogEntry { uint64_t swap, ready, submit, fence, start; uint32_t id, surface, s2s, blit, ahead, buf, te, xfer, pk; char fate; };
+ struct FlogEntry { uint64_t swap, ready, submit, fence, start; uint32_t id, surface, s2s, blit, ahead, buf, te, xfer, pk; char fate, path; };
  FlogEntry    *fFlog; /* SWEET_FB_FLOG entries, allocated only with bit 8 (10 KB; the object is limited to 16 KB by kalloc_type) */
- unsigned      fFlogState, fFlogN, fFlogSwaps;
+ unsigned      fFlogState, fFlogN, fFlogSwaps, fTrigSwaps, fTrigDrops;
  uint32_t      fFlogGpuID, fSupersededSkips;
- bool          fCopyFirst, fSkipSuperseded;
+ bool          fCopyFirst, fSkipSuperseded, fFlogTrigger; /* trigger: bit 28, the log starts at the first not-shown burst instead of the warmup */
  FlogEntry *flogFind(uint32_t id) { if (fFlogState != 2 || !id) return NULL; for (unsigned i = fFlogN; i--;) if (fFlog[i].id == id) return &fFlog[i]; return NULL; }
  void flogFate(uint32_t id, char fate) { FlogEntry *e = flogFind(id); if (e && !e->fate) e->fate = fate; }
+ /* The drop path letter of a logged frame; with bit 28 a not-shown frame (paths up to UnLost) also feeds the start trigger. */
+ void unshownLog(unsigned path, uint32_t id) {
+  static const char letters[] = "srufocplh-aA";
+  if (FlogEntry *e = flogFind(id)) { if (!e->path && letters[path] != '-') e->path = letters[path]; }
+  else if (fFlogState == 1 && fFlogTrigger && path <= UnLost && fFlogSwaps > SWEET_FB_FLOG_TRIGGER_FLOOR) fTrigDrops++;
+ }
  static uint32_t firstSurface(const SwapRecord &r) { for (unsigned i = 0; i < SWEET_FB_LAYERS; i++) if (r.surfaces[i]) return r.surfaces[i]->id; return 0; }
  void flogSwap(const SwapRecord &r, uint32_t id) {
-  if (fFlogState == 1 && ++fFlogSwaps >= SWEET_FB_FLOG_WARMUP) fFlogState = 2;
+  if (fFlogState == 1) {
+   ++fFlogSwaps;
+   if (!fFlogTrigger ? fFlogSwaps >= SWEET_FB_FLOG_WARMUP : fTrigDrops >= SWEET_FB_FLOG_TRIGGER_DROPS) fFlogState = 2;
+   else if (fFlogTrigger && fFlogSwaps > SWEET_FB_FLOG_TRIGGER_FLOOR && ++fTrigSwaps >= SWEET_FB_FLOG_TRIGGER_SWAPS) fTrigSwaps = fTrigDrops = 0;
+  }
   if (fFlogState != 2 || fFlogN >= SWEET_FB_FLOG) return;
   FlogEntry &e = fFlog[fFlogN++]; bzero(&e, sizeof(e)); e.id = id; e.swap = r.swapped; e.surface = firstSurface(r);
  }
@@ -224,22 +243,28 @@ public:
   if (open && flogUs(now, fFlog[fFlogN-1].swap) < 2000000) return;
   fFlogState = 3;
   uint64_t period = fTeValid ? fTe.period : fTickAbs, base = fFlog[0].swap; long long pus = flogUs(base+period, base);
-  IOLog("SWEET FB: flog begin frames=%u warmup_swaps=%u period_us=%lld fields: n id surface swap_us(from frame 0) then us after this swap: ready copy_submit fence start, "
-      "gpu submit_to_copy_start blit, client_jobs_ahead buffer te_count prev_xfer_done_us fate(S shown, D dropped, P replaced while waiting START, - open), pk=1 a parked client job followed the copy (bit 27); -1 none\n",
-      fFlogN, SWEET_FB_FLOG_WARMUP, pus);
-  unsigned shown = 0, dropped = 0, replaced = 0, copied = 0, copiedDropped = 0, behind = 0, pairs = 0, longS2s = 0, parked = 0, gaps[3] = {0, 0, 0}, lastTe = 0; bool haveTe = false;
+  IOLog("SWEET FB: flog begin frames=%u warmup_swaps=%u period_us=%lld trigger=%u trigger_drops=%u fields: n id surface swap_us(from frame 0) then us after this swap: ready copy_submit fence start, "
+      "gpu submit_to_copy_start blit, client_jobs_ahead buffer te_count prev_xfer_done_us fate(S shown, D dropped, P replaced while waiting START, - open), pk=1 a parked client job followed the copy (bit 27), "
+      "dp=drop path (s stale, r not ready, u superseded, f failed copy, o fifo overflow, c refused with full queue, p replaced unstarted, l pending lost, h scanout stop, a/A STARTed by the spin thread during the next copy, - none); -1 none\n",
+      fFlogN, fFlogSwaps, pus, fFlogTrigger ? 1u : 0u, fTrigDrops);
+  static const char paths[] = "srufocplh-aA";
+  unsigned shown = 0, dropped = 0, replaced = 0, copied = 0, copiedDropped = 0, behind = 0, pairs = 0, longS2s = 0, parked = 0, gaps[3] = {0, 0, 0}, lastTe = 0, byPath[UnPaths] = {}; bool haveTe = false;
   for (unsigned i = 0; i < fFlogN; i++) {
    FlogEntry &e = fFlog[i]; char fate = e.fate ? e.fate : '-';
-   IOLog("SWEET FB: flog %u %u %u %lld %lld %lld %lld %lld %d %d %u %u %u %u %c pk=%u\n", i, e.id, e.surface, flogUs(e.swap, base), flogUs(e.ready, e.swap), flogUs(e.submit, e.swap),
-       flogUs(e.fence, e.swap), flogUs(e.start, e.swap), e.submit ? (int)e.s2s : -1, e.submit ? (int)e.blit : -1, e.ahead, e.buf, e.te, e.xfer, fate, e.pk);
+   IOLog("SWEET FB: flog %u %u %u %lld %lld %lld %lld %lld %d %d %u %u %u %u %c pk=%u dp=%c\n", i, e.id, e.surface, flogUs(e.swap, base), flogUs(e.ready, e.swap), flogUs(e.submit, e.swap),
+       flogUs(e.fence, e.swap), flogUs(e.start, e.swap), e.submit ? (int)e.s2s : -1, e.submit ? (int)e.blit : -1, e.ahead, e.buf, e.te, e.xfer, fate, e.pk, e.path ? e.path : '-');
    shown += fate == 'S'; dropped += fate == 'D'; replaced += fate == 'P';
+   for (unsigned k = 0; k < UnPaths; k++) if (e.path && e.path == paths[k]) byPath[k]++;
    if (e.submit) { copied++; copiedDropped += fate != 'S'; behind += e.ahead != 0; longS2s += e.s2s != UINT32_MAX && e.s2s > 3000; parked += e.pk != 0; }
    if (i && e.fence && fFlog[i-1].fence && e.fence > fFlog[i-1].fence && e.fence-fFlog[i-1].fence < period/2) pairs++; /* two copies done within half a period */
    if (fate == 'S') { if (haveTe) { unsigned d = (e.te-lastTe) & 0xffffu; if (d) gaps[d >= 3 ? 2 : d-1]++; } lastTe = e.te; haveTe = true; }
   }
   IOLog("SWEET FB: flog end shown=%u dropped=%u replaced_waiting_start=%u copied=%u copied_not_shown=%u copies_behind_client_job=%u submit_to_start_over_3ms=%u"
-      " fence_pairs_within_half_period=%u start_te_gaps 1/2/3+=%u/%u/%u superseded_skips=%u copies_releasing_parked_job=%u\n",
-      shown, dropped, replaced, copied, copiedDropped, behind, longS2s, pairs, gaps[0], gaps[1], gaps[2], fSupersededSkips, parked);
+      " fence_pairs_within_half_period=%u start_te_gaps 1/2/3+=%u/%u/%u superseded_skips=%u copies_releasing_parked_job=%u"
+      " drop_paths s/r/u/f/o/c/p/l/h/a/A=%u/%u/%u/%u/%u/%u/%u/%u/%u/%u/%u\n",
+      shown, dropped, replaced, copied, copiedDropped, behind, longS2s, pairs, gaps[0], gaps[1], gaps[2], fSupersededSkips, parked,
+      byPath[UnStale], byPath[UnNotReady], byPath[UnSuperseded], byPath[UnFailedCopy], byPath[UnFifo], byPath[UnRefusedFull], byPath[UnReplaced],
+      byPath[UnLost], byPath[UnStop], byPath[UnStarted], byPath[UnStartedRace]);
  }
  bool teVsyncTick(uint64_t &now, bool fallback);
  void teVsyncLog(uint64_t now);
@@ -248,6 +273,7 @@ public:
  uint32_t      fSupersededSkips;
  static bool recordReady(const SwapRecord &) { return false; }
  void flogFate(uint32_t, char) {}
+ void unshownLog(unsigned, uint32_t) {}
  void flogSwap(const SwapRecord &, uint32_t) {}
  void publishDueLocked(void) {}
 #endif
@@ -600,8 +626,8 @@ AppleCLCD::start(IOService *provider)
  uint32_t nc = 0;
  PE_parse_boot_argn("fuxigpuncimport", &nc, sizeof(nc));
  if (fScanout && (nc & 8u)) fFlog = IONewZeroData(FlogEntry, SWEET_FB_FLOG);
- fFlogState = fFlog ? 1 : 0; fCopyFirst = fScanout && (nc & 16u); fSkipSuperseded = fScanout && (nc & 32u);
- if (fScanout && (nc & (56u | 134217728u))) IOLog("SWEET FB: frame_log=%u copy_first=%u skip_superseded=%u park=%u (fuxigpuncimport 8/16/32/134217728)\n", fFlogState, fCopyFirst, fSkipSuperseded, fCopyFirst && (nc & 134217728u) ? 1u : 0u);
+ fFlogState = fFlog ? 1 : 0; fCopyFirst = fScanout && (nc & 16u); fSkipSuperseded = fScanout && (nc & 32u); fFlogTrigger = fFlog && (nc & 268435456u);
+ if (fScanout && (nc & (56u | 134217728u | 268435456u))) IOLog("SWEET FB: frame_log=%u copy_first=%u skip_superseded=%u park=%u flog_trigger=%u (fuxigpuncimport 8/16/32/134217728/268435456)\n", fFlogState, fCopyFirst, fSkipSuperseded, fCopyFirst && (nc & 134217728u) ? 1u : 0u, fFlogTrigger ? 1u : 0u);
  if (fScanout) {
   fWriterWakeCall = thread_call_allocate(&AppleCLCD::writerWake, this);
   if (!fWriterWakeCall) return false;
@@ -971,20 +997,21 @@ void AppleCLCD::presentNext(void)
 {
  SwapRecord record = {};
  IOLockLock(fLock);
- unsigned chosen = 0;
+ unsigned chosen = 0, superseded = 0;
  bool replay = fReplay || !fPendingCount;
- if (fSkipSuperseded && !replay) for (unsigned j = fPendingCount; j-- > 1;) if (recordReady(fPending[j])) { chosen = j; fSupersededSkips += j; break; }
+ if (fSkipSuperseded && !replay) for (unsigned j = fPendingCount; j-- > 1;) if (recordReady(fPending[j])) { chosen = superseded = j; fSupersededSkips += j; break; }
  for (;;) {
   if (replay && !fLastValid) { fReplay = false; fDirty = fPendingCount != 0; publishDueLocked(); IOLockUnlock(fLock); return; }
   SwapRecord &candidate = replay ? fLast : fPending[chosen];
   observeRecord(candidate, false);
   if (candidate.stale && !candidate.shown) {
+   unshown(UnStale, get32(candidate.bytes, 0x50));
    if (replay) { releaseRecord(fLast); fLastValid = fReplay = false; }
    else {
     releaseRecord(candidate); fPendingCount--;
     for (unsigned i = chosen; i < fPendingCount; i++) fPending[i] = fPending[i+1];
    }
-   fReadySkips++; fStatDropped++; chosen = 0; replay = fPendingCount == 0;
+   fReadySkips++; fStatDropped++; chosen = superseded = 0; replay = fPendingCount == 0;
    if (replay) { fDirty = false; publishDueLocked(); IOLockUnlock(fLock); return; }
    continue;
   }
@@ -1020,8 +1047,8 @@ void AppleCLCD::presentNext(void)
   if (replay) {
    bzero(&fLast, sizeof(fLast)); fLastValid = false; fReplay = false;
   } else {
-   for (unsigned i = 0; i < chosen; i++) releaseRecord(fPending[i]);
-   if (fReplay) { fReplay = false; fReadySkips++; fStatDropped++; }
+   for (unsigned i = 0; i < chosen; i++) { unshown(i < superseded ? UnSuperseded : UnNotReady, get32(fPending[i].bytes, 0x50)); releaseRecord(fPending[i]); }
+   if (fReplay) { fReplay = false; fReadySkips++; fStatDropped++; unshown(UnFailedCopy, get32(fLast.bytes, 0x50)); }
    fReadySkips += chosen; fStatDropped += chosen;
    fPendingCount -= chosen + 1;
    for (unsigned i = 0; i < fPendingCount; i++) fPending[i] = fPending[i + chosen + 1];
@@ -1038,7 +1065,7 @@ void AppleCLCD::presentNext(void)
  if (accepted) {
   releaseRecord(fLast); fLast = record; fLastValid = true;
  } else if (fPendingCount == SWEET_FB_QUEUE_DEPTH) {
-  releaseRecord(record); fOverflowDrops++; fStatDropped++;
+  unshown(UnRefusedFull, get32(record.bytes, 0x50)); releaseRecord(record); fOverflowDrops++; fStatDropped++;
  } else {
   for (unsigned i = fPendingCount; i; i--) fPending[i] = fPending[i-1];
   fPending[0] = record; fPendingCount++;
@@ -1077,9 +1104,9 @@ AppleCLCD::swap(const uint8_t *rec)
 #endif
   }
  }
- if (!held) { releaseRecord(record); IOLockUnlock(fLock); return kIOReturnNoResources; }
+ if (!held) { unshown(UnRejected, id); releaseRecord(record); IOLockUnlock(fLock); return kIOReturnNoResources; }
  if (fPendingCount == SWEET_FB_QUEUE_DEPTH) {
-  releaseRecord(fPending[0]);
+  unshown(UnFifo, get32(fPending[0].bytes, 0x50)); releaseRecord(fPending[0]);
   for (unsigned i = 1; i < fPendingCount; i++) fPending[i-1] = fPending[i];
   fPendingCount--; fOverflowDrops++; fStatDropped++;
  }
@@ -1145,10 +1172,10 @@ void AppleCLCD::stopRecords(void)
  if (fGpuPending) fScanoutHeld = true;
  if (fGpuPending) for (unsigned i = 0; i < SWEET_FB_LAYERS; i++) if (fLast.surfaces[i]) sweet_surface_display_poison(fLast.surfaces[i]);
 #endif
- for (unsigned i = 0; i < fPendingCount; i++) releaseRecord(fPending[i]);
+ for (unsigned i = 0; i < fPendingCount; i++) { unshown(UnStop, get32(fPending[i].bytes, 0x50)); releaseRecord(fPending[i]); }
  if (fPublicationPending) {
   SwapStatus &status = fSwapStatus[fPublicationID % SWEET_FB_SWAP_HISTORY];
-  if (status.id == fPublicationID && status.state != SwapShown) { status.state = SwapDropped; flogFate(fPublicationID, 'P'); }
+  if (status.id == fPublicationID && status.state != SwapShown) { status.state = SwapDropped; flogFate(fPublicationID, 'P'); unshown(UnStop, fPublicationID); }
   fPublicationPending = false;
  }
  fPendingCount = 0; releaseRecord(fLast); fLastValid = fReplay = fDirty = false; publishDueLocked();
@@ -1357,18 +1384,32 @@ void AppleCLCD::completePresent(uint64_t took)
  IOLockLock(fLock);
  SwapRecord &record = fPresentRecord ? *fPresentRecord : fLast;
  consumeRecord(record);
- if (fPublicationPending) {
-  SwapStatus &status = fSwapStatus[fPublicationID % SWEET_FB_SWAP_HISTORY];
-  if (status.id == fPublicationID && status.state != SwapShown) { status.state = SwapDropped; flogFate(fPublicationID, 'P'); }
-  fPublicationPending = false; fStatDropped++;
-  IOLockWakeup(fLock, fSwapStatus, false);
- }
+ uint32_t id = get32(record.bytes, 0x50); bool waiting = fPublicationPending;
  IOLockUnlock(fLock);
+ /* The frame still waiting for START (its offer returned 2): the TE spin thread (bit 262144 overlap) may have STARTed it while this
+  * copy ran, unreported because retry does not run with a copy in flight. Shown, with its own START stamps, before this offer. */
+ if (waiting && fuxi_gpu_scanout_async_take()) {
+  IOLockLock(fLock); unshown(UnStarted, fPublicationID); IOLockUnlock(fLock);
+  presentStats(fPublicationTime); waiting = false;
+ }
  int published = fuxi_gpu_scanout_publish();
+ if (waiting) {
+  unsigned fate = fuxi_gpu_scanout_offer_fate();
+  if (fate == 1) { IOLockLock(fLock); unshown(UnStartedRace, fPublicationID); IOLockUnlock(fLock); presentStats(fPublicationTime); } /* STARTed after the take: its stamps may be this offer's */
+  else {
+   IOLockLock(fLock);
+   SwapStatus &status = fSwapStatus[fPublicationID % SWEET_FB_SWAP_HISTORY];
+   if (status.id == fPublicationID && status.state != SwapShown) { status.state = SwapDropped; flogFate(fPublicationID, 'P'); }
+   unshown(fate == 2 ? UnReplaced : UnLost, fPublicationID);
+   fPublicationPending = false; fStatDropped++;
+   IOLockWakeup(fLock, fSwapStatus, false);
+   IOLockUnlock(fLock);
+  }
+ }
  if (!published) fuxi_display_kick();
  if (published == 2) {
   IOLockLock(fLock);
-  fPublicationPending = true; fPublicationTime = took; fPublicationID = get32(record.bytes, 0x50);
+  fPublicationPending = true; fPublicationTime = took; fPublicationID = id;
   memcpy(fPublicationStage, fStage, sizeof(fStage));
   IOLockUnlock(fLock);
  }
@@ -1457,6 +1498,8 @@ void AppleCLCD::presentStats(uint64_t took)
   uint64_t waits[2] = { fWaitPoll[0], fWaitPoll[1] }, early = fWaitEarly, latest = fWaitLatest;
   unsigned outstanding = fOutstandingMax;
 		fStatSwaps = fStatDropped = 0;
+  uint32_t un[UnPaths], unSum = 0; memcpy(un, fUnshown, sizeof(un)); bzero(fUnshown, sizeof(fUnshown));
+  for (unsigned i = UnStale; i <= UnLost; i++) unSum += un[i];
 #if defined(FUXI)
   uint32_t bins[7]; memcpy(bins, fSwapBins, sizeof(bins)); bzero(fSwapBins, sizeof(fSwapBins));
   uint64_t period_ns = 0; absolutetime_to_nanoseconds(fTeValid ? fTe.period : fTickAbs, &period_ns);
@@ -1499,6 +1542,9 @@ void AppleCLCD::presentStats(uint64_t took)
 		fuxi_gpu_abi_stats_log();
 		fuxi_gpu_abi_sched_log();
   if (fSkipSuperseded) { IOLog("SWEET FB: superseded_skips=%u (ready swaps dropped before their copy, a newer ready swap copied instead)\n", fSupersededSkips); fSupersededSkips = 0; }
+  IOLog("SWEET FB: unshown paths stale=%u not_ready=%u superseded=%u failed_copy=%u fifo=%u refused_full=%u replaced=%u lost=%u sum=%u of %u not shown;"
+      " outside it stop=%u rejected=%u; counted shown spin_started=%u spin_race=%u\n", un[UnStale], un[UnNotReady], un[UnSuperseded], un[UnFailedCopy],
+      un[UnFifo], un[UnRefusedFull], un[UnReplaced], un[UnLost], unSum, dropped, un[UnStop], un[UnRejected], un[UnStarted], un[UnStartedRace]);
 		fGpuBusyTicks = fGpuFailed = 0;
 		fGpuFrames = fCpuFrames = 0;
 		fGpuTime = fCpuTime = 0;

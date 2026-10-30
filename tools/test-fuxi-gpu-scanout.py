@@ -604,10 +604,10 @@ static void triple_tests(uint8_t *panel) {
  // B transfers: ready A, then copy into C without waiting for A's START.
  ctl[0x1c/4]=1;intf[0x2b0/4]=100;
  assert(fuxi_gpu_scanout_acquire()==1 && fg_scanout_copy==0);
- assert(fuxi_gpu_scanout_publish()==2 && fg_scanout_ready==0 && !fg_scanout_ready_drops);
+ assert(fuxi_gpu_scanout_publish()==2 && fg_scanout_ready==0 && !fg_scanout_ready_drops && !fuxi_gpu_scanout_offer_fate());
  assert(fuxi_gpu_scanout_acquire()==1 && fg_scanout_copy==2 && fg_scanout_front==1);
  fg_busy=1;assert(!fuxi_gpu_scanout_retry() && fuxi_gpu_scanout_publish()==-1 && starts==1);
- fg_busy=0;assert(fuxi_gpu_scanout_publish()==2 && fg_scanout_ready==2 && fg_scanout_ready_drops==1);
+ fg_busy=0;assert(fuxi_gpu_scanout_publish()==2 && fg_scanout_ready==2 && fg_scanout_ready_drops==1 && fuxi_gpu_scanout_offer_fate()==2); // A replaced unstarted
  assert(fuxi_gpu_scanout_acquire()==1 && fg_scanout_copy==0); // replaced A is free again
  assert(fuxi_gpu_scanout_retry()==2);intf[0x298/4]+=1u<<16;
  assert(fuxi_gpu_scanout_retry()==2);ctl[0x1c/4]=0;assert(fuxi_gpu_scanout_retry()==2);
@@ -1097,7 +1097,9 @@ static void hard_tests(uint8_t *panel) {
  assert(starts==s0+1 && fg_scanout_front==Y && !fg_scanout_back_ready && st[FG_SPIN_COPY_STARTED]==1 && !st[FG_SPIN_COPY_SAME]);
  assert(fg_scanout_writable && fg_scanout_copy_open && fg_scanout_copy==X && !fg_scanout_spin_stolen);
  ticks+=20000;ctl[0x1c/4]=0;intf[0x2b0/4]=2400;
- assert(fuxi_gpu_scanout_publish()>=0 && fg_scanout_ready==X);
+ assert(fg_scanout_async_published && fuxi_gpu_scanout_publish()>=0 && fg_scanout_ready==X);
+ assert(fuxi_gpu_scanout_offer_fate()==1 && !fg_scanout_async_published && !fuxi_gpu_scanout_async_take()); // Y was STARTed during X's copy: reported once
+ fg_scanout_async_published=1;assert(fuxi_gpu_scanout_async_take()==1 && !fg_scanout_async_published && !fuxi_gpu_scanout_async_take());
  // Same buffer as the copy: still refused and counted.
  fg_scanout_copy_open=1;fg_scanout_copy=fg_scanout_ready=2;fg_scanout_back_ready=1;fg_scanout_spin_busy=0;fg_scanout_writable=1;s0=starts;
  ticks+=20000;fg_scanout_ph_t=ticks;fg_scanout_ph_c=13;fg_scanout_last_start=ticks-4000;fg_scanout_last_count=13;ctl[0x1c/4]=1;intf[0x2b0/4]=100;

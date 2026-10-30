@@ -1013,7 +1013,7 @@
  #endif
 --- a/bsd/dev/fuxi_adreno.h
 +++ b/bsd/dev/fuxi_adreno.h
-@@ -2,19 +2,72 @@
+@@ -2,19 +2,76 @@
  #define FUXI_ADRENO_H
  #define FG_CACHE_SLOTS 4u
  /* Timings in mach absolute ticks, CPU uses scheduler runtime (excludes sleep).
@@ -1066,6 +1066,10 @@
 +int fuxi_gpu_scanout_acquire(void);
 +int fuxi_gpu_scanout_publish(void);
 +int fuxi_gpu_scanout_retry(void);
++/* Not-shown accounting: offer_fate is what became of the frame waiting at the last publish (0 none, 1 STARTed by the spin thread
++ * during the copy, 2 replaced unstarted); async_take returns 1 once when the spin thread STARTed the waiting frame unreported. */
++unsigned fuxi_gpu_scanout_offer_fate(void);
++int fuxi_gpu_scanout_async_take(void);
 +int fuxi_gpu_scanout_pending(void);
 +int fuxi_gpu_scanout_double(void);
 +int fuxi_gpu_scanout_triple(void);
@@ -1603,7 +1607,7 @@
 +#endif
 --- a/bsd/dev/fuxi_gpu_scanout.inc
 +++ b/bsd/dev/fuxi_gpu_scanout.inc
-@@ -0,0 +1,1984 @@
+@@ -0,0 +1,1996 @@
 +/* SPDX-License-Identifier: MIT
 + * Copyright (c) 2026 NativeMetal contributors
 + * Ported from UniXNU drivers/NativeMetal/GpuScanoutClient.h (MIT).
@@ -3494,14 +3498,26 @@
 +      fg_scanout_failed, fg_busy, fg_scanout_writable, fg_scanout_copy_open, fg_scanout_spin_stolen, fg_scanout_spin_busy, fg_scanout_back_ready, fg_scanout_starts);
 + }
 +}
++/* What became of the frame that was waiting when the last offer came (read by the display path right after fuxi_gpu_scanout_publish,
++ * for its not-shown accounting): 0 none waiting, 1 STARTed by the spin thread during the copy (shown), 2 replaced before any START. */
++static unsigned fg_scanout_offer_fate;
++unsigned fuxi_gpu_scanout_offer_fate(void) { return fg_scanout_offer_fate; }
++/* The spin thread STARTed the waiting frame and no retry has reported it yet (1, cleared): the display path then counts it shown. */
++int fuxi_gpu_scanout_async_take(void)
++{
++ FG_GUARD;
++ unsigned a = fg_scanout_async_published; fg_scanout_async_published = 0;
++ return a != 0;
++}
 +int fuxi_gpu_scanout_publish(void)
 +{
-+ if (!fuxi_gpu_scanout_owned()) return 0;
++ if (!fuxi_gpu_scanout_owned()) { fg_scanout_offer_fate = 0; return 0; }
 + FG_GUARD;
 + fg_scanout_copy_open = 0;
++ fg_scanout_offer_fate = fg_scanout_async_published ? 1 : fg_scanout_back_ready ? 2 : 0;
 + fg_scanout_unsteal();
 + if (fg_scanout_failed || fg_busy || !fg_scanout_writable) { fg_scanout_refused("publish"); return -1; }
-+ if (fg_abi_hard && fg_scanout_async_published) fg_scanout_async_published = 0; /* the waiting frame was STARTed during this copy: this offer replaces its record */
++ if (fg_scanout_async_published) fg_scanout_async_published = 0; /* the waiting frame was STARTed during this copy (fate 1): this offer replaces its record */
 + if (fg_scanout_double_active) {
 +  if (fg_scanout_back_ready && fg_scanout_triple_requested) fg_scanout_ready_drops++;
 +  fg_scanout_ready = fg_scanout_triple_requested ? fg_scanout_copy : fg_scanout_front ^ 1u;
@@ -3614,7 +3630,7 @@
 +SOFTWARE.
 --- a/bsd/dev/fuxi_gpu_abi_backend.inc
 +++ b/bsd/dev/fuxi_gpu_abi_backend.inc
-@@ -0,0 +1,1213 @@
+@@ -0,0 +1,1214 @@
 +/* Built into fuxi_adreno.c, with access to its proven SMMU/ring helpers.
 + * Single privileged diagnostic client, not a security boundary for PM4.
 + * Its root has no scanout or surface-cache mappings. The kernel-only runtime
@@ -3663,7 +3679,8 @@
 + * coherent); 128 ranged TLBIVAL for a small unmap; 256 map waits for an idle GPU first (the pre-N167 behaviour; default maps while a
 + * job runs, see fg_abi_map_locked); 512 queue a submit behind a running job (see fg_abi_submit_locked). Parsed once in fg_abi_init. 1048576
 + * (scanout copy-source pre-clean) is parsed by fuxi_gpu_scanout_configure. 67108864 (bit 26): WaitFence sleeps on the GPU fence interrupt (fuxi_gpu_irq.inc).
-+ * 134217728 (bit 27, needs 16): park the job copy priority would refuse and ring it behind the copy (fg_pk_park). */
++ * 134217728 (bit 27, needs 16): park the job copy priority would refuse and ring it behind the copy (fg_pk_park). 268435456 (bit 28, with 8):
++ * the frame log starts at the first burst of not-shown frames (parsed by SweetFramebuffer). */
 +static unsigned fg_irq_want;
 +static unsigned fg_abi_coh_wb; /* the passing variant mapped the data page cacheable write-back, inner-shareable: imports are then mapped that way */
 +static unsigned fg_abi_coh, fg_abi_coh_tries; /* coh: 0 untested, 1 proven coherent, 2 refused */

@@ -4,13 +4,19 @@
 Reads a boot log (bytes, any noise), extracts the `SWEET FB: flog N ...` lines and prints where the time between a swap and its
 START goes: swap->ready (writer retire), ready->copy submit, submit->copy start on the GPU (the wait behind ring work), the blit,
 fence->START, plus a TE-window replay that tells "no new copy ready at the window" (GPU side) from "a copy was ready but no START"
-(display side). Optional fields added by later kernels (eager copy) are parsed when present. Usage: fuxi-flog.py boot.log [...]"""
+(display side). Optional fields added by later kernels (eager copy, dp= drop path letter, trigger=) are parsed when present, and the
+periodic `SWEET FB: unshown paths` lines are summed over the whole log. Usage: fuxi-flog.py boot.log [...]"""
 import re
 import statistics
 import sys
 
-LINE = re.compile(rb'SWEET FB: flog (\d+) (\d+) (\d+) (-?\d+) (-?\d+) (-?\d+) (-?\d+) (-?\d+) (-?\d+) (-?\d+) (\d+) (\d+) (\d+) (\d+) ([SDP-])((?: [a-z]+=-?\d+)*)')
-BEGIN = re.compile(rb'SWEET FB: flog begin frames=(\d+) warmup_swaps=(\d+) period_us=(\d+)')
+LINE = re.compile(rb'SWEET FB: flog (\d+) (\d+) (\d+) (-?\d+) (-?\d+) (-?\d+) (-?\d+) (-?\d+) (-?\d+) (-?\d+) (\d+) (\d+) (\d+) (\d+) ([SDP-])((?: [a-z]+=-?\d+)*)(?: dp=([A-Za-z-]))?')
+BEGIN = re.compile(rb'SWEET FB: flog begin frames=(\d+) warmup_swaps=(\d+) period_us=(\d+)(?: trigger=(\d+) trigger_drops=(\d+))?')
+UNSHOWN = re.compile(rb'SWEET FB: unshown paths ((?:[a-z_]+=\d+[ ;]*)+)of (\d+) not shown; outside it ((?:[a-z_]+=\d+ ?)+); counted shown ((?:[a-z_]+=\d+ ?)+)')
+UNSHOWN_KV = re.compile(rb'([a-z_]+)=(\d+)')
+# Drop path letters of the frame log (dp=), as printed by SweetFramebuffer::flogPrint.
+PATHS = {'s': 'stale', 'r': 'not_ready', 'u': 'superseded', 'f': 'failed_copy', 'o': 'fifo', 'c': 'refused_full', 'p': 'replaced',
+         'l': 'lost', 'h': 'stop', 'a': 'spin_started', 'A': 'spin_race'}
 END = re.compile(rb'SWEET FB: flog end [^\n]*')
 NAMES = ('n', 'id', 'surface', 'swap', 'ready', 'submit', 'fence', 'start', 's2s', 'blit', 'ahead', 'buf', 'te', 'xfer')
 
@@ -28,12 +34,25 @@ def parse(data):
             break
         seen.add(e['n'])
         e['fate'] = x.group(15).decode()
+        e['dp'] = x.group(17).decode() if x.group(17) else '-'
         for kv in x.group(16).split():
             k, v = kv.split(b'=')
             e[k.decode()] = int(v)
         rows.append(e)
     end = END.search(data, m.start())
     return period, rows, end.group(0).decode(errors='replace') if end else None
+
+
+def unshown_totals(data):
+    """Sum of every `SWEET FB: unshown paths` line (one per 600 shown frames): (windows, {field: total}, not_shown total)."""
+    totals, windows, not_shown = {}, 0, 0
+    for m in UNSHOWN.finditer(data):
+        windows += 1
+        not_shown += int(m.group(2))
+        for g in (1, 3, 4):
+            for k, v in UNSHOWN_KV.findall(m.group(g)):
+                totals[k.decode()] = totals.get(k.decode(), 0) + int(v)
+    return windows, totals, not_shown
 
 
 def absolute(e, key):
@@ -85,6 +104,12 @@ def te_replay(period, rows, tol=400):
 def report(path, data):
     period, rows, end = parse(data)
     print('== %s' % path)
+    windows, totals, not_shown = unshown_totals(data)
+    if windows:
+        print('unshown paths over %d windows (not shown %d): ' % (windows, not_shown) + ' '.join('%s=%d' % kv for kv in totals.items()))
+    m = BEGIN.search(data)
+    if m and m.group(4) is not None:
+        print('flog trigger=%s trigger_drops=%s warmup_swaps=%s' % (m.group(4).decode(), m.group(5).decode(), m.group(2).decode()))
     if not rows:
         print('no frame log')
         return
@@ -134,7 +159,13 @@ def report(path, data):
         lp = r['late_parts']
         print(summary('copy_late_fence_after_window_us', r['late_us']) + ' late copies: avg swap_to_ready=%d ready_to_submit=%d queue_behind_ring=%d behind_client_job=%d/%d' % (
             statistics.mean(x[0] for x in lp), statistics.mean(x[1] for x in lp), statistics.mean(x[2] for x in lp), sum(1 for x in lp if x[3]), len(lp)))
-    extra = sorted({k for e in rows for k in e if k not in NAMES and k != 'fate'})
+    dps = {}
+    for e in rows:
+        if e['dp'] != '-':
+            dps[e['dp']] = dps.get(e['dp'], 0) + 1
+    if dps:
+        print('drop_paths ' + ' '.join('%s=%d' % (PATHS.get(k, k), v) for k, v in sorted(dps.items())))
+    extra = sorted({k for e in rows for k in e if k not in NAMES and k not in ('fate', 'dp')})
     for k in extra:
         print(summary(k, [e[k] for e in rows if k in e and e[k] >= 0]))
     if end:
