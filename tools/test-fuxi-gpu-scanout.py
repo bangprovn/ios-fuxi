@@ -30,12 +30,12 @@ static unsigned fg_abi_inline; static int fg_inl_usable(void) { return 0; }
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
-static char doubleStats[512],ssppLog[512],dpuLog[4096];
+static char doubleStats[512],ssppLog[512],dpuLog[16384];
 static int scanout_printf(const char *format,...) {
  va_list args;va_start(args,format);
  if(strstr(format,"double=1 flips="))vsnprintf(doubleStats,sizeof(doubleStats),format,args);
  if(strstr(format,"sspp vig0"))vsnprintf(ssppLog,sizeof(ssppLog),format,args);
- if(strstr(format,"dpu smmu")){size_t n=strlen(dpuLog);if(n<sizeof(dpuLog))vsnprintf(dpuLog+n,sizeof(dpuLog)-n,format,args);}
+ if(strstr(format,"dpu smmu") || strstr(format,"dpu stage2")){size_t n=strlen(dpuLog);if(n<sizeof(dpuLog))vsnprintf(dpuLog+n,sizeof(dpuLog)-n,format,args);}
  va_end(args);return 0;
 }
 #define printf scanout_printf
@@ -56,13 +56,52 @@ static unsigned traceCount,dsiReads,dmaStarts,pendingDma,noDone,busyAfterDone,st
 static unsigned errorOnDone,tearReadbackMismatch;
 static volatile uint32_t *fuxi_ctl0=ctl,*fuxi_intf1=intf;
 static int fuxi_gpu_ready(void) {return ready;}
-// apps_smmu model: read only by construction (no write path), fault offset, map/unmap balance.
+// apps_smmu model: fault offset, map/unmap balance; writes only through a read/write (map 2) mapping and only inside the one bank page
+// smmuBank (asserted), so an SMR/S2CR/CBAR or any global (GR0 TLBIALLNSNH/TLBGSYNC) write fails the test. Bank semantics: FSR fault
+// bits are write-one-to-clear and FORMAT (10:9) read only; RESUME, TLBIALL and TLBSYNC are write only (counted, not stored).
+#define FG_DPU_SMMU_SIZE 0x100000u
 static uint32_t smmu[0x100000/4];
-static unsigned smmuMapped,smmuMaps,smmuFailMap,smmuFault=~0u,smmuReads;
-static int fg_dpu_smmu_map(unsigned map) {if(!map){smmuMapped=0;return 1;}smmuMaps++;if(smmuFailMap)return 0;smmuMapped=1;return 1;}
+static unsigned smmuMapped,smmuMaps,smmuFailMap,smmuFault=~0u,smmuReads,smmuWrites,smmuRwMaps,smmuBank=~0u,smmuIgnore,smmuTlbi,smmuResume;
+static int fg_dpu_smmu_map(unsigned map) {if(!map){smmuMapped=0;return 1;}smmuMaps++;if(smmuFailMap)return 0;smmuMapped=map;smmuRwMaps+=map==2;return 1;}
 static int fg_dpu_smmu_read(unsigned off,unsigned *v) {
  assert(smmuMapped);if(off>=sizeof(smmu) || (off&3) || off==smmuFault)return 0;smmuReads++;*v=smmu[off/4];return 1;
 }
+static int fg_dpu_smmu_write(unsigned off,unsigned v) {
+ assert(smmuMapped==2 && smmuBank!=~0u && off>=smmuBank && off<smmuBank+0x1000 && !(off&3));smmuWrites++;
+ unsigned r=off-smmuBank;
+ if(r==0x618 || r==0x7f0){smmuTlbi+=r==0x618;return 1;}
+ if(r==0x8){smmuResume++;return 1;}
+ if(r==0x58){smmu[off/4]&=~(v&0xc00001feu);return 1;}
+ if(smmuIgnore && r!=0)return 1;
+ smmu[off/4]=v;return 1;
+}
+// Stage-2 memory model: allocations get fake physical addresses; the table pool is contiguous, the surface scattered (16 pages below
+// 4 GiB, the rest above, every other page, descending).
+struct dpuAlloc {uint8_t *host;unsigned bytes,contiguous;};
+static struct dpuAlloc dpuAllocs[4];
+static unsigned dpuAllocCount,dpuFrees,dpuAllocFail,dpuPageFail;
+static int fg_dpu_mem(unsigned bytes,unsigned contiguous,uintptr_t *va) {
+ if(dpuAllocFail && contiguous+1==dpuAllocFail)return 0;
+ assert(dpuAllocCount<4);uint8_t *m=aligned_alloc(4096,(bytes+4095)&~4095u);assert(m);memset(m,0,bytes);
+ dpuAllocs[dpuAllocCount++]=(struct dpuAlloc){m,bytes,contiguous};*va=(uintptr_t)m;return 1;
+}
+static void fg_dpu_mem_free(uintptr_t va,unsigned bytes) {
+ if(!va)return;
+ for(unsigned i=0;i<dpuAllocCount;i++)if(dpuAllocs[i].host==(uint8_t *)va && dpuAllocs[i].bytes==bytes){free(dpuAllocs[i].host);dpuAllocs[i].host=0;dpuFrees++;return;}
+ assert(0);
+}
+static uint64_t dpuSurfacePa(unsigned i,unsigned n) {return i<16?0xa0000000ull+i*4096ull:0x900000000ull+(uint64_t)(n-1-i)*8192ull;}
+static uint64_t fg_dpu_page_pa(uintptr_t va) {
+ for(unsigned i=0;i<dpuAllocCount;i++){struct dpuAlloc *a=&dpuAllocs[i];
+  if(!a->host || va<(uintptr_t)a->host || va>=(uintptr_t)a->host+a->bytes)continue;
+  unsigned page=(unsigned)((va-(uintptr_t)a->host)/4096);
+  if(dpuPageFail && !a->contiguous && page==dpuPageFail)return 0;
+  return a->contiguous?0x880000000ull+(va-(uintptr_t)a->host):dpuSurfacePa(page,(a->bytes+4095)/4096)+(va&4095);}
+ return 0;
+}
+static unsigned dpuCleans;
+static void fg_dpu_clean(uintptr_t va,unsigned bytes) {(void)va;(void)bytes;dpuCleans++;}
+static void (*startHook)(void);
 static unsigned modelDrain,modelTe,modelPanel120,modelDouble,modelTriple,parseDouble,parseTriple,modelNc;
 static uint8_t modelB[4320u*2400],modelC[4320u*2400];
 static unsigned failBMap,failCMap;
@@ -122,7 +161,7 @@ static unsigned fg_access(uint64_t pa,uint64_t *value,unsigned wr,unsigned wide)
     assert(traceCount>=3 && trace[traceCount-2].pa==0xae16018 && trace[traceCount-3].pa==0xae05014);
     assert(ctl[0x18/4]&1);
    }
-   assert(!fg_busy && !(intf[0x2b4/4]&0x80000000u));starts++;}
+   assert(!fg_busy && !(intf[0x2b4/4]&0x80000000u));starts++;if(startHook)startHook();}
  } else {
   reads++;
   if(pa>=0xae94000 && pa<0xae95000)dsiReads++;
@@ -141,6 +180,9 @@ static unsigned fg_scanout_owned_for_model(void) {return fg_scanout_owned;}
 static unsigned fg_scanout_double_for_model(void) {return fg_scanout_double_active;}
 static void reset(void) {
  memset(sspp,0,sizeof(sspp));sspp[0x14/4]=0xb8000000u;modelNc=fg_scanout_preclean=fg_scanout_dpu_dump=0;ssppLog[0]=dpuLog[0]=0;smmuMapped=smmuMaps=smmuFailMap=smmuReads=0;smmuFault=~0u;
+ smmuWrites=smmuRwMaps=smmuIgnore=smmuTlbi=smmuResume=0;smmuBank=~0u;startHook=0;probeScript=0;fg_scanout_dpu_stage2=0;
+ for(unsigned i=0;i<dpuAllocCount;i++)free(dpuAllocs[i].host);
+ dpuAllocCount=dpuFrees=dpuAllocFail=dpuPageFail=dpuCleans=0;
  fg_scanout_double_requested=fg_scanout_double_active=fg_scanout_double_initialized=fg_scanout_front=0;
  parseDouble=parseTriple=0;
  fg_scanout_triple_requested=modelTriple=failCMap=fg_scanout_ready=fg_scanout_copy=0;
@@ -189,6 +231,152 @@ static void phase_run(uint64_t e,unsigned c,unsigned hold,unsigned wakeOff) {
  phE=e+phSkew;phC=c;phHold=hold;ticks=e+wakeOff;fg_scanout_ph_e=e;fg_scanout_spin_sync=0;fg_scanout_spin_serial=fg_scanout_starts;
  fg_scanout_spin_c0=c;fg_scanout_ph_wake=ticks;fg_scanout_spin_busy=1;probeScript=phase_script;phase_script();
  fg_scanout_spin_run(0,0);probeScript=0;}
+// Direct-scanout stage 2 (fuxigpuncimport bits 22+23): MDSS fetch model at each START (latch on flush, walk the bank's stage-1 table
+// when SCTLR.M is set, check every fetched row's physical address and pixels, record a translation fault in FSR).
+#define DPU_CB (0x80000u+3*0x1000u)
+static uint32_t smmuSnap[0x100000/4],ssppSnap[1024];
+static unsigned dpuFetches,dpuTranslated,dpuWindowFetches,dpuBadFetch,dpuPixelChecks,dpuFaultAt,dpuFaultSs,dpuStuck,holdCalls,holdFault;
+static uint64_t *dpuTable(uint64_t pa) {
+ for(unsigned i=0;i<dpuAllocCount;i++){struct dpuAlloc *a=&dpuAllocs[i];
+  if(a->host && a->contiguous && pa>=0x880000000ull && pa+4096<=0x880000000ull+a->bytes && !(pa&4095))return (uint64_t *)(a->host+(pa-0x880000000ull));}
+ return 0;
+}
+static int dpu_walk(uint32_t va,uint64_t *pa) {
+ uint64_t ttbr=((uint64_t)smmu[(DPU_CB+0x24)/4]<<32)|smmu[(DPU_CB+0x20)/4];
+ if((smmu[(DPU_CB+0x30)/4]&63)!=32 || (smmu[(DPU_CB+0x30)/4]&0xc000) || smmu[(DPU_CB+0x38)/4]!=0x44)return 0;
+ uint64_t *t=dpuTable(ttbr&0xffffffff000ull);unsigned sh=30;
+ for(unsigned level=1;level<=3;level++,sh-=9){
+  if(!t)return 0;
+  uint64_t d=t[(va>>sh)&(level==1?3:511)];
+  if((d&3)==1 && level<3){if(!(d&(1u<<10)))return 0;uint64_t m=(1ull<<sh)-1;*pa=(d&0xfffffffff000ull&~m)|(va&m);return 1;}
+  if((d&3)!=3)return 0;
+  if(level==3){if(!(d&(1u<<10)))return 0;*pa=(d&0xfffffffff000ull)|(va&4095);return 1;}
+  t=dpuTable(d&0xfffffffff000ull);
+ }
+ return 0;
+}
+static uint8_t *dpuSurfaceHost(uint64_t pa) {
+ for(unsigned i=0;i<dpuAllocCount;i++){struct dpuAlloc *a=&dpuAllocs[i];unsigned n=(a->bytes+4095)/4096;
+  if(!a->host || a->contiguous)continue;
+  for(unsigned p=0;p<n;p++)if((pa&~4095ull)==dpuSurfacePa(p,n))return a->host+p*4096+(pa&4095);}
+ return 0;
+}
+static void dpu_fetch(void) {
+ if(ctl[0x18/4]&1){sspp[0xa4/4]=sspp[0x14/4];ctl[0x18/4]&=~1u;}
+ dpuFetches++;
+ if(dpuStuck && dpuFetches==dpuStuck){ctl[0x1c/4]=1;intf[0x2b0/4]=700;return;}
+ ctl[0x1c/4]=0;intf[0x2b0/4]=0;
+ uint32_t src=sspp[0xa4/4],xy=sspp[0x08/4],stride=sspp[0x24/4]&0xffff;
+ unsigned sx=xy&0xffff,sy=xy>>16,on=smmu[DPU_CB/4]&1,fault=dpuFaultAt==dpuFetches;
+ if(on)dpuTranslated++;
+ if(src==0x10000000u){if(!on)dpuBadFetch++;else dpuWindowFetches++;}
+ for(unsigned y=0;y<2400 && !fault;y++)for(unsigned k=0;k<3 && !fault;k++){
+  unsigned x=k==0?0:k==1?540:1079;uint32_t va=src+(sy+y)*stride+(sx+x)*4;uint64_t pa=va;
+  if(on && !dpu_walk(va,&pa)){fault=1;break;}
+  if(src==0x10000000u){
+   unsigned off=va-src;uint8_t *h=dpuSurfaceHost(pa);
+   if(pa!=dpuSurfacePa(off/4096,2741)+(off&4095) || !h || *(uint32_t *)h!=fg_dpu_pattern(sx+x,sy+y))dpuBadFetch++;else dpuPixelChecks++;
+  } else if(pa!=va || src!=0xb8000000u)dpuBadFetch++;
+ }
+ if(fault)smmu[(DPU_CB+0x58)/4]|=dpuFaultSs?0x40000002u:2u;
+}
+static void hold_fault(void) {if(sspp[0xa4/4]==0x10000000u && ++holdCalls==holdFault)smmu[(DPU_CB+0x58)/4]|=2u;}
+static void dpu_setup(uint8_t *panel,unsigned bits) {
+ reset();modelNc=327168|bits;memset(smmu,0,sizeof(smmu));
+ smmu[0]=0x2d0406u;smmu[0x20/4]=0x4c017e69u;smmu[0x24/4]=0x60000046u;smmu[0x28/4]=0x5111u; // S224: 105 SMRs, 70 banks, 4K pages, OAS 36
+ smmu[(0x800+4*3)/4]=0x80021c00u;smmu[(0xc00+4*3)/4]=3;      // S224 display handoff <0x1c00 0x2> -> bank 3
+ smmu[(0x800+4*4)/4]=0x80000400u;smmu[(0xc00+4*4)/4]=5;      // another master on bank 5 (stands for touch/WLAN/UFS): never touched
+ smmu[(0x1000+4*3)/4]=0x1f000u;smmu[(0x1800+4*3)/4]=1;smmu[(0x1000+4*5)/4]=0x10000u;smmu[(0x1800+4*5)/4]=1;
+ smmu[DPU_CB/4]=0xe0;smmu[(DPU_CB+0x10)/4]=0x60;smmu[(DPU_CB+0x58)/4]=0x400;
+ smmu[(0x80000+5*0x1000)/4]=0x61;smmu[(0x80000+5*0x1000+0x20)/4]=0x12345000u;
+ sspp[0]=sspp[0x0c/4]=0x09600438u;sspp[0x24/4]=4320;sspp[0x30/4]=0x237ff;sspp[0x34/4]=0x3020001;sspp[0xa4/4]=0xb8000000u;
+ smmuBank=DPU_CB;startHook=dpu_fetch;
+ dpuFetches=dpuTranslated=dpuWindowFetches=dpuBadFetch=dpuPixelChecks=dpuFaultAt=dpuFaultSs=dpuStuck=holdCalls=holdFault=0;
+ fuxi_gpu_scanout_configure((uintptr_t)panel,1,0);
+ memcpy(smmuSnap,smmu,sizeof(smmu));
+ assert(!fuxi_gpu_scanout_acquire() && !smmuWrites); // takeover: AR off, bit-22 survey (read only)
+ memcpy(ssppSnap,sspp,sizeof(sspp));ticks+=20000;
+}
+static void dpu_restored(void) {
+ assert(!memcmp(smmu,smmuSnap,sizeof(smmu)));                 // byte-exact bank, and nothing else in apps_smmu changed
+ assert(!memcmp(sspp,ssppSnap,sizeof(sspp)));                 // A geometry, source and CURRENT_SRC0
+ assert(!dpuBadFetch && !(ctl[0x18/4]&1) && !ctl[0x1c/4]);
+ assert(dpuFrees==dpuAllocCount && !smmuMapped);
+}
+static void dpu_stage2_tests(uint8_t *panel) {
+ // Success: identity STARTs, translated flip of the scattered surface, hold, restore; every bank write in bank 3, three bank TLBIALLs.
+ dpu_setup(panel,0xc00000u);
+ assert(fg_scanout_dpu_stage2 && strstr(dpuLog,"dpu stage2 requested"));
+ assert(!fuxi_gpu_scanout_acquire());
+ assert(strstr(dpuLog,"dpu stage2 begin img=0 xy=0 ystride0=0x10e0 src0=0xb8000000 cur=0xb8000000 flush=0 start=0 line=0\n"));
+ assert(strstr(dpuLog,"dpu stage2 bank cb=3 smr3 s2cr=0x3 cbar=0x1f000 cba2r=0x1 saved sctlr=0xe0 tcr2=0x60 ttbr0=0 tcr=0 mair0=0 fsr=0x400 oas_bits=36\n"));
+ assert(strstr(dpuLog,"dpu stage2 memory tables=0x880000000 surface 1125x2436 stride=4608 pages=2741 above4g=2725 runs=2726 first=0xa0000000 last=0x900000000\n"));
+ assert(strstr(dpuLog,"dpu stage2 enabled sctlr=0xe0->0x61 ttbr0=0x880000000 tcr=0x800020 tcr2=0x61 mair0=0x44 tlbi=bank\n"));
+ assert(strstr(dpuLog,"dpu stage2 identity starts=60 fsr=0x400 cur=0xb8000000 xfer_us avg=18667 max=18667\n"));
+ assert(strstr(dpuLog,"dpu stage2 mapped iova=0x10000000 pages=2741 window=0x2000000 tlbi=bank\n"));
+ assert(strstr(dpuLog,"dpu stage2 flip src0=0x10000000 img=0x9840465 xy=0x120016 ystride0=0x1200 xfer_us=18667 fsr=0x400 cur=0x10000000 latched=1\n"));
+ assert(strstr(dpuLog,"dpu stage2 hold_ms=2000 fsr=0x400\n"));
+ assert(strstr(dpuLog,"dpu stage2 restored A img=0 xy=0 ystride0=0x10e0 src0=0xb8000000"));
+ assert(strstr(dpuLog,"dpu stage2 bank restored exact=1 sctlr=0xe0 tcr2=0x60 ttbr0=0 tcr=0 mair0=0 fsr=0x400\n"));
+ assert(strstr(dpuLog,"dpu stage2 done result=ok step=restore identity_starts=60 flip_latched=1 hold_ms=2000 exact=1\n"));
+ assert(!strstr(dpuLog,"fault step") && !strstr(dpuLog,"memory kept"));
+ assert(starts==62 && dpuTranslated==62 && dpuWindowFetches==1 && dpuPixelChecks==3*2400 && smmuTlbi==3 && !smmuResume && smmuRwMaps==1);
+ assert(dpuAllocCount==2 && dpuCleans==3 && !fg_scanout_dpu_stage2);
+ dpu_restored();
+ // The normal gates resume: one floor wait from the last START, then the ordinary writable/publish path; stage 2 never repeats.
+ unsigned w=smmuWrites;assert(!fuxi_gpu_scanout_acquire());ticks+=20000;
+ assert(fuxi_gpu_scanout_acquire()==1 && fuxi_gpu_scanout_publish()==1 && starts==63 && smmuWrites==w && !fg_scanout_failed);
+ // Bits clear: bit 22 alone is the read-only survey; bit 23 alone is ignored; neither maps apps_smmu. No write, START or allocation.
+ for(unsigned c=0;c<3;c++){
+  dpu_setup(panel,c==0?0x400000u:c==1?0x800000u:0);
+  assert(!fg_scanout_dpu_stage2 && fuxi_gpu_scanout_acquire()==1 && !smmuWrites && !smmuRwMaps && !starts && !dpuAllocCount);
+  assert(!strstr(dpuLog,"stage2 begin") && (c==1?strstr(dpuLog,"dpu stage2 ignored: bit 23 needs bit 22")!=0:!strstr(dpuLog,"stage2")));
+  assert(c?!smmuMaps:smmuMaps==1);
+ }
+ // Faults are undone: identity START 6 (with a stalled transaction: RESUME), the translated flip, and the hold.
+ for(unsigned c=0;c<3;c++){
+  dpu_setup(panel,0xc00000u);
+  if(c==0){dpuFaultAt=6;dpuFaultSs=1;}else if(c==1)dpuFaultAt=61;else{holdFault=5;probeScript=hold_fault;}
+  assert(!fuxi_gpu_scanout_acquire());probeScript=0;
+  assert(strstr(dpuLog,c==0?"fault step=identity reason=fault starts=5 fsr=0x40000402":c==1?"fault step=flip reason=fault starts=60 fsr=0x402":
+      "fault step=hold reason=fault starts=60 fsr=0x402"));
+  assert(strstr(dpuLog,"bank restored exact=1") && strstr(dpuLog,"result=fault"));
+  assert(strstr(dpuLog,c==0?"undone step=identity start=1":c==1?"undone step=flip start=1":"undone step=hold start=1"));
+  assert(smmuResume==(c==0) && starts==(c==0?7u:62u) && dpuTranslated==(c==0?6u:61u) && sspp[0xa4/4]==0xb8000000u);
+  assert(!strstr(dpuLog,"hold_ms=2000 fsr") && !fg_scanout_failed);
+  dpu_restored();
+ }
+ // The bank ignores the table: undone before translation is enabled, no START at all.
+ dpu_setup(panel,0xc00000u);smmuIgnore=1;assert(!fuxi_gpu_scanout_acquire());smmuIgnore=0;
+ assert(strstr(dpuLog,"fault step=install reason=bank ignored the table") && strstr(dpuLog,"exact=1") && !starts && !strstr(dpuLog,"undone"));
+ dpu_restored();
+ // A flip transfer that never finishes: translation stays on (identity + window), the memory is kept and the scanout stops.
+ dpu_setup(panel,0xc00000u);dpuStuck=61;assert(fuxi_gpu_scanout_acquire()==-1 && fg_scanout_failed);
+ assert(strstr(dpuLog,"fault step=flip reason=transfer timeout") && strstr(dpuLog,"translation kept on") && (smmu[DPU_CB/4]&1) && !dpuFrees);
+ assert(sspp[0x14/4]==0xb8000000u && !smmuMapped);
+ // Refusals before any SMMU write: translation already on, a recorded fault, CBAR type, two banks, VIG0 flush pending, source not A,
+ // allocations and page lookups.
+ for(unsigned c=0;c<9;c++){
+  static const char *why[9]={"translation already on","fault already recorded","CBAR is not stage 1","display streams on two banks",
+      "transfer or VIG0 flush pending","source is not A","step=memory reason=allocation","step=memory reason=allocation","surface page beyond OAS"};
+  dpu_setup(panel,0xc00000u);
+  if(c==0)smmu[DPU_CB/4]=0xe1;
+  if(c==1)smmu[(DPU_CB+0x58)/4]=0x402;
+  if(c==2)smmu[(0x1000+4*3)/4]=0x2f000u;
+  if(c==3){smmu[(0x800+4*9)/4]=0x80001c02u;smmu[(0xc00+4*9)/4]=4;}
+  if(c==4)ctl[0x18/4]=1;
+  if(c==5)sspp[0x14/4]=0xb8a00000u;
+  if(c==6)dpuAllocFail=1;
+  if(c==7)dpuAllocFail=2;
+  if(c==8)dpuPageFail=7;
+  memcpy(smmuSnap,smmu,sizeof(smmu));
+  assert(!fuxi_gpu_scanout_acquire() && strstr(dpuLog,why[c]) && strstr(dpuLog,"nothing written"));
+  assert(!smmuWrites && !starts && !memcmp(smmu,smmuSnap,sizeof(smmu)) && dpuFrees==dpuAllocCount && !smmuMapped);
+  ctl[0x18/4]=0;dpuAllocFail=dpuPageFail=0;
+ }
+ reset();
+ puts("PASS: dpu stage 2 (bits 22+23): bank-3-only writes, byte-exact restore, bank TLBI only, identity + scattered-window walk model, fault/stall/timeout undo, refusals write nothing, bits clear inert");
+}
 static void panel120_tests(uint8_t *panel) {
  // Exact boot-arg admission; no ownership means no DSI read, write, or command.
  reset();panel120_setup();modelPanel120=0;panel120_drain(panel);
@@ -931,7 +1119,7 @@ int main(void) {
  reset();modelNc=327168|0x100000u;sspp[0]=0x09600438u;sspp[0x24/4]=4320;fuxi_gpu_scanout_configure((uintptr_t)panel,1,0);
  assert(fuxi_gpu_scanout_preclean() && !fuxi_gpu_scanout_acquire() && writes==1 && !starts);
  assert(strstr(ssppLog,"size=0x9600438 img=0 xy=0 ") && strstr(ssppLog,"src0=0xb8000000 ystride0=0x10e0 format=0 "));
- // fuxigpuncimport bit 22: the read-only DPU survey adds no MMIO write and an identical write trace; SMMU is never written.
+ // fuxigpuncimport bit 22: the read-only DPU survey adds no MMIO write and an identical write trace; SMMU is never written (read-only map).
  reset();modelNc=327168;fuxi_gpu_scanout_configure((uintptr_t)panel,1,0);assert(!fuxi_gpu_scanout_acquire());
  unsigned baseWrites=writes,baseTrace=traceCount;assert(!dpuLog[0] && !smmuMaps);
  reset();modelNc=327168|0x400000u;memset(smmu,0,sizeof(smmu));
@@ -960,6 +1148,8 @@ int main(void) {
  assert(!fuxi_gpu_scanout_acquire() && strstr(dpuLog,"smrs=0 cbs=0") && strstr(dpuLog,"matches=0 faults=1"));
  reset();modelNc=0x400000u|327168;smmuFailMap=1;fuxi_gpu_scanout_configure((uintptr_t)panel,1,0);
  assert(!fuxi_gpu_scanout_acquire() && strstr(dpuLog,"dpu smmu map failed") && strstr(dpuLog,"vig0 size=") && writes==baseWrites);
+ assert(!smmuWrites && !smmuRwMaps);
+ dpu_stage2_tests(panel);
  reset();
  // Only exact option value 1 activates the lane/checker.
  fuxi_gpu_scanout_configure((uintptr_t)panel,2,1);assert(!fg_scanout_requested && !fg_scanout_checks);

@@ -86,6 +86,7 @@ static unsigned fg_scanout_ready, fg_scanout_copy, fg_scanout_buffer_flips[3];
 /* fuxigpuncimport bit 20: copy-source clean outside the ring hold (SweetSurface), SSPP survey. */
 static unsigned fg_scanout_preclean;
 static unsigned fg_scanout_dpu_dump; /* fuxigpuncimport bit 22: read-only DPU/apps_smmu survey at takeover (fg_scanout_dpu_survey) */
+static unsigned fg_scanout_dpu_stage2; /* fuxigpuncimport bits 22+23: one translated display test after the drain (fg_scanout_dpu_stage2_run) */
 static unsigned fg_scanout_target(void)
 {
  for (unsigned i = 0; i < (fg_scanout_triple_requested ? 3u : 2u); i++)
@@ -113,6 +114,7 @@ void fuxi_gpu_scanout_configure(uintptr_t pixels, unsigned enabled, unsigned che
   unsigned drain = 0, te = 0, panel120 = 0, double_buffer = 0, triple_buffer = 0, nc = 0;
   fg_scanout_preclean = PE_parse_boot_argn("fuxigpuncimport", &nc, sizeof(nc)) && (nc & 0x100000u);
   fg_scanout_dpu_dump = (nc & 0x400000u) != 0; /* bit 22: read-only DPU/SMMU survey at takeover */
+  fg_scanout_dpu_stage2 = (nc & 0xc00000u) == 0xc00000u; /* bit 23 needs bit 22 */
   fg_scanout_double_requested = PE_parse_boot_argn("fuxiscandouble", &double_buffer, sizeof(double_buffer)) && double_buffer == 1;
   unsigned triple = PE_parse_boot_argn("fuxiscantriple", &triple_buffer, sizeof(triple_buffer)) && triple_buffer == 1;
   fg_scanout_triple_requested = fg_scanout_double_requested && triple;
@@ -128,6 +130,8 @@ void fuxi_gpu_scanout_configure(uintptr_t pixels, unsigned enabled, unsigned che
       fg_scanout_drain_us, fg_scanout_te_mode, fg_scanout_checks);
   if (fg_scanout_preclean) printf("FUXI SCANOUT: preclean=1 copy source cleaned before the ring reservation\n");
   if (fg_scanout_dpu_dump) printf("FUXI SCANOUT: dpu smmu survey requested (read only)\n");
+  if (fg_scanout_dpu_stage2) printf("FUXI SCANOUT: dpu stage2 requested: one translated display test after the inherited drain\n");
+  else if (nc & 0x800000u) printf("FUXI SCANOUT: dpu stage2 ignored: bit 23 needs bit 22\n");
  }
 }
 int fuxi_gpu_scanout_preclean(void) { return fg_scanout_preclean; }
@@ -822,6 +826,297 @@ static void fg_scanout_dpu_survey(void)
      v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11]);
  printf("FUXI SCANOUT: dpu smmu done matches=%u faults=%u (read only)\n", hits, faults);
 }
+/* fuxigpuncimport bits 22+23 (value 12582912; direct-scanout stage 2), default off, once, after the inherited drain and the panel120
+ * switch, before B/C exist: one test of a stage-1 table on the display's own apps_smmu bank. The table layout, enable, fault watch,
+ * undo and bank TLB flush are adapted from ShengUfs NativeUfs.cpp (f2d6a4a) dpuEnable/dpuTlbFlush/native_ufs_dpu_map and the 4 KiB
+ * page list from GopFramebuffer NativeLegacyDisplay.cpp (33e941a) directSlot. ShengUfs: SPDX BSD-2-Clause-Patent in the source, LICENSE
+ * file BSD-2-Clause, Copyright (c) 2026, blu-sharky (LICENSE.ShengUfs). GopFramebuffer: BSD-2-Clause-Patent, Copyright (c) 2026,
+ * ArmVirtPlatform contributors (LICENSE.GopFramebuffer). Fuxi changes: the bank is the one
+ * the SMRs already route 0x1c00/0x1c02 to (S224: SMR3 -> S2CR translate -> bank 3, CBAR type 1 = stage 1 with stage 2 bypass, CBA2R VA64,
+ * SCTLR 0xe0 = M clear, CFRE|CFIE|CFCFG); TCR2 PASize is IDR2.OAS (S224: 36 bits) instead of 48; the window's leaves start empty so a
+ * stray IOVA fetch faults; translation is switched only while CTL START is clear and the write line idle, and is switched off only
+ * after A (identity) is latched again. Never written: SMRs, S2CRs, CBAR/CBA2R, any global register or global TLB invalidate (apps_smmu
+ * also serves touch, WLAN and UFS); bank writes are limited to the offsets in fg_dpu_cb_wr. Steps, each logged as "FUXI SCANOUT: dpu
+ * stage2 ...": check idle and SRC0 = CURRENT_SRC0 = A; find the bank; allocate the table and a wired 1125x2436 test surface (stride 4608,
+ * scattered pages); install TTBR0/TCR2/TCR/MAIR0, bank TLBIALL, SCTLR M|CFRE|CFIE; FG_DPU_STARTS STARTs on A through the identity blocks
+ * with FSR checked after each; map the surface into the window (bank TLBIALL); point VIG0 at it with the logical-to-panel crop and START
+ * once; hold 2 s watching FSR; restore A's geometry and START (still translated); restore the bank registers and compare them with the
+ * saved values; bank TLBIALL. On a fault: A geometry, wait idle, bank restored (RESUME for a stalled transaction, FSR fault bits
+ * cleared), one untranslated START on A. FG_GUARD is held throughout (about 3.2 s at 60 Hz). Not yet observed on device. */
+#define FG_DPU_IOVA 0x10000000u
+#define FG_DPU_WINDOW (32u << 20)
+#define FG_DPU_L3 (FG_DPU_WINDOW >> 21)                  /* level-3 tables of the window */
+#define FG_DPU_TABLE_BYTES ((1u + FG_DPU_L3) * 4096u)     /* page 0 serves levels 0-2 (sheng i564), then the level-3 tables */
+#define FG_DPU_FAULTS 0xc00001feu                         /* FSR MULTI, SS, UUT..TF; bits 10:9 are FORMAT (S224 idle FSR 0x400) */
+#define FG_DPU_ATTRS ((1ull << 10) | (1ull << 6))         /* AF, AP[1]; AttrIndx 0 (MAIR0 0x44 normal non-cacheable), not shareable */
+#define FG_DPU_W 1125u
+#define FG_DPU_H 2436u
+#define FG_DPU_STRIDE 4608u
+#define FG_DPU_X 22u                                      /* SweetFramebuffer fOffX = (1125-1080)/2 */
+#define FG_DPU_Y 18u                                      /* fOffY = (2436-2400)/2 */
+#define FG_DPU_BYTES ((FG_DPU_STRIDE*FG_DPU_H + 4095u) & ~4095u)
+#define FG_DPU_STARTS 60u
+#define FG_DPU_HOLD_US 2000000u
+#define FG_DPU_XFER_US 100000u
+static uint64_t fg_dpu_pages[FG_DPU_WINDOW/4096];
+/* Test pattern: red outside the 1080x2400 crop, a 4 pixel white frame on its edge, eight vertical bars inside. */
+static uint32_t fg_dpu_pattern(unsigned x, unsigned y)
+{
+ static const uint32_t bars[8] = {0xffff0000u, 0xff00ff00u, 0xff0000ffu, 0xffffff00u, 0xff00ffffu, 0xffff00ffu, 0xff808080u, 0xff000000u};
+ if (x < FG_DPU_X || x >= FG_DPU_X + 1080u || y < FG_DPU_Y || y >= FG_DPU_Y + 2400u) return 0xffff0000u;
+ x -= FG_DPU_X; y -= FG_DPU_Y;
+ if (x < 4 || x >= 1076 || y < 4 || y >= 2396) return 0xffffffffu;
+ return bars[x/135];
+}
+/* The only bank offsets ever written: SCTLR, RESUME, TCR2, TTBR0, TCR, MAIR0, FSR, TLBIALL, TLBSYNC. */
+static int fg_dpu_cb_wr(unsigned cbo, unsigned off, unsigned value)
+{
+ static const unsigned ok[10] = {0x0, 0x8, 0x10, 0x20, 0x24, 0x30, 0x38, 0x58, 0x618, 0x7f0};
+ unsigned allowed = 0;
+ for (unsigned i = 0; i < 10; i++) allowed |= off == ok[i];
+ return allowed && fg_dpu_smmu_write(cbo + off, value);
+}
+static int fg_dpu_tlbi(unsigned cbo)
+{
+ unsigned st = 1;
+ if (!fg_dpu_cb_wr(cbo, 0x618, 0) || !fg_dpu_cb_wr(cbo, 0x7f0, 0)) return 0;
+ __asm__ volatile("dsb sy" ::: "memory");
+ for (unsigned i = 0; i < 1000; i++) {
+  if (!fg_dpu_smmu_read(cbo + 0x7f4, &st)) return 0;
+  if (!(st & 1)) return 1;
+  delay(1);
+ }
+ return 0;
+}
+static int fg_dpu_idle(void)
+{
+ unsigned start, line;
+ return fg_scanout_read(FG_SCAN_CTL+0x1c, &start) && fg_scanout_read(FG_SCAN_INTF+0x2b0, &line) && !(start & 1) &&
+     (!(line & 65535) || (line & 65535) >= 2400);
+}
+/* Poll for START clear and the write line idle, up to FG_DPU_XFER_US after t0. */
+static int fg_dpu_wait(uint64_t t0, unsigned *us)
+{
+ uint64_t hz = rsr("cntfrq_el0");
+ for (;;) {
+  uint64_t el = (rsr("cntpct_el0") - t0)*1000000/hz;
+  *us = (unsigned)el;
+  if (fg_dpu_idle()) return 1;
+  if (el >= FG_DPU_XFER_US) return 0;
+  delay(250);
+ }
+}
+/* START and wait for its transfer, which begins at the next TE (at most a period later): the first poll is a period plus 2 ms after. */
+static int fg_dpu_start(unsigned *us)
+{
+ uint64_t t0 = rsr("cntpct_el0");
+ *us = 0;
+ if (!fg_scanout_write(FG_SCAN_CTL+0x1c, 1)) return 0;
+ __asm__ volatile("dsb sy" ::: "memory");
+ delay(fg_scanout_period_us + 2000u);
+ return fg_dpu_wait(t0, us);
+}
+static const unsigned fg_dpu_geo_reg[4] = {0xae05004, 0xae05008, 0xae05024, 0xae05014}; /* SRC_IMG_SIZE, SRC_XY, SRC_YSTRIDE0, SRC0_ADDR */
+/* VIG0 geometry and source, then CTL0 FLUSH bit0 (VIG0) keeping other pending bits; latched at the next START. */
+static int fg_dpu_geometry(const unsigned g[4])
+{
+ unsigned flush;
+ for (unsigned i = 0; i < 4; i++) if (!fg_scanout_write(fg_dpu_geo_reg[i], g[i])) return 0;
+ if (!fg_scanout_read(FG_SCAN_CTL+0x18, &flush) || !fg_scanout_write(FG_SCAN_CTL+0x18, flush | 1u)) return 0;
+ __asm__ volatile("dsb sy" ::: "memory");
+ return 1;
+}
+/* 0 = finished, skipped or undone (the caller re-arms the START gates), -1 = scanout stopped. */
+static int fg_scanout_dpu_stage2_run(void)
+{
+ static const unsigned paw[6] = {32, 36, 40, 42, 44, 48};
+ unsigned g[4], want[4], cur = ~0u, flush = ~0u, start = ~0u, line = ~0u, faults = 0, us = 0, cb = ~0u, smr_at = ~0u, s2cr = 0;
+ unsigned id0 = 0, id1 = 0, id2 = 0, smrs = 0, cbs = 0, shift = 12, gr1 = 0, cb_base = 0, oas = 0, cbar = 0, cba2r = 0;
+ unsigned sctlr = 0, tcr2 = 0, lo = 0, hi = 0, tcr = 0, mair0 = 0, fsr0 = 0, fsr = 0, cbo = 0, pages = FG_DPU_BYTES/4096, above = 0, runs = 0;
+ unsigned ntcr2 = 0, ntcr = 32u | (1u << 23), nsctlr = 0, rb[4] = {0};
+ unsigned translating = 0, moved = 0, n = 0, max_us = 0, sum_us = 0, latched = 0, exact = 0, held = 0;
+ uintptr_t tv = 0, sv = 0;
+ uint64_t tpa = 0, limit = 0;
+ volatile uint64_t *l1, *l3;
+ const char *why = 0, *step = "precheck";
+ for (unsigned i = 0; i < 4; i++) if (!fg_scanout_read(fg_dpu_geo_reg[i], &g[i])) g[i] = ~0u;
+ (void)fg_scanout_read(0xae050a4, &cur); (void)fg_scanout_read(FG_SCAN_CTL+0x18, &flush);
+ (void)fg_scanout_read(FG_SCAN_CTL+0x1c, &start); (void)fg_scanout_read(FG_SCAN_INTF+0x2b0, &line);
+ printf("FUXI SCANOUT: dpu stage2 begin img=%#x xy=%#x ystride0=%#x src0=%#x cur=%#x flush=%#x start=%#x line=%u\n",
+     g[0], g[1], g[2], g[3], cur, flush, start, line & 65535);
+ want[0] = (FG_DPU_H << 16) | FG_DPU_W; want[1] = (FG_DPU_Y << 16) | FG_DPU_X; want[2] = (g[2] & 0xffff0000u) | FG_DPU_STRIDE; want[3] = FG_DPU_IOVA;
+ if (g[0] == ~0u || g[1] == ~0u || g[2] == ~0u || g[3] == ~0u || cur == ~0u || flush == ~0u || start == ~0u || line == ~0u) why = "MMIO read";
+ else if ((start & 1) || (flush & 1) || ((line & 65535) && (line & 65535) < 2400)) why = "transfer or VIG0 flush pending";
+ else if (g[3] != 0xb8000000u || cur != 0xb8000000u) why = "source is not A";
+ else if (fg_busy) why = "GPU busy";
+ else if (!fg_dpu_smmu_map(2)) why = "smmu map failed";
+ if (why) goto skip;
+ id0 = fg_scanout_smmu_rd(0x20, &faults); id1 = fg_scanout_smmu_rd(0x24, &faults); id2 = fg_scanout_smmu_rd(0x28, &faults);
+ if (faults) { why = "IDR read"; goto skip; }
+ smrs = (id0 & 0xffu) > 128 ? 128 : id0 & 0xffu; cbs = id1 & 0xffu; shift = id1 >> 31 ? 16 : 12;
+ gr1 = 1u << shift; cb_base = (1u << (((id1 >> 28) & 7) + 1)) << shift;
+ oas = (id2 >> 4) & 15; if (oas > 5) oas = 5;
+ limit = 1ull << paw[oas];
+ for (unsigned i = 0; i < smrs && !why; i++) {
+  unsigned smr = fg_scanout_smmu_rd(0x800 + 4*i, &faults), s;
+  if (faults) { why = "SMR read"; break; }
+  if (!fg_scanout_smr_dpu(smr)) continue;
+  s = fg_scanout_smmu_rd(0xc00 + 4*i, &faults);
+  if (faults || ((s >> 16) & 3)) why = "display stream not translating";
+  else if (cb != ~0u && (s & 0xffu) != cb) why = "display streams on two banks";
+  else if (cb == ~0u) { cb = s & 0xffu; smr_at = i; s2cr = s; }
+ }
+ if (!why && cb == ~0u) why = "no display SMR";
+ if (!why && (cb >= cbs || cb_base + ((cb + 1) << shift) > FG_DPU_SMMU_SIZE)) why = "bank index";
+ if (why) goto skip;
+ cbar = fg_scanout_smmu_rd(gr1 + 4*cb, &faults); cba2r = fg_scanout_smmu_rd(gr1 + 0x800 + 4*cb, &faults);
+ cbo = cb_base + (cb << shift);
+ sctlr = fg_scanout_smmu_rd(cbo, &faults); tcr2 = fg_scanout_smmu_rd(cbo + 0x10, &faults);
+ lo = fg_scanout_smmu_rd(cbo + 0x20, &faults); hi = fg_scanout_smmu_rd(cbo + 0x24, &faults);
+ tcr = fg_scanout_smmu_rd(cbo + 0x30, &faults); mair0 = fg_scanout_smmu_rd(cbo + 0x38, &faults); fsr0 = fg_scanout_smmu_rd(cbo + 0x58, &faults);
+ printf("FUXI SCANOUT: dpu stage2 bank cb=%u smr%u s2cr=%#x cbar=%#x cba2r=%#x saved sctlr=%#x tcr2=%#x ttbr0=%#llx tcr=%#x mair0=%#x fsr=%#x oas_bits=%u\n",
+     cb, smr_at, s2cr, cbar, cba2r, sctlr, tcr2, (unsigned long long)hi << 32 | lo, tcr, mair0, fsr0, paw[oas]);
+ if (faults) why = "bank read";
+ else if (((cbar >> 16) & 3) != 1) why = "CBAR is not stage 1 with stage 2 bypass";
+ else if (!(cba2r & 1)) why = "bank is not AArch64";
+ else if (sctlr & 1) why = "translation already on";
+ else if (fsr0 & FG_DPU_FAULTS) why = "fault already recorded";
+ if (why) goto skip;
+ /* Memory before any SMMU write: a failure here changes nothing. */
+ step = "memory";
+ if (!fg_dpu_mem(FG_DPU_TABLE_BYTES, 1, &tv) || !fg_dpu_mem(FG_DPU_BYTES, 0, &sv)) { why = "allocation"; goto skip; }
+ tpa = fg_dpu_page_pa(tv);
+ for (unsigned i = 0; i < FG_DPU_TABLE_BYTES/4096u && !why; i++)
+  if (!tpa || (tpa & 4095) || fg_dpu_page_pa(tv + i*4096u) != tpa + i*4096u || tpa + FG_DPU_TABLE_BYTES > limit) why = "table not contiguous or beyond OAS";
+ for (unsigned i = 0; i < pages && !why; i++) {
+  uint64_t pa = fg_dpu_page_pa(sv + (uintptr_t)i*4096u);
+  if (!pa || (pa & 4095) || pa >= limit) why = "surface page beyond OAS";
+  fg_dpu_pages[i] = pa;
+  above += pa >= (1ull << 32);
+  runs += !i || pa != fg_dpu_pages[i-1] + 4096u;
+ }
+ if (why) goto skip;
+ for (unsigned y = 0; y < FG_DPU_H; y++)
+  for (unsigned x = 0; x < FG_DPU_W; x++) ((uint32_t *)sv)[y*(FG_DPU_STRIDE/4) + x] = fg_dpu_pattern(x, y);
+ /* One page for levels 0-2 (sheng i564: the walk was seen starting at level 0 with T0SZ 32): [0] points back at itself, [2] and [3] are the
+  * 1 GiB identity blocks for 0x80000000..0xffffffff (A, B, C at 0xb8000000..), [IOVA>>21 + t] the window's level-3 tables (left empty). */
+ l1 = (volatile uint64_t *)tv; l3 = l1 + 512;
+ l1[0] = tpa | 3;
+ l1[2] = 0x80000000ull | FG_DPU_ATTRS | 1;
+ l1[3] = 0xc0000000ull | FG_DPU_ATTRS | 1;
+ for (unsigned t = 0; t < FG_DPU_L3; t++) l1[(FG_DPU_IOVA >> 21) + t] = (tpa + (1 + t)*4096ull) | 3;
+ fg_dpu_clean(tv, FG_DPU_TABLE_BYTES); fg_dpu_clean(sv, FG_DPU_BYTES);
+ printf("FUXI SCANOUT: dpu stage2 memory tables=%#llx surface %ux%u stride=%u pages=%u above4g=%u runs=%u first=%#llx last=%#llx\n",
+     (unsigned long long)tpa, FG_DPU_W, FG_DPU_H, FG_DPU_STRIDE, pages, above, runs, (unsigned long long)fg_dpu_pages[0],
+     (unsigned long long)fg_dpu_pages[pages-1]);
+ if (!fg_dpu_idle()) { why = "transfer pending"; goto skip; }
+ /* Install: TTBR0, TCR2 (PASize = OAS, other bits kept), TCR (T0SZ 32, 4 KiB granule, non-cacheable walks, EPD1), MAIR0 attribute 0. */
+ step = "install";
+ ntcr2 = (tcr2 & ~7u) | oas; nsctlr = (sctlr & ~0x80u) | 0x61u;
+ if (!fg_dpu_cb_wr(cbo, 0x20, (unsigned)tpa) || !fg_dpu_cb_wr(cbo, 0x24, (unsigned)(tpa >> 32)) || !fg_dpu_cb_wr(cbo, 0x10, ntcr2) ||
+     !fg_dpu_cb_wr(cbo, 0x30, ntcr) || !fg_dpu_cb_wr(cbo, 0x38, 0x44)) { why = "bank write"; goto undo; }
+ rb[0] = fg_scanout_smmu_rd(cbo + 0x20, &faults); rb[1] = fg_scanout_smmu_rd(cbo + 0x24, &faults);
+ rb[2] = fg_scanout_smmu_rd(cbo + 0x30, &faults); rb[3] = fg_scanout_smmu_rd(cbo + 0x10, &faults);
+ if (faults || rb[0] != (unsigned)tpa || rb[1] != (unsigned)(tpa >> 32) || rb[2] != ntcr || (rb[3] & 7) != oas) { why = "bank ignored the table"; goto undo; }
+ if (!fg_dpu_tlbi(cbo)) { why = "bank TLB sync"; goto undo; }
+ /* SCTLR: M, CFRE, CFIE; CFCFG cleared so a fault terminates the fetch instead of stalling the display. */
+ if (!fg_dpu_cb_wr(cbo, 0x0, nsctlr) || fg_scanout_smmu_rd(cbo, &faults) != nsctlr) { why = "SCTLR"; goto undo; }
+ translating = 1;
+ __asm__ volatile("dsb sy" ::: "memory"); __asm__ volatile("isb" ::: "memory");
+ printf("FUXI SCANOUT: dpu stage2 enabled sctlr=%#x->%#x ttbr0=%#llx tcr=%#x tcr2=%#x mair0=0x44 tlbi=bank\n",
+     sctlr, nsctlr, (unsigned long long)tpa, ntcr, ntcr2);
+ /* Identity: STARTs on A through the 1 GiB blocks. */
+ step = "identity";
+ for (n = 0; n < FG_DPU_STARTS; n++) {
+  if (!fg_dpu_start(&us)) { why = "transfer timeout"; goto undo; }
+  fsr = fg_scanout_smmu_rd(cbo + 0x58, &faults);
+  if (faults || (fsr & FG_DPU_FAULTS)) { why = "fault"; goto undo; }
+  sum_us += us; if (us > max_us) max_us = us;
+ }
+ if (!fg_scanout_read(0xae050a4, &cur) || cur != 0xb8000000u) { why = "identity CURRENT_SRC0"; goto undo; }
+ printf("FUXI SCANOUT: dpu stage2 identity starts=%u fsr=%#x cur=%#x xfer_us avg=%u max=%u\n", n, fsr, cur, sum_us/n, max_us);
+ /* Map the surface into the window while the display is idle and fetches A. */
+ step = "map";
+ for (unsigned i = 0; i < pages; i++) l3[i] = fg_dpu_pages[i] | FG_DPU_ATTRS | 3;
+ fg_dpu_clean(tv + 4096u, FG_DPU_L3*4096u);
+ if (!fg_dpu_tlbi(cbo)) { why = "bank TLB sync"; goto undo; }
+ printf("FUXI SCANOUT: dpu stage2 mapped iova=%#x pages=%u window=%#x tlbi=bank\n", FG_DPU_IOVA, pages, FG_DPU_WINDOW);
+ /* Flip: VIG0 crops the centred 1080x2400 of the 1125x2436 surface; SRC_SIZE, OUT_SIZE/OUT_XY, format and DSC are unchanged. */
+ step = "flip"; moved = 1;
+ if (!fg_dpu_geometry(want)) { why = "flip MMIO"; goto undo; }
+ if (!fg_dpu_start(&us)) { why = "transfer timeout"; goto undo; }
+ fsr = fg_scanout_smmu_rd(cbo + 0x58, &faults);
+ (void)fg_scanout_read(0xae050a4, &cur);
+ latched = cur == FG_DPU_IOVA;
+ printf("FUXI SCANOUT: dpu stage2 flip src0=%#x img=%#x xy=%#x ystride0=%#x xfer_us=%u fsr=%#x cur=%#x latched=%u\n",
+     want[3], want[0], want[1], want[2], us, fsr, cur, latched);
+ if (faults || (fsr & FG_DPU_FAULTS)) { why = "fault"; goto undo; }
+ /* Hold: the panel shows the translated frame from its own memory; no transfer runs. */
+ step = "hold";
+ for (held = 0; held < FG_DPU_HOLD_US; held += 50000u) {
+  delay(50000);
+  fsr = fg_scanout_smmu_rd(cbo + 0x58, &faults);
+  if (faults || (fsr & FG_DPU_FAULTS)) { why = "fault"; goto undo; }
+ }
+ printf("FUXI SCANOUT: dpu stage2 hold_ms=%u fsr=%#x\n", held/1000, fsr);
+ /* Back to A while still translated (identity), so A is latched before translation goes off. */
+ step = "restore";
+ if (!fg_dpu_geometry(g)) { why = "restore MMIO"; goto undo; }
+ if (!fg_dpu_start(&us)) { why = "transfer timeout"; goto undo; }
+ fsr = fg_scanout_smmu_rd(cbo + 0x58, &faults);
+ if (!fg_scanout_read(0xae050a4, &cur) || cur != 0xb8000000u) { why = "restore CURRENT_SRC0"; goto undo; }
+ if (faults || (fsr & FG_DPU_FAULTS)) { why = "fault"; goto undo; }
+ moved = 0;
+ printf("FUXI SCANOUT: dpu stage2 restored A img=%#x xy=%#x ystride0=%#x src0=%#x xfer_us=%u fsr=%#x cur=%#x\n", g[0], g[1], g[2], g[3], us, fsr, cur);
+undo:
+ if (why) {
+  unsigned f = 0, far_lo = fg_scanout_smmu_rd(cbo + 0x60, &f), far_hi = fg_scanout_smmu_rd(cbo + 0x64, &f), fsynr0 = fg_scanout_smmu_rd(cbo + 0x68, &f);
+  fsr = fg_scanout_smmu_rd(cbo + 0x58, &f);
+  printf("FUXI SCANOUT: dpu stage2 fault step=%s reason=%s starts=%u fsr=%#x far=%#llx fsynr0=%#x\n", step, why, n, fsr,
+      (unsigned long long)far_hi << 32 | far_lo, fsynr0);
+  if (moved && !fg_dpu_geometry(g)) printf("FUXI SCANOUT: dpu stage2 undo: A geometry write failed\n");
+  /* Translation goes off only with no transfer running (the latched source may still be the window). */
+  if (!fg_dpu_wait(rsr("cntpct_el0"), &us)) {
+   printf("FUXI SCANOUT: dpu stage2 undo incomplete: transfer not idle; translation kept on (identity + window), memory kept\n");
+   (void)fg_dpu_smmu_map(0);
+   return fg_scanout_stop("dpu stage2 transfer not idle");
+  }
+ }
+ {
+  /* SCTLR first (translation off), then the table registers, the fault record and the bank TLB. */
+  unsigned f = 0, now = fg_scanout_smmu_rd(cbo + 0x58, &f), ok = fg_dpu_cb_wr(cbo, 0x0, sctlr), r[7];
+  __asm__ volatile("dsb sy" ::: "memory"); __asm__ volatile("isb" ::: "memory");
+  ok &= fg_dpu_cb_wr(cbo, 0x20, lo) & fg_dpu_cb_wr(cbo, 0x24, hi) & fg_dpu_cb_wr(cbo, 0x10, tcr2) & fg_dpu_cb_wr(cbo, 0x30, tcr) &
+      fg_dpu_cb_wr(cbo, 0x38, mair0);
+  if (!f && (now & (1u << 30))) ok &= fg_dpu_cb_wr(cbo, 0x8, 1);  /* RESUME: terminate a stalled transaction */
+  if (!f && (now & FG_DPU_FAULTS)) ok &= fg_dpu_cb_wr(cbo, 0x58, now & FG_DPU_FAULTS); /* write one to clear */
+  ok &= fg_dpu_tlbi(cbo);
+  r[0] = fg_scanout_smmu_rd(cbo, &f); r[1] = fg_scanout_smmu_rd(cbo + 0x10, &f); r[2] = fg_scanout_smmu_rd(cbo + 0x20, &f);
+  r[3] = fg_scanout_smmu_rd(cbo + 0x24, &f); r[4] = fg_scanout_smmu_rd(cbo + 0x30, &f); r[5] = fg_scanout_smmu_rd(cbo + 0x38, &f);
+  r[6] = fg_scanout_smmu_rd(cbo + 0x58, &f);
+  exact = ok && !f && r[0] == sctlr && r[1] == tcr2 && r[2] == lo && r[3] == hi && r[4] == tcr && r[5] == mair0 && r[6] == fsr0;
+  printf("FUXI SCANOUT: dpu stage2 bank restored exact=%u sctlr=%#x tcr2=%#x ttbr0=%#llx tcr=%#x mair0=%#x fsr=%#x\n", exact, r[0], r[1],
+      (unsigned long long)r[3] << 32 | r[2], r[4], r[5], r[6]);
+  if (why && translating) {
+   /* After a fault the display may hold the window address or a bad frame: one untranslated START on A. */
+   unsigned ok2 = fg_dpu_start(&us);
+   (void)fg_scanout_read(0xae050a4, &cur);
+   printf("FUXI SCANOUT: dpu stage2 undone step=%s start=%u xfer_us=%u cur=%#x\n", step, ok2, us, cur);
+   if (!ok2) { (void)fg_dpu_smmu_map(0); return fg_scanout_stop("dpu stage2 undo transfer"); }
+  }
+ }
+ (void)fg_dpu_smmu_map(0);
+ if (exact && cur == 0xb8000000u) { fg_dpu_mem_free(tv, FG_DPU_TABLE_BYTES); fg_dpu_mem_free(sv, FG_DPU_BYTES); }
+ else printf("FUXI SCANOUT: dpu stage2 memory kept (bank not restored exactly or source not A)\n");
+ printf("FUXI SCANOUT: dpu stage2 done result=%s step=%s identity_starts=%u flip_latched=%u hold_ms=%u exact=%u\n",
+     why ? "fault" : "ok", step, n, latched, held/1000, exact);
+ return 0;
+skip:
+ (void)fg_dpu_smmu_map(0);
+ fg_dpu_mem_free(tv, FG_DPU_TABLE_BYTES); fg_dpu_mem_free(sv, FG_DPU_BYTES);
+ printf("FUXI SCANOUT: dpu stage2 skipped step=%s reason=%s; nothing written\n", step, why);
+ return 0;
+}
 /* DO NOT ENABLE (G186): leave bit 131072 off. Count 0 does not repeat the transfer and count 1 only every second TE (60 Hz), so this can
  * never reach 120 Hz; and after an autorefresh disable the CTL START bit was seen stuck (start=0x1, write line 0), so the drain timed out
  * ("transfer drain timeout") and the scanout stopped for the boot. Kept only for reference.
@@ -1333,6 +1628,15 @@ static int fg_scanout_acquire(unsigned publication)
    fg_scanout_te_window = count >> 16;
    return 0;
   }
+ }
+ if (fg_scanout_dpu_stage2) {
+  /* Bits 22+23: the inherited transfer has drained (and panel120 switched): run the one translated test, then wait with fresh gates. */
+  unsigned count;
+  fg_scanout_dpu_stage2 = 0;
+  if (fg_scanout_dpu_stage2_run() < 0) return -1;
+  if (!fg_scanout_read(FG_SCAN_INTF+0x298, &count)) return fg_scanout_stop("dpu stage2 read te count");
+  fg_scanout_arm(count);
+  return 0;
  }
  if (fg_scanout_double_requested && !fg_scanout_double_initialized) {
   fg_scanout_pixels_b = fuxi_gpu_nc_pointer(0xb8a00000u, 4320u*2400);

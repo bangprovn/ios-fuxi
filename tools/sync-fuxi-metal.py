@@ -23,6 +23,8 @@ FILES = {
     'bsd/dev/fuxi_gpu_irq.inc': 'fuxi_gpu_irq.inc',
     'bsd/dev/LICENSE.ArmCpu': 'LICENSE.ArmCpu',
     'bsd/dev/LICENSE.UniXNU-sheng': 'LICENSE.UniXNU-sheng',
+    'bsd/dev/LICENSE.ShengUfs': 'LICENSE.ShengUfs',
+    'bsd/dev/LICENSE.GopFramebuffer': 'LICENSE.GopFramebuffer',
     'bsd/dev/fuxi_gpu_dcvs.h': 'fuxi_gpu_dcvs.h',
     'osfmk/arm/fuxi_adreno_host.c': 'fuxi_adreno_host.c',
 }

@@ -1614,7 +1614,210 @@ the fault-safe accessor, which does not latch `fg_access_failed`, and logs:
   prints 0xffffffff and is counted in faults.
 
 It writes nothing to the SMMU or MDSS. The host test checks this: the write
-trace is identical with and without bit 22, and the model has no SMMU write
-path. The decoding assumes SMMUv2 without EXID (sCR0 bit 3 clear). The bank
-state, and whether the hypervisor lets EL1 read that bank, are not yet
-observed.
+trace is identical with and without bit 22, and the survey maps apps_smmu
+read-only (the model fails any SMMU write that is not made through the
+stage-2 read/write mapping). The decoding assumes SMMUv2 without EXID (sCR0
+bit 3 clear). Boot S224 observed the survey (EL1 reads work, `faults=0`); the
+values are decoded in the stage-2 section below.
+
+### Direct-DPU-scanout stage 2: one translated flip (`fuxigpuncimport` bits 22+23)
+
+Bits 22+23 (4194304 + 8388608), default off. From the current base 2948680 the
+boot value is **15531592** (7 to 8 digits). Bit 23 without bit 22 is ignored
+and logs `dpu stage2 ignored: bit 23 needs bit 22`. Bit 22 alone stays the
+read-only survey. The code is `fg_scanout_dpu_stage2_run` in
+`xnu/fuxi-adreno/fuxi_gpu_scanout.inc`, with the apps_smmu read/write map and
+memory helpers in `fuxi_adreno.c`. It is adapted from ShengUfs `NativeUfs.cpp`
+(f2d6a4a): `dpuEnable` (table layout, register values, the 50 ms FSR watch,
+undo), `dpuTlbFlush` and `native_ufs_dpu_map`. The 4 KiB page list comes from
+GopFramebuffer `NativeLegacyDisplay.cpp` (33e941a) `directSlot`. ShengUfs is
+SPDX BSD-2-Clause-Patent in its sources and BSD-2-Clause in its LICENSE file;
+GopFramebuffer is BSD-2-Clause-Patent. Both licenses ship next to the code as
+`LICENSE.ShengUfs` and `LICENSE.GopFramebuffer`, and the 0098 patch carries them.
+
+#### S224 survey, decoded (observed values; field names from the SMMUv2 layout)
+
+| Register | Value | Meaning |
+|---|---|---|
+| sCR0 | 0x2d0406 | CLIENTPD 0 (SMR matching active), GFRE/GFIE set, EXIDENABLE 0 (15-bit SMR ids, as the code assumes), USFCFG 1 (unmatched streams fault). The bits above 16 were not decoded. |
+| IDR0 | 0x4c017e69 | NUMSMRG 105; S1TS 1, S2TS 0 (EL1 sees no stage 2), SMS 1, ATOSNS 1 (no ATOS, so there is no translation self-check, as on sheng); NUMSIDB 15; CTTW and BTM set; NUMIRPT 1 |
+| IDR1 | 0x60000046 | 4 KiB register pages; NUMPAGENDXB 6, so banks start at 128 pages = 0x80000; NUMCB 70; NUMS2CB 0 |
+| IDR2 | 0x5111 | IAS 1 and OAS 1 (both 36 bits), UBS 1; 4 KiB and 64 KiB granules |
+| SMR3 | 0x80021c00 | valid, id 0x1c00, mask 0x2: both display streams 0x1c00 and 0x1c02 |
+| S2CR3 | 0x3 | type 0 (translate) into bank 3 |
+| CBAR3 | 0x1f000 | TYPE 1, meaning stage 1 with stage 2 bypass; VMID 0; bits 15:12 = 0xf (GUESS: bypass memory attributes), IRPTNDX 0 |
+| CBA2R3 | 0x1 | VA64: AArch64 descriptors |
+| bank 3 SCTLR | 0xe0 | M 0 (translation off, so the display fetches physical addresses); CFRE, CFIE, CFCFG set (with M set, a fault would stall) |
+| TTBR0/TCR/MAIR0 | 0 | never programmed |
+| TCR2 | 0x60 | PASize 0; bits 5-6 kept as found (GUESS: TBI0/TBI1) |
+| FSR | 0x400 | FORMAT (bits 10:9) = 2, AArch64; no fault bits |
+
+This is the same bank-3 / SCTLR 0xe0 handoff sheng recorded (its i562). An idle
+FSR is not 0, so every "FSR clean" check in stage 2 tests the fault bits
+(MULTI, SS, UUT..TF; mask 0xc00001fe), not FSR == 0.
+
+#### Geometry
+
+A/B/C (observed) are 1080x2400 BGRA with stride 4320 (YSTRIDE0 0x10e0), 10 MiB
+apart from 0xb8000000. VIG0 SRC_SIZE = OUT_SIZE = 0x09600438, SRC_IMG_SIZE 0,
+SRC_XY 0, OUT_XY 0, format 0x237ff, unpack 0x3020001.
+
+The test surface is CoreAnimation's logical size: 1125x2436, stride 4608. That
+is 11225088 bytes, or 2741 4 KiB pages. The panel shows the centred
+1080x2400 part, at the same origin SweetFramebuffer's copy uses (`fOffX` =
+(1125-1080)/2 = 22, `fOffY` = (2436-2400)/2 = 18). Stage 2 writes:
+
+| Register | A | Test surface |
+|---|---|---|
+| SRC_IMG_SIZE +0x04 | 0 | 0x09840465 (2436<<16 \| 1125) |
+| SRC_XY +0x08 | 0 | 0x00120016 (18<<16 \| 22) |
+| SRC_YSTRIDE0 +0x24 | 0x10e0 | 0x1200 (the high half is kept) |
+| SRC0 +0x14 | 0xb8000000 | 0x10000000 (IOVA) |
+| SRC_SIZE, OUT_SIZE, OUT_XY, format, unpack | | unchanged, so the output and DSC stay 1080x2400 |
+
+The first byte fetched is at offset 83032 (18 x 4608 + 22 x 4). The last is at
+11141943, inside the surface. Two things here are GUESSES: that this SSPP needs
+SRC_IMG_SIZE when SRC_XY is not 0, and that x = 22 has no alignment rule for a
+32-bit format. An SRC0 offset of 83032 was rejected for the same reason:
+the alignment rule is unknown.
+
+#### Sequence
+
+The sequence runs once. It starts at the first acquire after the inherited
+transfer has drained (after the floor, with START clear and the write line
+idle) and after the panel120 switch. It runs before B and C are set up, under
+FG_GUARD. Every step logs a `FUXI SCANOUT: dpu stage2 ...` line.
+
+1. `begin img= xy= ystride0= src0= cur= flush= start= line=`. The run is
+   refused unless START, the VIG0 flush bit and the write line are idle,
+   SRC0 = CURRENT_SRC0 = A, and the GPU ring is idle.
+2. apps_smmu is mapped read/write, and the bank is found by the stage-1 SMR
+   scan. Every SMR covering 0x1c00/0x1c02 must translate into one bank. CBAR
+   must be type 1 and CBA2R must be VA64. SCTLR.M must be clear and no fault
+   may be recorded. Logged as `bank cb= smrN s2cr= cbar= cba2r= saved sctlr=
+   tcr2= ttbr0= tcr= mair0= fsr= oas_bits=`.
+3. Memory, allocated before any SMMU write:
+   - The table is 17 pages, physically contiguous. Page 0 serves levels 0-2
+     (sheng's i564 layout): [0] points to itself, [2] and [3] are 1 GiB
+     identity blocks for 0x80000000-0xffffffff, and [128..143] point to the
+     window's 16 level-3 tables.
+   - The surface is wired, zeroed `kmem_alloc` memory with its pages scattered.
+   - The leaves are AF|AP[1], AttrIndx 0, not shareable. Every PA must be
+     below the OAS (36 bits).
+   - The pattern is red outside the crop, a 4-pixel white frame on the crop
+     edge, and 8 vertical bars. It is cleaned to the PoC.
+   - Logged as `memory tables= surface 1125x2436 stride=4608 pages=2741
+     above4g= runs= first= last=`. above4g counts pages that need the window
+     because they are beyond the 32-bit SRC0. Placement is up to the VM
+     allocator: memory above 4 GiB cannot be requested.
+4. Install:
+   - TTBR0 = table, TCR2 = PASize from IDR2.OAS (other bits kept: S224 gives
+     0x61). Sheng uses 48-bit (5); here PASize equals the reported OAS.
+   - TCR = 0x800020 (T0SZ 32, 4 KiB granule, non-cacheable walks, EPD1), MAIR0 = 0x44.
+   - The values are read back, then a bank TLBIALL and TLBSYNC follow.
+   - SCTLR = (old & ~CFCFG) | M|CFRE|CFIE, which is 0x61. A fault then
+     terminates instead of stalling.
+   - Logged as `enabled sctlr=0xe0->0x61 ttbr0= tcr=0x800020 tcr2=0x61
+     mair0=0x44 tlbi=bank`.
+5. `identity starts=60 fsr= cur= xfer_us avg= max=`: 60 STARTs on A through
+   the identity block. Each one waits a period plus 2 ms, then polls (up to
+   100 ms) for START clear and the write line idle, then checks FSR.
+6. `mapped iova=0x10000000 pages=2741 window=0x2000000 tlbi=bank`: the
+   window's leaves, which were empty until now (so a stray IOVA fetch would
+   fault), are written, cleaned and followed by a bank TLBIALL.
+7. `flip src0=0x10000000 img=0x9840465 xy=0x120016 ystride0=0x1200 xfer_us=
+   fsr= cur= latched=`: the geometry is written, then CTL0 FLUSH |= 1 and one
+   START. `latched=1` means CURRENT_SRC0 read back as the IOVA. 0 is only
+   logged, not treated as a failure.
+8. `hold_ms=2000 fsr=`: the panel keeps showing the frame from its own RAM.
+   FSR is read every 50 ms.
+9. `restored A img=0 xy=0 ystride0=0x10e0 src0=0xb8000000 xfer_us= fsr= cur=`:
+   A's geometry is written back, flushed and STARTed while translation is
+   still on (identity). CURRENT_SRC0 must be A again before translation goes
+   off.
+10. `bank restored exact= sctlr= tcr2= ttbr0= tcr= mair0= fsr=`:
+    - SCTLR is restored first, then TTBR0/TCR2/TCR/MAIR0. FSR fault bits are
+      cleared (write one to clear), RESUME is written for a stalled
+      transaction (SS), and a bank TLBIALL follows.
+    - `exact=1` means every register reads back exactly as saved, FSR included.
+    - The memory is freed only when `exact=1` and the source is A. Otherwise
+      `memory kept` is logged.
+11. `done result=ok|fault step= identity_starts= flip_latched= hold_ms= exact=`.
+    The START gates are then re-armed from the current TE count, and the
+    normal path continues (double or triple setup, copies).
+
+On a fault, an MMIO failure or a register that ignores writes, the log has
+`fault step= reason= starts= fsr= far= fsynr0=`. The undo then runs:
+
+- A's geometry is rewritten (with a flush).
+- The driver waits for idle.
+- Step 10 runs.
+- If translation was on, one untranslated START on A follows:
+  `undone step= start= xfer_us= cur=`.
+
+If the transfer never goes idle, `undo incomplete: transfer not idle;
+translation kept on (identity + window), memory kept` is logged. The table
+stays live, because the latched source may still be the window, and the
+scanout stops. A refusal before any SMMU write logs `skipped step= reason=;
+nothing written`.
+
+Writes that never happen:
+
+- SMRs, S2CRs, CBAR/CBA2R, any GR0/GR1 register, and the global TLB
+  invalidates. apps_smmu also serves touch, WLAN and UFS.
+- `fg_dpu_cb_wr` accepts only the bank offsets SCTLR 0x0, RESUME 0x8, TCR2
+  0x10, TTBR0 0x20/0x24, TCR 0x30, MAIR0 0x38, FSR 0x58, TLBIALL 0x618 and
+  TLBSYNC 0x7f0.
+
+The FG_GUARD lock is held for about 3.2 s at 60 Hz (60 x 18.7 ms + 2 s hold),
+or about 2.7 s at 120 Hz. The GPU ring and presents wait for that time once
+per boot.
+
+Host test (`tools/test-fuxi-gpu-scanout.py`, `dpu_stage2_tests`). The model has
+apps_smmu with the S224 values plus another live bank for a different master,
+and an MDSS fetch model. At each START the fetch model latches SRC0 on a
+flush. When SCTLR.M is set, it walks the bank's table for three pixels of every
+row. It checks the physical address of each walk: identity for A, the exact
+scattered page for the window. It also checks the pattern pixels, and sets FSR
+TF on a failed walk. The test proves:
+
+- Every SMMU write lands in bank 3's page. So there are no SMR/S2CR/global
+  writes, and the only invalidate is the bank TLBIALL (3 on success).
+- After success and after every undo, the whole 1 MiB apps_smmu model is
+  byte-identical to before, and so are the VIG0 registers.
+- Faults at identity START 6 (with SS, so RESUME), at the flip and during the
+  hold are undone; the restore is exact, A is shown again and the memory is freed.
+- A bank that ignores the table is undone with no START.
+- A stuck flip transfer keeps translation and memory and stops the scanout.
+- Each refusal writes nothing: translation already on, a recorded fault, the
+  CBAR type, streams on two banks, a pending flush, a source that is not A,
+  either allocation failing, a page lookup failing.
+- Bits clear: none set, bit 22 alone or bit 23 alone causes no SMMU write,
+  START or allocation.
+
+`--xnu-buildtree` checks the kernel syntax of `fuxi_adreno.c`
+(`kmem_alloc_contig`, `CleanPoC_DcacheRegion_Force`).
+
+Risks (none of this is observed yet):
+
+- The hypervisor may ignore or abort EL1 writes to the bank. A fault-safe
+  write, or the readback check, turns that into an undo with no START.
+- The handoff SMR also routes 0x1c02. Any display fetch outside 2-4 GiB
+  (GUESS: none from the bootloader configuration) would fault and be undone.
+- A walk or terminate fault gives one garbage or black frame. CFCFG is
+  cleared, so the display should not stall. That is a GUESS, but it matches
+  the SMMUv2 rule.
+- Sheng i564 recorded a level-0 start for T0SZ 32, so the one-page L0-L2
+  layout is kept.
+- The 3 s lock hold at boot. The SRC_IMG_SIZE/SRC_XY requirements and the
+  x-alignment above.
+
+Expected lines with bits 22+23 on a good run, in order: the stage-1 `dpu smmu`
+lines, `begin`, `bank cb=3 smr3 s2cr=0x3 cbar=0x1f000 cba2r=0x1 saved
+sctlr=0xe0 tcr2=0x60 ttbr0=0 tcr=0 mair0=0 fsr=0x400 oas_bits=36`, `memory`,
+`enabled sctlr=0xe0->0x61 ... tcr=0x800020 tcr2=0x61 mair0=0x44`, `identity
+starts=60`, `mapped`, `flip ... latched=1`, `hold_ms=2000`, `restored A`,
+`bank restored exact=1 sctlr=0xe0 tcr2=0x60 ttbr0=0 tcr=0 mair0=0 fsr=0x400`,
+`done result=ok`. The panel should show the bars with a white frame and no red
+edge for about 2 s, then the boot image again. Stage 3 (bit 24) would
+remap CA surfaces per frame using the same window.

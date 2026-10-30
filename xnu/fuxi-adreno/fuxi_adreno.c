@@ -499,30 +499,34 @@ int fuxi_gpu_map(unsigned slot, uint64_t generation, uintptr_t source,
  return 1;
 }
 /* fuxigpuncimport bit 22 (scanout takeover survey): a temporary READ-only apps_smmu mapping, removed after the dump. Reads are
- * fault-safe and never latch fg_access_failed (the hypervisor may protect a bank); nothing is ever written through it. */
+ * fault-safe and never latch fg_access_failed (the hypervisor may protect a bank). map 1 = read only (bit 22); map 2 = read/write, only
+ * for the bits 22+23 stage-2 test (fg_scanout_dpu_stage2_run), whose writes go through fg_dpu_smmu_write to one bank page alone. */
 #define FG_DPU_SMMU_PA 0x15000000u
 #define FG_DPU_SMMU_SIZE 0x100000u
 static vm_offset_t fg_dpu_smmu_va;
+static unsigned fg_dpu_smmu_rw;
 static int fg_dpu_smmu_map(unsigned map)
 {
  if (!map || fg_dpu_smmu_va) {
-  if (!map && fg_dpu_smmu_va) {
+  if (map) return map == 1 || fg_dpu_smmu_rw;
+  if (fg_dpu_smmu_va) {
    pmap_remove(kernel_pmap, fg_dpu_smmu_va, fg_dpu_smmu_va + FG_DPU_SMMU_SIZE);
    kmem_free(kernel_map, fg_dpu_smmu_va, FG_DPU_SMMU_SIZE);
-   fg_dpu_smmu_va = 0;
+   fg_dpu_smmu_va = 0; fg_dpu_smmu_rw = 0;
   }
   return 1;
  }
  vm_offset_t va = 0;
+ vm_prot_t prot = map == 2 ? VM_PROT_READ | VM_PROT_WRITE : VM_PROT_READ;
  if (kmem_alloc(kernel_map, &va, FG_DPU_SMMU_SIZE, KMA_VAONLY | KMA_KOBJECT | KMA_NOPAGEWAIT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) return 0;
  for (vm_size_t off = 0; off < FG_DPU_SMMU_SIZE; off += PAGE_SIZE)
-  if (pmap_enter_options_addr(kernel_pmap, va + off, FG_DPU_SMMU_PA + off, VM_PROT_READ, VM_PROT_NONE, VM_WIMG_IO, TRUE,
+  if (pmap_enter_options_addr(kernel_pmap, va + off, FG_DPU_SMMU_PA + off, prot, VM_PROT_NONE, VM_WIMG_IO, TRUE,
       PMAP_OPTIONS_NOWAIT, NULL) != KERN_SUCCESS) {
    pmap_remove(kernel_pmap, va, va + FG_DPU_SMMU_SIZE);
    kmem_free(kernel_map, va, FG_DPU_SMMU_SIZE);
    return 0;
   }
- fg_dpu_smmu_va = va;
+ fg_dpu_smmu_va = va; fg_dpu_smmu_rw = map == 2;
  return 1;
 }
 static int fg_dpu_smmu_read(unsigned off, unsigned *value)
@@ -532,6 +536,32 @@ static int fg_dpu_smmu_read(unsigned off, unsigned *value)
  *value = (unsigned)v;
  return 1;
 }
+static int fg_dpu_smmu_write(unsigned off, unsigned value)
+{
+ uint64_t v = value;
+ if (!fg_dpu_smmu_va || !fg_dpu_smmu_rw || off >= FG_DPU_SMMU_SIZE || (off & 3) || fuxi_gpu_access(fg_dpu_smmu_va + off, &v, 1, 0)) return 0;
+ __asm__ volatile("dsb sy" ::: "memory");
+ return 1;
+}
+/* Stage-2 memory: wired, zeroed kernel memory (physically contiguous for the page tables, scattered for the test surface), its 4 KiB
+ * page addresses and a clean to the point of coherency (the display bank walks and fetches non-cacheable). */
+static int fg_dpu_mem(unsigned bytes, unsigned contiguous, uintptr_t *va)
+{
+ vm_offset_t a = 0;
+ kern_return_t kr = contiguous ?
+     kmem_alloc_contig(kernel_map, &a, round_page(bytes), PAGE_MASK, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_NOPAGEWAIT, VM_KERN_MEMORY_IOKIT) :
+     kmem_alloc(kernel_map, &a, round_page(bytes), KMA_KOBJECT | KMA_ZERO | KMA_NOPAGEWAIT, VM_KERN_MEMORY_IOKIT);
+ if (kr != KERN_SUCCESS) return 0;
+ *va = a;
+ return 1;
+}
+static void fg_dpu_mem_free(uintptr_t va, unsigned bytes) { if (va) kmem_free(kernel_map, va, round_page(bytes)); }
+static uint64_t fg_dpu_page_pa(uintptr_t va)
+{
+ ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
+ return pn ? ptoa_64(pn) + (va & PAGE_MASK) : 0;
+}
+static void fg_dpu_clean(uintptr_t va, unsigned bytes) { CleanPoC_DcacheRegion_Force(va, bytes); }
 static int fg_abi_live_for_scanout(void);
 #include "fuxi_gpu_scanout.inc"
 static int fg_abi_init(void);
