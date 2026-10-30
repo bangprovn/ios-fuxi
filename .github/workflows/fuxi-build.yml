@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       kernel:
-        description: Kernel/boot-argument profiles (current source, WLAN opt-in)
+        description: Kernel/boot-argument profiles (current source, WLAN opt-in; metal4e = opt-in arm64e build, not in all)
         type: choice
-        options: [none, metal4, wlan6g, all]
+        options: [none, metal4, wlan6g, metal4e, all]
         default: metal4
       metal:
         description: Signed FuxiMetal, smoke, own metallib and pinned metal2vulkan

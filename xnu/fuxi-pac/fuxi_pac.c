@@ -13,6 +13,9 @@
  * by sleh_synchronous and recorded; the C side checks the flag after each instruction. Each step is kprintf'd
  * before it runs and kept per CPU; startAll prints one line per CPU and a summary (fuxi_pac_logic.h).
  * Unset (or the bit clear): no register is touched, the sleh hook only compares the PC with an empty range.
+ * arm64e kernel (patch 0115, FP_LIVE): the kernel itself signs with the keys start.s programmed, so the probe runs
+ * live: keys are read, never written (keywr, the SCTLR write and the key restore are skipped), PAC/AUT/PACGA use the
+ * boot's shared key set, and the summary also prints the start.s key-init words ("FUXI PAC: native", always).
  */
 #include <pexpert/arm64/board_config.h>
 #if defined(FUXI)
@@ -22,6 +25,14 @@
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 #include "fuxi_pac_logic.h"
+
+#if defined(__arm64e__) || __has_feature(ptrauth_calls)
+#define FP_LIVE 1
+/* osfmk/arm64/start.s (patch 0115): PAC_INIT_KEY_STATE key set and status words. */
+extern uint64_t fuxi_native_pac[FP_NATIVE_WORDS];
+#else
+#define FP_LIVE 0
+#endif
 
 /* Hooks (patch 0114): iokit/Kernel/arm/SweetCPU.cpp, osfmk/arm64/sleh.c */
 int fuxi_pac_enabled(void);
@@ -247,6 +258,7 @@ fp_probe(struct fp_result *r, unsigned cpu)
 	unsigned level, wrote_sctlr = 0;
 
 	r->sctlr_back = 1;      /* nothing changed yet; the final SCTLR read decides */
+	r->live = FP_LIVE;
 	fp_step(r, cpu, FP_STEP_GUARD);
 	r->guard = !fp_do(r, cpu, FP_OP_UDF, 0, 0, 0) && FP_EC(r->last_esr) == FP_EC_UNKNOWN;
 	if (!r->guard) {
@@ -277,8 +289,8 @@ fp_probe(struct fp_result *r, unsigned cpu)
 	}
 	fp_step(r, cpu, FP_STEP_KEYWR);
 	for (unsigned i = 0; i < FP_NKEYS; i++) {
-		if (!(r->key_rd & (1u << i))) {
-			continue;
+		if (r->live || !(r->key_rd & (1u << i))) {
+			continue;       /* live: the running kernel's return addresses are signed with these keys */
 		}
 		if (!fp_do(r, cpu, FP_OP_KEY_WR + i, fp_key_pattern(i), 0, 0) || !fp_do(r, cpu, FP_OP_KEY_RD + i, 0, 0, &v)) {
 			r->key_trap |= 1u << i;
@@ -291,7 +303,9 @@ fp_probe(struct fp_result *r, unsigned cpu)
 
 	if (level) {
 		fp_step(r, cpu, FP_STEP_SCTLR);
-		if (!fp_do(r, cpu, FP_OP_SCTLR_WR, r->sctlr | FP_SCTLR_EN, 0, 0)) {
+		if (r->live) {
+			r->sctlr_set = r->sctlr;        /* start.s enabled the keys; never rewrite SCTLR under signed code */
+		} else if (!fp_do(r, cpu, FP_OP_SCTLR_WR, r->sctlr | FP_SCTLR_EN, 0, 0)) {
 			r->sctlr_trap = 1;
 		} else {
 			wrote_sctlr = 1;
@@ -312,7 +326,10 @@ fp_probe(struct fp_result *r, unsigned cpu)
 	}
 
 	fp_step(r, cpu, FP_STEP_RESTORE);
-	for (unsigned i = 0; i < FP_NKEYS; i++) {
+	if (r->live) {
+		r->key_back = r->key_rd;        /* nothing was written */
+	}
+	for (unsigned i = 0; i < FP_NKEYS && !r->live; i++) {
 		if ((r->key_rd & (1u << i)) && fp_do(r, cpu, FP_OP_KEY_WR + i, orig[i], 0, 0) &&
 		    fp_do(r, cpu, FP_OP_KEY_RD + i, 0, 0, &v) && v == orig[i]) {
 			r->key_back |= 1u << i;
@@ -380,6 +397,10 @@ void
 fuxi_pac_log_summary(unsigned int ncpu)
 {
 	char line[256];
+#if FP_LIVE
+	(void)fp_format_native(line, (unsigned)sizeof(line), fuxi_native_pac, ncpu);
+	printf("%s\n", line);
+#endif
 	if (!fuxi_pac_enabled()) {
 		return;
 	}

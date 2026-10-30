@@ -101,7 +101,7 @@
  osfmk/arm64/loose_ends.c	standard
 --- a/osfmk/arm64/fuxi_pac_logic.h
 +++ b/osfmk/arm64/fuxi_pac_logic.h
-@@ -0,0 +1,363 @@
+@@ -0,0 +1,425 @@
 +/* Pure helpers of osfmk/arm64/fuxi_pac.c (patch 0114), shared with the host
 + * test tools/test-fuxi-pac.py. No kernel headers: integers in, text out.
 + */
@@ -113,6 +113,17 @@
 +#define FP_NKEYS        10              /* APIA, APIB, APDA, APDB, APGA; Lo then Hi */
 +#define FP_KEYS_ALL     0x3ffu
 +#define FP_NAUTH        4               /* IA, IB, DA, DB */
++
++/* arm64e (patch 0115): fuxi_native_pac word offsets, mirrored from osfmk/arm64/pac_asm.h NATIVE_PAC_*. */
++#define FP_NATIVE_READY         10
++#define FP_NATIVE_MODE          11      /* 1 native, 2 hyp (the first CPU's key readback differed) */
++#define FP_NATIVE_CPUS          12
++#define FP_NATIVE_BAD           13
++#define FP_NATIVE_BAD_MPIDR     14
++#define FP_NATIVE_GA_REF        15
++#define FP_NATIVE_GA_BAD        16
++#define FP_NATIVE_GA_MPIDR      17
++#define FP_NATIVE_WORDS         24
 +
 +/* SCTLR_EL1 enables, in the order of the en= field: EnIA, EnIB, EnDA, EnDB. */
 +#define FP_SCTLR_ENIA   (1ULL << 31)
@@ -209,6 +220,7 @@
 +	int key_used;                   /* PACIA differs between the test key and the original key: 1, 0, -1 not run */
 +	uint64_t sig[FP_NAUTH + 1];     /* signed test pointer per key with the test keys, then PACGA */
 +	unsigned traps, last_esr;
++	unsigned live;                  /* arm64e kernel: the keys in use are never written (keywr, SCTLR write and restore skipped) */
 +};
 +
 +static inline const char *
@@ -216,6 +228,9 @@
 +{
 +	if (r->key_trap) {
 +		return "trap";
++	}
++	if (r->live) {
++		return r->key_rd == FP_KEYS_ALL ? "live" : "partial";
 +	}
 +	if (r->key_ok == FP_KEYS_ALL) {
 +		return "ok";
@@ -317,8 +332,8 @@
 +/*
 + * FUXI PAC: cpu=N midr= isar1= isar2= apa= api= apa3= gpa= gpi= gpa3= en=<EnIA EnIB EnDA EnDB> guard=
 + *   keys_rw=ok|ignored|trap|partial|none keys=<ok>/<rd>/<ign>/<trap> restored= pac_ok= auth=<IA IB DA DB GA>
-+ *   key_used= auth_fail_ok= fail=<IA IB DA DB> fpac=0|1|2 sig= traps= esr=
-+ * or "FUXI PAC: cpu=N incomplete step=NAME" when the probe has not finished.
++ *   key_used= auth_fail_ok= fail=<IA IB DA DB> fpac=0|1|2 sig= traps= esr= [mode=live]
++ * (arm64e: keys_rw=live, the keys start.s programmed are read, never written) or "FUXI PAC: cpu=N incomplete step=NAME" when the probe has not finished.
 + * Returns the line length (the buffer is always terminated).
 + */
 +static inline unsigned
@@ -396,6 +411,9 @@
 +	fp_append_u(buf, size, &at, r->traps);
 +	fp_append(buf, size, &at, " esr=");
 +	fp_append_x(buf, size, &at, r->last_esr);
++	if (r->live) {
++		fp_append(buf, size, &at, " mode=live");
++	}
 +	return at;
 +}
 +
@@ -403,11 +421,12 @@
 + * FUXI PAC: summary cpus= probed= pauth= keys_rw_ok= pac_ok= auth_fail_ok= fpac= restored= consistent= verdict=
 + * verdict: ready (every CPU: keys read back, all round trips, tampering rejected, state restored, identical
 + * signatures), else the first failing class: incomplete, no-pauth, keys, pac, auth, restore, mixed.
++ * " mode=live" when any CPU ran live (arm64e): its signatures use the boot's shared key set.
 + */
 +static inline unsigned
 +fp_format_summary(char *buf, unsigned size, const struct fp_result *r, unsigned ncpu)
 +{
-+	unsigned at = 0, probed = 0, pauth = 0, keys = 0, pac = 0, fail = 0, fpac = 0, back = 0, consistent = 1;
++	unsigned at = 0, probed = 0, pauth = 0, keys = 0, pac = 0, fail = 0, fpac = 0, back = 0, consistent = 1, live = 0;
 +	const struct fp_result *first = 0;
 +	const char *verdict;
 +	if (!size) {
@@ -422,13 +441,14 @@
 +		}
 +		probed++;
 +		pauth += fp_auth_level(r[c].isar1, r[c].isar2) != 0;
-+		keys += fp_keys_rw(&r[c])[0] == 'o';
++		keys += fp_keys_rw(&r[c])[0] == 'o' || fp_keys_rw(&r[c])[0] == 'l';
++		live |= r[c].live;
 +		pac += (unsigned)fp_pac_ok(&r[c]);
 +		fail += fp_auth_fail_ok(&r[c]) == 1;
 +		fpac += fp_fpac(r[c].isar1, r[c].isar2) != 0;
 +		back += (unsigned)fp_restored(&r[c]);
-+		if (!fp_pac_ok(&r[c]) || r[c].key_ok != FP_KEYS_ALL) {
-+			continue;       /* signatures are comparable only under the test keys */
++		if (!fp_pac_ok(&r[c]) || (r[c].key_ok != FP_KEYS_ALL && !r[c].live)) {
++			continue;       /* signatures are comparable only under the test keys (or the shared live keys) */
 +		}
 +		if (!first) {
 +			first = &r[c];
@@ -461,13 +481,55 @@
 +	fp_append_u(buf, size, &at, consistent);
 +	fp_append(buf, size, &at, " verdict=");
 +	fp_append(buf, size, &at, verdict);
++	if (live) {
++		fp_append(buf, size, &at, " mode=live");
++	}
++	return at;
++}
++
++/*
++ * arm64e (patch 0115), from the fuxi_native_pac words start.s wrote (keys are never printed):
++ * FUXI PAC: native mode=native|hyp|unset cpus=<passes>/<ncpu> bad= bad_mpidr= ga= ga_bad= ga_mpidr= verdict=
++ * verdict: ok, else the first of: missing (no key set), mixed (a CPU computed another PACGA and parked),
++ * hyp-keys (the first CPU's keys did not read back: kernel and processes use the keys found),
++ * readback (a later pass did not read back), no-ga (no PACGA reference), cpus (fewer passes than CPUs).
++ */
++static inline unsigned
++fp_format_native(char *buf, unsigned size, const uint64_t *w, unsigned ncpu)
++{
++	unsigned at = 0;
++	const char *verdict;
++	if (!size) {
++		return 0;
++	}
++	verdict = w[FP_NATIVE_READY] != 1 ? "missing" : w[FP_NATIVE_GA_BAD] ? "mixed" : w[FP_NATIVE_MODE] == 2 ? "hyp-keys" :
++	    w[FP_NATIVE_BAD] ? "readback" : !w[FP_NATIVE_GA_REF] ? "no-ga" : w[FP_NATIVE_CPUS] < ncpu ? "cpus" : "ok";
++	buf[0] = 0;
++	fp_append(buf, size, &at, "FUXI PAC: native mode=");
++	fp_append(buf, size, &at, w[FP_NATIVE_MODE] == 1 ? "native" : w[FP_NATIVE_MODE] == 2 ? "hyp" : "unset");
++	fp_append(buf, size, &at, " cpus=");
++	fp_append_u(buf, size, &at, w[FP_NATIVE_CPUS]);
++	fp_append(buf, size, &at, "/");
++	fp_append_u(buf, size, &at, ncpu);
++	fp_append(buf, size, &at, " bad=");
++	fp_append_u(buf, size, &at, w[FP_NATIVE_BAD]);
++	fp_append(buf, size, &at, " bad_mpidr=");
++	fp_append_x(buf, size, &at, w[FP_NATIVE_BAD_MPIDR]);
++	fp_append(buf, size, &at, " ga=");
++	fp_append_u(buf, size, &at, w[FP_NATIVE_GA_REF] != 0);
++	fp_append(buf, size, &at, " ga_bad=");
++	fp_append_u(buf, size, &at, w[FP_NATIVE_GA_BAD]);
++	fp_append(buf, size, &at, " ga_mpidr=");
++	fp_append_x(buf, size, &at, w[FP_NATIVE_GA_MPIDR]);
++	fp_append(buf, size, &at, " verdict=");
++	fp_append(buf, size, &at, verdict);
 +	return at;
 +}
 +
 +#endif /* FUXI_PAC_LOGIC_H */
 --- a/osfmk/arm64/fuxi_pac.c
 +++ b/osfmk/arm64/fuxi_pac.c
-@@ -0,0 +1,389 @@
+@@ -0,0 +1,410 @@
 +/* FUXI pointer-authentication self-test (patch 0114), stage 0 of arm64e. Off unless a boot-arg asks.
 + *
 + * fuxigpuncimport bit 25 (value 33554432; the other bits keep their GPU meaning, 22-24 are DPU scanout) runs, at EL1 on every CPU in
@@ -483,6 +545,9 @@
 + * by sleh_synchronous and recorded; the C side checks the flag after each instruction. Each step is kprintf'd
 + * before it runs and kept per CPU; startAll prints one line per CPU and a summary (fuxi_pac_logic.h).
 + * Unset (or the bit clear): no register is touched, the sleh hook only compares the PC with an empty range.
++ * arm64e kernel (patch 0115, FP_LIVE): the kernel itself signs with the keys start.s programmed, so the probe runs
++ * live: keys are read, never written (keywr, the SCTLR write and the key restore are skipped), PAC/AUT/PACGA use the
++ * boot's shared key set, and the summary also prints the start.s key-init words ("FUXI PAC: native", always).
 + */
 +#include <pexpert/arm64/board_config.h>
 +#if defined(FUXI)
@@ -492,6 +557,14 @@
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
 +#include "fuxi_pac_logic.h"
++
++#if defined(__arm64e__) || __has_feature(ptrauth_calls)
++#define FP_LIVE 1
++/* osfmk/arm64/start.s (patch 0115): PAC_INIT_KEY_STATE key set and status words. */
++extern uint64_t fuxi_native_pac[FP_NATIVE_WORDS];
++#else
++#define FP_LIVE 0
++#endif
 +
 +/* Hooks (patch 0114): iokit/Kernel/arm/SweetCPU.cpp, osfmk/arm64/sleh.c */
 +int fuxi_pac_enabled(void);
@@ -717,6 +790,7 @@
 +	unsigned level, wrote_sctlr = 0;
 +
 +	r->sctlr_back = 1;      /* nothing changed yet; the final SCTLR read decides */
++	r->live = FP_LIVE;
 +	fp_step(r, cpu, FP_STEP_GUARD);
 +	r->guard = !fp_do(r, cpu, FP_OP_UDF, 0, 0, 0) && FP_EC(r->last_esr) == FP_EC_UNKNOWN;
 +	if (!r->guard) {
@@ -747,8 +821,8 @@
 +	}
 +	fp_step(r, cpu, FP_STEP_KEYWR);
 +	for (unsigned i = 0; i < FP_NKEYS; i++) {
-+		if (!(r->key_rd & (1u << i))) {
-+			continue;
++		if (r->live || !(r->key_rd & (1u << i))) {
++			continue;       /* live: the running kernel's return addresses are signed with these keys */
 +		}
 +		if (!fp_do(r, cpu, FP_OP_KEY_WR + i, fp_key_pattern(i), 0, 0) || !fp_do(r, cpu, FP_OP_KEY_RD + i, 0, 0, &v)) {
 +			r->key_trap |= 1u << i;
@@ -761,7 +835,9 @@
 +
 +	if (level) {
 +		fp_step(r, cpu, FP_STEP_SCTLR);
-+		if (!fp_do(r, cpu, FP_OP_SCTLR_WR, r->sctlr | FP_SCTLR_EN, 0, 0)) {
++		if (r->live) {
++			r->sctlr_set = r->sctlr;        /* start.s enabled the keys; never rewrite SCTLR under signed code */
++		} else if (!fp_do(r, cpu, FP_OP_SCTLR_WR, r->sctlr | FP_SCTLR_EN, 0, 0)) {
 +			r->sctlr_trap = 1;
 +		} else {
 +			wrote_sctlr = 1;
@@ -782,7 +858,10 @@
 +	}
 +
 +	fp_step(r, cpu, FP_STEP_RESTORE);
-+	for (unsigned i = 0; i < FP_NKEYS; i++) {
++	if (r->live) {
++		r->key_back = r->key_rd;        /* nothing was written */
++	}
++	for (unsigned i = 0; i < FP_NKEYS && !r->live; i++) {
 +		if ((r->key_rd & (1u << i)) && fp_do(r, cpu, FP_OP_KEY_WR + i, orig[i], 0, 0) &&
 +		    fp_do(r, cpu, FP_OP_KEY_RD + i, 0, 0, &v) && v == orig[i]) {
 +			r->key_back |= 1u << i;
@@ -850,6 +929,10 @@
 +fuxi_pac_log_summary(unsigned int ncpu)
 +{
 +	char line[256];
++#if FP_LIVE
++	(void)fp_format_native(line, (unsigned)sizeof(line), fuxi_native_pac, ncpu);
++	printf("%s\n", line);
++#endif
 +	if (!fuxi_pac_enabled()) {
 +		return;
 +	}

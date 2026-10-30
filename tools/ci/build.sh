@@ -5,9 +5,10 @@ root=$(cd "$(dirname "$0")/../.." && pwd)
 usage() {
     cat <<'HELP'
 Usage: tools/ci/build.sh TARGET [--dry-run]
-Targets: kernel-metal4, kernel-wlan6g, metal, nativemetal, mesa, tools
+Targets: kernel-metal4, kernel-wlan6g, kernel-metal4e, metal, nativemetal, mesa, tools
        tools/ci/build.sh --plan KERNEL METAL MESA TOOLS [NATIVEMETAL]
-KERNEL: none|metal4|wlan6g|all; remaining plan arguments: true|false
+KERNEL: none|metal4|wlan6g|metal4e|all; remaining plan arguments: true|false
+metal4e is the opt-in arm64e build of the metal4 kernel (FUXI_ARM64E=1, patch 0115); all does not include it.
 Outputs: tools/out/ci/TARGET/ (explicit allowlist, logs, SHA256SUMS)
 Caches: deps/ci-downloads/; isolated build directories: deps/ci-work-TARGET/
 Requires a Mac with preinstalled Xcode 15.4 (kernel) or a selected full Xcode
@@ -23,7 +24,7 @@ case "$1" in
     -h|--help) [[ $# == 1 ]] || die 'unexpected help arguments'; usage; exit 0 ;;
     --plan)
         [[ $# == 5 || $# == 6 ]] || die '--plan needs KERNEL METAL MESA TOOLS [NATIVEMETAL]'
-        case "$2" in none|metal4|wlan6g|all) ;; *) die 'invalid kernel selection' ;; esac
+        case "$2" in none|metal4|wlan6g|metal4e|all) ;; *) die 'invalid kernel selection' ;; esac
         for flag in "$3" "$4" "$5" "${6:-false}"; do
             [[ $flag == true || $flag == false ]] || die 'plan flags must be true or false'
         done
@@ -31,6 +32,7 @@ case "$1" in
 import json, sys
 kernel, *flags = sys.argv[1:]
 targets = ["kernel-" + v for v in ("metal4", "wlan6g") if kernel in (v, "all")]
+targets += ["kernel-metal4e"] if kernel == "metal4e" else []
 targets += [t for t, f in zip(("metal", "mesa", "tools", "nativemetal"), flags) if f == "true"]
 if not targets:
     raise SystemExit("Select at least one target")
@@ -40,7 +42,7 @@ PY
 esac
 target=$1
 shift
-case "$target" in kernel-metal4|kernel-wlan6g|metal|nativemetal|mesa|tools) ;; *) die "unknown target: $target" ;; esac
+case "$target" in kernel-metal4|kernel-wlan6g|kernel-metal4e|metal|nativemetal|mesa|tools) ;; *) die "unknown target: $target" ;; esac
 dry=false
 if [[ $# == 1 && $1 == --dry-run ]]; then dry=true; shift; fi
 [[ $# == 0 ]] || die 'unexpected arguments'
@@ -52,6 +54,9 @@ if $dry; then
     printf 'target=%s\nartifact=fuxi-%s\noutput=tools/out/ci/%s\n' "$target" "$target" "$target"
     [[ $target != kernel-* ]] || printf 'iig=%s cache=%s\n' "$iig_mode" "${FUXI_IIG_CACHE:-xnu/iig-pregen}"
     printf 'pins: dxb=%s mesa=%s metal2vulkan=%s rust=%s\n' "$DXB_SHA" "$MESA_SHA" "$M2V_SHA" "$RUST_VERSION"
+    if [[ $target == kernel-metal4e ]]; then
+        echo 'kernel: arm64e (FUXI_ARM64E=1, patch 0115), metal4 cmdline + cmdline-cpus1.txt, needs ld-classic'
+    fi
     echo 'No downloads, builds, signing or packing in dry-run mode.'
     exit 0
 fi
@@ -195,6 +200,10 @@ setup() {
             [[ $(xcodebuild -version | head -1) == 'Xcode 15.'* ]] || die 'XNU requires Xcode 15 iig (or FUXI_IIG_MODE=replay)'
             xcrun --find iig
         fi
+        if [[ $target == kernel-metal4e ]]; then
+            # 0115 links with ld-classic -threaded_starts_section (arm_init signs the chains).
+            xcrun --sdk macosx --find ld-classic || die 'arm64e kernel needs ld-classic in the selected Xcode'
+        fi
         # The pinned builder tests xcodes even with Xcode preinstalled. Its
         # clean PATH includes this Homebrew prefix; no authentication needed.
         if ! command -v xcodes >/dev/null; then
@@ -205,7 +214,8 @@ setup() {
 }
 
 kernel() {
-    local dxb=$work/dxb variant=${target#kernel-}
+    local dxb=$work/dxb variant=${target#kernel-} arm64e=0
+    [[ $target == kernel-metal4e ]] && arm64e=1
     python3 tools/test-fuxi-iig-cache.py
     python3 tools/test-fuxi-backlight.py
     python3 tools/test-fuxi-prof.py
@@ -216,6 +226,7 @@ kernel() {
     python3 tools/sync-fuxi-audio.py --check
     python3 tools/test-fuxi-pac.py
     python3 tools/sync-fuxi-pac.py --check
+    python3 tools/test-fuxi-arm64e.py
     if [[ $target == kernel-wlan6g ]]; then
         # WLAN source keeps the existing artifact/target and cmdlines. Exercise the
         # exact C carried by patch 0099 before spending a hosted kernel build.
@@ -246,6 +257,8 @@ kernel() {
     (
         cd "$dxb"
         export MACOS_VERSION=13.5 KERNEL_CONFIG=DEVELOPMENT ARCH_CONFIG=ARM64 MACHINE_CONFIG=FUXI
+        # metal4e: MakeInc.def (patch 0115) switches FUXI to arm64e; unset everywhere else.
+        if [[ $arm64e == 1 ]]; then export FUXI_ARM64E=1; else unset FUXI_ARM64E; fi
         "$native/bin/bash" build.sh
     )
     cp "$dxb/fakeroot/System/Library/Kernels/kernel.development.fuxi" "$out/"
@@ -263,6 +276,18 @@ kernel() {
         (cd "$out/iig-pregen" && shasum -a 256 manifest.json)
     fi
     python3 tools/ci/kernel-inputs.py --variant "$variant" --out "$out"
+    if [[ $arm64e == 1 ]]; then
+        # The arm64e boot needs cpusubtype ARM64E and __TEXT,__thread_starts (arm_init signs those chains).
+        python3 - "$out/kernel.development.fuxi" <<'PY' | tee "$out/kernel-arch.txt"
+import sys
+sys.path.insert(0, 'tools')
+import mkpayload
+m = mkpayload.parse_macho(open(sys.argv[1], 'rb').read())
+print(f"cputype={m['cputype']:#x} cpusub={m['cpusub']} thread_starts={m['thread_starts']} chained_fixups={bool(m['fixups'])}")
+if m['cpusub'] != mkpayload.CPU_SUBTYPE_ARM64E or not m['thread_starts']:
+    raise SystemExit('metal4e kernel is not arm64e with __TEXT,__thread_starts')
+PY
+    fi
 }
 
 mesa_source() {

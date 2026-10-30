@@ -8,6 +8,13 @@ The kernel is linked as a PIE with LC_DYLD_CHAINED_FIXUPS. Nobody else
 kernelcaches itself, so the chains are walked here and every pointer is
 rewritten to its unslid target. The shim then only copies flat segments.
 
+An arm64e kernel (CI kernel=metal4e, patch 0115) is linked with
+__TEXT,__thread_starts instead: arm_init rebases and PAC-signs those chains on
+the device, so the segments are copied untouched. Authenticated chained fixups
+are refused, because resolving them here would leave unsigned pointers that the
+arm64e kernel then fails to authenticate (--allow-unsigned-auth overrides, for
+the stock VMAPPLE kernel only).
+
 Payload layout (little endian, all offsets from payload start):
   0x000  char  magic[8] = "SWEETXNU"
   0x008  u32   version = 1, nsegs
@@ -41,7 +48,7 @@ SEG_TABLE = CMDLINE + BOOT_LINE_LENGTH	# 0x2a8
 def parse_macho(buf):
     magic, cputype, cpusub, ftype, ncmds, sizeofcmds, flags, _ = struct.unpack_from('<8I', buf, 0)
     assert magic == 0xfeedfacf, 'not a 64-bit Mach-O'
-    segs, entry, fixups = [], None, None
+    segs, entry, fixups, thread_starts = [], None, None, None
     off = 32
     for _ in range(ncmds):
         cmd, size = struct.unpack_from('<II', buf, off)
@@ -49,6 +56,11 @@ def parse_macho(buf):
             name = buf[off + 8:off + 24].split(b'\0')[0].decode()
             vmaddr, vmsize, fileoff, filesize = struct.unpack_from('<4Q', buf, off + 24)
             segs.append(dict(name=name, vmaddr=vmaddr, vmsize=vmsize, fileoff=fileoff, filesize=filesize))
+            nsects, = struct.unpack_from('<I', buf, off + 64)
+            for s in range(nsects):
+                sect = off + 72 + 80 * s
+                if buf[sect:sect + 16].split(b'\0')[0] == b'__thread_starts':
+                    thread_starts = struct.unpack_from('<2Q', buf, sect + 32)	# addr, size
         elif cmd == LC_UNIXTHREAD:
             flavor, count = struct.unpack_from('<II', buf, off + 8)
             # arm_thread_state64: x0..x28, fp, lr, sp, pc, cpsr
@@ -56,7 +68,8 @@ def parse_macho(buf):
         elif cmd == LC_DYLD_CHAINED_FIXUPS:
             fixups = struct.unpack_from('<II', buf, off + 8)	# dataoff, datasize
         off += size
-    return dict(cputype=cputype, cpusub=cpusub & 0xff, segs=segs, entry=entry, fixups=fixups)
+    return dict(cputype=cputype, cpusub=cpusub & 0xff, segs=segs, entry=entry, fixups=fixups,
+                thread_starts=thread_starts, auth_fixups=0)
 
 
 def apply_chained_fixups(buf, m):
@@ -85,6 +98,7 @@ def apply_chained_fixups(buf, m):
             while True:
                 raw, = struct.unpack_from('<Q', buf, loc)
                 target, nxt, stride = decode(raw, fmt, image_base)
+                m['auth_fixups'] += fmt in (1, 7, 9, 12) and raw >> 63
                 struct.pack_into('<Q', buf, loc, target)
                 nfix += 1
                 if not nxt:
@@ -140,10 +154,18 @@ def adt_dram(adt_blob):
             struct.unpack('<Q', chosen.prop('dram-size'))[0])
 
 
-def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
+CPU_SUBTYPE_ARM64E = 2
+
+
+def build(kernel_path, adt_path, cmdline, ramdisk_path=None, allow_unsigned_auth=False):
     buf = bytearray(open(kernel_path, 'rb').read())
     m = parse_macho(buf)
     nfix = apply_chained_fixups(buf, m)
+    if m['auth_fixups'] and not allow_unsigned_auth:
+        raise SystemExit(f"{kernel_path}: {m['auth_fixups']} authenticated chained fixups would stay unsigned; "
+                         'link the arm64e kernel with -threaded_starts_section (patch 0115)')
+    if m['cpusub'] == CPU_SUBTYPE_ARM64E and not m['thread_starts'] and not allow_unsigned_auth:
+        raise SystemExit(f'{kernel_path}: arm64e kernel without __TEXT,__thread_starts: nothing signs its pointers')
     segs = [s for s in m['segs'] if s['vmsize']]
     text = m['segs'][0]
     assert text['name'] == '__TEXT' and text['fileoff'] == 0
@@ -187,7 +209,9 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
     out[CMDLINE:CMDLINE + len(cl)] = cl
     for i, t in enumerate(seg_table):
         struct.pack_into('<4Q', out, SEG_TABLE + 32 * i, *t)
-    info = dict(cputype=hex(m['cputype']), cpusub=m['cpusub'], fixups=nfix, virt_base=hex(virt_base),
+    info = dict(cputype=hex(m['cputype']), cpusub=m['cpusub'], fixups=nfix, auth_fixups=m['auth_fixups'],
+                thread_starts=m['thread_starts'] and (hex(m['thread_starts'][0]), hex(m['thread_starts'][1])),
+                virt_base=hex(virt_base),
                 entry=hex(m['entry']), kernel_end=hex(kernel_end), ramdisk=ramdisk, size=len(out),
                 segs=[(s['name'], hex(s['vmaddr']), hex(s['vmsize'])) for s in segs])
     return bytes(out), info
@@ -198,8 +222,10 @@ if __name__ == '__main__':
     ap.add_argument('kernel'); ap.add_argument('adt'); ap.add_argument('out')
     ap.add_argument('--cmdline', default='debug=0xc serial=3 cpus=1 keepsyms=1')
     ap.add_argument('--ramdisk', help='root image for md0 (boot with rd=md0)')
+    ap.add_argument('--allow-unsigned-auth', action='store_true',
+                    help='pack arm64e authenticated fixups unsigned (stock VMAPPLE kernel experiments only)')
     a = ap.parse_args()
-    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk)
+    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, a.allow_unsigned_auth)
     open(a.out, 'wb').write(blob)
     for k, v in info.items():
         if k != 'segs':

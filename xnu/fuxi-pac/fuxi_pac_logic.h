@@ -10,6 +10,17 @@
 #define FP_KEYS_ALL     0x3ffu
 #define FP_NAUTH        4               /* IA, IB, DA, DB */
 
+/* arm64e (patch 0115): fuxi_native_pac word offsets, mirrored from osfmk/arm64/pac_asm.h NATIVE_PAC_*. */
+#define FP_NATIVE_READY         10
+#define FP_NATIVE_MODE          11      /* 1 native, 2 hyp (the first CPU's key readback differed) */
+#define FP_NATIVE_CPUS          12
+#define FP_NATIVE_BAD           13
+#define FP_NATIVE_BAD_MPIDR     14
+#define FP_NATIVE_GA_REF        15
+#define FP_NATIVE_GA_BAD        16
+#define FP_NATIVE_GA_MPIDR      17
+#define FP_NATIVE_WORDS         24
+
 /* SCTLR_EL1 enables, in the order of the en= field: EnIA, EnIB, EnDA, EnDB. */
 #define FP_SCTLR_ENIA   (1ULL << 31)
 #define FP_SCTLR_ENIB   (1ULL << 30)
@@ -105,6 +116,7 @@ struct fp_result {
 	int key_used;                   /* PACIA differs between the test key and the original key: 1, 0, -1 not run */
 	uint64_t sig[FP_NAUTH + 1];     /* signed test pointer per key with the test keys, then PACGA */
 	unsigned traps, last_esr;
+	unsigned live;                  /* arm64e kernel: the keys in use are never written (keywr, SCTLR write and restore skipped) */
 };
 
 static inline const char *
@@ -112,6 +124,9 @@ fp_keys_rw(const struct fp_result *r)
 {
 	if (r->key_trap) {
 		return "trap";
+	}
+	if (r->live) {
+		return r->key_rd == FP_KEYS_ALL ? "live" : "partial";
 	}
 	if (r->key_ok == FP_KEYS_ALL) {
 		return "ok";
@@ -213,8 +228,8 @@ fp_append_c(char *buf, unsigned size, unsigned *at, char c)
 /*
  * FUXI PAC: cpu=N midr= isar1= isar2= apa= api= apa3= gpa= gpi= gpa3= en=<EnIA EnIB EnDA EnDB> guard=
  *   keys_rw=ok|ignored|trap|partial|none keys=<ok>/<rd>/<ign>/<trap> restored= pac_ok= auth=<IA IB DA DB GA>
- *   key_used= auth_fail_ok= fail=<IA IB DA DB> fpac=0|1|2 sig= traps= esr=
- * or "FUXI PAC: cpu=N incomplete step=NAME" when the probe has not finished.
+ *   key_used= auth_fail_ok= fail=<IA IB DA DB> fpac=0|1|2 sig= traps= esr= [mode=live]
+ * (arm64e: keys_rw=live, the keys start.s programmed are read, never written) or "FUXI PAC: cpu=N incomplete step=NAME" when the probe has not finished.
  * Returns the line length (the buffer is always terminated).
  */
 static inline unsigned
@@ -292,6 +307,9 @@ fp_format(char *buf, unsigned size, unsigned cpu, const struct fp_result *r)
 	fp_append_u(buf, size, &at, r->traps);
 	fp_append(buf, size, &at, " esr=");
 	fp_append_x(buf, size, &at, r->last_esr);
+	if (r->live) {
+		fp_append(buf, size, &at, " mode=live");
+	}
 	return at;
 }
 
@@ -299,11 +317,12 @@ fp_format(char *buf, unsigned size, unsigned cpu, const struct fp_result *r)
  * FUXI PAC: summary cpus= probed= pauth= keys_rw_ok= pac_ok= auth_fail_ok= fpac= restored= consistent= verdict=
  * verdict: ready (every CPU: keys read back, all round trips, tampering rejected, state restored, identical
  * signatures), else the first failing class: incomplete, no-pauth, keys, pac, auth, restore, mixed.
+ * " mode=live" when any CPU ran live (arm64e): its signatures use the boot's shared key set.
  */
 static inline unsigned
 fp_format_summary(char *buf, unsigned size, const struct fp_result *r, unsigned ncpu)
 {
-	unsigned at = 0, probed = 0, pauth = 0, keys = 0, pac = 0, fail = 0, fpac = 0, back = 0, consistent = 1;
+	unsigned at = 0, probed = 0, pauth = 0, keys = 0, pac = 0, fail = 0, fpac = 0, back = 0, consistent = 1, live = 0;
 	const struct fp_result *first = 0;
 	const char *verdict;
 	if (!size) {
@@ -318,13 +337,14 @@ fp_format_summary(char *buf, unsigned size, const struct fp_result *r, unsigned 
 		}
 		probed++;
 		pauth += fp_auth_level(r[c].isar1, r[c].isar2) != 0;
-		keys += fp_keys_rw(&r[c])[0] == 'o';
+		keys += fp_keys_rw(&r[c])[0] == 'o' || fp_keys_rw(&r[c])[0] == 'l';
+		live |= r[c].live;
 		pac += (unsigned)fp_pac_ok(&r[c]);
 		fail += fp_auth_fail_ok(&r[c]) == 1;
 		fpac += fp_fpac(r[c].isar1, r[c].isar2) != 0;
 		back += (unsigned)fp_restored(&r[c]);
-		if (!fp_pac_ok(&r[c]) || r[c].key_ok != FP_KEYS_ALL) {
-			continue;       /* signatures are comparable only under the test keys */
+		if (!fp_pac_ok(&r[c]) || (r[c].key_ok != FP_KEYS_ALL && !r[c].live)) {
+			continue;       /* signatures are comparable only under the test keys (or the shared live keys) */
 		}
 		if (!first) {
 			first = &r[c];
@@ -355,6 +375,48 @@ fp_format_summary(char *buf, unsigned size, const struct fp_result *r, unsigned 
 	fp_append_u(buf, size, &at, back);
 	fp_append(buf, size, &at, " consistent=");
 	fp_append_u(buf, size, &at, consistent);
+	fp_append(buf, size, &at, " verdict=");
+	fp_append(buf, size, &at, verdict);
+	if (live) {
+		fp_append(buf, size, &at, " mode=live");
+	}
+	return at;
+}
+
+/*
+ * arm64e (patch 0115), from the fuxi_native_pac words start.s wrote (keys are never printed):
+ * FUXI PAC: native mode=native|hyp|unset cpus=<passes>/<ncpu> bad= bad_mpidr= ga= ga_bad= ga_mpidr= verdict=
+ * verdict: ok, else the first of: missing (no key set), mixed (a CPU computed another PACGA and parked),
+ * hyp-keys (the first CPU's keys did not read back: kernel and processes use the keys found),
+ * readback (a later pass did not read back), no-ga (no PACGA reference), cpus (fewer passes than CPUs).
+ */
+static inline unsigned
+fp_format_native(char *buf, unsigned size, const uint64_t *w, unsigned ncpu)
+{
+	unsigned at = 0;
+	const char *verdict;
+	if (!size) {
+		return 0;
+	}
+	verdict = w[FP_NATIVE_READY] != 1 ? "missing" : w[FP_NATIVE_GA_BAD] ? "mixed" : w[FP_NATIVE_MODE] == 2 ? "hyp-keys" :
+	    w[FP_NATIVE_BAD] ? "readback" : !w[FP_NATIVE_GA_REF] ? "no-ga" : w[FP_NATIVE_CPUS] < ncpu ? "cpus" : "ok";
+	buf[0] = 0;
+	fp_append(buf, size, &at, "FUXI PAC: native mode=");
+	fp_append(buf, size, &at, w[FP_NATIVE_MODE] == 1 ? "native" : w[FP_NATIVE_MODE] == 2 ? "hyp" : "unset");
+	fp_append(buf, size, &at, " cpus=");
+	fp_append_u(buf, size, &at, w[FP_NATIVE_CPUS]);
+	fp_append(buf, size, &at, "/");
+	fp_append_u(buf, size, &at, ncpu);
+	fp_append(buf, size, &at, " bad=");
+	fp_append_u(buf, size, &at, w[FP_NATIVE_BAD]);
+	fp_append(buf, size, &at, " bad_mpidr=");
+	fp_append_x(buf, size, &at, w[FP_NATIVE_BAD_MPIDR]);
+	fp_append(buf, size, &at, " ga=");
+	fp_append_u(buf, size, &at, w[FP_NATIVE_GA_REF] != 0);
+	fp_append(buf, size, &at, " ga_bad=");
+	fp_append_u(buf, size, &at, w[FP_NATIVE_GA_BAD]);
+	fp_append(buf, size, &at, " ga_mpidr=");
+	fp_append_x(buf, size, &at, w[FP_NATIVE_GA_MPIDR]);
 	fp_append(buf, size, &at, " verdict=");
 	fp_append(buf, size, &at, verdict);
 	return at;

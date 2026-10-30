@@ -34,7 +34,7 @@ BASE = (
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--variant", choices=("metal4", "wlan6g"), required=True)
+    ap.add_argument("--variant", choices=("metal4", "wlan6g", "metal4e"), required=True)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--local-adt", type=Path,
                     help="LOCAL ONLY: preserve this integration ADT, including root extents")
@@ -55,12 +55,15 @@ def main():
         root = fuxi.build(ufs_readonly=True, smp=True, gpu_reserve=True)
     args.out.mkdir(parents=True, exist_ok=True)
     (args.out / "fuxi.adt").write_bytes(adt.serialize(root))
-    if args.variant == "metal4":
+    if args.variant in ("metal4", "metal4e"):
         line = BASE.replace("sweetnoexec=fairplayd.H2", "sweetnoexec=bluetoothd,fairplayd.H2")
         line = line.replace("bluetoothd:/usr/local/bin/fuxi-gpu-abi-test",
                             "peakpowermanagerd:/usr/local/bin/fuxi-metal-smoke")
         line += " sweetnull=backboardd,SpringBoard,fuxi-vk-smoke,peakpowermanagerd,fuxi-metal-smoke"
         cmdlines = {"cmdline.txt": line}
+        if args.variant == "metal4e":
+            # arm64e: the same boot, plus a one-core fallback (a CPU whose PACGA differs parks; docs-lanes/arm64e.md).
+            cmdlines["cmdline-cpus1.txt"] = line.replace(" cpus=7 ", " cpus=1 ")
     else:
         cmdlines = {"cmdline.txt": BASE + " fuxiwlan=1",
                     "cmdline-s22.txt": BASE + " fuxiwlan=22",

@@ -11,15 +11,16 @@ Built on macOS (Apple silicon) with
 ## Manual hosted builds
 
 `.github/workflows/fuxi-build.yml` runs only on `workflow_dispatch`. It needs no
-repository secrets. Select `kernel=none|metal4|wlan6g|all` (default `metal4`),
+repository secrets. Select `kernel=none|metal4|wlan6g|metal4e|all` (default `metal4`),
 and independent boolean inputs `metal`, `mesa`, `tools` (default `false`).
-`all` builds both kernel profiles; selecting nothing fails before allocating a
+`all` builds both kernel profiles; `metal4e` (opt-in arm64e build of the metal4
+kernel, patch 0115, `docs-lanes/arm64e.md`) is never part of `all`; selecting nothing fails before allocating a
 Mac. Each target runs independently, with a 120-minute limit and one artifact
 retained for **7 days**. Failed builds upload logs and their checksum manifest;
 check the job result before treating an artifact as complete.
 
 The Mac entry point is `bash tools/ci/build.sh TARGET`, where TARGET is
-`kernel-metal4`, `kernel-wlan6g`, `metal`, `mesa` or `tools`. It uses the runner's
+`kernel-metal4`, `kernel-wlan6g`, `kernel-metal4e`, `metal`, `mesa` or `tools`. It uses the runner's
 cmake/ninja/jq/pkg-config, builds or downloads the remaining tools (gum, bash,
 glslang) from checksum-pinned sources in `tools/ci/pins.env` (macOS 14 has no
 Homebrew bottles any more, so nothing is brew-installed), requires a full preinstalled Xcode, and uses ignored `deps/` and
@@ -97,6 +98,7 @@ have only been built with Xcode 15.4 here; check them separately on the new runn
 | Artifact | Contents in addition to `SHA256SUMS` and `logs/build.log` | Estimated cold runtime |
 | --- | --- | --- |
 | `fuxi-kernel-metal4` | `kernel.development.fuxi`, `kernel.development.fuxi.unstripped`, public `fuxi.adt`, `cmdline.txt` for the Metal smoke host | 15–35 min |
+| `fuxi-kernel-metal4e` | arm64e kernel pair (`FUXI_ARM64E=1`: ld-classic `__TEXT,__thread_starts`, keys programmed in start.s), public `fuxi.adt`, metal4 `cmdline.txt`, `cmdline-cpus1.txt` (one-core fallback), `kernel-arch.txt` | 15–35 min (not yet built) |
 | `fuxi-kernel-wlan6g` | Same kernel pair and public ADT, M6g `cmdline.txt` (full) and `cmdline-s22.txt` (stop at BHI completion) and `cmdline-s22-oldiova.txt` (same, old IOVA pool) | 15–35 min |
 | `fuxi-metal` | Complete ad-hoc signed `FuxiMetal.bundle`, `fuxi-metal-smoke`, our compiled `metal-smoke.metallib`, separately signed `libmetal2vulkan.dylib`, `metal2vulkan-source.tar.gz` with licences and vendored crate sources, `metal-clients.conf`, `metal-smoke.conf` | 10–25 min |
 | `fuxi-mesa` | Signed `libvulkan_freedreno.dylib`, `patches/`, `tools/` build/audit recipes, `mesa-licenses/` | 15–35 min |
@@ -124,6 +126,7 @@ examples assume the reviewed change has been integrated into `main`:
 # Run each target separately; all flags are explicit to avoid the kernel default.
 gh workflow run fuxi-build.yml -R bangprovn/ios-fuxi --ref main -f kernel=metal4 -f metal=false -f mesa=false -f tools=false
 gh workflow run fuxi-build.yml -R bangprovn/ios-fuxi --ref main -f kernel=wlan6g -f metal=false -f mesa=false -f tools=false
+gh workflow run fuxi-build.yml -R bangprovn/ios-fuxi --ref main -f kernel=metal4e -f metal=false -f mesa=false -f tools=false
 gh workflow run fuxi-build.yml -R bangprovn/ios-fuxi --ref main -f kernel=none -f metal=true -f mesa=false -f tools=false
 gh workflow run fuxi-build.yml -R bangprovn/ios-fuxi --ref main -f kernel=none -f metal=false -f mesa=true -f tools=false
 gh workflow run fuxi-build.yml -R bangprovn/ios-fuxi --ref main -f kernel=none -f metal=false -f mesa=false -f tools=true
