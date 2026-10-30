@@ -18,7 +18,7 @@ struct PassInfo {
 // the largest summed draw time and prints its 5 most expensive draws.
 struct DrawTex {uint32_t width=0,height=0,format=0;uint8_t kind=0,backed=0,imported=0;}; // kind 0 optimal, 1 linear alias, 2 optimal shadow of a buffer
 struct DrawInfo {
- bool begin=false;uint32_t pipeline=0,count=0,blend=0,srcRGB=0,dstRGB=0,srcAlpha=0,dstAlpha=0,mask=0,instr=0,samples=0,loops=0,kills=0,texCount=0,passW=0,passH=0,scW=0,scH=0;int32_t scX=0,scY=0;DrawTex tex[4];
+ bool begin=false;uint32_t fragHash=0,unroll=0,pipeline=0,count=0,blend=0,srcRGB=0,dstRGB=0,srcAlpha=0,dstAlpha=0,mask=0,instr=0,samples=0,loops=0,kills=0,texCount=0,passW=0,passH=0,scW=0,scH=0;int32_t scX=0,scY=0;DrawTex tex[4];
 };
 // Counts SPIR-V instructions, image samples, loop merges and discards in a fragment shader (word stream; header is 5 words).
 struct SpirvStats {uint32_t words=0,instr=0,samples=0,loops=0,kills=0,fetches=0,specConsts=0,switches=0,condBranches=0,selections=0,calls=0,phis=0,converts=0,f16Types=0,f32Types=0,relaxed=0,accessChains=0,quantize=0,loopsDontUnroll=0,loopsNone=0;};
@@ -30,6 +30,8 @@ inline SpirvStats spirvStats(const uint32_t *w,size_t n){
   else if(op==115)++s.converts;else if(op==65)++s.accessChains;else if(op==22 && len>=3){if(w[i+2]==16)++s.f16Types;else if(w[i+2]==32)++s.f32Types;}else if(op==71 && len>=3 && w[i+2]==0)++s.relaxed;i+=len;}
  return s;
 }
+// FNV-1a of a SPIR-V module's words: a pipeline's identity across boots (pipe ids are creation order).
+inline uint32_t spirvHash(const uint32_t *w,size_t n){uint32_t h=2166136261u;for(size_t i=0;w && i<n;++i)h=(h^w[i])*16777619u;return h;}
 // Upper bound for occlusion culling inside a pass: an opaque draw (no blend, all channels, no discard) is a candidate when a later opaque draw of the same pass has a scissor containing its own.
 // Geometry is not inspected, so this only says where a coverage proof would pay off; loadElide counts passes whose first draw is opaque over the whole render area (the load of the previous contents would be dead).
 struct OcclusionStats {uint32_t draws=0,candidates=0,loadElide=0,passes=0;uint64_t totalNs=0,candidateNs=0;};
@@ -56,10 +58,35 @@ inline void reportDraws(FILE *out,const std::vector<DrawInfo> &infos,const std::
  const auto &h=infos[b-1];
  fprintf(out,"FUXI MTL: gpu draw times passes=%zu top_pass=%zu %ux%u draws=%zu sum_ms=%.3f\n",passNs.size(),best,h.passW,h.passH,e-b,passNs[best]/1e6);
  for(size_t k=0;k<top && k<order.size();++k){const auto &d=infos[order[k]];
-  fprintf(out,"FUXI MTL: gpu draw top%zu ms=%.3f pipe=%06x verts=%u blend=%u rgb=%u/%u a=%u/%u mask=%u frag_instr=%u samples=%u loops=%u kills=%u scissor=%ux%u ns_per_kpx=%.1f tex=%u",k+1,ns[order[k]]/1e6,d.pipeline,d.count,d.blend,d.srcRGB,d.dstRGB,d.srcAlpha,d.dstAlpha,d.mask,d.instr,d.samples,d.loops,d.kills,d.scW,d.scH,(d.scW&&d.scH)?double(ns[order[k]])/(double(d.scW)*d.scH/1000.0):0.0,d.texCount);
+  fprintf(out,"FUXI MTL: gpu draw top%zu ms=%.3f pipe=%06x verts=%u blend=%u rgb=%u/%u a=%u/%u mask=%u frag_instr=%u samples=%u loops=%u kills=%u scissor=%ux%u ns_per_kpx=%.1f tex=%u fh=%08x unroll=%u",k+1,ns[order[k]]/1e6,d.pipeline,d.count,d.blend,d.srcRGB,d.dstRGB,d.srcAlpha,d.dstAlpha,d.mask,d.instr,d.samples,d.loops,d.kills,d.scW,d.scH,(d.scW&&d.scH)?double(ns[order[k]])/(double(d.scW)*d.scH/1000.0):0.0,d.texCount,d.fragHash,d.unroll);
   for(unsigned t=0;t<d.texCount && t<4;++t)fprintf(out," [%ux%u fmt=%u %s%s%s]",d.tex[t].width,d.tex[t].height,d.tex[t].format,d.tex[t].kind==1?"linear":d.tex[t].kind==2?"shadow":"optimal",d.tex[t].backed?" buffer-backed":"",d.tex[t].imported?" imported":"");
   fprintf(out,"\n");}
 }
+// GPU draw time per pipeline over every draw of the sampled submits (not only the top pass), reported every `every` samples in two windows: all sampled submits
+// and the heavy ones (draw sum >= heavyNs, e.g. Control Center / Spotlight). fh hashes the translated fragment SPIR-V, so rows of two boots match while pipe ids do not.
+class DrawPipeTimes {
+ struct Row {uint32_t pipe=0,fh=0,unroll=0,instr=0;uint64_t n=0,ns=0,px=0;};
+ std::mutex mutex;std::unordered_map<uint32_t,Row> rows[2];uint64_t samples[2]{},totalNs[2]{};
+public:
+ static constexpr uint64_t heavyNs=4000000;
+ // Returns true when `every` samples have been added since the last report.
+ bool add(const std::vector<DrawInfo> &infos,const std::vector<uint64_t> &ns,unsigned every=20){
+  std::lock_guard<std::mutex> guard(mutex);uint64_t sum=0;size_t n=std::min(infos.size(),ns.size());for(size_t i=0;i<n;++i)if(!infos[i].begin)sum+=ns[i];
+  for(unsigned w=0;w<2;++w){if(w && sum<heavyNs)break;++samples[w];totalNs[w]+=sum;
+   for(size_t i=0;i<n;++i){const auto &d=infos[i];if(d.begin)continue;auto &r=rows[w][d.pipeline];r.pipe=d.pipeline;r.fh=d.fragHash;r.unroll=d.unroll;r.instr=d.instr;++r.n;r.ns+=ns[i];r.px+=uint64_t(d.scW)*d.scH;}}
+  return every && samples[0]>=every;
+ }
+ void report(FILE *out,size_t top=8){
+  std::lock_guard<std::mutex> guard(mutex);
+  for(unsigned w=0;w<2;++w){if(!samples[w])continue;std::vector<const Row *> order;for(auto &kv:rows[w])order.push_back(&kv.second);
+   std::sort(order.begin(),order.end(),[](const Row *a,const Row *b){return a->ns!=b->ns?a->ns>b->ns:a->pipe<b->pipe;});
+   fprintf(out,"FUXI MTL: gpu draw pipes window=%s samples=%llu draw_ms/sample=%.3f pipes=%zu",w?"heavy":"all",(unsigned long long)samples[w],totalNs[w]/1e6/double(samples[w]),order.size());
+   for(size_t k=0;k<top && k<order.size();++k){const Row &r=*order[k];
+    fprintf(out," | pipe=%06x fh=%08x unroll=%u instr=%u n/sample=%.2f ms/sample=%.3f share_pct=%.1f ns_per_kpx=%.1f",r.pipe,r.fh,r.unroll,r.instr,double(r.n)/double(samples[w]),r.ns/1e6/double(samples[w]),totalNs[w]?100.0*double(r.ns)/double(totalNs[w]):0.0,r.px?double(r.ns)/(double(r.px)/1000.0):0.0);}
+   fprintf(out,"\n");}
+  for(unsigned w=0;w<2;++w){rows[w].clear();samples[w]=totalNs[w]=0;}
+ }
+};
 class PassTimes {
  struct Row {PassInfo info;uint64_t count=0,totalNs=0,maxNs=0,draws=0,copies=0,barriers=0,areaPixels=0,fullPixels=0;};
  std::mutex mutex;std::unordered_map<uint64_t,Row> rows;uint64_t submits=0,passes=0,passNs=0,wholeNs=0,clsCount[3]{},clsNs[3]{},areaCount[3]{},areaNs[3]{},areaPx[3]{},areaFull[3]{};

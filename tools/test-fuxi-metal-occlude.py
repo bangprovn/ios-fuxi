@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""FUXI_MTL_OCCLUDE / FUXI_MTL_NOFETCH_RP / FUXI_MTL_DRAW_AREA: CPU vertex evaluator and proof unit tests, then lavapipe pixels with each knob off and on (byte-for-byte equal), no downloads."""
+"""FUXI_MTL_OCCLUDE / FUXI_MTL_NOFETCH_RP / FUXI_MTL_DRAW_AREA / FUXI_MTL_SPIRV_UNROLL: CPU vertex evaluator and proof unit tests, then lavapipe pixels with each knob off and on (byte-for-byte equal), no downloads."""
 import argparse
 import os
 from pathlib import Path
@@ -19,6 +19,25 @@ VERTEX_ATTR = '#version 450\n' + PUSH + 'layout(location=0) in vec2 pos;\nvoid m
 FRAGMENT = '#version 450\n' + PUSH + 'layout(location=0) out vec4 outColor;\nvoid main(){outColor=pc.color;}\n'
 KILL = FRAGMENT.replace('void main(){', 'void main(){if(gl_FragCoord.x<6.0)discard;')
 STORAGE = FRAGMENT.replace('layout(location=0)', 'layout(set=0,binding=1,std430) buffer S {uint v;} s;\nlayout(location=0)').replace('void main(){', 'void main(){atomicAdd(s.v,1u);')
+# FUXI_MTL_SPIRV_UNROLL control: the shape metal2vulkan's roll pass writes (a DontUnroll k-trip loop whose trip constants are OpSelects on the trip index,
+# feeding a switch), with a plain nested loop for mode 2. The same push constants as FRAGMENT, so the occlusion bridge and scenarios run it unchanged.
+ROLLED = '''#version 450
+#extension GL_EXT_control_flow_attributes : require
+''' + PUSH + '''layout(location=0) out vec4 outColor;
+void main(){
+ vec4 c=pc.color;vec2 f=fract(gl_FragCoord.xy*0.0625);
+ [[dont_unroll]] for(int t=0;t<3;++t){
+  uint op=t==0?5u:(t==1?1u:6u);float k=t==0?0.75:(t==1?0.5:0.25);
+  for(int j=0;j<2;++j)c.rg+=f*k*0.125;
+  switch(op){
+   case 1u: c.rgb=c.rgb*vec3(0.9,1.1,0.8)+vec3(0.05*k); break;
+   case 5u: c=vec4(c.b,c.r,c.g,c.a); break;
+   case 6u: c.rgb=mix(c.rgb,vec3(dot(c.rgb,vec3(0.299,0.587,0.114))),k); break;
+   default: c*=0.5; break;
+  }
+ }
+ outColor=clamp(c,0.0,1.0);}
+'''
 EVAL = '''#version 450
 layout(constant_id=3) const int mode=0;
 layout(push_constant) uniform P {vec4 rect;} pc;
@@ -61,10 +80,12 @@ def main():
             out = d/(name+'.spv')
             subprocess.run([a.glslang, '-V', '--target-env', 'vulkan1.2', str(src), '-o', str(out)], check=True, capture_output=True)
             return out
-        for name in ('OcclusionProofTests', 'SpirvEvalTests'):
+        for name in ('OcclusionProofTests', 'SpirvEvalTests', 'SpirvUnrollTests'):
             subprocess.run(common+[str(ROOT/'tools/fuxi-metal'/(name+'.cpp')), '-o', str(d/name)], check=True)
         subprocess.run([str(d/'OcclusionProofTests')], env=env, check=True, timeout=30)
         subprocess.run([str(d/'SpirvEvalTests'), str(glsl('eval', EVAL, 'vert')), str(glsl('eval-rt', EVAL_RT, 'vert'))], env=env, check=True, timeout=60)
+        rolled = glsl('rolled', ROLLED, 'frag')
+        subprocess.run([str(d/'SpirvUnrollTests'), str(rolled)], env=env, check=True, timeout=30)
         if not a.icd:
             print('SKIP: lavapipe pixels require --icd')
             return
@@ -98,6 +119,30 @@ def main():
             built = sum(1 for l in nf.stderr.splitlines() if 'nofetch render pass pipeline' in l)
             assert built > 0, 'FUXI_MTL_NOFETCH_RP=1 never used a no-input-attachment render pass'
             print('  nofetch rp: pixels identical (alone and with occlude), %d variant pipelines built' % built)
+        # FUXI_MTL_SPIRV_UNROLL: the rolled control shader stands in for every fragment function; modes 1 and 2 must flip its loops and match mode 0 byte for byte.
+        roll = dict(env, CONTROL_FRAGMENT=str(rolled), CONTROL_FRAGMENT_KILL=str(glsl('rolled-kill', ROLLED.replace('void main(){', 'void main(){if(gl_FragCoord.x<6.0)discard;'), 'frag')),
+                    CONTROL_FRAGMENT_STORAGE=str(glsl('rolled-storage', ROLLED.replace('layout(location=0) out', 'layout(set=0,binding=1,std430) buffer S {uint v;} s;\nlayout(location=0) out').replace('void main(){', 'void main(){atomicAdd(s.v,1u);'), 'frag')))
+        def unroll(args, mode, occlude=False):
+            p = subprocess.run([str(d/'pixels')], env=dict(roll, FUXI_MTL_SPIRV_UNROLL=mode, FUXI_MTL_OCCLUDE='1' if occlude else '0', FUXI_MTL_OCCLUDE_MIN_PX='1', FUXI_MTL_PIPELINE_STATS='1', FUXI_MTL_TEST_BOOTARGS='fuxigpuframetrace=1 '+args),
+                               text=True, capture_output=True, timeout=240)
+            assert p.returncode == 0, (args, mode, p.stdout[-2000:], p.stderr[-4000:])
+            assert 'AddressSanitizer' not in p.stderr and 'runtime error:' not in p.stderr, p.stderr
+            assert 'FUXI MTL: policy spirv_unroll=%s' % (mode if mode in ('1', '2') else '0') in p.stderr, p.stderr[-2000:]
+            return p
+        for args in ('', 'fuxigpumerge=1 fuxigpuoverlap=1 fuxigpusubmit=1 fuxigpuperf=7'):
+            ref = unroll(args, '0')
+            r = keep(ref.stdout)
+            assert len(r) > 60 and 'FUXI MTL: spirv unroll' not in ref.stderr
+            for mode, occlude in (('1', False), ('2', False), ('2', True)):
+                p = unroll(args, mode, occlude)
+                assert keep(p.stdout) == r, 'pixels differ with FUXI_MTL_SPIRV_UNROLL=%s occlude=%d for %r' % (mode, occlude, args)
+                lines = [l for l in p.stderr.splitlines() if l.startswith('FUXI MTL: spirv unroll pipe=')]
+                assert len(lines) >= 10 and all(' flipped=1 ' in l and ' rc=0 ' in l and ' kept_sampling=0 ' in l for l in lines), lines[:3]
+                assert all((' nested=1 ' if mode == '2' else ' nested=0 ') in l for l in lines), lines[:3]
+                assert all(' fh=' in l for l in p.stderr.splitlines() if l.startswith('FUXI MTL: pipeline stats pipe=') and ' frag_words=' in l)
+                ex = [l for l in p.stderr.splitlines() if 'pipeline exec pipe=' in l][:2]
+                print('spirv unroll mode=%s occlude=%d args=%r: %d pixel lines identical, %d pipelines flipped; %s' % (mode, occlude, args, len(r), len(lines), lines[0][:200]))
+                if ex: print('  driver stats: ' + ex[-1][:300])
         # FUXI_MTL_DRAW_AREA: knob off is the reference; margins 0 and 16 must shrink (asserted per scenario in DrawAreaTests.cpp), a zero CPU budget must never shrink,
         # and the knob composes with OCCLUDE and GPU pass times. Every run's PIXELS/STATE lines must equal the reference.
         def area(args, extra):

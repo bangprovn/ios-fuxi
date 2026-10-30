@@ -52,6 +52,7 @@
 #include "PipelineCache.hpp"
 #include "ArtifactCache.hpp"
 #include "SpirvRelax.hpp"
+#include "SpirvUnroll.hpp"
 #include "SpirvLoops.hpp"
 #include "SpirvEval.hpp"
 #include "OcclusionProof.hpp"
@@ -111,7 +112,7 @@ struct VariantKey {
  explicit VariantKey(const DrawInput &input){for(unsigned i=0;i<resourceSlots;++i){auto *w=&words[i*8];w[0]=input.formats[i];w[1]=input.filters[i];memcpy(w+2,&input.lodMin[i],4);memcpy(w+3,&input.lodMax[i],4);for(unsigned stage=0;stage<2;++stage){w[4+stage*2]=input.buffers[stage][i].length!=0;w[5+stage*2]=input.buffers[stage][i].bytes;}}}
  bool operator==(const VariantKey &other) const {return words==other.words;}
 };
-struct Pipeline {uint32_t id{},fragInstr{},fragSamples{},fragLoops{},fragKills{};ShadowWindow shadowWindows[2][resourceSlots]{};std::array<uint32_t,resourceSlots> textureTypes{};size_t references=1,retainedBytes=0;bool writesStorage=false;void *translation{};CompileOptions options{};uint32_t fetchMask{};bool orderedColorAccess=false;std::vector<std::pair<uint32_t,VkRenderPass>> renders;VkPipeline pipeline{},stripPipeline{};std::array<VkPipeline,2> linePipelines{};std::array<VkPipeline,4> nfPipelines{};Translation recipe{};VkPipelineLayout layout{};VkRenderPass render{};uint32_t pushOffset{},pushSize{},pushStages{};uint8_t pushBytes[128]{};VkDescriptorSetLayout setLayout{};VkSampler bakedSamplers[16]{};BakedSampler bakedSamplerInfo[16]{};MipAccess mipAccess[2];uint32_t readOnlyStorage[2]{};std::vector<Descriptor> descriptors;std::vector<Buffer *> constantBlobs;std::vector<std::string> blobKeys;std::vector<std::array<uint8_t,32>> blobHashes;std::vector<std::pair<VariantKey,Pipeline *>> variants;
+struct Pipeline {uint32_t id{},fragInstr{},fragSamples{},fragLoops{},fragKills{},fragHash{},unrolled{};ShadowWindow shadowWindows[2][resourceSlots]{};std::array<uint32_t,resourceSlots> textureTypes{};size_t references=1,retainedBytes=0;bool writesStorage=false;void *translation{};CompileOptions options{};uint32_t fetchMask{};bool orderedColorAccess=false;std::vector<std::pair<uint32_t,VkRenderPass>> renders;VkPipeline pipeline{},stripPipeline{};std::array<VkPipeline,2> linePipelines{};std::array<VkPipeline,4> nfPipelines{};Translation recipe{};VkPipelineLayout layout{};VkRenderPass render{};uint32_t pushOffset{},pushSize{},pushStages{};uint8_t pushBytes[128]{};VkDescriptorSetLayout setLayout{};VkSampler bakedSamplers[16]{};BakedSampler bakedSamplerInfo[16]{};MipAccess mipAccess[2];uint32_t readOnlyStorage[2]{};std::vector<Descriptor> descriptors;std::vector<Buffer *> constantBlobs;std::vector<std::string> blobKeys;std::vector<std::array<uint8_t,32>> blobHashes;std::vector<std::pair<VariantKey,Pipeline *>> variants;
 };
 struct BufferBind {Buffer *buffer{};uint64_t offset{};bool bytes=false;uint32_t end{};
  uint64_t length() const{return end?end:buffer?buffer->length:0;}};
@@ -261,13 +262,13 @@ private:
  static constexpr size_t frameCacheLimit=512,viewCacheLimit=512;
  static uint64_t frameKey(const std::array<Texture *,8> &t,VkRenderPass render,const std::array<uint32_t,8> &levels){uint64_t h=0xcbf29ce484222325ull;for(size_t i=0;i<8;++i)h=((h^uint64_t(uintptr_t(t[i])))*0x100000001b3ull^levels[i])*0x100000001b3ull;return (h^uint64_t(uintptr_t(render)))*0x100000001b3ull;}
  static uint64_t viewKey(const Texture *t,VkFormat format,const std::array<uint32_t,4> &c,uint32_t base,uint32_t count){uint64_t h=0xcbf29ce484222325ull;for(uint64_t x:{uint64_t(uintptr_t(t)),uint64_t(format),uint64_t(c[0])|uint64_t(c[1])<<8|uint64_t(c[2])<<16|uint64_t(c[3])<<24,uint64_t(base)<<32|count})h=(h^x)*0x100000001b3ull;return h;}
- static constexpr uint32_t passStampLimit=255;static inline PassTimes passTimes;uint64_t drawSampleSerial=0;
+ static constexpr uint32_t passStampLimit=255;static inline PassTimes passTimes;static inline DrawPipeTimes drawPipes;uint64_t drawSampleSerial=0;
  void readDrawTimes(VkQueryPool pool,const std::vector<DrawInfo> &infos){
   if(!pool || infos.empty())return;std::vector<uint64_t> ticks(infos.size()+1),delta(infos.size());
   if(GetQueryPoolResults(device,pool,0,uint32_t(ticks.size()),ticks.size()*sizeof(uint64_t),ticks.data(),sizeof(uint64_t),VK_QUERY_RESULT_64_BIT)!=VK_SUCCESS)return;
   uint64_t mask=timestampBits>=64?UINT64_MAX:(uint64_t(1)<<timestampBits)-1;
   for(size_t i=0;i<infos.size();++i)delta[i]=uint64_t(double((ticks[i+1]-ticks[i])&mask)*timestampPeriod);
-  reportDraws(stderr,infos,delta);if(systemTranslationPolicy().occlude)occNoteDrawTimes(infos,delta);
+  reportDraws(stderr,infos,delta);if(drawPipes.add(infos,delta))drawPipes.report(stderr);if(systemTranslationPolicy().occlude)occNoteDrawTimes(infos,delta);
  }
  void readPassTimes(VkQueryPool pool,const std::vector<PassInfo> &infos,uint64_t whole){
   if(!pool || infos.empty())return;std::vector<uint64_t> ticks(infos.size()+1),delta(infos.size());
@@ -1044,7 +1045,7 @@ public:
   try{p->renders.push_back({key,render});}catch(...){DestroyRenderPass(device,render,nullptr);throw;}return render;
  }
  Pipeline *createPipeline(Translation translated,const CompileOptions &options) {
-  auto &tr=Translator::get();auto *p=new Pipeline{};p->options=options;{static std::atomic<uint32_t> serial{0};p->id=++serial;auto st=spirvStats(translated.fragment,translated.fragmentCount);p->fragInstr=st.instr;p->fragSamples=st.samples;p->fragLoops=st.loops;p->fragKills=st.kills;}
+  auto &tr=Translator::get();auto *p=new Pipeline{};p->options=options;{static std::atomic<uint32_t> serial{0};p->id=++serial;auto st=spirvStats(translated.fragment,translated.fragmentCount);p->fragInstr=st.instr;p->fragSamples=st.samples;p->fragLoops=st.loops;p->fragKills=st.kills;p->fragHash=spirvHash(translated.fragment,translated.fragmentCount);}
   if(tr.shadow_windows){ShadowWindow windows[2][resourceSlots]{};if(tr.shadow_windows(translated.handle,&windows[0][0])==1)memcpy(p->shadowWindows,windows,sizeof(windows));}
   p->textureTypes.fill(2);if(tr.texture_type)for(unsigned slot=0;slot<resourceSlots;++slot)p->textureTypes[slot]=tr.texture_type(translated.handle,slot);
   auto cleanup=[&]{if(translated.handle)tr.free(translated.handle);};
@@ -1128,12 +1129,13 @@ public:
   auto cleanup=[&]{for(auto m:modules)if(m)DestroyShaderModule(device,m,nullptr);};
   try {
    const uint32_t *words[]={translated.vertex,translated.fragment};size_t counts[]={translated.vertexCount,translated.fragmentCount};
-   std::vector<uint32_t> relaxedFragment;
+   std::vector<uint32_t> relaxedFragment,unrolledFragment;UnrollStats unrollStats{};
    for(unsigned i=0;i<2;++i) {
     if(!words[i] || counts[i]<5 || counts[i]>1024*1024 || words[i][0]!=0x07230203)throw std::runtime_error("invalid translator SPIR-V");
     if(i==1 && systemTranslationPolicy().fragRelaxed){unsigned marked=0,quantized=0; // FUXI_MTL_FRAG_RELAXED: f16-quantized chains may run in half precision ALUs
      if(relaxQuantizedChains(words[i],counts[i],relaxedFragment,marked,quantized)){words[i]=relaxedFragment.data();counts[i]=relaxedFragment.size();++relaxedPipelines;relaxedMarks+=marked;}
      static std::atomic<unsigned> lines{0};if(lines.fetch_add(1)<20 || lines.load()%50==0)fprintf(stderr,"FUXI MTL: frag relaxed pipe=%06x quantize_sites=%u marked=%u words=%zu->%zu pipelines=%llu total_marked=%llu\n",p->id,quantized,marked,size_t(translated.fragmentCount),counts[i],(unsigned long long)relaxedPipelines,(unsigned long long)relaxedMarks);}
+    if(i==1 && systemTranslationPolicy().spirvUnroll && unrollRolledLoops(words[i],counts[i],unrolledFragment,unrollStats,systemTranslationPolicy().spirvUnroll)){words[i]=unrolledFragment.data();counts[i]=unrolledFragment.size();} // FUXI_MTL_SPIRV_UNROLL
     VkShaderModuleCreateInfo mi{};mi.sType=VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;mi.codeSize=counts[i]*4;mi.pCode=words[i];check(CreateShaderModule(device,&mi,nullptr,&modules[i]));
    }
    if(translated.specCount>32 || translated.specSize>256)throw std::runtime_error("specialization bounds");
@@ -1189,6 +1191,8 @@ public:
       int(!!(stageFeedback[0].flags&VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT)),int(!!(stageFeedback[1].flags&VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT)),cacheBytes,unsigned(gi.flags));}
    }
    if(rc==VK_SUCCESS && systemTranslationPolicy().frameTrace)++frameCounts.pipelines;
+   if(systemTranslationPolicy().spirvUnroll && topology==Topology::Triangle && !nofetch && (unrollStats.flipped || unrollStats.keptSampling)){p->unrolled=unrollStats.flipped+unrollStats.nested;unrolledPipelines+=unrollStats.flipped?1:0;unrolledLoops+=unrollStats.flipped+unrollStats.nested;
+    static std::atomic<unsigned> lines{0};if(lines.fetch_add(1)<200 || lines.load()%50==0)fprintf(stderr,"FUXI MTL: spirv unroll pipe=%06x fh=%08x mode=%u loops=%u dont_unroll=%u flipped=%u nested=%u kept_sampling=%u create_ms=%.2f rc=%d pipelines=%llu loops_total=%llu\n",p->id,p->fragHash,systemTranslationPolicy().spirvUnroll,unrollStats.loops,unrollStats.dontUnroll,unrollStats.flipped,unrollStats.nested,unrollStats.keptSampling,std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-createStart).count(),int(rc),(unsigned long long)unrolledPipelines.load(),(unsigned long long)unrolledLoops.load());}
    if(rc!=VK_SUCCESS){if(result)DestroyPipeline(device,result,nullptr);check(rc);}
    if(systemTranslationPolicy().pipeStats && topology==Topology::Triangle)logPipelineStats(p,translated,result);
    if(cacheMode==CacheMode::persistent){
@@ -1202,8 +1206,8 @@ public:
  // exposes VK_KHR_pipeline_executable_properties, the post-optimization statistics (ir3 instruction counts, registers, spills).
  void logPipelineStats(Pipeline *p,const Translation &t,VkPipeline pipeline) {
   auto st=spirvStats(t.fragment,t.fragmentCount);auto vs=spirvStats(t.vertex,t.vertexCount);
-  fprintf(stderr,"FUXI MTL: pipeline stats pipe=%06x frag=%s vert=%s frag_words=%u frag_instr=%u samples=%u fetches=%u loops=%u kills=%u spec_consts=%u switches=%u cond_br=%u selections=%u calls=%u phis=%u converts=%u f16_types=%u f32_types=%u relaxed=%u access_chains=%u quantize_f16=%u loops_dontunroll=%u loops_none=%u vert_instr=%u vk_specs=%u fn_constants=%u/%u\n",
-   p->id,t.fragmentEntry?t.fragmentEntry:"?",t.vertexEntry?t.vertexEntry:"?",st.words,st.instr,st.samples,st.fetches,st.loops,st.kills,st.specConsts,st.switches,st.condBranches,st.selections,st.calls,st.phis,st.converts,st.f16Types,st.f32Types,st.relaxed,st.accessChains,st.quantize,st.loopsDontUnroll,st.loopsNone,vs.instr,t.specCount,p->options.constantCount[0],p->options.constantCount[1]);
+  fprintf(stderr,"FUXI MTL: pipeline stats pipe=%06x frag=%s vert=%s frag_words=%u frag_instr=%u samples=%u fetches=%u loops=%u kills=%u spec_consts=%u switches=%u cond_br=%u selections=%u calls=%u phis=%u converts=%u f16_types=%u f32_types=%u relaxed=%u access_chains=%u quantize_f16=%u loops_dontunroll=%u loops_none=%u vert_instr=%u vk_specs=%u fn_constants=%u/%u fh=%08x\n",
+   p->id,t.fragmentEntry?t.fragmentEntry:"?",t.vertexEntry?t.vertexEntry:"?",st.words,st.instr,st.samples,st.fetches,st.loops,st.kills,st.specConsts,st.switches,st.condBranches,st.selections,st.calls,st.phis,st.converts,st.f16Types,st.f32Types,st.relaxed,st.accessChains,st.quantize,st.loopsDontUnroll,st.loopsNone,vs.instr,t.specCount,p->options.constantCount[0],p->options.constantCount[1],p->fragHash);
   if(st.instr>=5000 && t.fragment){auto loops=spirvLoopReport(t.fragment,t.fragmentCount);unsigned bounds[5]{},sampleLoops=0,maxDepth=0;const char *names[]={"const","uniform","texel","local","unknown"};
    for(auto &l:loops){for(unsigned k=0;k<5;++k)if(l.bound==names[k])++bounds[k];if(l.samples)++sampleLoops;if(l.depth>maxDepth)maxDepth=l.depth;}
    fprintf(stderr,"FUXI MTL: pipeline loops pipe=%06x n=%zu const=%u uniform=%u texel=%u local=%u unknown=%u loops_with_samples=%u max_depth=%u\n",p->id,loops.size(),bounds[0],bounds[1],bounds[2],bounds[3],bounds[4],sampleLoops,maxDepth);
@@ -1676,7 +1680,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
  bool evictIdleSampleShadow(uint64_t idle) {auto best=sampleShadows.end();for(auto i=sampleShadows.begin();i!=sampleShadows.end();++i)if(i->second.t->references==1 && submits-i->second.used>=idle && (best==sampleShadows.end() || i->second.used<best->second.used))best=i;if(best==sampleShadows.end())return false;auto *t=best->second.t;sampleShadows.erase(best);destroyTextureUnlocked(t);++sampleShadowEvicted;return true;}
  void expireSampleShadows(uint64_t idle) {if(sampleShadows.empty())return;for(;;){bool any=false;for(auto &e:sampleShadows)if(e.second.t->references==1 && submits-e.second.used>=idle*5){any=true;break;}if(!any || !evictIdleSampleShadow(idle*5))return;}}
  void releaseSampleShadows() {auto all=std::move(sampleShadows);sampleShadows.clear();for(auto &e:all)destroyTextureUnlocked(e.second.t);}
- std::atomic<uint64_t> sampleShadowReused{0},sampleShadowCapped{0},sampleShadowEvicted{0},sampleShadowCreated{0},sampleShadowRefused{0},sampleShadowBytes{0},sampleHits{0},sampleCopies{0},sampleInvalidations{0},sampleHashedBytes{0},sampleCopiedBytes{0},sampleHashNs{0};unsigned hoistLogged=0;std::atomic<uint64_t> relaxedPipelines{0},relaxedMarks{0};
+ std::atomic<uint64_t> sampleShadowReused{0},sampleShadowCapped{0},sampleShadowEvicted{0},sampleShadowCreated{0},sampleShadowRefused{0},sampleShadowBytes{0},sampleHits{0},sampleCopies{0},sampleInvalidations{0},sampleHashedBytes{0},sampleCopiedBytes{0},sampleHashNs{0};unsigned hoistLogged=0;std::atomic<uint64_t> relaxedPipelines{0},relaxedMarks{0},unrolledPipelines{0},unrolledLoops{0};
  void hoistOffscreen(std::vector<Operation> &ops) {
   std::vector<PassGroup> groups;if(!buildGroups(ops,groups,true))return;
   std::vector<size_t> order;order.reserve(groups.size());unsigned moved=0,offs=0;std::map<std::string,unsigned> reasons;std::map<std::string,std::string> examples;
@@ -2426,7 +2430,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
       if(set!=boundSet || op.pipeline->layout!=boundLayout){CmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,op.pipeline->layout,0,1,&set,0,nullptr);boundSet=set;boundLayout=op.pipeline->layout;}
      }
      DrawInfo di{};di.scW=op.scissor.extent.width;di.scH=op.scissor.extent.height;di.scX=op.scissor.offset.x;di.scY=op.scissor.offset.y;
-     if(currentFrame || drawQ){const auto &po=op.pipeline->options;di.pipeline=op.pipeline->id;di.count=draw.count;di.blend=po.blend;di.srcRGB=po.srcRGB;di.dstRGB=po.dstRGB;di.srcAlpha=po.srcAlpha;di.dstAlpha=po.dstAlpha;di.mask=po.mask;di.instr=op.pipeline->fragInstr;di.samples=op.pipeline->fragSamples;di.loops=op.pipeline->fragLoops;di.kills=op.pipeline->fragKills;
+     if(currentFrame || drawQ){const auto &po=op.pipeline->options;di.pipeline=op.pipeline->id;di.count=draw.count;di.blend=po.blend;di.srcRGB=po.srcRGB;di.dstRGB=po.dstRGB;di.srcAlpha=po.srcAlpha;di.dstAlpha=po.dstAlpha;di.mask=po.mask;di.instr=op.pipeline->fragInstr;di.samples=op.pipeline->fragSamples;di.loops=op.pipeline->fragLoops;di.kills=op.pipeline->fragKills;di.fragHash=op.pipeline->fragHash;di.unroll=op.pipeline->unrolled;
       for(unsigned i=0;i<draw.descriptorCount;++i){const auto &d=draw.descriptors[i];if(d.source || (d.type!=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && d.type!=VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) || d.slot>=resourceSlots)continue;
        auto *t=d.slot==0 && !op.samples[0]?op.sourceTexture:op.samples[d.slot];if(!t)continue;uint8_t kind=t->tiling==VK_IMAGE_TILING_LINEAR?1:t->shadow?2:0;uint64_t bytes=uint64_t(t->width)*t->height*texelBytes(t->format);
        if(currentFrame){if(kind==1){++currentFrame->sampleLinear;currentFrame->sampleLinearBytes+=bytes;}else if(kind==2){++currentFrame->sampleShadow;currentFrame->sampleShadowBytes+=bytes;}else{++currentFrame->sampleOptimal;currentFrame->sampleOptimalBytes+=bytes;}}

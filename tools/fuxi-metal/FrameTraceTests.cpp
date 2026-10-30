@@ -96,6 +96,19 @@ int main(){
   char buffer[4096]{};FILE *o=fmemopen(buffer,sizeof buffer,"w");reportDraws(o,infos,ns);fclose(o);
   assert(strstr(buffer,"passes=2 top_pass=1 1125x2436 draws=7") && strstr(buffer,"top1 ms=0.160 pipe=000106") && strstr(buffer,"top5 ms=0.120") && !strstr(buffer,"top6 "));
   assert(strstr(buffer,"[1125x2436 fmt=80 linear]") && strstr(buffer,"frag_instr=12") && !strstr(buffer,"pipe=000001"));
+  assert(strstr(buffer,"tex=1 fh=00000000 unroll=0 [1125x2436"));
+  { // per-pipe GPU draw time over all passes, all and heavy windows, reset after the report
+   DrawPipeTimes dp;std::vector<DrawInfo> in;std::vector<uint64_t> t;
+   auto mk=[&](uint32_t pipe,uint32_t fh,uint64_t ns,uint32_t w,uint32_t h){DrawInfo d{};d.pipeline=pipe;d.fragHash=fh;d.unroll=pipe==7?2:0;d.instr=100;d.scW=w;d.scH=h;in.push_back(d);t.push_back(ns);};
+   DrawInfo m{};m.begin=true;in.push_back(m);t.push_back(999999999);mk(7,0xabcdef01,3000000,1000,1000);mk(9,0x22,1000000,500,500);in.push_back(m);t.push_back(5);mk(7,0xabcdef01,1000000,1000,1000);
+   assert(!dp.add(in,t,2));in.resize(3);t.resize(3);t[1]=1000000;t[2]=500000; // a light sample: 1.5 ms of draws
+   assert(dp.add(in,t,2));
+   char b[4096]{};FILE *o=fmemopen(b,sizeof b,"w");dp.report(o);fclose(o);
+   assert(strstr(b,"gpu draw pipes window=all samples=2 draw_ms/sample=3.250 pipes=2 | pipe=000007 fh=abcdef01 unroll=2 instr=100 n/sample=1.50 ms/sample=2.500 share_pct=76.9 ns_per_kpx=1666.7 | pipe=000009 fh=00000022 unroll=0 instr=100 n/sample=1.00 ms/sample=0.750"));
+   assert(strstr(b,"gpu draw pipes window=heavy samples=1 draw_ms/sample=5.000 pipes=2 | pipe=000007 fh=abcdef01 unroll=2 instr=100 n/sample=2.00 ms/sample=4.000 share_pct=80.0 ns_per_kpx=2000.0"));
+   char b2[64]{};o=fmemopen(b2,sizeof b2,"w");dp.report(o);fclose(o);assert(!b2[0]);
+   uint32_t a[2]={1,2},c[2]={1,3};assert(spirvHash(a,2)!=spirvHash(c,2) && spirvHash(a,2)==spirvHash(a,2) && spirvHash(nullptr,0)==2166136261u);
+  }
   uint32_t code[18]={0x07230203,0x10000,0,10,0};code[5]=(4u<<16)|21;code[9]=(5u<<16)|87;code[14]=(3u<<16)|246;code[17]=(1u<<16)|252;
   auto st=spirvStats(code,sizeof code/4);assert(st.instr==4 && st.samples==1 && st.loops==1 && st.kills==1);
   {std::vector<DrawInfo> in;std::vector<uint64_t> t;
