@@ -107,7 +107,7 @@ public:
  bool destroy(Texture *t) {if(t){limits.release(t->charged);delete t;}return !poisoned;}
  void destroy(Pipeline *p) {if(p && !--p->references)delete p;}
  bool requiresSampling(const Pipeline *p) const {return p->sampled;}
- void submit(const std::vector<Operation>& ops,const std::function<void()> &scheduled={},std::function<void()> *retirement=nullptr,const std::function<void()> &prepare={},const std::vector<PrepareWrite> * =nullptr) {
+ void submit(const std::vector<Operation>& ops,const std::function<void()> &scheduled={},std::function<void()> *retirement=nullptr,const std::function<void()> &prepare={},const std::vector<PrepareWrite> * =nullptr,const std::function<void()> & ={}) {
   if(retirement && beforeSubmit)beforeSubmit();
   if(prepare)prepare();
   if(retirement){auto copy=ops;submit(copy,scheduled);*retirement=[this]{requireLive();};return;}
