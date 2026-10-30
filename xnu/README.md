@@ -54,10 +54,12 @@ The workflow therefore has opt-in inputs; defaults keep the existing path:
 
 | Input | Default | Meaning |
 | --- | --- | --- |
-| `runner` | `macos-14` | `macos-14`, `macos-15` or `macos-26` |
-| `xcode` | `15.4` | `DEVELOPER_DIR=/Applications/Xcode_<xcode>.app`; a missing Xcode fails the job before building |
-| `iig_mode` | `xcode` | `xcode`: run Xcode 15 iig (fails on any other Xcode). `capture`: the same, then archive the iig outputs. `replay`: never run iig; install pregenerated outputs (any Xcode) |
-| `iig_run` | empty | replay source: a capture run's ID (`fuxi-iig-pregen-*` artifacts, kept 90 days); empty means a committed `xnu/iig-pregen/` |
+| `runner` | `macos-15` | `macos-14`, `macos-15` or `macos-26` |
+| `xcode` | `16.2` | `DEVELOPER_DIR=/Applications/Xcode_<xcode>.app`; a missing Xcode fails the job before building |
+| `iig_mode` | `replay` | `xcode`: run Xcode 15 iig (fails on any other Xcode). `capture`: the same, then archive the iig outputs. `replay`: never run iig; install pregenerated outputs (any Xcode) |
+| `iig_run` | `41098982212` | replay source: a capture run's ID (`fuxi-iig-pregen-*` artifacts, kept 90 days); empty means a committed `xnu/iig-pregen/` |
+
+Defaults since 2026-10-31: macos-15 + Xcode 16.2 + replay of capture run 41098982212 (macos-14/15.4 at 2ae1d27). A kernel built this way (run 41102135821) booted on the device with the same behaviour as the macos-14 builds. macOS 14 brownouts already cancel macos-14 jobs. The capture artifacts expire about 2027-01-29: capture again before then, or commit `xnu/iig-pregen/`. A capture needs a runner that still has Xcode 15.
 
 `capture`/`replay` add `iig-pregen/` (17 header/implementation pairs plus
 `manifest.json` with SHA-256 of each `.iig` input and output) to the kernel
