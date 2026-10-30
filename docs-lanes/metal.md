@@ -2816,6 +2816,7 @@ no per-range alias classes, so the port is the same idea in our shape:
   `stale ...` (the expected result on a non-snooping path), then `cleaned`/`skipped` deltas in the presents line.
 - `fuxigpuncimport` is a bitmask now: 1 NC-import (unchanged), 64 coherency self-test, 128 ranged TLBI. Values 2..32 are
   deliberately unused so concurrent lanes can claim them; other values of those bits were not meaningful before.
+  (Since claimed: 2 fenced WPTR, 4 stall recovery, 8/16/32 frame log, copy priority, superseded skip; see gpu-scanout.md.)
 - Tests: `tools/test-fuxi-metal.py` (overlap mirror, TLBIVAL values/limit/fallback/fault, self-test pass/stale/partial/hang/
   fault/busy/occupied, bitmask parse), `tools/test-fuxi-hostimport.py` (segment lookups, per-page predicate in a long run).
 - New log field: the self-test line above. Owned BO maps still need one pmap lookup per 16K page (scattered BOs); a contiguous

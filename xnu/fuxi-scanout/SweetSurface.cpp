@@ -359,7 +359,7 @@ static bool sweet_gpu_writer(SweetSurface *s, bool lock, bool pending = false)
   while (!pending && (sweet_gpu_submitting == s || sweet_gpu_inflight == s || sweet_surface_present_reading(s)))
    IOLockSleep(sweet_writer_lock, &sweet_gpu_inflight, THREAD_UNINT);
   if (s->gpuWriters == ~0u) { s->gpuQuarantined = true; sweet_surface_display_poison(s); }
-  if (!s->gpuQuarantined) s->gpuWriters++;
+  if (!s->gpuQuarantined) { s->gpuWriters++; fuxi_gpu_present_writer(s->id, !pending); } /* bit 16: lock-free, no GPU lock */
  } else if (s->gpuWriters && !--s->gpuWriters && !s->gpuQuarantined) {
   s->gpuReadyTime = mach_absolute_time();
   if (sweet_present_wake) sweet_present_wake(sweet_present_context);

@@ -1378,3 +1378,83 @@ cheap alternative plus the survey. It needs `fuxigpuscanout=1`:
   exercise the present table's mapping.
 
 Not yet observed.
+
+## Inline-mode present ordering: frame log, copy priority, superseded skip (fuxigpuncimport 8/16/32)
+
+Inferred from the O220 log (inline mode, `fuxigpuncimport=2948672`): the panel
+runs at about 84 Hz and the client swaps about 1.75 times per shown frame.
+Copies complete in pairs within one TE, and START gaps are 62% one TE, 33% two
+and 5% three or more. In inline mode a present copy is queued only after its
+frame's writer lease ends in userland (writer retire, then `presentNext`). By
+then the next frame's client job is usually in the ring already, so copy N
+runs behind job N+1. The bit-4096 hold does not apply in inline mode. Three
+unused bits of the same boot argument (formerly reserved, see metal.md) add
+opt-in tools. With all three set, `2948672` becomes `2948728`. That value has
+the same number of digits, so the command line does not grow. Each bit is
+independent, and with none set the behavior is unchanged.
+
+- **8, frame log** (`SweetFramebuffer`). After 3000 warmup swaps it records
+  128 consecutive swaps, prints them once, then stops. Each line has the swap
+  id, the first surface, and these times: swap (us from frame 0), then ready
+  (writer retire), copy submit, copy fence and START (us after that swap).
+  It also has the GPU stamps of that copy: submit-to-copy-start from the
+  always-on counter at fence page +192 (taken after the copy's WFI, so it
+  includes every job ahead in the ring), and the blit time. Then come the
+  client jobs in flight when the copy was queued (`fg_abi_seq -
+  fg_abi_completed`), the target buffer, the TE count at publish, the last
+  transfer-done time, and the fate (`S` shown, `D` dropped, `P` replaced
+  while waiting for START, `-` open). The summary line counts
+  `copies_behind_client_job`, `submit_to_start_over_3ms`,
+  `fence_pairs_within_half_period` and `start_te_gaps 1/2/3+`, which confirm
+  or refute the pairing directly.
+- **16, copy priority** (needs inline, 512|2097152; `fg_abi_copy_first`).
+  `SweetFramebuffer` publishes the surfaces of queued swaps whose copy is not
+  queued yet (`fuxi_gpu_present_due`, under its lock). `sweet_gpu_writer`
+  records `fg_abi_seq` at each active writer lock (`fuxi_gpu_present_writer`).
+  A pending AvoidSync reservation records "unknown" and never holds. A client
+  submit is refused (existing refuse/retry/wake path, wait kind 0) while a due
+  surface's recorded sequence differs from `fg_abi_seq`, meaning a submit
+  followed that lock and the writer job is in the ring. The hold is released
+  with a wake as soon as that surface leaves the due set (its copy is queued
+  or the swap is dropped). It is bounded to one panel period
+  (`fg_scanout_period_us`, or 16.7 ms when unknown) per due generation. Each
+  swap that adds a surface opens a new generation, and an expired generation
+  never holds again.
+- **32, skip superseded** (`SweetFramebuffer::presentNext`). When a newer
+  queued swap is already ready (no writer, not quarantined, epoch unchanged,
+  a racy probe that `sweet_surface_present_begin` re-checks), the older ready
+  swaps are dropped before their copy (about 0.56 ms of GPU each). Counted in
+  `SWEET FB: superseded_skips=` every 600 frames and in the frame-log summary.
+
+Why option A (hold client submits) and not option B (append the copy right
+after frame N's job): the kernel has no link between an ABI submit and an
+IOSurface. Option B would mean copying a surface whose writer lease is still
+active, which breaks the writer/reader invariant that keeps DSI from reading a
+half-written frame. Option A only delays client submits through the existing
+path. The copy path, the triple-buffer target choice (`fg_scanout_target`,
+never the front or the ready buffer), the single `fg_busy`/`fg_magic` fence
+and the ring are untouched.
+
+Log lines: `SWEET FB: frame_log= copy_first= skip_superseded= (fuxigpuncimport
+8/16/32)` at start; `SWEET FB: flog begin ...`, 128 `SWEET FB: flog N ...`,
+`SWEET FB: flog end shown= dropped= replaced_waiting_start= copied=
+copied_not_shown= copies_behind_client_job= submit_to_start_over_3ms=
+fence_pairs_within_half_period= start_te_gaps 1/2/3+= superseded_skips=`;
+`FUXI GPU: copy_first refused= episodes= released= expired= due_publishes=
+no_writer= bound_us=` next to the 600-inline-copies line.
+
+Risks:
+
+- If the thread that ends the writer lease is the one blocked in submit, the
+  hold lasts until its bound (`expired` counts this).
+- Frames with several submits, or unrelated clients submitting between the
+  lock and the frame's job, can be held. This is bounded and visible as
+  `refused`.
+- The GPU may idle between job N's end and copy N's submit. That is the
+  intended trade.
+- A stale due entry lasts until the next framebuffer publish.
+
+Tests: `tools/test-fuxi-metal.py` (copy priority),
+`tools/test-fuxi-unixnu.py` (frame log, due set, superseded skip),
+`tools/test-fuxi-adreno.py` (copy stamps),
+`tools/test-fuxi-gpu-scanout.py` (writer record). Not yet observed.

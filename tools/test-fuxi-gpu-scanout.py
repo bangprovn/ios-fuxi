@@ -1174,6 +1174,7 @@ int main(void) {
         stubs = '''
 #include <cstdarg>
 #define FUXI 1
+static uint32_t cfWriterId; static int cfWriterActive=-1; static void fuxi_gpu_present_writer(uint32_t id,int active) {cfWriterId=id;cfWriterActive=active;}
 #define kIOSurfaceLockReadOnly 1
 #define kIOReturnNotFound 3
 #define kIOReturnNotReady 4
@@ -1243,7 +1244,7 @@ static int IOLog(const char *format,...) {va_list args;va_start(args,format);vsn
  assert(sweet_gpu_writer(&pendingSurface,false) && releaseWakes==wakes);
  assert(sweet_gpu_writer(&pendingSurface,false) && releaseWakes==wakes+1);
  assert(sweet_gpu_writer(&pendingSurface,false) && releaseWakes==wakes+1); // unmatched unlock
- assert(sweet_gpu_writer(&pendingSurface,true,true));pendingSurface.gpuQuarantined=true;
+ pendingSurface.id=77;assert(sweet_gpu_writer(&pendingSurface,true,true) && cfWriterId==77 && cfWriterActive==0);pendingSurface.gpuQuarantined=true;
  assert(!sweet_gpu_writer(&pendingSurface,false) && releaseWakes==wakes+1);
  pendingSurface.gpuQuarantined=false;sweet_surface_present_notify(nullptr,nullptr);
  assert(sweet_gpu_writer(&pendingSurface,true) && sweet_gpu_writer(&pendingSurface,false) && releaseWakes==wakes+1);
@@ -1309,7 +1310,7 @@ static int IOLog(const char *format,...) {va_list args;va_start(args,format);vsn
 '''
         model = cache.MODEL.replace(' IOLockFree(sweet_gpu_lock);', extra + ' IOLockFree(sweet_gpu_lock);')
         model = model.replace('assert(sweet_surface_gpu_poll(&elapsed)==1);IOLockLock(p);', 'if(sweet_present_count)sweet_surface_present_end();else assert(sweet_surface_gpu_poll(&elapsed)==1);IOLockLock(p);')
-        compile_run(tmp, 'cache', cache.PREFIX.replace('uint64_t gpuReadyTime=0;', 'uint64_t gpuReadyTime=0,gpuWriterSerial=0,gpuWriterEpoch=0,gpuCleanSerial=0,gpuCleanEpoch=0;bool gpuCleanValid=false;') + stubs + declarations + funcs + model, cpp=True)
+        compile_run(tmp, 'cache', cache.PREFIX.replace('uint64_t gpuReadyTime=0;', 'uint32_t id=0;uint64_t gpuReadyTime=0,gpuWriterSerial=0,gpuWriterEpoch=0,gpuCleanSerial=0,gpuCleanEpoch=0;bool gpuCleanValid=false;') + stubs + declarations + funcs + model, cpp=True)
         source = (ROOT / 'xnu/fuxi-unixnu/SweetFramebuffer.cpp').read_text()
         declaration = source[source.index('class AppleCLCD :'):source.index('OSDefineMetaClassAndStructors(AppleCLCD')]
         declaration = declaration.replace(': public IOMobileFramebuffer', '').replace('OSDeclareDefaultStructors(AppleCLCD);', 'public:')

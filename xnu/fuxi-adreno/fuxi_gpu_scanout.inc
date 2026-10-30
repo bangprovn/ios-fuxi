@@ -31,6 +31,7 @@
 #define FG_SCAN_DSI 0x0ae94000u
 #define FG_SCAN_DSI_TIMEOUT_US 20000u
 static struct fg_present_times fg_scanout_stamps;
+static struct fg_copy_stamps fg_copy_log; /* fuxi_gpu_copy_stamps: frame log detail of the last copy and START */
 static unsigned fg_scanout_panel120_attempted, fg_scanout_panel120_active;
 static unsigned fg_scanout_period_us = 16667u, fg_scanout_explicit_drain;
 static unsigned fg_scanout_owned, fg_scanout_failed, fg_scanout_writable;
@@ -75,7 +76,7 @@ static void fg_scanout_xfer_sample(void)
  while (bin < 7 && us >= fg_scanout_xfer_edges[bin]) bin++;
  fg_scanout_xfer_hist[bin]++; fg_scanout_xfer_n++; fg_scanout_xfer_sum += us;
  if (us > fg_scanout_xfer_max) fg_scanout_xfer_max = us;
- fg_scanout_xfer_open = 0;
+ fg_scanout_xfer_open = 0; fg_copy_log.xfer_us = (uint32_t)us;
 }
 static unsigned fg_scanout_double_active, fg_scanout_double_initialized, fg_scanout_front;
 static unsigned fg_scanout_back_ready, fg_scanout_flips, fg_scanout_ready_drops, fg_scanout_retries;
@@ -131,6 +132,11 @@ void fuxi_gpu_scanout_stamps(struct fg_present_times *times)
 {
  FG_GUARD;
  *times = fg_scanout_stamps;
+}
+void fuxi_gpu_copy_stamps(struct fg_copy_stamps *stamps)
+{
+ FG_GUARD;
+ *stamps = fg_copy_log;
 }
 int fuxi_gpu_scanout_owned(void)
 {
@@ -1388,6 +1394,7 @@ static int fg_scanout_publish(void)
  if (fg_scanout_ready_at) { fg_scanout_r2s += now - fg_scanout_ready_at; fg_scanout_r2s_n++; }
  fg_scanout_ready_at = fg_scanout_charged_at = 0;
  fg_scanout_te_frames = fg_scanout_last_count = count >> 16;
+ fg_copy_log.te = count >> 16;
  if (++fg_scanout_starts % 600 == 0) {
   uint64_t span = now - fg_scanout_window_start;
   unsigned frames = (fg_scanout_te_frames - fg_scanout_te_window) & 0xffffu;

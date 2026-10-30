@@ -11,6 +11,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / 'xnu/fuxi-unixnu'
 PRESENT_TIMES = re.search(r'struct fg_present_times \{.*?\};',
+    (ROOT / 'xnu/fuxi-adreno/fuxi_adreno.h').read_text(), re.S)[0] + '\n' + re.search(r'struct fg_copy_stamps \{.*?\};',
     (ROOT / 'xnu/fuxi-adreno/fuxi_adreno.h').read_text(), re.S)[0]
 TE_OBSERVER = re.search(r'struct fg_te_observer \{.*?\};',
     (ROOT / 'xnu/fuxi-adreno/fuxi_adreno.h').read_text(), re.S)[0]
@@ -244,6 +245,8 @@ DISPLAY_PREFIX = r'''
 #define SWEET_FB_LAYERS 4
 #define SWEET_FB_QUEUE_DEPTH 3
 #define SWEET_FB_SWAP_HISTORY 64
+#define SWEET_FB_FLOG 128
+#define SWEET_FB_FLOG_WARMUP 3000
 #define SWEET_FB_NOTIFY_TYPES 8
 #define SWEET_FB_NOTIFY_VSYNC 5
 #define SWEET_FB_FORMAT_BGRA 0x42475241
@@ -304,6 +307,10 @@ static bool scanOwned=false,scanBackReady=false,scanDouble=false,scanTriple=fals
 static unsigned scanRetries,scanCpuAcquires;
 static fg_present_times scanTimes;
 static void fuxi_gpu_scanout_stamps(fg_present_times *t) {*t=scanTimes;}
+static fg_copy_stamps copyStamps;
+static void fuxi_gpu_copy_stamps(fg_copy_stamps *t) {*t=copyStamps;}
+static uint32_t dueIds[8];static unsigned dueN,duePublishes;
+static void fuxi_gpu_present_due(const uint32_t *ids,unsigned n) {assert(n<=8);memcpy(dueIds,ids,n*sizeof(*ids));dueN=n;duePublishes++;}
 static int scanCpuAcquire=1;
 static int fuxi_gpu_scanout_triple(void) {return scanTriple;}
 static int fuxi_gpu_scanout_double(void) {return scanDouble;}
@@ -323,8 +330,13 @@ static unsigned scanPublications;
 static int fuxi_gpu_scanout_acquire(void) {return scanAcquire;}
 static int fuxi_gpu_scanout_publish(void) {scanPublications++;if(scanPublish==1){scanTimes.previous_start=scanTimes.start;scanTimes.start=mach_absolute_time();}if(scanPublish==2)scanBackReady=true;return scanPublish;}
 static char importStatsLog[2048],teStatsLog[2048],frameStatsLog[2048],stageStatsLog[2048],pacingStatsLog[2048];
+static char flogEndLog[1024];static unsigned flogLines;
 static int IOLog(const char *format,...) {
  logs++;
+ if(!strncmp(format,"SWEET FB: flog %u",17))flogLines++;
+ if(strstr(format,"SWEET FB: flog end")) {
+  va_list args;va_start(args,format);vsnprintf(flogEndLog,sizeof(flogEndLog),format,args);va_end(args);
+ }
  if(strstr(format,"SWEET FB: pacing")) {
   va_list args;va_start(args,format);vsnprintf(pacingStatsLog,sizeof(pacingStatsLog),format,args);va_end(args);
  }
@@ -814,6 +826,51 @@ int main(void) {
  assert(tri.fScanoutHeld && !tri.fPublicationPending);
  scanDouble=scanTriple=scanOwned=scanBackReady=false;scanPublish=0;gpuMode=0;
  puts("PASS: triple same-step copy admission, source holds/mode0 at retire, newest-ready mode1 drop, failed-copy replay, saved publication stages, CPU and stop");
+ }
+ {
+ // fuxigpuncimport 8/16/32: frame log fates and summary, due-surface publication, superseded ready swap dropped before its copy.
+ OSArray logClients;AppleCLCD lf={};lf.fClients=&logClients;lf.fLock=&lock;lf.fScanout=true;lf.fConsolePaused=true;lf.fFlushTicks=1;
+ lf.fWidth=18;lf.fHeight=3;lf.fRowBytes=96;lf.fPixels=(uintptr_t)pixels;lf.fTickAbs=8333;
+ lf.fSwapID=3000;scanOwned=scanDouble=scanTriple=true;scanAcquire=1;scanPublish=1;scanRetryResult=0;gpuMode=2;pollMode=1;
+ unsigned baseRefs=refs;
+ uint8_t frame[SWEET_FB_SWAP_REC_SIZE];memcpy(frame,rec,sizeof(frame));
+ lf.fCopyFirst=true;lf.fFlogState=1;lf.fFlogSwaps=SWEET_FB_FLOG_WARMUP-2;
+ put32(frame,0x50,2001);assert(!lf.swap(frame) && lf.fFlogState==1 && !lf.fFlogN); // last warmup swap
+ assert(dueN==1 && dueIds[0]==surface.id);
+ lf.presentStep(true);assert(lf.fGpuPending && dueN==0); // copy queued: no longer due
+ lf.presentStep(true);assert(!lf.fGpuPending && lf.fSwapStatus[2001%SWEET_FB_SWAP_HISTORY].state==AppleCLCD::SwapShown);
+ copyStamps.s2s_us=6800;copyStamps.blit_us=560;copyStamps.ahead=1;copyStamps.buffer=2;
+ unsigned beforeLines=flogLines;
+ for(unsigned i=0;i<SWEET_FB_FLOG;i++) {
+  copyStamps.te=(uint32_t)(10+2*i);
+  put32(frame,0x50,2002+i);assert(!lf.swap(frame));
+  if(i==0)assert(lf.fFlogState==2 && lf.fFlogN==1 && lf.fFlog[0].id==2002 && lf.fFlog[0].surface==surface.id);
+  if(i==5) { scanPublish=2;lf.presentStep(true);lf.presentStep(true);assert(lf.fPublicationPending);scanPublish=1;continue; } // waits for START
+  lf.presentStep(true);assert(lf.fGpuPending);lf.presentStep(true); // the retire of 6 replaces 5, then 6 STARTs
+ }
+ assert(lf.fFlog[0].fate=='S' && lf.fFlog[0].submit && lf.fFlog[0].fence>=lf.fFlog[0].submit && lf.fFlog[0].start && lf.fFlog[0].ahead==1 && lf.fFlog[0].buf==2 && lf.fFlog[0].s2s==6800);
+ assert(lf.fFlog[5].fate=='P' && lf.fFlog[6].fate=='S' && lf.fFlogState==3 && flogLines==beforeLines+SWEET_FB_FLOG);
+ assert(strstr(flogEndLog,"shown=127 dropped=0 replaced_waiting_start=1 copied=128 copied_not_shown=1 copies_behind_client_job=128 submit_to_start_over_3ms=128"));
+ assert(strstr(flogEndLog,"start_te_gaps 1/2/3+=0/125/1"));
+ // Bit 32: two ready swaps behind a copy in flight; the older is dropped before its copy.
+ lf.fSkipSuperseded=true;
+ put32(frame,0x50,2200);assert(!lf.swap(frame));lf.presentStep(true);assert(lf.fGpuPending && dueN==0);
+ put32(frame,0x50,2201);assert(!lf.swap(frame));put32(frame,0x50,2202);assert(!lf.swap(frame));
+ assert(dueN==2 && lf.fPendingCount==2);
+ pollMode=0;lf.presentStep(true);assert(lf.fPendingCount==2 && lf.fGpuPending);
+ pollMode=1;unsigned copiesBefore=surfaceCopies;lf.presentStep(true); // 2200 retires and STARTs, then 2202 is copied, 2201 dropped
+ assert(surfaceCopies==copiesBefore+1 && lf.fSupersededSkips==1 && !lf.fPendingCount && lf.fGpuPending && dueN==0);
+ assert(lf.swapWait(2201,0x80000001u,0)==kIOReturnAborted && lf.swapWait(2202,0x80000001u,0)==kIOReturnBusy);
+ lf.presentStep(true);assert(lf.swapWait(2202,0x80000001u,0)==0);
+ // Not ready (writer active): no skip, both wait; once ready the newest goes.
+ put32(frame,0x50,2203);assert(!lf.swap(frame));lf.presentStep(true);assert(lf.fGpuPending);
+ put32(frame,0x50,2204);assert(!lf.swap(frame));put32(frame,0x50,2205);assert(!lf.swap(frame));
+ surface.gpuWriters=1;lf.presentStep(true);assert(!lf.fGpuPending && lf.fPendingCount==2 && lf.fSupersededSkips==1 && dueN==2);
+ surface.gpuWriters=0;lf.presentStep(true);assert(lf.fGpuPending && !lf.fPendingCount && lf.fSupersededSkips==2);
+ lf.presentStep(true);assert(lf.swapWait(2205,0x80000001u,0)==0 && lf.swapWait(2204,0x80000001u,0)==kIOReturnAborted);
+ IOLockLock(lf.fLock);lf.stopRecords();IOLockUnlock(lf.fLock);assert(refs==baseRefs && dueN==0);
+ scanDouble=scanTriple=scanOwned=scanBackReady=false;scanPublish=0;gpuMode=0;copyStamps={};
+ puts("PASS: frame log (bit 8): warmup, per-frame fates S/P, GPU detail, one-shot summary and TE gaps; due surfaces (bit 16) follow the queue and the copy; superseded ready swap dropped before its copy (bit 32), not while a writer holds it");
  }
  {
  // Exact production stage aggregation, mach-to-us conversion, 600-frame cadence and reset.

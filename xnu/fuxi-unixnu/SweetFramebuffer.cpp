@@ -97,6 +97,8 @@ enum {
 #define SWEET_FB_LAYERS                 4
 #define SWEET_FB_QUEUE_DEPTH            3
 #define SWEET_FB_SWAP_HISTORY           64
+#define SWEET_FB_FLOG                   128     /* fuxigpuncimport bit 8: frames in the one-shot present event log */
+#define SWEET_FB_FLOG_WARMUP            3000    /* swaps before it starts */
 #define SWEET_FB_NOTIFY_TYPES           8
 #define SWEET_FB_NOTIFY_VSYNC           5
 #define SWEET_FB_VSYNC_US               16667
@@ -185,8 +187,69 @@ public:
  bool          fSwapHist;      /* disp0 fuxi,swap-hist=1: SwapEnd intervals in vsync periods */
  uint64_t      fSwapLast, fSwapIdle;
  uint32_t      fSwapBins[7];   /* 0..4, 5+ (<100 ms), idle */
+ /* fuxigpuncimport bit 8: one present event log of SWEET_FB_FLOG consecutive swaps after the warmup (state 0 off, 1 warmup, 2 recording,
+  * 3 printed); bit 16: the surfaces of swaps whose copy is not queued yet go to the kernel copy priority; bit 32: a ready swap with a
+  * newer ready swap behind it is dropped before its copy (the newer one is copied instead). */
+ struct FlogEntry { uint64_t swap, ready, submit, fence, start; uint32_t id, surface, s2s, blit, ahead, buf, te, xfer; char fate; };
+ FlogEntry     fFlog[SWEET_FB_FLOG];
+ unsigned      fFlogState, fFlogN, fFlogSwaps;
+ uint32_t      fFlogGpuID, fSupersededSkips;
+ bool          fCopyFirst, fSkipSuperseded;
+ FlogEntry *flogFind(uint32_t id) { if (fFlogState != 2 || !id) return NULL; for (unsigned i = fFlogN; i--;) if (fFlog[i].id == id) return &fFlog[i]; return NULL; }
+ void flogFate(uint32_t id, char fate) { FlogEntry *e = flogFind(id); if (e && !e->fate) e->fate = fate; }
+ static uint32_t firstSurface(const SwapRecord &r) { for (unsigned i = 0; i < SWEET_FB_LAYERS; i++) if (r.surfaces[i]) return r.surfaces[i]->id; return 0; }
+ void flogSwap(const SwapRecord &r, uint32_t id) {
+  if (fFlogState == 1 && ++fFlogSwaps >= SWEET_FB_FLOG_WARMUP) fFlogState = 2;
+  if (fFlogState != 2 || fFlogN >= SWEET_FB_FLOG) return;
+  FlogEntry &e = fFlog[fFlogN++]; bzero(&e, sizeof(e)); e.id = id; e.swap = r.swapped; e.surface = firstSurface(r);
+ }
+ /* Ready to read without the reader slot (racy probe; present_begin re-checks under the writer lock). */
+ static bool recordReady(const SwapRecord &r) {
+  if (r.stale) return false;
+  for (unsigned i = 0; i < SWEET_FB_LAYERS; i++) if (r.surfaces[i] && (r.surfaces[i]->gpuWriters || r.surfaces[i]->gpuQuarantined || r.surfaces[i]->gpuWriterEpoch != r.epochs[i])) return false;
+  return true;
+ }
+ void publishDueLocked(void) {
+  if (!fCopyFirst) return;
+  uint32_t ids[SWEET_FB_QUEUE_DEPTH+1], id; unsigned n = 0;
+  if (fPresentRecord && !fGpuPending && (id = firstSurface(*fPresentRecord))) ids[n++] = id;
+  for (unsigned i = 0; i < fPendingCount && n < SWEET_FB_QUEUE_DEPTH+1; i++) if ((id = firstSurface(fPending[i]))) ids[n++] = id;
+  fuxi_gpu_present_due(ids, n);
+ }
+ static long long flogUs(uint64_t t, uint64_t base) { uint64_t ns; if (!t || t < base) return -1; absolutetime_to_nanoseconds(t-base, &ns); return (long long)(ns/1000); }
+ /* Once, after the last entry has a fate (or 2 s after its swap): one line per frame, then a summary. */
+ void flogPrint(uint64_t now) {
+  if (fFlogState != 2 || fFlogN < SWEET_FB_FLOG) return;
+  bool open = false; for (unsigned i = 0; i < fFlogN; i++) if (!fFlog[i].fate) open = true;
+  if (open && flogUs(now, fFlog[fFlogN-1].swap) < 2000000) return;
+  fFlogState = 3;
+  uint64_t period = fTeValid ? fTe.period : fTickAbs, base = fFlog[0].swap; long long pus = flogUs(base+period, base);
+  IOLog("SWEET FB: flog begin frames=%u warmup_swaps=%u period_us=%lld fields: n id surface swap_us(from frame 0) then us after this swap: ready copy_submit fence start, "
+      "gpu submit_to_copy_start blit, client_jobs_ahead buffer te_count prev_xfer_done_us fate(S shown, D dropped, P replaced while waiting START, - open); -1 none\n",
+      fFlogN, SWEET_FB_FLOG_WARMUP, pus);
+  unsigned shown = 0, dropped = 0, replaced = 0, copied = 0, copiedDropped = 0, behind = 0, pairs = 0, longS2s = 0, gaps[3] = {0, 0, 0}, lastTe = 0; bool haveTe = false;
+  for (unsigned i = 0; i < fFlogN; i++) {
+   FlogEntry &e = fFlog[i]; char fate = e.fate ? e.fate : '-';
+   IOLog("SWEET FB: flog %u %u %u %lld %lld %lld %lld %lld %d %d %u %u %u %u %c\n", i, e.id, e.surface, flogUs(e.swap, base), flogUs(e.ready, e.swap), flogUs(e.submit, e.swap),
+       flogUs(e.fence, e.swap), flogUs(e.start, e.swap), e.submit ? (int)e.s2s : -1, e.submit ? (int)e.blit : -1, e.ahead, e.buf, e.te, e.xfer, fate);
+   shown += fate == 'S'; dropped += fate == 'D'; replaced += fate == 'P';
+   if (e.submit) { copied++; copiedDropped += fate != 'S'; behind += e.ahead != 0; longS2s += e.s2s != UINT32_MAX && e.s2s > 3000; }
+   if (i && e.fence && fFlog[i-1].fence && e.fence > fFlog[i-1].fence && e.fence-fFlog[i-1].fence < period/2) pairs++; /* two copies done within half a period */
+   if (fate == 'S') { if (haveTe) { unsigned d = (e.te-lastTe) & 0xffffu; if (d) gaps[d >= 3 ? 2 : d-1]++; } lastTe = e.te; haveTe = true; }
+  }
+  IOLog("SWEET FB: flog end shown=%u dropped=%u replaced_waiting_start=%u copied=%u copied_not_shown=%u copies_behind_client_job=%u submit_to_start_over_3ms=%u"
+      " fence_pairs_within_half_period=%u start_te_gaps 1/2/3+=%u/%u/%u superseded_skips=%u\n",
+      shown, dropped, replaced, copied, copiedDropped, behind, longS2s, pairs, gaps[0], gaps[1], gaps[2], fSupersededSkips);
+ }
  bool teVsyncTick(uint64_t &now, bool fallback);
  void teVsyncLog(uint64_t now);
+#else
+ static const bool fSkipSuperseded = false;
+ uint32_t      fSupersededSkips;
+ static bool recordReady(const SwapRecord &) { return false; }
+ void flogFate(uint32_t, char) {}
+ void flogSwap(const SwapRecord &, uint32_t) {}
+ void publishDueLocked(void) {}
 #endif
  void scanoutLog(bool gpu, uint64_t bytes, uint64_t copy, uint64_t prepare);
  bool          fGpuPending, fPublicationPending;
@@ -534,6 +597,10 @@ AppleCLCD::start(IOService *provider)
   IOLog("FUXI SCANOUT: unavailable, requires sweetfb_noconsole=1; existing present path\n");
  if (fScanout) { sweet_console_muted = 1; fConsolePaused = true; }
  fuxi_gpu_scanout_configure(fPixels, fScanout, check);
+ uint32_t nc = 0;
+ PE_parse_boot_argn("fuxigpuncimport", &nc, sizeof(nc));
+ fFlogState = fScanout && (nc & 8u) ? 1 : 0; fCopyFirst = fScanout && (nc & 16u); fSkipSuperseded = fScanout && (nc & 32u);
+ if (fScanout && (nc & 56u)) IOLog("SWEET FB: frame_log=%u copy_first=%u skip_superseded=%u (fuxigpuncimport 8/16/32)\n", fFlogState, fCopyFirst, fSkipSuperseded);
  if (fScanout) {
   fWriterWakeCall = thread_call_allocate(&AppleCLCD::writerWake, this);
   if (!fWriterWakeCall) return false;
@@ -799,7 +866,10 @@ void AppleCLCD::recordDone(SwapRecord &record, bool shown)
  consumeRecord(record); record.shown |= shown;
  uint32_t id = get32(record.bytes, 0x50);
  SwapStatus &status = fSwapStatus[id % SWEET_FB_SWAP_HISTORY];
- if (id && status.id == id && (shown || !fPublicationPending || id != fPublicationID)) { status.state = record.shown || status.state == SwapShown ? SwapShown : SwapDropped; IOLockWakeup(fLock, fSwapStatus, false); }
+ if (id && status.id == id && (shown || !fPublicationPending || id != fPublicationID)) {
+  status.state = record.shown || status.state == SwapShown ? SwapShown : SwapDropped; IOLockWakeup(fLock, fSwapStatus, false);
+  if (status.state == SwapDropped) flogFate(id, 'D');
+ }
 }
 
 void AppleCLCD::releaseRecord(SwapRecord &record)
@@ -862,6 +932,7 @@ bool AppleCLCD::presentStep(bool flush)
   if (completed == 1) {
    struct fg_present_times times; fuxi_gpu_scanout_stamps(&times);
    fStage[4] = times.fence;
+   if (FlogEntry *e = flogFind(fFlogGpuID)) { struct fg_copy_stamps cs; fuxi_gpu_copy_stamps(&cs); e->fence = times.fence; e->s2s = cs.s2s_us; e->blit = cs.blit_us; e->ahead = cs.ahead; e->buf = cs.buffer; }
    fGpuFrames++; fGpuTime += elapsed;
    completePresent(elapsed + fScanoutPrepare);
    scanoutLog(true, fScanoutBytes, elapsed, fScanoutPrepare);
@@ -898,8 +969,9 @@ void AppleCLCD::presentNext(void)
  IOLockLock(fLock);
  unsigned chosen = 0;
  bool replay = fReplay || !fPendingCount;
+ if (fSkipSuperseded && !replay) for (unsigned j = fPendingCount; j-- > 1;) if (recordReady(fPending[j])) { chosen = j; fSupersededSkips += j; break; }
  for (;;) {
-  if (replay && !fLastValid) { fReplay = false; fDirty = fPendingCount != 0; IOLockUnlock(fLock); return; }
+  if (replay && !fLastValid) { fReplay = false; fDirty = fPendingCount != 0; publishDueLocked(); IOLockUnlock(fLock); return; }
   SwapRecord &candidate = replay ? fLast : fPending[chosen];
   observeRecord(candidate, false);
   if (candidate.stale && !candidate.shown) {
@@ -909,7 +981,7 @@ void AppleCLCD::presentNext(void)
     for (unsigned i = chosen; i < fPendingCount; i++) fPending[i] = fPending[i+1];
    }
    fReadySkips++; fStatDropped++; chosen = 0; replay = fPendingCount == 0;
-   if (replay) { fDirty = false; IOLockUnlock(fLock); return; }
+   if (replay) { fDirty = false; publishDueLocked(); IOLockUnlock(fLock); return; }
    continue;
   }
 #if defined(FUXI)
@@ -920,7 +992,7 @@ void AppleCLCD::presentNext(void)
    fQueuedDefers++;
    if (replay && fPendingCount) { replay = false; continue; }
    if (!replay && ++chosen < fPendingCount) continue;
-   IOLockUnlock(fLock); return;
+   publishDueLocked(); IOLockUnlock(fLock); return;
   }
   candidate.ready = ready;
 #endif
@@ -937,7 +1009,7 @@ void AppleCLCD::presentNext(void)
 #if defined(FUXI)
     if (fScanout) sweet_surface_present_end();
 #endif
-    recordDone(candidate, true); IOLockUnlock(fLock); return;
+    recordDone(candidate, true); publishDueLocked(); IOLockUnlock(fLock); return;
    }
   }
   record = candidate;
@@ -969,6 +1041,7 @@ void AppleCLCD::presentNext(void)
  }
  fDirty = fPendingCount != 0 || fReplay;
  if (fScanoutHeld && !fGpuPending) stopRecords();
+ publishDueLocked();
  IOLockUnlock(fLock);
 }
 
@@ -1012,6 +1085,7 @@ AppleCLCD::swap(const uint8_t *rec)
  if (outstanding > fOutstandingMax) fOutstandingMax = outstanding;
  fPending[fPendingCount++] = record;
  fStatSwaps++; fDirty = true; wakePresentLocked();
+ flogSwap(record, id); publishDueLocked();
 #if defined(FUXI)
  /* Diagnostic only: fTe is the timer's last observation, read without its ordering. */
  if (fSwapHist) {
@@ -1070,10 +1144,10 @@ void AppleCLCD::stopRecords(void)
  for (unsigned i = 0; i < fPendingCount; i++) releaseRecord(fPending[i]);
  if (fPublicationPending) {
   SwapStatus &status = fSwapStatus[fPublicationID % SWEET_FB_SWAP_HISTORY];
-  if (status.id == fPublicationID && status.state != SwapShown) status.state = SwapDropped;
+  if (status.id == fPublicationID && status.state != SwapShown) { status.state = SwapDropped; flogFate(fPublicationID, 'P'); }
   fPublicationPending = false;
  }
- fPendingCount = 0; releaseRecord(fLast); fLastValid = fReplay = fDirty = false;
+ fPendingCount = 0; releaseRecord(fLast); fLastValid = fReplay = fDirty = false; publishDueLocked();
  IOLockWakeup(fLock, fSwapStatus, false);
 }
 
@@ -1192,6 +1266,8 @@ AppleCLCD::present(const SwapRecord &record)
              fScanoutPrepare = mach_absolute_time() - copyStart;
              struct fg_present_times times; fuxi_gpu_scanout_stamps(&times);
              fStageGpu = true; fStage[3] = times.submitted;
+             fFlogGpuID = get32(rec, 0x50);
+             if (FlogEntry *e = flogFind(fFlogGpuID)) { e->ready = record.ready; e->submit = times.submitted; }
              if (read.held) { sweet_surface_present_end(); read.held = false; }
              if (fEarlyRetire) retireEarly(record);
              fScanoutBytes = fuxi_gpu_scanout_double() ? (uint64_t)1080 * 2400 * 4 : (uint64_t)w * h * 4;
@@ -1279,7 +1355,7 @@ void AppleCLCD::completePresent(uint64_t took)
  consumeRecord(record);
  if (fPublicationPending) {
   SwapStatus &status = fSwapStatus[fPublicationID % SWEET_FB_SWAP_HISTORY];
-  if (status.id == fPublicationID && status.state != SwapShown) status.state = SwapDropped;
+  if (status.id == fPublicationID && status.state != SwapShown) { status.state = SwapDropped; flogFate(fPublicationID, 'P'); }
   fPublicationPending = false; fStatDropped++;
   IOLockWakeup(fLock, fSwapStatus, false);
  }
@@ -1344,6 +1420,7 @@ void AppleCLCD::presentStats(uint64_t took)
  uint64_t activeStage[6]; bool deferred = fPublicationPending;
  memcpy(activeStage, fStage, sizeof(fStage));
  IOLockLock(fLock);
+ uint32_t shownID = deferred ? fPublicationID : get32((fPresentRecord ? *fPresentRecord : fLast).bytes, 0x50);
  if (deferred) {
   SwapStatus &status = fSwapStatus[fPublicationID % SWEET_FB_SWAP_HISTORY];
   if (status.id == fPublicationID) status.state = SwapShown;
@@ -1355,6 +1432,13 @@ void AppleCLCD::presentStats(uint64_t took)
  uint64_t t1 = mach_absolute_time();
  stageStats(t1);
  if (deferred) memcpy(fStage, activeStage, sizeof(fStage));
+ if (fFlogState == 2) {
+  if (FlogEntry *e = flogFind(shownID)) {
+   struct fg_present_times pt; fuxi_gpu_scanout_stamps(&pt); struct fg_copy_stamps cs; fuxi_gpu_copy_stamps(&cs);
+   e->start = fScanout && fuxi_gpu_scanout_owned() ? pt.start : t1; e->te = cs.te; e->xfer = cs.xfer_us; e->fate = 'S';
+  }
+  flogPrint(t1);
+ }
 	fStatCopy += took;
 	fStatCopyMax = took > fStatCopyMax ? took : fStatCopyMax;
 	if (++fStatFrames >= 600) {
@@ -1410,6 +1494,7 @@ void AppleCLCD::presentStats(uint64_t took)
 		    imports, mapped, cleaned, skipped, invalidated);
 		fuxi_gpu_abi_stats_log();
 		fuxi_gpu_abi_sched_log();
+  if (fSkipSuperseded) { IOLog("SWEET FB: superseded_skips=%u (ready swaps dropped before their copy, a newer ready swap copied instead)\n", fSupersededSkips); fSupersededSkips = 0; }
 		fGpuBusyTicks = fGpuFailed = 0;
 		fGpuFrames = fCpuFrames = 0;
 		fGpuTime = fCpuTime = 0;

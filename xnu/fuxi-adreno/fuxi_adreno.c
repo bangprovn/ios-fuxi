@@ -325,6 +325,8 @@ static uint32_t fg_inl_n, fg_inl_fb[FG_INL_REASONS], fg_inl_lat_n;
 static uint64_t fg_inl_lat, fg_inl_latmax;
 static void fg_inl_mirror(unsigned idx, uint64_t v);
 static int fg_inl_usable(void), fg_inl_to_present(void);
+static unsigned fg_abi_inflight(void); /* client jobs submitted, not retired (frame log: what an inline copy queues behind) */
+static void fg_cf_log(void); /* bit 16 copy priority counters, with the inline line */
 #define FG_INL_SRC_VA 0x90000000u
 #define FG_INL_FB_VA 0xa0000000u
 /* One transient PFN list, serialized by the surface cache lock. Keep lookup
@@ -755,11 +757,12 @@ static void fg_cp_stamp(unsigned off)
 static void fg_cp_retire(void)
 {
  uint32_t s0 = g3_read(G3_FENCE_PA+FG_CP_STAMP), s1 = g3_read(G3_FENCE_PA+FG_CP_STAMP+8), s2 = g3_read(G3_FENCE_PA+FG_CP_STAMP+16), now = g3_gr(0x980);
- fg_cp_n++;
+ fg_cp_n++; fg_copy_log.s2s_us = fg_copy_log.blit_us = UINT32_MAX;
  if (fg_access_failed || !s0 || !s1 || !s2) fg_cp_bad++;
  else {
   uint32_t v[4] = {s0-fg_cp_submit_lo, s1-s0, s2-s1, now-s2};
   for (unsigned i = 0; i < 4; i++) { fg_cp_sum[i] += v[i]; if (v[i] > fg_cp_max[i]) fg_cp_max[i] = v[i]; }
+  fg_copy_log.s2s_us = (uint32_t)((uint64_t)v[0]*10/192); fg_copy_log.blit_us = (uint32_t)((uint64_t)v[1]*10/192);
  }
  if (!(fg_cp_n % 600)) {
   #define FG_US(t) ((unsigned long long)((t)*10/192))
@@ -894,6 +897,7 @@ int fuxi_gpu_copy(unsigned slot, uint64_t generation, uintptr_t source, uint64_t
  fg_scanout_stamps.submitted = fg_submit_time; fg_scanout_stamps.fence = 0;
  fg_busy = 1; fg_abi_present_wait = 0; /* the copy owns the GPU now; the client hold (bit 4096) ends */
  fg_inl_busy = inl;
+ fg_copy_log.ahead = inl ? fg_abi_inflight() : 0; fg_copy_log.buffer = fg_scanout_double_active ? fg_scanout_copy : 0;
  if (inl) {
   fg_inl_n++;
   if (!(fg_inl_n % 600)) {
@@ -903,6 +907,7 @@ int fuxi_gpu_copy(unsigned slot, uint64_t generation, uintptr_t source, uint64_t
    printf("FUXI GPU: inline_copies %u fallback_copies %u (no_root %u window %u ring %u buffers %u client_busy %u switch %u) queue_to_retire avg %llu us max %llu us\n", fg_inl_n,
        fg_inl_fb[0]+fg_inl_fb[1]+fg_inl_fb[2]+fg_inl_fb[3]+fg_inl_fb[4]+fg_inl_fb[5], fg_inl_fb[0], fg_inl_fb[1], fg_inl_fb[2], fg_inl_fb[3], fg_inl_fb[4], fg_inl_fb[5], (unsigned long long)(ns/1000), (unsigned long long)(mx/1000));
    fg_inl_lat = fg_inl_latmax = 0; fg_inl_lat_n = 0;
+   fg_cf_log();
   }
  }
  FG_ABI_WAKE(); /* a held client submit re-checks: the hold ended, the GPU is busy with the copy */

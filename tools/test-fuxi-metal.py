@@ -109,6 +109,7 @@ int main() {
 '''
 BACKEND_PREFIX = r'''
 static unsigned fg_scanout_reserved,fg_scanout_owned,scanoutStops;
+static unsigned fg_scanout_period_us=8333;
 static unsigned dcvsKicks;static void fg_dcvs_kick(void) {dcvsKicks++;}
 static int fg_scanout_stop(const char *reason) {(void)reason;scanoutStops++;return -1;}
 #include <assert.h>
@@ -741,6 +742,41 @@ int main(void) {
   #undef DONE_UP_TO
   fg_abi_inline=0;fg_scanout_double_requested=0;
   puts("PASS: inline root (bit 21): client-root window (carveout A/B + mirrored sources), root kept after retirement, copy in flight never refuses or delays a client job, fence-only retire, return to the present root, setup failure keeps the old path");
+ }
+ /* Copy priority (bit 16, inline only): a submit is refused while a due surface's writer job is already in the ring; released by the copy
+  * leaving the due set, bounded to one panel period per due generation; pending locks and unknown surfaces never hold. */
+ {
+  uint64_t sz[1]={4096},ad[1]={va},f=0;unsigned k=9;
+  #define RET(n) do { g_wr(G3_FENCE_PA,FG_ABI_FENCE_OFF+4,(n));regs[0x806]=regs[0x807]=g3_wptr;assert(!fuxi_gpu_abi_poll(n)); } while (0)
+  #define SUB() (fuxi_gpu_abi_submit(ad,sz,1,&f))
+  const uint32_t s7=7,s8=8,s9=9,s10=10;
+  seed();ncimportArg=512|16;assert(fg_abi_init() && !fg_abi_cf);fuxi_gpu_present_writer(7,1);assert(!fg_cf_w[0].id); /* needs inline */
+  seed();ncimportArg=512|2097152|16;fg_scanout_double_requested=1;fg_scanout_triple_requested=0;memset(presentL2,0,sizeof presentL2);presentL2[128+3]=0x41000|3;
+  assert(fg_abi_init() && fg_abi_inline && fg_abi_cf);assert(!fuxi_gpu_abi_map(va,source,bytes,3,0,2));
+  assert(!SUB() && f==1 && fg_inl_usable());RET(1);
+  wakes=0;fuxi_gpu_abi_wake_hook=count_wake;ticks=1000;
+  fuxi_gpu_present_writer(7,1);fuxi_gpu_present_due(&s7,1);assert(fg_cf_gen==1); /* frame N locked at seq 1, swap N due */
+  assert(!SUB() && f==2);RET(2); /* job N itself */
+  assert(SUB()==1 && fg_cf_holding && fg_abi_seq==2);fuxi_gpu_abi_submit_wait_us(&k);assert(!k && wait_us()==8334); /* job N+1 waits for copy N */
+  ticks+=1000;assert(SUB()==1 && wait_us()==7334);
+  wakes=0;fuxi_gpu_present_due(&s7,1);assert(fg_cf_holding && !wakes); /* same set: no release (a retire also wakes) */
+  fuxi_gpu_present_due(NULL,0);assert(!fg_cf_holding && wakes==1); /* copy N queued */
+  assert(!SUB() && f==3);RET(3);
+  /* Expiry: one period per generation; a second submit in the same generation is not held again. */
+  fuxi_gpu_present_writer(7,1);fuxi_gpu_present_due(&s7,1);assert(fg_cf_gen==2);
+  assert(!SUB() && f==4);RET(4);assert(SUB()==1);ticks+=8334;assert(!SUB() && f==5 && !fg_cf_holding);RET(5);assert(!SUB() && f==6);RET(6);
+  /* Frame N+1 on another buffer: a new surface opens a new generation with a new bound. */
+  fuxi_gpu_present_writer(8,1);fuxi_gpu_present_due(&s8,1);assert(fg_cf_gen==3);assert(!SUB() && f==7);RET(7);assert(SUB()==1);
+  wakes=0;fuxi_gpu_present_due(NULL,0);assert(!fg_cf_holding && wakes==1);
+  /* Pending (AvoidSync) lock and a surface without a writer record never hold. */
+  fuxi_gpu_present_writer(9,0);fuxi_gpu_present_due(&s9,1);assert(!SUB() && f==8);RET(8);assert(!SUB() && f==9);RET(9);
+  fuxi_gpu_present_due(&s10,1);assert(!SUB() && f==10);RET(10);
+  assert(fg_cf_stats[0]==4 && fg_cf_stats[1]==3 && fg_cf_stats[2]==2 && fg_cf_stats[3]==1 && fg_cf_stats[5]>=1);
+  fg_cf_log();assert(!fg_cf_stats[0] && !fg_cf_stats[4] && fg_abi_inflight()==0);
+  #undef RET
+  #undef SUB
+  fuxi_gpu_abi_wake_hook=NULL;fg_abi_inline=fg_abi_cf=0;fg_scanout_double_requested=0;ticks=0;
+  puts("PASS: copy priority (bit 16, inline only): refuse while the due frame's writer job is queued, wait hint and kind 0, release wake on copy, one-period bound per generation, pending/unknown locks never hold");
  }
  /* Legacy opt-in (fuxigpuncimport 256): a map waits for an idle GPU again. */
  seed();ncimportArg=256;assert(fg_abi_init() && fg_abi_mapwait);
