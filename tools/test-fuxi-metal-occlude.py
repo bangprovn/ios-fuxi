@@ -72,8 +72,8 @@ def main():
         subprocess.run(common+['-shared', '-fPIC', str(ROOT/'tools/fuxi-metal/OcclusionBridge.cpp'), '-o', str(d/'bridge.so')], check=True)
         subprocess.run(common+['-DFUXI_MTL_HOST_TEST', '-DFUXI_MTL_ICD="'+str(a.icd.resolve())+'"', '-DFUXI_MTL_TRANSLATOR="'+str(d/'bridge.so')+'"',
                                str(ROOT/'tools/fuxi-metal/OcclusionTests.cpp'), '-ldl', '-pthread', '-o', str(d/'pixels')], check=True)
-        def run(args, occlude):
-            p = subprocess.run([str(d/'pixels')], env=dict(env, FUXI_MTL_OCCLUDE='1' if occlude else '0', FUXI_MTL_OCCLUDE_MIN_PX='1', FUXI_MTL_TEST_BOOTARGS='fuxigpuframetrace=1 '+args),
+        def run(args, occlude, nofetch=False):
+            p = subprocess.run([str(d/'pixels')], env=dict(env, FUXI_MTL_OCCLUDE='1' if occlude else '0', FUXI_MTL_NOFETCH_RP='1' if nofetch else '0', FUXI_MTL_OCCLUDE_MIN_PX='1', FUXI_MTL_TEST_BOOTARGS='fuxigpuframetrace=1 '+args),
                                text=True, capture_output=True, timeout=240)
             assert p.returncode == 0, (args, occlude, p.stdout[-2000:], p.stderr[-4000:])
             assert 'AddressSanitizer' not in p.stderr and 'runtime error:' not in p.stderr, p.stderr
@@ -86,6 +86,12 @@ def main():
             summary = [l for l in on.stdout.splitlines() if l.startswith('OCC ')]
             print('args=%r: %d pixel lines identical; %s' % (args, len(a_), ' '.join(l[4:] for l in summary if l.startswith('OCC fuzz') or 'stack' in l)))
             print([l for l in on.stderr.splitlines() if 'FUXI MTL: occlude' in l][-1:] or 'no occlude report line (reported on the periodic counter)')
+            assert 'nofetch render pass pipeline' not in off.stderr, 'nofetch variant built with the knob off'
+            nf, both = run(args, False, True), run(args, True, True)
+            assert keep(nf.stdout) == a_ and keep(both.stdout) == a_, 'pixels differ with FUXI_MTL_NOFETCH_RP=1 for ' + repr(args)
+            built = sum(1 for l in nf.stderr.splitlines() if 'nofetch render pass pipeline' in l)
+            assert built > 0, 'FUXI_MTL_NOFETCH_RP=1 never used a no-input-attachment render pass'
+            print('  nofetch rp: pixels identical (alone and with occlude), %d variant pipelines built' % built)
         print('PASS: occlusion proofs and pixels')
 
 if __name__ == '__main__':

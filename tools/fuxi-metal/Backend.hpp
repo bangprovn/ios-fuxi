@@ -110,7 +110,7 @@ struct VariantKey {
  explicit VariantKey(const DrawInput &input){for(unsigned i=0;i<resourceSlots;++i){auto *w=&words[i*8];w[0]=input.formats[i];w[1]=input.filters[i];memcpy(w+2,&input.lodMin[i],4);memcpy(w+3,&input.lodMax[i],4);for(unsigned stage=0;stage<2;++stage){w[4+stage*2]=input.buffers[stage][i].length!=0;w[5+stage*2]=input.buffers[stage][i].bytes;}}}
  bool operator==(const VariantKey &other) const {return words==other.words;}
 };
-struct Pipeline {uint32_t id{},fragInstr{},fragSamples{},fragLoops{},fragKills{};ShadowWindow shadowWindows[2][resourceSlots]{};std::array<uint32_t,resourceSlots> textureTypes{};size_t references=1,retainedBytes=0;bool writesStorage=false;void *translation{};CompileOptions options{};uint32_t fetchMask{};bool orderedColorAccess=false;std::vector<std::pair<uint32_t,VkRenderPass>> renders;VkPipeline pipeline{},stripPipeline{};std::array<VkPipeline,2> linePipelines{};Translation recipe{};VkPipelineLayout layout{};VkRenderPass render{};uint32_t pushOffset{},pushSize{},pushStages{};uint8_t pushBytes[128]{};VkDescriptorSetLayout setLayout{};VkSampler bakedSamplers[16]{};BakedSampler bakedSamplerInfo[16]{};MipAccess mipAccess[2];uint32_t readOnlyStorage[2]{};std::vector<Descriptor> descriptors;std::vector<Buffer *> constantBlobs;std::vector<std::string> blobKeys;std::vector<std::array<uint8_t,32>> blobHashes;std::vector<std::pair<VariantKey,Pipeline *>> variants;
+struct Pipeline {uint32_t id{},fragInstr{},fragSamples{},fragLoops{},fragKills{};ShadowWindow shadowWindows[2][resourceSlots]{};std::array<uint32_t,resourceSlots> textureTypes{};size_t references=1,retainedBytes=0;bool writesStorage=false;void *translation{};CompileOptions options{};uint32_t fetchMask{};bool orderedColorAccess=false;std::vector<std::pair<uint32_t,VkRenderPass>> renders;VkPipeline pipeline{},stripPipeline{};std::array<VkPipeline,2> linePipelines{};std::array<VkPipeline,4> nfPipelines{};Translation recipe{};VkPipelineLayout layout{};VkRenderPass render{};uint32_t pushOffset{},pushSize{},pushStages{};uint8_t pushBytes[128]{};VkDescriptorSetLayout setLayout{};VkSampler bakedSamplers[16]{};BakedSampler bakedSamplerInfo[16]{};MipAccess mipAccess[2];uint32_t readOnlyStorage[2]{};std::vector<Descriptor> descriptors;std::vector<Buffer *> constantBlobs;std::vector<std::string> blobKeys;std::vector<std::array<uint8_t,32>> blobHashes;std::vector<std::pair<VariantKey,Pipeline *>> variants;
 };
 struct BufferBind {Buffer *buffer{};uint64_t offset{};bool bytes=false;uint32_t end{};
  uint64_t length() const{return end?end:buffer?buffer->length:0;}};
@@ -855,6 +855,7 @@ public:
    if(p->pipeline)DestroyPipeline(device,p->pipeline,nullptr);
    if(p->stripPipeline)DestroyPipeline(device,p->stripPipeline,nullptr);
    for(auto line:p->linePipelines)if(line)DestroyPipeline(device,line,nullptr);
+   for(auto nf:p->nfPipelines)if(nf)DestroyPipeline(device,nf,nullptr);
    if(p->layout)DestroyPipelineLayout(device,p->layout,nullptr);
    if(p->setLayout)DestroyDescriptorSetLayout(device,p->setLayout,nullptr);
    for(auto sampler:p->bakedSamplers)if(sampler)DestroySampler(device,sampler,nullptr);
@@ -1003,8 +1004,8 @@ public:
    recordRecipe(identity,v,vn,f,fn,options);}
   return p;
  }
- VkRenderPass renderPass(Pipeline *p,const Operation *op) {
-  unsigned count=p->options.colorCount;uint32_t key=0;
+ VkRenderPass renderPass(Pipeline *p,const Operation *op,bool nofetch=false) {
+  unsigned count=p->options.colorCount;uint32_t key=nofetch?1u<<30:0;
   for(unsigned i=0;i<count;++i){auto c=op?op->color(i):ColorTarget{};key|=(c.load*2+c.store)<<(i*3);}
   for(auto e:p->renders)if(e.first==key)return e.second;
   if(p->renders.size()>=256)throw std::runtime_error("render pass action variant bound 256");
@@ -1022,7 +1023,8 @@ public:
   // runtime variants: input references participate in pass compatibility.
   // orderedColorAccess is already in CompileOptions / translator identity;
   // variants inherit those options. Merge changes recording only, not this ABI.
-  if(orderedColorAccess){sub.flags=VK_SUBPASS_DESCRIPTION_RASTERIZATION_ORDER_ATTACHMENT_COLOR_ACCESS_BIT_EXT;sub.inputAttachmentCount=count;sub.pInputAttachments=refs;}
+  // nofetch variant (FUXI_MTL_NOFETCH_RP): no input attachments, so Turnip sees no feedback loop (no per-pass UCHE invalidate / blit-cache clean / WFI, no single-prim mode).
+  if(orderedColorAccess && !nofetch){sub.flags=VK_SUBPASS_DESCRIPTION_RASTERIZATION_ORDER_ATTACHMENT_COLOR_ACCESS_BIT_EXT;sub.inputAttachmentCount=count;sub.pInputAttachments=refs;}
   VkSubpassDependency deps[2]{};deps[0].srcSubpass=VK_SUBPASS_EXTERNAL;deps[0].dstSubpass=0;
   deps[0].srcStageMask=VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;deps[0].dstStageMask=VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
   deps[0].srcAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;deps[0].dstAccessMask=VK_ACCESS_COLOR_ATTACHMENT_READ_BIT|VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
@@ -1033,7 +1035,7 @@ public:
    deps[0].srcStageMask=producers;deps[0].srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT|VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT|VK_ACCESS_TRANSFER_WRITE_BIT;
    deps[1].dstStageMask=VK_PIPELINE_STAGE_VERTEX_INPUT_BIT|producers;deps[1].dstAccessMask=VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT|VK_ACCESS_COLOR_ATTACHMENT_READ_BIT|VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT|VK_ACCESS_TRANSFER_READ_BIT|VK_ACCESS_TRANSFER_WRITE_BIT|VK_ACCESS_INPUT_ATTACHMENT_READ_BIT|VK_ACCESS_UNIFORM_READ_BIT|VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT|VK_ACCESS_INDEX_READ_BIT;
   }
-  if(orderedColorAccess){deps[0].dstStageMask|=VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;deps[0].dstAccessMask|=VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;deps[1].srcStageMask|=VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;deps[1].srcAccessMask|=VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;}
+  if(orderedColorAccess && !nofetch){deps[0].dstStageMask|=VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;deps[0].dstAccessMask|=VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;deps[1].srcStageMask|=VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;deps[1].srcAccessMask|=VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;}
   VkRenderPassCreateInfo ri{};ri.sType=VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;ri.attachmentCount=used;ri.pAttachments=attachments;ri.subpassCount=1;ri.pSubpasses=&sub;ri.dependencyCount=2;ri.pDependencies=deps;
   VkRenderPass render{};check(CreateRenderPass(device,&ri,nullptr,&render));
   try{p->renders.push_back({key,render});}catch(...){DestroyRenderPass(device,render,nullptr);throw;}return render;
@@ -1116,7 +1118,7 @@ public:
   }catch(...) {cleanup();destroyPipelineUnlocked(p);throw;}
  }
  // Recipe pointers belong to the retained translation product; inline arrays are copied.
- VkPipeline buildTopologyPipeline(Pipeline *p,Topology topology) {
+ VkPipeline buildTopologyPipeline(Pipeline *p,Topology topology,bool nofetch=false) {
   requireLive();if(!validTopology(topology))throw std::runtime_error("invalid pipeline topology");
   CompileBoostScope compileBoost("topology");
   const auto &translated=p->recipe;VkShaderModule modules[2]{};
@@ -1160,10 +1162,10 @@ public:
    VkPipelineColorBlendAttachmentState blends[8]{};
    for(unsigned i=0;i<p->options.colorCount;++i){auto &blend=blends[i];auto c=translated.colors[i];blend.colorWriteMask=c.mask;blend.blendEnable=c.blend;
     blend.srcColorBlendFactor=(VkBlendFactor)c.factors[0];blend.dstColorBlendFactor=(VkBlendFactor)c.factors[1];blend.colorBlendOp=(VkBlendOp)c.factors[2];blend.srcAlphaBlendFactor=(VkBlendFactor)c.factors[3];blend.dstAlphaBlendFactor=(VkBlendFactor)c.factors[4];blend.alphaBlendOp=(VkBlendOp)c.factors[5];}
-   VkPipelineColorBlendStateCreateInfo bs{};bs.sType=VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;bs.attachmentCount=p->options.colorCount;bs.pAttachments=blends;if(orderedColorAccess && (translated.fetchMask || !systemTranslationPolicy().orderFetchOnly))bs.flags=VK_PIPELINE_COLOR_BLEND_STATE_CREATE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_BIT_EXT;
+   VkPipelineColorBlendStateCreateInfo bs{};bs.sType=VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;bs.attachmentCount=p->options.colorCount;bs.pAttachments=blends;if(orderedColorAccess && !nofetch && (translated.fetchMask || !systemTranslationPolicy().orderFetchOnly))bs.flags=VK_PIPELINE_COLOR_BLEND_STATE_CREATE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_BIT_EXT;
 
    VkGraphicsPipelineCreateInfo gi{};gi.sType=VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;gi.stageCount=2;gi.pStages=stages;gi.pVertexInputState=&vertex;gi.pInputAssemblyState=&assembly;
-   gi.pViewportState=&vp;gi.pRasterizationState=&raster;gi.pMultisampleState=&ms;gi.pColorBlendState=&bs;gi.layout=p->layout;gi.renderPass=p->render;
+   gi.pViewportState=&vp;gi.pRasterizationState=&raster;gi.pMultisampleState=&ms;gi.pColorBlendState=&bs;gi.layout=p->layout;gi.renderPass=nofetch?renderPass(p,nullptr,true):p->render;
    VkDynamicState dynamicStates[]={VK_DYNAMIC_STATE_VIEWPORT,VK_DYNAMIC_STATE_SCISSOR};VkPipelineDynamicStateCreateInfo dynamic{};dynamic.sType=VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;dynamic.dynamicStateCount=2;dynamic.pDynamicStates=dynamicStates;gi.pDynamicState=&dynamic;
    auto cache=pipelineCache.get();
    VkPipelineCreationFeedback feedback{},stageFeedback[2]{};VkPipelineCreationFeedbackCreateInfo feedbackInfo{};
@@ -1228,8 +1230,12 @@ public:
    fprintf(stderr,"FUXI MTL: pipeline exec pipe=%06x stage=0x%x name=%s%s\n",p->id,unsigned(props[e].stages),props[e].name,line.c_str());}
 #endif
  }
- VkPipeline topologyPipeline(Pipeline *p,Topology topology) {
+ VkPipeline topologyPipeline(Pipeline *p,Topology topology,bool nofetch=false) {
   requireLive();if(!validTopology(topology))throw std::runtime_error("invalid pipeline topology");
+  if(nofetch){auto &nf=p->nfPipelines[uint32_t(topology)];if(!nf){if(p->fetchMask)throw std::runtime_error("nofetch pipeline for a fetch plan");auto began=std::chrono::steady_clock::now();nf=buildTopologyPipeline(p,topology,true);
+   auto ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-began).count();++nfBuilt;nfBuildMs+=ms;
+   fprintf(stderr,"FUXI MTL: nofetch render pass pipeline pipe=%06x topology=%u %.3f ms (built=%llu)\n",p->id,uint32_t(topology),ms,(unsigned long long)nfBuilt);}
+   return nf;}
   if(topology==Topology::Triangle)return p->pipeline;
   if(topology==Topology::TriangleStrip)return p->stripPipeline;
   auto &cached=p->linePipelines[uint32_t(topology)-2];
@@ -1266,6 +1272,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
  // Culled draws stay in `ops` (pass load/store semantics untouched) and are only not recorded. Load elision turns LOAD into DONT_CARE when a kept dst-independent coverer paints the whole render area and nothing before it reads the target.
  struct OccPlan {std::vector<uint8_t> culled,hasCover,reads,mask;std::vector<Cover> cover;};
  // no-proof backoff: after 600 submits in which no cover was ever proven, analyze only every 64th submit; any proof resets it
+ uint64_t nfBuilt=0;double nfBuildMs=0; // FUXI_MTL_NOFETCH_RP: lazily built no-input-attachment pipeline variants
  std::atomic<uint64_t> occIdle{0},occSkipped{0};uint64_t occOkSeen{0};
  bool occProbe(){uint64_t ok=occCoverOk;if(ok!=occOkSeen){occOkSeen=ok;occIdle=0;}uint64_t n=++occIdle;if(n<=600||n%64==0)return true;++occSkipped;return false;}
  std::atomic<uint64_t> occSubmits{0},occVictims{0},occCoverTries{0},occCoverOk{0},occCulled{0},occElided{0},occEvalNs{0},occEstNs{0},occUnpriced{0},occCulledKpx{0};
@@ -2205,7 +2212,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
     if(op.texture && !op.pipeline && !op.clearOnly)transition(op.texture,VK_IMAGE_LAYOUT_GENERAL,op.generateMips?op.mipBase:(!op.upload && !op.sourceTexture?op.srcLevel:op.dstLevel),op.generateMips?op.mipCount:1);
     if(op.pipeline || op.clearOnly)for(unsigned i=0;i<op.colorCount;++i){auto c=op.color(i);if(c.texture)transition(c.texture,VK_IMAGE_LAYOUT_GENERAL,c.level,1);}
    };
-   VkPipeline boundPipeline{};VkPipelineLayout boundLayout{};VkDescriptorSet boundSet{};
+   VkPipeline boundPipeline{};VkPipelineLayout boundLayout{};VkDescriptorSet boundSet{};bool passNoFetch=false;uint32_t passFetchDraws=0;
    VkViewport boundViewport{};VkRect2D boundScissor{};bool dynamicBound=false;
    for(size_t opIndex=0;opIndex<ops.size();++opIndex) {diagnosticOp=opIndex;const auto &op=ops[opIndex];const auto &draw=draws[opIndex];
     size_t passEnd=mergeEnds.empty()?opIndex:mergeEnds[opIndex];const bool culledOp=occPlan && occPlan->culled[opIndex];
@@ -2242,7 +2249,10 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
         tl==1?"no(linear)":(t->usage&VK_IMAGE_USAGE_STORAGE_BIT)?"no(storage)":wide?"possible":"unknown(format)");}}
      if(passQ){cur={};cur.width=op.texture->levelWidth(op.dstLevel);cur.tiling=op.texture->rtTarget?2:op.texture->tiling==VK_IMAGE_TILING_LINEAR?1:0;cur.height=op.texture->levelHeight(op.dstLevel);cur.colors=used;
       for(unsigned i=0,u=0;i<op.colorCount && u<8;++i){auto c=op.color(i);if(!c.texture)continue;unsigned st=passEnd>opIndex?ops[passEnd].color(i).store:c.store;cur.load|=uint32_t(c.load&3u)<<(u*2);cur.store|=(st?1u:0u)<<u;++u;}}
-     auto render=renderPass(op.pipeline,passOp?&*passOp:&op);
+     passFetchDraws=0;for(size_t i=opIndex;i<=passEnd;++i)if(ops[i].pipeline && ops[i].pipeline->fetchMask)++passFetchDraws;
+     // every draw of the pass lacks a fetch plan: use the render pass without input attachments (a pass is a feedback loop to Turnip only when it declares one)
+     passNoFetch=systemTranslationPolicy().nofetchRp && !passFetchDraws && orderedColorAccess;
+     auto render=renderPass(op.pipeline,passOp?&*passOp:&op,passNoFetch);
      VkFramebufferCreateInfo fi{};fi.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;fi.renderPass=render;
      fi.attachmentCount=used;fi.pAttachments=compactViews;fi.width=op.texture->levelWidth(op.dstLevel);fi.height=op.texture->levelHeight(op.dstLevel);fi.layers=1;VkFramebuffer frame{};
      {Measure measure{objectNanos,SubPhase::objects};uint64_t frameProbes=0;auto found=frameCache.end();{auto range=frameIndex.equal_range(frameKey(targets,render,levels));for(auto it=range.first;it!=range.second;++it){++frameProbes;auto &c=frameCache[it->second];if(c.textures==targets && c.render==render && c.levels==levels){found=frameCache.begin()+it->second;break;}}}
@@ -2270,7 +2280,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
      if(drawQ && drawInfos.size()<passStampLimit){DrawInfo m{};m.begin=true;m.passW=ri.renderArea.extent.width;m.passH=ri.renderArea.extent.height;drawInfos.push_back(m);CmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,drawQ,uint32_t(drawInfos.size()));}
      }else if(currentFrame)++currentFrame->mergedDraws;
      if(!culledOp){
-     auto pipeline=topologyPipeline(op.pipeline,op.topology);
+     auto pipeline=topologyPipeline(op.pipeline,op.topology,passNoFetch);
      if(pipeline!=boundPipeline){CmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline);boundPipeline=pipeline;}
      if(currentFrame)++currentFrame->draws;++cur.draws;
      if(!dynamicBound || memcmp(&boundViewport,&op.viewport,sizeof(op.viewport))){CmdSetViewport(cmd,0,1,&op.viewport);boundViewport=op.viewport;}
@@ -2404,7 +2414,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
      else {barrier.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
      pb(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&barrier,0,nullptr,0,nullptr);}}
     if(passQ && opIndex==passEnd && passInfos.size()<passStampLimit){ // stamp after the pass and its closing barrier
-     PassInfo info{};if(op.texture && op.pipeline)info=cur;
+     PassInfo info{};if(op.texture && op.pipeline){info=cur;info.nofetch=passNoFetch;info.fetchDraws=passFetchDraws;}
      else {info.kind=op.clearOnly?1:2;if(op.texture){info.width=op.texture->levelWidth(op.dstLevel);info.height=op.texture->levelHeight(op.dstLevel);}if(op.clearOnly)info.colors=op.colorCount;}
      info.copies=stampCopies;info.barriers=stampBarriers;stampCopies=stampBarriers=0;passInfos.push_back(info);CmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,passQ,uint32_t(passInfos.size()));
     }
