@@ -12,7 +12,7 @@
 + * blocks} (4 KiB units, partition-relative) and "fuxi-root-blocks" is the
 + * root size. ufsroot0 is the file's contents; no I/O leaves its extents.
 + */
-+#define FX_MAX_EXTENTS 512
++#define FX_MAX_EXTENTS 8192
 +static struct { uint64_t file, part, count; } fx_ext[FX_MAX_EXTENTS];
 +static unsigned fx_next;
 +static bool fx_root;                    /* extent table loaded and validated */
