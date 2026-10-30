@@ -1,0 +1,67 @@
+--- a/bsd/dev/arm/kern_machdep.c
++++ b/bsd/dev/arm/kern_machdep.c
+@@ -16,6 +16,9 @@
+ #include        <libkern/libkern.h>
+ #include        <machine/exec.h>
+ #include        <pexpert/arm64/board_config.h>
++#if defined(FUXI) && defined(__arm64e__)
++#include        <pexpert/pexpert.h>
++#endif
+ 
+ #if __arm64__
+ static cpu_subtype_t cpu_subtype32(void);
+@@ -59,6 +62,26 @@
+ 	/* Future ABIs are allowed, but exec_mach_imgact will treat it like an arm64 slice */
+ 	return 11;
+ }
++
++#if defined(FUXI) && defined(__arm64e__)
++/*
++ * FUXI arm64e (patch 0116): the root is arm64 userland (dyld_shared_cache_arm64 only). The arm64e slice of a fat
++ * binary would run with user JOP on unsigned arm64 shared-cache pointers (E231: FPAC in bsdthread_register's
++ * pmap_auth_user_ptr). Grade arm64e below arm64 (10) and arm64_all (9): fat binaries run their arm64 slice with
++ * IMGPF_NOJOP, arm64e-only binaries still run as arm64e. fuxiarm64e=1 restores Apple's preference (arm64e userland).
++ */
++static int fuxi_prefer_arm64e = -1;
++
++static int
++fuxi_arm64e_grade(int grade)
++{
++	if (fuxi_prefer_arm64e < 0) {
++		int v = 0;
++		fuxi_prefer_arm64e = (PE_parse_boot_argn("fuxiarm64e", &v, sizeof(v)) && v) ? 1 : 0;
++	}
++	return (fuxi_prefer_arm64e || grade == 0) ? grade : 8;
++}
++#endif /* FUXI && __arm64e__ */
+ #endif /* __arm64__ */
+ 
+ /**********************************************************************
+@@ -95,7 +118,11 @@
+ 		case CPU_SUBTYPE_ARM64E:
+ 			switch (execsubtype) {
+ 			case CPU_SUBTYPE_ARM64E:
++#if defined(FUXI) && defined(__arm64e__)
++				return fuxi_arm64e_grade(grade_arm64e_binary(execfeatures));
++#else
+ 				return grade_arm64e_binary(execfeatures);
++#endif
+ 			case CPU_SUBTYPE_ARM64_V8:
+ 				return 10;
+ 			case CPU_SUBTYPE_ARM64_ALL:
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -1340,6 +1340,13 @@
+ 	} else {
+ 		imgp->ip_flags |= IMGPF_NOJOP;
+ 	}
++#if defined(FUXI) && defined(__arm64e__)
++	/* FUXI arm64e (patch 0116): the only processes whose user pointers the kernel authenticates. */
++	if (!(imgp->ip_flags & IMGPF_NOJOP)) {
++		printf("FUXI ARM64E: exec %s arm64e slice cpusub=0x%x user_jop=1\n",
++		    (imgp->ip_vp && imgp->ip_vp->v_name) ? imgp->ip_vp->v_name : "?", (unsigned)mach_header->cpusubtype);
++	}
++#endif
+ #endif
+ 
+ 	/* Copy in arguments/environment from the old process */

@@ -12,7 +12,12 @@
   - mkpayload refuses arm64e kernels it cannot boot correctly (auth chained fixups, no __thread_starts);
   - the CI plan/dry-run/workflow/kernel-inputs plumbing, with metal4/wlan6g/all unchanged.
 
-  --tree DIR   also dry-run 0115 with `patch -p1` in DIR, an xnu-8796.141.3 tree with 0001..0114 applied
+  - 0116 (user JOP for arm64 userland): only FUXI && __arm64e__ blocks in kern_machdep.c/kern_exec.c, nothing
+    removed; fuxi_arm64e_grade compiled and run: arm64e slices grade 8 (below arm64 10 / arm64_all 9) unless
+    fuxiarm64e=1, an unacceptable slice stays 0.
+
+  --tree DIR   also dry-run 0115 and 0116 with `patch -p1` in DIR, an xnu-8796.141.3 tree with 0001..0114
+               applied, and compile DIR's real grade_binary with 0116 for a host-subtype-arm64e fat-binary choice
 """
 import argparse
 import re
@@ -28,19 +33,23 @@ PATCH_PATH = ROOT/'xnu/patches/0115-fuxi-arm64e.patch'
 PATCH = PATCH_PATH.read_text()
 FILES = ['iokit/Kernel/arm/SweetCPU.cpp', 'makedefs/MakeInc.def', 'osfmk/arm64/machine_routines_asm.s',
          'osfmk/arm64/pac_asm.h', 'osfmk/arm64/start.s', 'pexpert/pexpert/arm64/SWEET.h']
+JOP_PATH = ROOT/'xnu/patches/0116-fuxi-arm64e-user-jop.patch'
+JOP = JOP_PATH.read_text()
+JOP_FILES = ['bsd/dev/arm/kern_machdep.c', 'bsd/kern/kern_exec.c']
+GATE = '#if defined(FUXI) && defined(__arm64e__)'
 sys.path.insert(0, str(ROOT/'tools'))
 import mkpayload  # noqa: E402
 
 
-def section(path):
-    m = re.search(r'^--- a/' + re.escape(path) + r'\n\+\+\+ b/' + re.escape(path) + r'\n(.*?)(?=^--- a/|\Z)', PATCH,
+def section(path, patch=PATCH):
+    m = re.search(r'^--- a/' + re.escape(path) + r'\n\+\+\+ b/' + re.escape(path) + r'\n(.*?)(?=^--- a/|\Z)', patch,
                   re.M | re.S)
     assert m, path
     return m[1]
 
 
-def hunks(path):
-    return [h.splitlines()[1:] for h in re.split(r'^(?=@@ )', section(path), flags=re.M) if h.startswith('@@')]
+def hunks(path, patch=PATCH):
+    return [h.splitlines()[1:] for h in re.split(r'^(?=@@ )', section(path, patch), flags=re.M) if h.startswith('@@')]
 
 
 def new_side(lines):
@@ -287,6 +296,150 @@ def ci():
     print('PASS: CI kernel=metal4e plans kernel-metal4e only (not in all); metal4/wlan6g/all plans unchanged')
 
 
+def jop_structure():
+    assert re.findall(r'^--- a/(\S+)$', JOP, re.M) == JOP_FILES and re.findall(r'^\+\+\+ b/(\S+)$', JOP, re.M) == JOP_FILES
+    for path in JOP_FILES:
+        stack = []          # one entry per open added #if: True once its #else is reached
+        for h in hunks(path, JOP):
+            assert not [l for l in h if l.startswith('-')], path + ': 0116 removes nothing'
+            for l in h:
+                if not l.startswith('+'):
+                    # original lines may only sit in the #else branch (the unchanged non-FUXI-arm64e path)
+                    assert not stack or stack[-1], path + ': original line inside an added FUXI block'
+                    continue
+                t = l[1:].strip()
+                if t.startswith('#if'):
+                    assert stack or t == GATE, l
+                    stack.append(False)
+                elif t.startswith('#else'):
+                    stack[-1] = True
+                elif t.startswith('#endif'):
+                    stack.pop()
+                elif t:
+                    assert stack and not stack[-1], path + ': ungated added line ' + l
+            assert not stack, path
+    md = '\n'.join(new_side([l for h in hunks(JOP_FILES[0], JOP) for l in h]))
+    assert '\t\t\t\treturn fuxi_arm64e_grade(grade_arm64e_binary(execfeatures));\n#else\n' \
+           '\t\t\t\treturn grade_arm64e_binary(execfeatures);\n#endif\n\t\t\tcase CPU_SUBTYPE_ARM64_V8:\n\t\t\t\treturn 10;' in md
+    ex = '\n'.join(new_side([l for h in hunks(JOP_FILES[1], JOP) for l in h]))
+    assert re.search(r'imgp->ip_flags \|= IMGPF_NOJOP;\n\t}\n' + re.escape(GATE) + r'\n.*?if \(!\(imgp->ip_flags & '
+                     r'IMGPF_NOJOP\)\) \{\n\t\tprintf\("FUXI ARM64E: exec %s arm64e slice cpusub=0x%x user_jop=1\\n"', ex, re.S)
+    print('PASS: 0116 only adds FUXI && __arm64e__ blocks (grade_binary arm64e case, exec log after IMGPF_NOJOP)')
+
+
+JOP_HARNESS = r'''
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+static int bootarg = -1;
+static int PE_parse_boot_argn(const char *n, void *p, int size)
+{
+	if (strcmp(n, "fuxiarm64e") || bootarg < 0 || size != (int)sizeof(int)) return 0;
+	memcpy(p, &bootarg, sizeof(int));
+	return 1;
+}
+%s
+int main(int argc, char **argv)
+{
+	(void)argc;
+	bootarg = atoi(argv[1]);
+	printf("%%d %%d %%d\n", fuxi_arm64e_grade(12), fuxi_arm64e_grade(11), fuxi_arm64e_grade(0));
+	return 0;
+}
+'''
+
+
+def jop_grade():
+    cc = shutil.which('clang-18') or shutil.which('cc')
+    if not cc:
+        print('SKIP: no host C compiler; fuxi_arm64e_grade not run')
+        return
+    src = new_side(hunks(JOP_FILES[0], JOP)[1])
+    helper = '\n'.join(src[src.index(GATE) + 1:src.index('#endif /* FUXI && __arm64e__ */')])
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        (tmp/'g.c').write_text(JOP_HARNESS % helper)
+        subprocess.run([cc, '-std=c11', '-Wall', '-Wextra', '-Werror', str(tmp/'g.c'), '-o', str(tmp/'g')], check=True)
+        got = {a: subprocess.run([str(tmp/'g'), a], check=True, capture_output=True, text=True).stdout.split()
+               for a in ('-1', '0', '1')}
+    assert got == {'-1': ['8', '8', '0'], '0': ['8', '8', '0'], '1': ['12', '11', '0']}, got
+    print('PASS: fuxi_arm64e_grade: arm64e slice 12/11 -> 8 (< arm64 10, arm64_all 9), 0 stays 0; fuxiarm64e=1 keeps 12/11')
+
+
+def jop_tree(tree):
+    """DIR's real kern_machdep.c with 0116, built for a host whose cpu_subtype() is arm64e."""
+    cc = shutil.which('clang-18') or shutil.which('cc')
+    if not cc:
+        print('SKIP: no host C compiler; real grade_binary not compiled')
+        return
+    hdr = (Path(tree)/'osfmk/mach/machine.h').read_text()
+    want = ('CPU_ARCH_ABI64', 'CPU_TYPE_ARM', 'CPU_TYPE_ARM64', 'CPU_SUBTYPE_MASK', 'CPU_SUBTYPE_ARM64_ALL',
+            'CPU_SUBTYPE_ARM64_V8', 'CPU_SUBTYPE_ARM64E', 'CPU_SUBTYPE_PTRAUTH_ABI',
+            'CPU_SUBTYPE_ARM64_PTR_AUTH_MASK', 'CPU_SUBTYPE_ARM64_PTR_AUTH_VERSION',
+            'CPU_SUBTYPE_ARM64_PTR_AUTH_CURRENT_VERSION')
+    defs = [m[0] for m in re.finditer(r'^#define\s+(CPU_\w+)\b.*$', hdr, re.M)
+            if m[1] in want or m[1].startswith('CPU_SUBTYPE_ARM_')]
+    for w in want:
+        assert any(re.match(r'#define\s+' + w + r'\b', d) for d in defs), w
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        (tmp/'src/bsd/dev/arm').mkdir(parents=True)
+        shutil.copy(Path(tree)/JOP_FILES[0], tmp/'src'/JOP_FILES[0])
+        one = '--- a/%s\n+++ b/%s\n' % (JOP_FILES[0], JOP_FILES[0]) + section(JOP_FILES[0], JOP)
+        subprocess.run(['patch', '-p1', '-s', '-N', '-F0'], input=one, text=True, cwd=tmp/'src', check=True)
+        inc = tmp/'inc'
+        stubs = {
+            'sys/types.h': '#include <stdbool.h>\n#include <stdint.h>\n#define __unused __attribute__((unused))\n',
+            'mach/machine.h': 'typedef int integer_t;\ntypedef integer_t cpu_type_t;\ntypedef integer_t cpu_subtype_t;\n'
+                              + '\n'.join(defs) + '\n',
+            'kern/cpu_number.h': 'cpu_subtype_t cpu_subtype(void);\n', 'libkern/libkern.h': '', 'machine/exec.h': '', 'pexpert/arm64/board_config.h': '',
+            'pexpert/pexpert.h': 'extern int PE_parse_boot_argn(const char *, void *, int);\n',
+        }
+        for name, text in stubs.items():
+            (inc/name).parent.mkdir(parents=True, exist_ok=True)
+            (inc/name).write_text(text)
+        (tmp/'h.c').write_text(r'''
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/types.h>
+#include <mach/machine.h>
+int grade_binary(cpu_type_t, cpu_subtype_t, cpu_subtype_t, bool);
+static int bootarg = -1;
+cpu_subtype_t cpu_subtype(void) { return CPU_SUBTYPE_ARM64E; }
+int PE_parse_boot_argn(const char *n, void *p, int size)
+{
+	if (strcmp(n, "fuxiarm64e") || bootarg < 0 || size != (int)sizeof(int)) return 0;
+	memcpy(p, &bootarg, sizeof(int));
+	return 1;
+}
+int main(int argc, char **argv)
+{
+	(void)argc;
+	bootarg = atoi(argv[1]);
+	cpu_subtype_t e = CPU_SUBTYPE_ARM64E | CPU_SUBTYPE_PTRAUTH_ABI |
+	    (CPU_SUBTYPE_ARM64_PTR_AUTH_CURRENT_VERSION << 24);
+	printf("%d %d %d %d\n", grade_binary(CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64E, e, false),
+	    grade_binary(CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_V8, 0, false),
+	    grade_binary(CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_ALL, 0, false),
+	    grade_binary(CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64E, CPU_SUBTYPE_ARM64E, false));
+	return 0;
+}
+''')
+        res = {}
+        for flags in (['-D__arm64e__=1'], []):
+            exe = tmp/('g%d' % len(flags))
+            subprocess.run([cc, '-std=c11', '-w', '-D__arm64__=1', '-DFUXI=1', '-DXNU_TARGET_OS_IOS=1', *flags,
+                            '-I', str(inc), str(tmp/'src'/JOP_FILES[0]), str(tmp/'h.c'), '-o', str(exe)], check=True)
+            for a in ('-1', '1'):
+                res[(len(flags), a)] = subprocess.run([str(exe), a], check=True, capture_output=True,
+                                                      text=True).stdout.split()
+    # arm64e host: fat arm64e+arm64 picks arm64 (10 > 8) by default, arm64e (12) with fuxiarm64e=1; unversioned 0.
+    assert res[(1, '-1')] == ['8', '10', '9', '0'] and res[(1, '1')] == ['12', '10', '9', '0'], res
+    assert res[(0, '-1')] == res[(0, '1')] == ['12', '10', '9', '0'], res      # no __arm64e__: Apple grading
+    print('PASS: real grade_binary + 0116 on an arm64e host: fat binary -> arm64 slice (10 > 8); fuxiarm64e=1 -> arm64e (12)')
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--tree')
@@ -297,9 +450,14 @@ def main():
     assemble(native)
     payload()
     ci()
+    jop_structure()
+    jop_grade()
     if args.tree:
-        subprocess.run(['patch', '-p1', '--dry-run', '-s', '-N', '-F0'], input=PATCH, text=True, cwd=args.tree, check=True)
-        print('PASS: 0115 applies to', args.tree)
+        for name, text in (('0115', PATCH), ('0116', JOP)):
+            subprocess.run(['patch', '-p1', '--dry-run', '-s', '-N', '-F0'], input=text, text=True, cwd=args.tree,
+                           check=True)
+            print('PASS: %s applies to %s' % (name, args.tree))
+        jop_tree(args.tree)
 
 
 if __name__ == '__main__':

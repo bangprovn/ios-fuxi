@@ -14,7 +14,7 @@ Built on macOS (Apple silicon) with
 repository secrets. Select `kernel=none|metal4|wlan6g|metal4e|all` (default `metal4`),
 and independent boolean inputs `metal`, `mesa`, `tools` (default `false`).
 `all` builds both kernel profiles; `metal4e` (opt-in arm64e build of the metal4
-kernel, patch 0115, `docs-lanes/arm64e.md`) is never part of `all`; selecting nothing fails before allocating a
+kernel, patches 0115/0116, `docs-lanes/arm64e.md`) is never part of `all`; selecting nothing fails before allocating a
 Mac. Each target runs independently, with a 120-minute limit and one artifact
 retained for **7 days**. Failed builds upload logs and their checksum manifest;
 check the job result before treating an artifact as complete.

@@ -210,6 +210,51 @@ The ld-classic threaded link should carry no `LC_DYLD_CHAINED_FIXUPS`. That is a
 - Drivers and kexts: everything in the kernel must be arm64e. Our drivers are compiled with the kernel. A kext built for arm64 would be
   rejected or would crash on its first indirect call (guess).
 
+## First boot: E231 (main 371fec5, CI 41065534474) and patch 0116
+
+The CI build succeeded on the first try. Observed on E231:
+
+- `FUXI PAC: native mode=native cpus=7/7 bad=0 ga=1 ga_bad=0 verdict=ok`.
+- The live probe summary reads `verdict=ready mode=live` on 7/7 CPUs.
+- launchd and many iOS 16.7 daemons ran.
+- Then cpu 5 panicked: `PAC failure from kernel with IA key while authing x0` in `ml_auth_ptr_unchecked`, called from
+  `pmap_auth_user_ptr_internal`. The panic shows esr 0x72000000 (FPAC), x0 = x22 = 0x1f79be724 (an unsigned shared-cache address),
+  x2 = 0 (modifier) and x3 = 0 (jop key).
+
+Decoded from source and the unslid kernel:
+
+- An IA key with modifier 0 is `machine_thread_function_pointers_convert_from_user` (`status.c:812`). Its callers are
+  `bsdthread_register` (`pthread_shims.c:348`, libpthread's thread start pointers, called once per process from libSystem
+  init) and the sigaction paths in `kern_sig.c:262/276`. It authenticates only when the current thread lacks
+  `ARM_MACHINE_THREAD_DISABLE_USER_JOP`.
+- That flag comes from `IMGPF_NOJOP`. Under `HAS_APPLE_PAC`, `kern_exec.c:1336` sets it for every slice that is not arm64e, and it then
+  reaches the task and thread at `kern_exec.c:4134/5101` and `pcb.c:250`. The device kernel has all of these paths: `exec_mach_imgact`
+  sets `ip_flags` bit 31 from `(cpusubtype & ~MASK) != 2`, and `posix_spawn` and `__mac_execve` call `ml_*_set_disable_user_jop`.
+  So arm64 slices were not the problem.
+- The cause: under `HAS_APPLE_PAC`, `cpuid.c:96` reports `CPU_ARCH_ARMv8E`, so the host subtype is arm64e (`cpu.c:723`). Then
+  `grade_binary` (`bsd/dev/arm/kern_machdep.c`) prefers a fat binary's arm64e slice (grade 12) over arm64 (10). That process runs
+  with user JOP on, but the root only has `dyld_shared_cache_arm64`, whose pointers are unsigned. The first AUT of such a pointer
+  faults. On FPAC hardware, a failed AUT in the kernel is a panic rather than a poisoned pointer.
+- Supporting evidence from the log: only `SafariBookmarksSyncAgent` (pid 84) got its own shared region. The `check_np` lookups failed,
+  and the process mapped all `dyld_shared_cache_arm64.*` files itself, as `kern_exec.c:1551` does for arm64e processes. The panic
+  follows its mappings. The `exec xpcproxy` line just before the panic is most likely another process.
+- Not verified: that `SafariBookmarksSyncAgent` really is fat arm64/arm64e. The rootfs was not read.
+
+Patch 0116 (`xnu/patches/0116-fuxi-arm64e-user-jop.patch`) changes nothing outside `FUXI && __arm64e__` and removes no lines:
+
+- `grade_binary`: an arm64e slice grades 8, below arm64 (10) and arm64_all (9). A fat binary therefore runs its arm64 slice, with
+  `IMGPF_NOJOP` and no user pointer authentication; dyld goes through the same grading. An arm64e-only binary still runs as arm64e
+  with user JOP on, unchanged. The boot argument `fuxiarm64e=1` restores Apple's preference, for stage 2.
+- `exec_mach_imgact`: each process that keeps user JOP logs `FUXI ARM64E: exec NAME arm64e slice cpusub=0x... user_jop=1`. That is
+  a new log field, not yet observed. On the E231 root this line is expected to be absent or rare (guess).
+
+Still open:
+
+- On FPAC hardware, `ml_auth_ptr_unchecked` faults instead of poisoning. A genuinely arm64e process that hands the kernel a bad or
+  unsigned pointer therefore panics the kernel instead of getting a poisoned value. This is the stage-2 blocker.
+- The candidate fix is an FPAC-safe compare: re-sign the stripped pointer and compare it with the original. It is not written yet,
+  because the TBI and top-byte handling needs care.
+
 ## Expected first CI failures (guesses, most likely first)
 
 1. `ld-classic` is missing, or the selected Xcode rejects `-threaded_starts_section`. Xcode 15.4 should ship ld-classic (guess).
@@ -248,7 +293,12 @@ The ld-classic threaded link should carry no `LC_DYLD_CHAINED_FIXUPS`. That is a
 - the `fuxi_native_pac` layout against `fuxi_pac_logic.h`;
 - the native `PAC_INIT_KEY_STATE` and the start.s additions, assembled with clang-18 for `arm64e-apple-macos`;
 - the mkpayload arm64e refusals;
-- the CI plan: `metal4e` is not in `all`, the dry-run line, and `cmdline-cpus1.txt`.
+- the CI plan: `metal4e` is not in `all`, the dry-run line, and `cmdline-cpus1.txt`;
+- the 0116 structure: only `FUXI && __arm64e__` blocks, with original lines only in their `#else` branches;
+- `fuxi_arm64e_grade`, compiled and run for grades 12, 11 and 0, with and without `fuxiarm64e`;
+- with `--tree`: 0115 and 0116 apply. The tree's real `grade_binary` with 0116 is compiled against stub headers, using the tree's
+  `mach/machine.h` constants, for a host whose subtype is arm64e. A fat binary must pick arm64 (10 > 8). With `fuxiarm64e=1` it must
+  pick arm64e (12). Without `__arm64e__`, Apple's grading must be unchanged.
 
 `tools/test-fuxi-pac.py` adds an arm64e compile and a host simulation of both modes:
 
