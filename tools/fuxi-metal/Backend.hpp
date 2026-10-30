@@ -1111,7 +1111,7 @@ public:
    }catch(...){pipelineCache.finishedPair(std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-began).count());throw;}
    auto buildMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-began).count();pipelineCache.finishedPair(buildMs);
    fprintf(stderr,"FUXI MTL: Vulkan pipelines PASS %.3f ms cache=%u\n",buildMs,pipelineCache.get()!=VK_NULL_HANDLE);
-   fprintf(stderr,"FUXI MTL: framebuffer fetch plan mask=%u ordered=%u\n",p->fetchMask,p->orderedColorAccess);
+   fprintf(stderr,"FUXI MTL: framebuffer fetch plan mask=%u ordered=%u blend_order_flag=%d\n",p->fetchMask,p->orderedColorAccess,int(orderedColorAccess && (p->fetchMask || !systemTranslationPolicy().orderFetchOnly)));
    p->translation=translated.handle;translated.handle=nullptr;cleanup();return p;
   }catch(...) {cleanup();destroyPipelineUnlocked(p);throw;}
  }
@@ -1160,7 +1160,7 @@ public:
    VkPipelineColorBlendAttachmentState blends[8]{};
    for(unsigned i=0;i<p->options.colorCount;++i){auto &blend=blends[i];auto c=translated.colors[i];blend.colorWriteMask=c.mask;blend.blendEnable=c.blend;
     blend.srcColorBlendFactor=(VkBlendFactor)c.factors[0];blend.dstColorBlendFactor=(VkBlendFactor)c.factors[1];blend.colorBlendOp=(VkBlendOp)c.factors[2];blend.srcAlphaBlendFactor=(VkBlendFactor)c.factors[3];blend.dstAlphaBlendFactor=(VkBlendFactor)c.factors[4];blend.alphaBlendOp=(VkBlendOp)c.factors[5];}
-   VkPipelineColorBlendStateCreateInfo bs{};bs.sType=VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;bs.attachmentCount=p->options.colorCount;bs.pAttachments=blends;if(orderedColorAccess)bs.flags=VK_PIPELINE_COLOR_BLEND_STATE_CREATE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_BIT_EXT;
+   VkPipelineColorBlendStateCreateInfo bs{};bs.sType=VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;bs.attachmentCount=p->options.colorCount;bs.pAttachments=blends;if(orderedColorAccess && (translated.fetchMask || !systemTranslationPolicy().orderFetchOnly))bs.flags=VK_PIPELINE_COLOR_BLEND_STATE_CREATE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_BIT_EXT;
 
    VkGraphicsPipelineCreateInfo gi{};gi.sType=VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;gi.stageCount=2;gi.pStages=stages;gi.pVertexInputState=&vertex;gi.pInputAssemblyState=&assembly;
    gi.pViewportState=&vp;gi.pRasterizationState=&raster;gi.pMultisampleState=&ms;gi.pColorBlendState=&bs;gi.layout=p->layout;gi.renderPass=p->render;
@@ -1265,6 +1265,9 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
  // channel D writes, have no discard and no fb-fetch/storage side effects. Anything between D and C that could observe D's pixels (sampling or fetching the target, storage writers, non-draw ops) forgets the coverers.
  // Culled draws stay in `ops` (pass load/store semantics untouched) and are only not recorded. Load elision turns LOAD into DONT_CARE when a kept dst-independent coverer paints the whole render area and nothing before it reads the target.
  struct OccPlan {std::vector<uint8_t> culled,hasCover,reads,mask;std::vector<Cover> cover;};
+ // no-proof backoff: after 600 submits in which no cover was ever proven, analyze only every 64th submit; any proof resets it
+ std::atomic<uint64_t> occIdle{0},occSkipped{0};uint64_t occOkSeen{0};
+ bool occProbe(){uint64_t ok=occCoverOk;if(ok!=occOkSeen){occOkSeen=ok;occIdle=0;}uint64_t n=++occIdle;if(n<=600||n%64==0)return true;++occSkipped;return false;}
  std::atomic<uint64_t> occSubmits{0},occVictims{0},occCoverTries{0},occCoverOk{0},occCulled{0},occElided{0},occEvalNs{0},occEstNs{0},occUnpriced{0},occCulledKpx{0};
  std::mutex occMutex;std::map<std::string,uint64_t> occWhy;std::unordered_map<uint32_t,double> occRate;double occRateAll=0;std::vector<uint8_t> occZero;struct OccEval {bool ok=false;std::string why;std::vector<std::array<float,4>> pos;};std::map<std::array<uint64_t,2>,OccEval> occEvalCache;std::atomic<uint64_t> occEvalHits{0};
  void occFail(const std::string &why){std::lock_guard<std::mutex> g(occMutex);++occWhy[why.substr(0,40)];}
@@ -1412,7 +1415,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
  void releaseRtShadows() {for(auto &e:rtShadows)destroyTextureUnlocked(e.second.s);rtShadows.clear();rtRefused.clear();}
  void reportOcclude() {
   {std::string why;{std::lock_guard<std::mutex> g(occMutex);std::vector<std::pair<uint64_t,std::string>> v;for(auto &e:occWhy)v.push_back({e.second,e.first});std::sort(v.rbegin(),v.rend());for(size_t i=0;i<v.size() && i<10;++i)why+=" "+v[i].second+"="+std::to_string(v[i].first);}
-   fprintf(stderr,"FUXI MTL: occlude submits=%llu victims=%llu cover_tries=%llu cover_ok=%llu culled=%llu culled_kpx=%llu culled_est_ms=%.3f unpriced=%llu loads_elided=%llu eval_ms=%.3f eval_cache_hits=%llu min_px=%u why:%s\n",(unsigned long long)occSubmits,(unsigned long long)occVictims,(unsigned long long)occCoverTries,(unsigned long long)occCoverOk,(unsigned long long)occCulled,(unsigned long long)occCulledKpx,double(occEstNs)/1e6,(unsigned long long)occUnpriced,(unsigned long long)occElided,double(occEvalNs)/1e6,(unsigned long long)occEvalHits,systemTranslationPolicy().occludeMinPx,why.c_str());}
+   fprintf(stderr,"FUXI MTL: occlude submits=%llu victims=%llu cover_tries=%llu cover_ok=%llu culled=%llu culled_kpx=%llu culled_est_ms=%.3f unpriced=%llu loads_elided=%llu eval_ms=%.3f eval_cache_hits=%llu min_px=%u skipped_submits=%llu why:%s\n",(unsigned long long)occSubmits,(unsigned long long)occVictims,(unsigned long long)occCoverTries,(unsigned long long)occCoverOk,(unsigned long long)occCulled,(unsigned long long)occCulledKpx,double(occEstNs)/1e6,(unsigned long long)occUnpriced,(unsigned long long)occElided,double(occEvalNs)/1e6,(unsigned long long)occEvalHits,systemTranslationPolicy().occludeMinPx,(unsigned long long)occSkipped,why.c_str());}
  }
  void reportRtCounters() {
   {uint64_t n=submitEntered,s=submits;if(n && s)fprintf(stderr,"FUXI MTL: submit pipeline submits=%llu encode_ms=%.3f slot_wait_ms=%.3f blocked_pct=%.1f blocked_full=%llu blocked_drain=%llu blocked_conflict=%llu gpu_latency_ms=%.3f retire_host_ms=%.3f (per submit; encode includes slot waits; gpu_latency is queue submit to fence)\n",(unsigned long long)n,submitPrepareNanos/1e6/n,submitSlotWaitNanos/1e6/n,100.0*submitBlocked/n,(unsigned long long)submitBlockedFull,(unsigned long long)submitBlockedDrain,(unsigned long long)submitBlockedConflict,submitWaitNanos/1e6/s,submitRetireNanos/1e6/s);}
@@ -1954,7 +1957,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
     }
    }
    std::optional<OccPlan> occPlan;
-   if(systemTranslationPolicy().occlude){occPlan.emplace();try{occludeAnalyze(ops,draws,*occPlan);}catch(const std::exception &e){occFail(std::string("analysis:")+e.what());occPlan.reset();}}
+   if(systemTranslationPolicy().occlude && occProbe()){occPlan.emplace();try{occludeAnalyze(ops,draws,*occPlan);}catch(const std::exception &e){occFail(std::string("analysis:")+e.what());occPlan.reset();}}
    // Plan only after runtime variants, access proofs and skipped draws are final.
    // Every admitted shader writes attachments only. Storage buffers require
    // a NonWritable contract in every referencing stage; unknown writers split.
