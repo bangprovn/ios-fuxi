@@ -30,7 +30,7 @@ void fuxi_gpu_scanout_stamps(struct fg_present_times *times);
 /* Frame log detail (fuxigpuncimport bit 8): GPU always-on stamps of the last retired copy (doorbell to its start stamp at fence page
  * +192, i.e. the wait behind earlier ring work, and its blits; UINT32_MAX without stamps), client jobs in flight ahead of it at
  * submit (inline mode), its scanout buffer, the TE count read after the last START and the last transfer's done time in us. */
-struct fg_copy_stamps { uint32_t s2s_us, blit_us, ahead, buffer, te, xfer_us; };
+struct fg_copy_stamps { uint32_t s2s_us, blit_us, ahead, buffer, te, xfer_us, parked; }; /* parked: a parked client job (bit 27) went in behind this copy */
 void fuxi_gpu_copy_stamps(struct fg_copy_stamps *stamps);
 /* Copy priority (fuxigpuncimport bit 16, inline mode only; lock-free, no GPU lock): present_due publishes the surface ids of the swaps
  * whose present copy is not queued yet (callers serialize), present_writer the ABI sequence at a surface's writer lock (active 0: an

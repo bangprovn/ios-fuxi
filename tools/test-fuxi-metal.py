@@ -168,6 +168,9 @@ static unsigned fg_abi_inline,fg_inl_ready,fg_root_client,fg_inl_busy,fg_inl_fbm
 static uint64_t presentL2[512];
 static volatile uint64_t *fg_l2(void) {return presentL2;}
 static unsigned fg_access_failed,fg_busy,fg_client_busy,g3_wptr,g3_bank=2,g3_asid=3;
+enum { FG_PK_COPY, FG_PK_IDLE, FG_PK_CAP, FG_PK_SUBMIT, FG_PK_NOTDUE, FG_PK_OTHER, FG_PK_REASONS }; /* as fuxi_adreno.c */
+static unsigned fg_pk_n;
+static int fg_pk_flush(unsigned why);
 static unsigned cacheClean,cacheInvalidate,ncimportArg;
 static int PE_parse_boot_argn(const char *name,void *value,size_t bytes) {
  assert(!strcmp(name,"fuxigpuncimport") && bytes==sizeof(unsigned));
@@ -777,6 +780,58 @@ int main(void) {
   #undef SUB
   fuxi_gpu_abi_wake_hook=NULL;fg_abi_inline=fg_abi_cf=0;fg_scanout_double_requested=0;ticks=0;
   puts("PASS: copy priority (bit 16, inline only): refuse while the due frame's writer job is queued, wait hint and kind 0, release wake on copy, one-period bound per generation, pending/unknown locks never hold");
+ }
+ /* Park (bit 27, needs 16): the job copy priority would refuse is built and fenced but not rung; the submit returns at once (the caller's
+  * backend mutex is free, so frame N's lease can end and its copy be queued); the copy rings it right behind itself. */
+ {
+  uint64_t sz[1]={4096},ad[1]={va},f=0;
+  #define RET(n) do { g_wr(G3_FENCE_PA,FG_ABI_FENCE_OFF+4,(n));regs[0x806]=regs[0x807]=g3_wptr;assert(!fuxi_gpu_abi_poll(n)); } while (0)
+  #define SUB() (fuxi_gpu_abi_submit(ad,sz,1,&f))
+  #define POLL(n) (fuxi_gpu_abi_poll(n))
+  const uint32_t s7=7,s8=8,s9=9,s10=10,s11=11;
+  seed();ncimportArg=512|2097152|134217728;assert(fg_abi_init() && fg_abi_inline && !fg_abi_cf && !fg_abi_pk); /* needs 16 */
+  seed();ncimportArg=512|2097152|16;assert(fg_abi_init() && fg_abi_cf && !fg_abi_pk); /* default off */
+  seed();ncimportArg=512|2097152|16|134217728;fg_scanout_double_requested=1;fg_scanout_triple_requested=0;memset(presentL2,0,sizeof presentL2);presentL2[128+3]=0x41000|3;
+  assert(fg_abi_init() && fg_abi_pk);assert(!fuxi_gpu_abi_map(va,source,bytes,3,0,2));
+  assert(!SUB() && f==1);RET(1);ticks=1000;
+  /* Copy release: job N rings, job N+1 parks (no wait hint, no refusal), the copy's words go first, then the parked frame. */
+  fuxi_gpu_present_writer(7,1);fuxi_gpu_present_due(&s7,1);
+  assert(!SUB() && f==2 && !fg_pk_n);
+  unsigned w=g3_wptr,db=doorbells;assert(!SUB() && f==3 && fg_pk_n && g3_wptr==w && doorbells==db && fg_abi_seq==3 && !fg_cf_stats[0] && fg_abi_inflight()==2);
+  uint32_t frame[FG_ABI_FRAME_WORDS];unsigned fn=fg_pk_n;memcpy(frame,fg_pk_words,fn*4);
+  assert(POLL(2)==1 && POLL(3)==1 && fg_pk_n); /* not due to leave yet: the writer fence is unwritten */
+  g3_emit(0x70000001u);g3_emit(0xC0FFEEu);w=g3_wptr; /* the copy */
+  assert(!fg_pk_flush(FG_PK_COPY) && !fg_pk_n && g3_wptr==((w+fn)&8191) && doorbells==db+1);
+  for (unsigned i=0;i<fn;i++) assert(ring[(w+i)&8191]==frame[i]);
+  assert(!fg_pk_flush(FG_PK_COPY) && g3_wptr==((w+fn)&8191)); /* nothing parked: no-op */
+  fuxi_gpu_present_due(NULL,0);RET(3);assert(fg_abi_completed==3 && !fg_client_busy);
+  /* Idle release: the writer job's fence is written and no copy follows within FG_PK_IDLE_US; the generation then stops parking. */
+  fuxi_gpu_present_writer(8,1);fuxi_gpu_present_due(&s8,1);assert(!SUB() && f==4 && !fg_pk_n);
+  w=g3_wptr;assert(!SUB() && f==5 && fg_pk_n && g3_wptr==w);
+  g_wr(G3_FENCE_PA,FG_ABI_FENCE_OFF+4,4);assert(POLL(5)==1 && fg_pk_n && fg_abi_completed==4);
+  ticks+=FG_PK_IDLE_US-1;assert(POLL(5)==1 && fg_pk_n);ticks+=1;assert(POLL(5)==1 && !fg_pk_n && g3_wptr!=w);
+  assert(!SUB() && f==6 && !fg_pk_n);RET(6); /* expired generation */
+  /* Cap: the writer job still runs two periods after parking. */
+  fuxi_gpu_present_writer(9,1);fuxi_gpu_present_due(&s9,1);assert(!SUB() && f==7);assert(!SUB() && f==8 && fg_pk_n);
+  ticks+=2*fg_cf_bound()-1;assert(POLL(8)==1 && fg_pk_n);ticks+=1;assert(POLL(8)==1 && !fg_pk_n);RET(8);
+  /* Next submit: the parked job rings first, the new one parks in its place; the due surface leaving the set (dropped swap) rings it. */
+  fuxi_gpu_present_writer(10,1);fuxi_gpu_present_due(&s10,1);assert(!SUB() && f==9);assert(!SUB() && f==10 && fg_pk_n);
+  w=g3_wptr;fn=fg_pk_n;assert(!SUB() && f==11 && fg_pk_n && g3_wptr==((w+fn)&8191));
+  fuxi_gpu_present_due(NULL,0);w=g3_wptr;assert(POLL(11)==1 && !fg_pk_n && g3_wptr!=w);RET(11);
+  /* Pending (AvoidSync) lock: nothing parks. */
+  fuxi_gpu_present_writer(11,0);fuxi_gpu_present_due(&s11,1);assert(!SUB() && f==12 && !fg_pk_n);assert(!SUB() && f==13 && !fg_pk_n);RET(13);
+  /* Counters: parked 5 (copy 1, idle 1, cap 1, submit 1, not_due 1), one parked after its writer job was already done: none here. */
+  assert(fg_pk_stats[FG_PK_REASONS]==5 && fg_pk_stats[FG_PK_COPY]==1 && fg_pk_stats[FG_PK_IDLE]==1 && fg_pk_stats[FG_PK_CAP]==1 && fg_pk_stats[FG_PK_SUBMIT]==1 && fg_pk_stats[FG_PK_NOTDUE]==1);
+  assert(fg_pk_idle_n==1 && fg_pk_idle_max==FG_PK_IDLE_US && !fg_pk_stats[FG_PK_REASONS+2]);
+  fg_cf_log();assert(!fg_pk_stats[FG_PK_REASONS] && !fg_pk_idle_n);
+  /* Fault: a parked job is discarded, never rung; its fence fails with the client. */
+  fuxi_gpu_present_writer(7,1);fuxi_gpu_present_due(&s7,1);assert(!SUB() && f==14);assert(!SUB() && f==15 && fg_pk_n);
+  w=g3_wptr;(void)fg_abi_fault("test");assert(!fg_pk_n && g3_wptr==w && POLL(15)<0 && SUB()<0);
+  #undef RET
+  #undef SUB
+  #undef POLL
+  fuxi_gpu_present_due(NULL,0);fg_abi_inline=fg_abi_cf=fg_abi_pk=0;fg_scanout_double_requested=0;ticks=0;
+  puts("PASS: park (bit 27, needs 16, inline only): the refused job is fenced but not rung and returns at once; rung right behind the copy, or on writer-done idle 1.5 ms (generation expires), cap of two periods, next submit (order kept), due surface leaving; pending lock never parks; fault discards; counters and log reset");
  }
  /* Legacy opt-in (fuxigpuncimport 256): a map waits for an idle GPU again. */
  seed();ncimportArg=256;assert(fg_abi_init() && fg_abi_mapwait);

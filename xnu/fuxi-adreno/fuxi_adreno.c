@@ -328,6 +328,11 @@ static void fg_inl_mirror(unsigned idx, uint64_t v);
 static int fg_inl_usable(void), fg_inl_to_present(void);
 static unsigned fg_abi_inflight(void); /* client jobs submitted, not retired (frame log: what an inline copy queues behind) */
 static void fg_cf_log(void); /* bit 16 copy priority counters, with the inline line */
+/* fuxigpuncimport bit 27 (134217728, needs 16): a client submit that copy priority would refuse is parked instead (built, not rung; see
+ * fg_pk_park) and goes into the ring right behind the due copy, or on one of these other releases. */
+enum { FG_PK_COPY, FG_PK_IDLE, FG_PK_CAP, FG_PK_SUBMIT, FG_PK_NOTDUE, FG_PK_OTHER, FG_PK_REASONS };
+static unsigned fg_pk_n; /* words of the parked job, 0 none */
+static int fg_pk_flush(unsigned why);
 #define FG_INL_SRC_VA 0x90000000u
 #define FG_INL_FB_VA 0xa0000000u
 /* One transient PFN list, serialized by the surface cache lock. Keep lookup
@@ -933,7 +938,9 @@ int fuxi_gpu_copy(unsigned slot, uint64_t generation, uintptr_t source, uint64_t
  fg_scanout_stamps.submitted = fg_submit_time; fg_scanout_stamps.fence = 0;
  fg_busy = 1; fg_abi_present_wait = 0; /* the copy owns the GPU now; the client hold (bit 4096) ends */
  fg_inl_busy = inl;
- fg_copy_log.ahead = inl ? fg_abi_inflight() : 0; fg_copy_log.buffer = fg_scanout_double_active ? fg_scanout_copy : 0;
+ fg_copy_log.ahead = inl ? fg_abi_inflight()-(fg_pk_n ? 1u : 0u) : 0; fg_copy_log.buffer = fg_scanout_double_active ? fg_scanout_copy : 0; /* a parked job follows the copy */
+ fg_copy_log.parked = inl && fg_pk_n;
+ if (inl && fg_pk_n) (void)fg_pk_flush(FG_PK_COPY); /* bit 27: the parked client job goes right behind this copy (a fault there takes the fault path, as a submit would) */
  if (inl) {
   fg_inl_n++;
   if (!(fg_inl_n % 600)) {

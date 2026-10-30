@@ -26,7 +26,10 @@ static unsigned fg_abi_host_handoff, fg_abi_ncimport, fg_abi_unstick, fg_abi_coh
 static uint32_t fg_abi_q_stats[6]; /* queued, deepest, refused for a present, full, refused by the hold, hold expired */
 static unsigned fg_abi_hold;
 static unsigned fg_abi_cf, fg_cf_holding; /* bit 16 copy priority, see fg_abi_copy_first */
-static void fg_cf_reset(void);
+static unsigned fg_abi_pk; /* bit 27 park instead of refuse, see fg_pk_park */
+#define FG_PK_IDLE_US 1500u
+static void fg_cf_reset(void), fg_pk_reset(void);
+static int fg_pk_check(void);
 /* Hook the userclient installs: wakes submits waiting out a refusal (NULL in host tests, where the macro is defined here). */
 void (*fuxi_gpu_abi_wake_hook)(void);
 #ifndef FG_ABI_WAKE
@@ -42,7 +45,8 @@ static uint64_t fg_abi_map_work;
  * copy priority (fg_abi_copy_first); 64 coherent-import self-test (skips the per-submit clean/retire invalidate only if it proves the GPU path
  * coherent); 128 ranged TLBIVAL for a small unmap; 256 map waits for an idle GPU first (the pre-N167 behaviour; default maps while a
  * job runs, see fg_abi_map_locked); 512 queue a submit behind a running job (see fg_abi_submit_locked). Parsed once in fg_abi_init. 1048576
- * (scanout copy-source pre-clean) is parsed by fuxi_gpu_scanout_configure. 67108864 (bit 26): WaitFence sleeps on the GPU fence interrupt (fuxi_gpu_irq.inc). */
+ * (scanout copy-source pre-clean) is parsed by fuxi_gpu_scanout_configure. 67108864 (bit 26): WaitFence sleeps on the GPU fence interrupt (fuxi_gpu_irq.inc).
+ * 134217728 (bit 27, needs 16): park the job copy priority would refuse and ring it behind the copy (fg_pk_park). */
 static unsigned fg_irq_want;
 static unsigned fg_abi_coh_wb; /* the passing variant mapped the data page cacheable write-back, inner-shareable: imports are then mapped that way */
 static unsigned fg_abi_coh, fg_abi_coh_tries; /* coh: 0 untested, 1 proven coherent, 2 refused */
@@ -367,7 +371,7 @@ static int fg_abi_fault(const char *why)
   if (!fg_access_failed && f>fg_abi_completed && f<=fg_abi_seq) fg_abi_completed=f;
  }
  fg_abi_hang_dump(why);
- fg_abi_poisoned = 1;
+ fg_abi_poisoned = 1; fg_pk_n = 0; /* a parked job never reaches the ring; its fence fails with the client */
  fg_fail(why,0x701);
  fg_abi_drained = fg_isolate();
  if (!fg_abi_drained && fg_scanout_owned) (void)fg_scanout_stop("GPU DMA drain failed");
@@ -428,6 +432,7 @@ static int fg_inl_setup(void)
 static int fg_inl_to_present(void)
 {
  if (!fg_root_client) return 1;
+ if (fg_pk_n) { (void)fg_pk_flush(FG_PK_OTHER); return 0; } /* a parked job needs the client root: ring it, switch when idle */
  if (fg_client_busy || fg_busy) return 0;
  if (g3_faulted() || g3_gr(0x806) != g3_wptr || g3_gr(0x807) != g3_wptr || (g3_gr(0x210) & ~1u)) return 0;
  if (!fg_abi_switch(G3_PT)) { (void)fg_abi_fault("inline restore present TTBR"); return 0; }
@@ -480,6 +485,7 @@ static int fg_abi_observe(void)
  if (fg_abi_poisoned) return fg_abi_timed_out ? (fg_abi_drained ? -3 : -4) : (fg_abi_drained ? -1 : -2);
  if (!fuxi_gpu_ready()) return -1;
  if (fg_access_failed || g3_faulted()) return fg_abi_fault("client GPU fault");
+ if (fg_pk_n) { int r=fg_pk_check(); if (r) return r; } /* bit 27: release a parked job whose copy is not coming */
  if (!fg_client_busy) return 0;
  /* Inline root (bit 21): the root stays, and a present copy may sit behind this job, so its fence alone retires it. */
  if (g3_read(G3_FENCE_PA+FG_ABI_FENCE_OFF+4)==fg_abi_seq &&
@@ -511,7 +517,7 @@ static void fg_abi_watch(thread_call_param_t arg, thread_call_param_t unused)
 {
  (void)arg; (void)unused;
  FG_GUARD;
- if (fg_abi_observe()==1) {
+ if (fg_abi_observe()==1 || fg_pk_n) { /* a parked job keeps the watchdog: fg_pk_check runs from here when no one waits */
   uint64_t deadline;
   clock_interval_to_deadline(2,NSEC_PER_MSEC,&deadline);
   (void)thread_call_enter_delayed(&fg_client_watchdog,deadline);
@@ -521,7 +527,8 @@ static int fg_abi_init(void)
 {
  unsigned bits=0;
  (void)PE_parse_boot_argn("fuxigpuncimport",&bits,sizeof(bits));
- fg_abi_ncimport=bits&1; fg_wptr_fence=(bits>>1)&1; fg_abi_unstick=(bits>>2)&1; fg_abi_cohtest=(bits>>6)&1; fg_abi_tlbpages=(bits>>7)&1; fg_abi_mapwait=(bits>>8)&1; fg_abi_queue=(bits>>9)&1; fg_abi_roimport=(bits>>10)&1; fg_abi_pace=(bits>>11)&1; fg_abi_hold=(bits>>12)&1; fg_abi_start=(bits>>13)&1; fg_abi_probe=(bits>>14)&1; fg_abi_spin=(bits>>15)&1; fg_abi_mid=(bits>>16)&1; fg_abi_ar=(bits>>17)&1; fg_abi_hard=(bits>>18)&1; fg_abi_dirty=(bits>>19)&1; fg_abi_inline=((bits>>21)&1) && ((bits>>9)&1); fg_abi_cf=fg_abi_inline && ((bits>>4)&1); fg_irq_want=(bits>>26)&1; fg_cf_reset(); fg_inl_ready=fg_root_client=fg_inl_busy=fg_inl_fbmask=0; fg_abi_hold_since=0; fg_abi_present_wait=0; memset(fg_abi_q_stats,0,sizeof(fg_abi_q_stats));
+ fg_abi_ncimport=bits&1; fg_wptr_fence=(bits>>1)&1; fg_abi_unstick=(bits>>2)&1; fg_abi_cohtest=(bits>>6)&1; fg_abi_tlbpages=(bits>>7)&1; fg_abi_mapwait=(bits>>8)&1; fg_abi_queue=(bits>>9)&1; fg_abi_roimport=(bits>>10)&1; fg_abi_pace=(bits>>11)&1; fg_abi_hold=(bits>>12)&1; fg_abi_start=(bits>>13)&1; fg_abi_probe=(bits>>14)&1; fg_abi_spin=(bits>>15)&1; fg_abi_mid=(bits>>16)&1; fg_abi_ar=(bits>>17)&1; fg_abi_hard=(bits>>18)&1; fg_abi_dirty=(bits>>19)&1; fg_abi_inline=((bits>>21)&1) && ((bits>>9)&1); fg_abi_cf=fg_abi_inline && ((bits>>4)&1); fg_abi_pk=fg_abi_cf && ((bits>>27)&1); fg_irq_want=(bits>>26)&1; fg_cf_reset(); fg_pk_reset(); fg_inl_ready=fg_root_client=fg_inl_busy=fg_inl_fbmask=0; fg_abi_hold_since=0; fg_abi_present_wait=0; memset(fg_abi_q_stats,0,sizeof(fg_abi_q_stats));
+ if (fg_abi_pk) printf("FUXI GPU: copy_first_park=1 idle_us=%u cap=2 periods (fuxigpuncimport 134217728 with 16, inline mode)\n", FG_PK_IDLE_US);
  fg_abi_coh=fg_abi_coh_tries=0;
  for (unsigned i=0;i<sizeof(fg_abi_used)/sizeof(fg_abi_used[0]);i++) fg_abi_used[i]=0;
  /* 772 4K pages: root, two L2s, kernel runtime L3, 768 client L3s.
@@ -828,18 +835,29 @@ void fuxi_gpu_present_due(const uint32_t *ids, unsigned count)
  if (removed && FG_CF_LD(fg_cf_holding)) { fg_cf_stats[2]++; FG_CF_ST(fg_cf_holding, 0); FG_ABI_WAKE(); }
 }
 static uint64_t fg_cf_bound(void) { return rsr("cntfrq_el0")*(fg_scanout_period_us ? fg_scanout_period_us : 16667u)/1000000; }
+/* Under the GPU lock. 1 when a due surface's writer job is in the ring (a submit followed its active lock; with before != 0 only a
+ * writer job with a fence below before counts); *wfence = the earliest such writer job's fence (lock sequence + 1). */
+static int fg_cf_due_writer(uint32_t before, uint32_t *wfence, int count)
+{
+ const uint32_t n = FG_CF_LD(fg_cf_due_n);
+ unsigned due = 0;
+ for (unsigned i = 0; i < n && i < FG_CF_DUE; i++) {
+  uint32_t id = FG_CF_LD(fg_cf_due[i]), seq = UINT32_MAX, known = 0;
+  for (unsigned k = 0; k < FG_CF_WRITERS; k++) if (FG_CF_LD(fg_cf_w[k].id) == id) { seq = FG_CF_LD(fg_cf_w[k].seq); known = 1; }
+  if (!known && count) fg_cf_stats[5]++;
+  if (seq == UINT32_MAX || seq == fg_abi_seq || (before && seq+1 >= before)) continue;
+  if (!due || seq+1 < *wfence) *wfence = seq+1;
+  due = 1;
+ }
+ return due;
+}
 /* Under the GPU lock, inline submits only. 1: refuse this submit (the caller waits for a wake or the rest of the bound). */
 static int fg_abi_copy_first(void)
 {
  if (!fg_abi_cf) return 0;
- const uint32_t gen = FG_CF_LD(fg_cf_gen), n = FG_CF_LD(fg_cf_due_n);
- unsigned due = 0;
- for (unsigned i = 0; i < n && i < FG_CF_DUE && !due; i++) {
-  uint32_t id = FG_CF_LD(fg_cf_due[i]), seq = UINT32_MAX, known = 0;
-  for (unsigned k = 0; k < FG_CF_WRITERS; k++) if (FG_CF_LD(fg_cf_w[k].id) == id) { seq = FG_CF_LD(fg_cf_w[k].seq); known = 1; }
-  if (!known) fg_cf_stats[5]++;
-  due = seq != UINT32_MAX && seq != fg_abi_seq; /* a submit followed the active lock: the writer job is in the ring */
- }
+ const uint32_t gen = FG_CF_LD(fg_cf_gen);
+ uint32_t wfence = 0;
+ const unsigned due = fg_cf_due_writer(0, &wfence, 1);
  if (!due || gen == fg_cf_expired_gen) { FG_CF_ST(fg_cf_holding, 0); return 0; }
  const uint64_t now = rsr("cntpct_el0");
  if (fg_cf_held_gen != gen) { fg_cf_held_gen = gen; fg_cf_since = now; fg_cf_stats[1]++; }
@@ -848,12 +866,93 @@ static int fg_abi_copy_first(void)
  return 1;
 }
 static unsigned fg_abi_inflight(void) { return fg_abi_seq-fg_abi_completed; }
+/* Park (fuxigpuncimport bit 27, value 134217728; needs copy priority 16, so inline 512|2097152). Device R223 (16 alone): copy_first
+ * refused ~850 submits per 600 copies, released 0, expired ~300, copies behind a client job 108/128, client swaps 60 Hz. Cause: FuxiMetal's
+ * Backend::submit holds the backend mutex across vkQueueSubmit, so the refused (sleeping) submit of job N+1 holds it; job N's retirement
+ * waits for its fence without the mutex, then takes it before the surface lease ends, so the writer unlock that queues copy N cannot
+ * happen until the refusal times out, and job N+1 is then in the ring ahead of copy N anyway. Parking breaks the cycle in the kernel:
+ * the refused job is built (frame words, TLB, import clean, fence = ++fg_abi_seq) but not written to the ring and the submit returns
+ * at once, so the mutex is free, job N retires, the lease ends, SweetFramebuffer queues copy N and fuxi_gpu_copy rings the parked job
+ * right behind it. One job at most. Released by: the copy (FG_PK_COPY); FG_PK_IDLE_US after the due writer job's fence is written
+ * (the copy is not coming: several submits per frame, a deferred present); 2 panel periods after parking (cap; job N may still have
+ * been running then); the next submit (order kept: the parked job first); the due writer leaving the due set; a classic copy's root
+ * switch or a fault (discarded, the client is poisoned). An idle or cap release ends that due generation's parks, like the hold's
+ * expiry. The GPU idles from job N's end to copy N's submit (device Q222: ~0.2 ms writer retire, then ~0.05 ms, or ~0.7 ms while the
+ * previous copy still runs). Ring room for the parked frame plus one copy is reserved at park time (only the copy is written before the
+ * parked job). Not yet observed on device. */
+static uint32_t fg_pk_words[FG_ABI_FRAME_WORDS];
+static uint32_t fg_pk_fence, fg_pk_wfence, fg_pk_gen, fg_pk_stats[FG_PK_REASONS+3], fg_pk_idle_n; /* stats: releases per reason, parked, no ring room, not after writer */
+static uint64_t fg_pk_since, fg_pk_retired, fg_pk_sum, fg_pk_max, fg_pk_idle_sum, fg_pk_idle_max;
+static void fg_pk_stats_reset(void) { fg_pk_idle_n=0; fg_pk_sum=fg_pk_max=fg_pk_idle_sum=fg_pk_idle_max=0; memset(fg_pk_stats,0,sizeof(fg_pk_stats)); }
+static void fg_pk_reset(void) { fg_pk_n=fg_pk_fence=fg_pk_wfence=fg_pk_gen=0; fg_pk_since=fg_pk_retired=0; fg_pk_stats_reset(); }
+static int fg_pk_written(uint32_t fence) { uint32_t f=g3_read(G3_FENCE_PA+FG_ABI_FENCE_OFF+4); return !fg_access_failed && (int32_t)(f-fence)>=0; }
+/* Under the GPU lock: ring the parked job (GPU order: after whatever was written since it was parked, i.e. the due copy). 0 or a fault. */
+static int fg_pk_flush(unsigned why)
+{
+ if (!fg_pk_n) return 0;
+ const unsigned n=fg_pk_n; fg_pk_n=0;
+ const uint64_t now=rsr("cntpct_el0"), d=now-fg_pk_since;
+ fg_pk_stats[why<FG_PK_REASONS ? why : FG_PK_OTHER]++; fg_pk_sum+=d; if (d>fg_pk_max) fg_pk_max=d;
+ if (fg_pk_retired) { uint64_t i=now-fg_pk_retired; fg_pk_idle_sum+=i; fg_pk_idle_n++; if (i>fg_pk_idle_max) fg_pk_idle_max=i; }
+ if (!fg_inl_usable()) { fg_abi_poisoned=1; return -1; } /* the window went away: the job's fence fails with the client */
+ if (g3_faulted()) return fg_abi_fault("client parked pre-ring fault");
+ const unsigned queued=fg_client_busy;
+ for (unsigned i=0;i<n;i++) g3_emit(fg_pk_words[i]);
+ g3_wptr &= 8191;
+ __asm__ volatile("dsb sy" ::: "memory");
+ if (!queued) { fg_client_deadline=now+rsr("cntfrq_el0")/10; fg_abi_stage=0; }
+ fg_client_busy=1;
+ fg_dcvs_kick();
+ if (!fg_ring_doorbell() || fg_access_failed) return fg_abi_fault("client parked doorbell");
+ if (!queued) { uint64_t deadline; clock_interval_to_deadline(2,NSEC_PER_MSEC,&deadline); (void)thread_call_enter_delayed(&fg_client_watchdog,deadline); }
+ else { fg_abi_q_stats[0]++; if (fg_abi_seq-fg_abi_completed>fg_abi_q_stats[1]) fg_abi_q_stats[1]=fg_abi_seq-fg_abi_completed; }
+ return 0;
+}
+/* Under the GPU lock, from fg_abi_observe (WaitFence polls, the 2 ms watchdog): release a parked job whose copy is not coming. */
+static int fg_pk_check(void)
+{
+ const uint64_t now=rsr("cntpct_el0");
+ uint32_t wf=0;
+ if (!fg_pk_retired && fg_pk_written(fg_pk_wfence)) fg_pk_retired=now;
+ unsigned why=!fg_cf_due_writer(fg_pk_fence,&wf,0) ? FG_PK_NOTDUE :
+     fg_pk_retired && now-fg_pk_retired>=rsr("cntfrq_el0")*FG_PK_IDLE_US/1000000 ? FG_PK_IDLE : now-fg_pk_since>=2*fg_cf_bound() ? FG_PK_CAP : FG_PK_REASONS;
+ if (why==FG_PK_REASONS) return 0;
+ if (why!=FG_PK_NOTDUE) fg_cf_expired_gen=fg_pk_gen;
+ return fg_pk_flush(why);
+}
+/* Under the GPU lock, inline submits: 1 when this job (n words, already built with fence fg_abi_seq+1) should be parked. */
+static int fg_pk_want(unsigned n, uint32_t *wfence)
+{
+ if (!fg_abi_pk || fg_pk_n) return 0;
+ const uint32_t gen=FG_CF_LD(fg_cf_gen);
+ if (gen==fg_cf_expired_gen || !fg_cf_due_writer(0,wfence,1)) return 0;
+ uint32_t used=(g3_wptr-g3_gr(0x806))&8191;
+ if (fg_access_failed || used+n+1024+64>8191) { fg_pk_stats[FG_PK_REASONS+1]++; return 0; } /* room for this frame and one copy (fuxi_gpu_copy wants 1024) */
+ return 1;
+}
+static void fg_pk_park(const uint32_t *words, unsigned n, uint32_t wfence)
+{
+ memcpy(fg_pk_words,words,n*sizeof(words[0]));
+ fg_pk_n=n; fg_pk_fence=fg_abi_seq+1; fg_pk_wfence=wfence; fg_pk_gen=FG_CF_LD(fg_cf_gen);
+ fg_pk_since=rsr("cntpct_el0"); fg_pk_retired=fg_pk_written(wfence) ? fg_pk_since : 0;
+ fg_pk_stats[FG_PK_REASONS]++; if (fg_pk_retired) fg_pk_stats[FG_PK_REASONS+2]++;
+ if (!fg_client_busy) { uint64_t deadline; clock_interval_to_deadline(2,NSEC_PER_MSEC,&deadline); (void)thread_call_enter_delayed(&fg_client_watchdog,deadline); }
+}
 static void fg_cf_log(void)
 {
  if (!fg_abi_cf) return;
  printf("FUXI GPU: copy_first refused=%u episodes=%u released=%u expired=%u due_publishes=%u no_writer=%u bound_us=%u\n",
      fg_cf_stats[0], fg_cf_stats[1], fg_cf_stats[2], fg_cf_stats[3], fg_cf_stats[4], fg_cf_stats[5], fg_scanout_period_us);
  memset(fg_cf_stats, 0, sizeof(fg_cf_stats));
+ if (!fg_abi_pk) return;
+ const uint64_t f=rsr("cntfrq_el0") ? rsr("cntfrq_el0") : 1, r=fg_pk_stats[FG_PK_COPY]+fg_pk_stats[FG_PK_IDLE]+fg_pk_stats[FG_PK_CAP]+fg_pk_stats[FG_PK_SUBMIT]+fg_pk_stats[FG_PK_NOTDUE]+fg_pk_stats[FG_PK_OTHER];
+ printf("FUXI GPU: copy_first_park parked=%u released_by copy=%u idle=%u cap=%u submit=%u not_due=%u other=%u no_room=%u writer_done_at_park=%u"
+     " parked_us avg=%llu max=%llu writer_done_to_release_us n=%u avg=%llu max=%llu idle_us=%u\n",
+     fg_pk_stats[FG_PK_REASONS], fg_pk_stats[FG_PK_COPY], fg_pk_stats[FG_PK_IDLE], fg_pk_stats[FG_PK_CAP], fg_pk_stats[FG_PK_SUBMIT], fg_pk_stats[FG_PK_NOTDUE],
+     fg_pk_stats[FG_PK_OTHER], fg_pk_stats[FG_PK_REASONS+1], fg_pk_stats[FG_PK_REASONS+2],
+     (unsigned long long)(r ? fg_pk_sum*1000000/f/r : 0), (unsigned long long)(fg_pk_max*1000000/f), fg_pk_idle_n,
+     (unsigned long long)(fg_pk_idle_n ? fg_pk_idle_sum*1000000/f/fg_pk_idle_n : 0), (unsigned long long)(fg_pk_idle_max*1000000/f), FG_PK_IDLE_US);
+ fg_pk_stats_reset();
 }
 /* submit_split (always on, a few counter reads per submit): ticks per phase of a successful backend submit, refused attempts as one lump
  * with their reasons, the wait for the GPU lock, and the cache clean volume. fg_abi_ss_cur is filled by one attempt under the lock and
@@ -871,7 +970,8 @@ static int fg_abi_submit_locked(const uint64_t *iovas, const uint64_t *sizes,
  const unsigned inl=fg_inl_usable(); /* bit 21: client root installed for good; a copy never refuses or delays a client job */
  if (!inl && (fg_busy || fg_scanout_reserved)) FG_REFUSE(0);
  if (!inl && fg_abi_present_held()) { fg_abi_q_stats[4]++; FG_REFUSE(1); }
- if (inl && fg_abi_copy_first()) FG_REFUSE(1); /* bit 16: the due copy goes first */
+ if (fg_pk_n) { int r=fg_pk_flush(FG_PK_SUBMIT); if (r) return r; } /* bit 27: the parked job keeps its place, ahead of this one */
+ if (inl && !fg_abi_pk && fg_abi_copy_first()) FG_REFUSE(1); /* bit 16: the due copy goes first (bit 27 parks below instead) */
  /* Why a submit needed an idle GPU: (1) it installs the client root with a full-ASID invalidate, which would pull the page tables from
   * under a running present job; (2) the ring was assumed empty (RPTR==WPTR) and one fence tracked one job; (3) a frame opens with a
   * CP context reset, which is safe only after the previous frame's WFI. Behind a running *client* job (1) is moot, (3) is ordered by
@@ -895,6 +995,8 @@ static int fg_abi_submit_locked(const uint64_t *iovas, const uint64_t *sizes,
  if (!n) return -1;
  FG_SS(FG_SS_FRAME);
  fg_abi_ibs[0]++; fg_abi_ibs[1]+=count; if (count>fg_abi_ibs[2]) fg_abi_ibs[2]=count; if (count>16) fg_abi_ibs[3]++;
+ uint32_t pk_writer=0;
+ const unsigned park=inl && fg_pk_want(n,&pk_writer); /* bit 27: a due writer job is in the ring, its copy is not: park this one */
  if (queued || inl) {
   /* Same root, nothing to switch. Leaves are only added to never-used VA (fg_abi_map_locked), but if any map happened since the last
    * submit drop the ASID's translations anyway: fail closed on the no-negative-caching assumption. */
@@ -915,6 +1017,7 @@ static int fg_abi_submit_locked(const uint64_t *iovas, const uint64_t *sizes,
  fg_abi_ss_cur_clean=fg_abi_cleaned-fg_abi_ss_cur_clean; fg_abi_ss_cur_skip=fg_abi_skipped-fg_abi_ss_cur_skip;
  __asm__ volatile("dsb sy" ::: "memory");
  FG_SS(FG_SS_CACHE);
+ if (park) { fg_abi_submit_map_seq=fg_abi_map_seq; fg_pk_park(words,n,pk_writer); *fence=++fg_abi_seq; FG_SS(FG_SS_BELL); return 0; } /* rung by fg_pk_flush */
  for (unsigned i=0;i<n;i++) g3_emit(words[i]);
  g3_wptr &= 8191;
  __asm__ volatile("dsb sy" ::: "memory");

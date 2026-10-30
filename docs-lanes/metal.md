@@ -2818,6 +2818,7 @@ no per-range alias classes, so the port is the same idea in our shape:
   deliberately unused so concurrent lanes can claim them; other values of those bits were not meaningful before.
   (Since claimed: 2 fenced WPTR, 4 stall recovery, 8/16/32 frame log, copy priority, superseded skip; see gpu-scanout.md.)
   Bit 25 (value 33554432) is not a GPU option: it runs the kernel PAC self-test (patch 0114, [arm64e.md](arm64e.md)).
+  Bit 27 (value 134217728, needs 16) parks the job copy priority would refuse instead of refusing it (gpu-scanout.md).
 - Tests: `tools/test-fuxi-metal.py` (overlap mirror, TLBIVAL values/limit/fallback/fault, self-test pass/stale/partial/hang/
   fault/busy/occupied, bitmask parse), `tools/test-fuxi-hostimport.py` (segment lookups, per-page predicate in a long run).
 - New log field: the self-test line above. Owned BO maps still need one pmap lookup per 16K page (scattered BOs); a contiguous

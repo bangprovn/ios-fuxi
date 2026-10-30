@@ -842,7 +842,7 @@ int main(void) {
  copyStamps.s2s_us=6800;copyStamps.blit_us=560;copyStamps.ahead=1;copyStamps.buffer=2;
  unsigned beforeLines=flogLines;
  for(unsigned i=0;i<SWEET_FB_FLOG;i++) {
-  copyStamps.te=(uint32_t)(10+2*i);
+  copyStamps.te=(uint32_t)(10+2*i);copyStamps.parked=i%4==0; // bit 27: every fourth copy released a parked client job
   put32(frame,0x50,2002+i);assert(!lf.swap(frame));
   if(i==0)assert(lf.fFlogState==2 && lf.fFlogN==1 && lf.fFlog[0].id==2002 && lf.fFlog[0].surface==surface.id);
   if(i==5) { scanPublish=2;lf.presentStep(true);lf.presentStep(true);assert(lf.fPublicationPending);scanPublish=1;continue; } // waits for START
@@ -852,6 +852,7 @@ int main(void) {
  assert(lf.fFlog[5].fate=='P' && lf.fFlog[6].fate=='S' && lf.fFlogState==3 && flogLines==beforeLines+SWEET_FB_FLOG);
  assert(strstr(flogEndLog,"shown=127 dropped=0 replaced_waiting_start=1 copied=128 copied_not_shown=1 copies_behind_client_job=128 submit_to_start_over_3ms=128"));
  assert(strstr(flogEndLog,"start_te_gaps 1/2/3+=0/125/1"));
+ assert(lf.fFlog[0].pk==1 && lf.fFlog[1].pk==0 && strstr(flogEndLog,"copies_releasing_parked_job=32"));copyStamps.parked=0;
  // Bit 32: two ready swaps behind a copy in flight; the older is dropped before its copy.
  lf.fSkipSuperseded=true;
  put32(frame,0x50,2200);assert(!lf.swap(frame));lf.presentStep(true);assert(lf.fGpuPending && dueN==0);

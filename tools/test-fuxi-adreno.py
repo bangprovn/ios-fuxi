@@ -71,8 +71,11 @@ static uint64_t fg_generation[4], model_l2[512];
 #define FG_INL_SRC_VA 0x90000000u
 #define FG_CP_STAMP 192u
 static uint32_t fg_cp_submit_lo, fg_cp_n, fg_cp_bad, fg_cp_pitch, fg_cp_rects; static uint64_t fg_cp_sum[4], fg_cp_max[4];
-static struct { uint32_t s2s_us, blit_us, ahead, buffer, te, xfer_us; } fg_copy_log; static unsigned inflight_model, cf_logs;
+static struct { uint32_t s2s_us, blit_us, ahead, buffer, te, xfer_us, parked; } fg_copy_log; static unsigned inflight_model, cf_logs;
 static unsigned fg_abi_inflight(void) { return inflight_model; } static void fg_cf_log(void) { cf_logs++; }
+enum { FG_PK_COPY, FG_PK_IDLE, FG_PK_CAP, FG_PK_SUBMIT, FG_PK_NOTDUE, FG_PK_OTHER, FG_PK_REASONS };
+static unsigned fg_pk_n, pk_flushes, pk_flush_why, pk_wptr_at_flush; static unsigned g3_wptr; /* tentative; defined with the ring model below */
+static int fg_pk_flush(unsigned why) { pk_flushes++; pk_flush_why=why; pk_wptr_at_flush=g3_wptr; fg_pk_n=0; return 0; } /* model: the backend rings it (test-fuxi-metal covers fg_pk_flush) */
 #define FG_INL_FB_VA 0xa0000000u
 static unsigned fg_abi_inline, fg_inl_ready, fg_root_client, fg_inl_busy, fg_inl_fbmask, inl_usable_model, inl_present_calls;
 enum { FG_INL_NOROOT, FG_INL_WINDOW, FG_INL_RING, FG_INL_BUFFERS, FG_INL_CLIENT, FG_INL_SWITCH, FG_INL_REASONS };
@@ -369,9 +372,13 @@ int main(void)
  reset(); memset(model_mirror,0,sizeof model_mirror); fg_abi_inline=1; fg_inl_ready=1; fg_inl_fbmask=1; fg_root_client=1; inl_usable_model=1; fg_inl_n=0; memset(fg_inl_fb,0,sizeof fg_inl_fb);
  assert(fuxi_gpu_map(0,1,(uintptr_t)source_buf,4352*10,&times) && !memcmp(model_mirror,model_l2,sizeof model_l2));
  fg_client_busy=1; mode=6; /* GPU reports busy for the whole test: only the copy's own fence may retire it */
- inflight_model=2; cache_clean=1; assert(fuxi_gpu_copy(0,1,(uintptr_t)source_buf,4352*10,4352,0,0,0,0,10,10,&times)==2 && fg_busy && fg_inl_busy && fg_inl_n==1 && !fg_abi_present_wait && fg_copy_log.ahead==2); inflight_model=0;
+ inflight_model=2; cache_clean=1; assert(fuxi_gpu_copy(0,1,(uintptr_t)source_buf,4352*10,4352,0,0,0,0,10,10,&times)==2 && fg_busy && fg_inl_busy && fg_inl_n==1 && !fg_abi_present_wait && fg_copy_log.ahead==2 && !fg_copy_log.parked && !pk_flushes); inflight_model=0;
  assert(fuxi_gpu_copy(0,1,(uintptr_t)source_buf,4352*10,4352,0,0,0,0,10,10,&times)==0); /* one present in flight */
  ticks+=200000; assert(fuxi_gpu_poll(&times)==1 && !fg_busy && !fg_inl_busy && fg_inl_lat_n==1 && (fg_copy_log.s2s_us!=0 || fg_copy_log.blit_us!=0)); /* frame log stamps: us or UINT32_MAX without stamps */
+ /* Bit 27: a parked client job (counted in flight) is not ahead of the copy and is rung once, after the copy's words. */
+ { unsigned w0=g3_wptr; inflight_model=2; fg_pk_n=40; cache_clean=1; assert(fuxi_gpu_copy(0,1,(uintptr_t)source_buf,4352*10,4352,0,0,0,0,10,10,&times)==2 && fg_copy_log.ahead==1 && fg_copy_log.parked==1);
+   assert(pk_flushes==1 && pk_flush_why==FG_PK_COPY && !fg_pk_n && ((pk_wptr_at_flush-w0)&8191)>100); inflight_model=0; pk_flushes=0;
+   ticks+=200000; assert(fuxi_gpu_poll(&times)==1 && !fg_busy); }
  { uint32_t px; memcpy(&px,panel,4); uint32_t sp; memcpy(&sp,source_buf,4); assert(px==sp); }
  /* No room in the ring, or an unmapped buffer set: classic path, which needs the present root and so refuses while the client runs. */
  g3_wptr=(rptr+8191-100)&8191; cache_clean=1; assert(fuxi_gpu_copy(0,1,(uintptr_t)source_buf,4352*10,4352,0,0,0,0,10,10,&times)==0 && fg_inl_fb[FG_INL_RING]==1 && fg_inl_fb[FG_INL_CLIENT]==1 && inl_present_calls==1);

@@ -190,7 +190,7 @@ public:
  /* fuxigpuncimport bit 8: one present event log of SWEET_FB_FLOG consecutive swaps after the warmup (state 0 off, 1 warmup, 2 recording,
   * 3 printed); bit 16: the surfaces of swaps whose copy is not queued yet go to the kernel copy priority; bit 32: a ready swap with a
   * newer ready swap behind it is dropped before its copy (the newer one is copied instead). */
- struct FlogEntry { uint64_t swap, ready, submit, fence, start; uint32_t id, surface, s2s, blit, ahead, buf, te, xfer; char fate; };
+ struct FlogEntry { uint64_t swap, ready, submit, fence, start; uint32_t id, surface, s2s, blit, ahead, buf, te, xfer, pk; char fate; };
  FlogEntry    *fFlog; /* SWEET_FB_FLOG entries, allocated only with bit 8 (10 KB; the object is limited to 16 KB by kalloc_type) */
  unsigned      fFlogState, fFlogN, fFlogSwaps;
  uint32_t      fFlogGpuID, fSupersededSkips;
@@ -225,21 +225,21 @@ public:
   fFlogState = 3;
   uint64_t period = fTeValid ? fTe.period : fTickAbs, base = fFlog[0].swap; long long pus = flogUs(base+period, base);
   IOLog("SWEET FB: flog begin frames=%u warmup_swaps=%u period_us=%lld fields: n id surface swap_us(from frame 0) then us after this swap: ready copy_submit fence start, "
-      "gpu submit_to_copy_start blit, client_jobs_ahead buffer te_count prev_xfer_done_us fate(S shown, D dropped, P replaced while waiting START, - open); -1 none\n",
+      "gpu submit_to_copy_start blit, client_jobs_ahead buffer te_count prev_xfer_done_us fate(S shown, D dropped, P replaced while waiting START, - open), pk=1 a parked client job followed the copy (bit 27); -1 none\n",
       fFlogN, SWEET_FB_FLOG_WARMUP, pus);
-  unsigned shown = 0, dropped = 0, replaced = 0, copied = 0, copiedDropped = 0, behind = 0, pairs = 0, longS2s = 0, gaps[3] = {0, 0, 0}, lastTe = 0; bool haveTe = false;
+  unsigned shown = 0, dropped = 0, replaced = 0, copied = 0, copiedDropped = 0, behind = 0, pairs = 0, longS2s = 0, parked = 0, gaps[3] = {0, 0, 0}, lastTe = 0; bool haveTe = false;
   for (unsigned i = 0; i < fFlogN; i++) {
    FlogEntry &e = fFlog[i]; char fate = e.fate ? e.fate : '-';
-   IOLog("SWEET FB: flog %u %u %u %lld %lld %lld %lld %lld %d %d %u %u %u %u %c\n", i, e.id, e.surface, flogUs(e.swap, base), flogUs(e.ready, e.swap), flogUs(e.submit, e.swap),
-       flogUs(e.fence, e.swap), flogUs(e.start, e.swap), e.submit ? (int)e.s2s : -1, e.submit ? (int)e.blit : -1, e.ahead, e.buf, e.te, e.xfer, fate);
+   IOLog("SWEET FB: flog %u %u %u %lld %lld %lld %lld %lld %d %d %u %u %u %u %c pk=%u\n", i, e.id, e.surface, flogUs(e.swap, base), flogUs(e.ready, e.swap), flogUs(e.submit, e.swap),
+       flogUs(e.fence, e.swap), flogUs(e.start, e.swap), e.submit ? (int)e.s2s : -1, e.submit ? (int)e.blit : -1, e.ahead, e.buf, e.te, e.xfer, fate, e.pk);
    shown += fate == 'S'; dropped += fate == 'D'; replaced += fate == 'P';
-   if (e.submit) { copied++; copiedDropped += fate != 'S'; behind += e.ahead != 0; longS2s += e.s2s != UINT32_MAX && e.s2s > 3000; }
+   if (e.submit) { copied++; copiedDropped += fate != 'S'; behind += e.ahead != 0; longS2s += e.s2s != UINT32_MAX && e.s2s > 3000; parked += e.pk != 0; }
    if (i && e.fence && fFlog[i-1].fence && e.fence > fFlog[i-1].fence && e.fence-fFlog[i-1].fence < period/2) pairs++; /* two copies done within half a period */
    if (fate == 'S') { if (haveTe) { unsigned d = (e.te-lastTe) & 0xffffu; if (d) gaps[d >= 3 ? 2 : d-1]++; } lastTe = e.te; haveTe = true; }
   }
   IOLog("SWEET FB: flog end shown=%u dropped=%u replaced_waiting_start=%u copied=%u copied_not_shown=%u copies_behind_client_job=%u submit_to_start_over_3ms=%u"
-      " fence_pairs_within_half_period=%u start_te_gaps 1/2/3+=%u/%u/%u superseded_skips=%u\n",
-      shown, dropped, replaced, copied, copiedDropped, behind, longS2s, pairs, gaps[0], gaps[1], gaps[2], fSupersededSkips);
+      " fence_pairs_within_half_period=%u start_te_gaps 1/2/3+=%u/%u/%u superseded_skips=%u copies_releasing_parked_job=%u\n",
+      shown, dropped, replaced, copied, copiedDropped, behind, longS2s, pairs, gaps[0], gaps[1], gaps[2], fSupersededSkips, parked);
  }
  bool teVsyncTick(uint64_t &now, bool fallback);
  void teVsyncLog(uint64_t now);
@@ -601,7 +601,7 @@ AppleCLCD::start(IOService *provider)
  PE_parse_boot_argn("fuxigpuncimport", &nc, sizeof(nc));
  if (fScanout && (nc & 8u)) fFlog = IONewZeroData(FlogEntry, SWEET_FB_FLOG);
  fFlogState = fFlog ? 1 : 0; fCopyFirst = fScanout && (nc & 16u); fSkipSuperseded = fScanout && (nc & 32u);
- if (fScanout && (nc & 56u)) IOLog("SWEET FB: frame_log=%u copy_first=%u skip_superseded=%u (fuxigpuncimport 8/16/32)\n", fFlogState, fCopyFirst, fSkipSuperseded);
+ if (fScanout && (nc & (56u | 134217728u))) IOLog("SWEET FB: frame_log=%u copy_first=%u skip_superseded=%u park=%u (fuxigpuncimport 8/16/32/134217728)\n", fFlogState, fCopyFirst, fSkipSuperseded, fCopyFirst && (nc & 134217728u) ? 1u : 0u);
  if (fScanout) {
   fWriterWakeCall = thread_call_allocate(&AppleCLCD::writerWake, this);
   if (!fWriterWakeCall) return false;
@@ -936,7 +936,7 @@ bool AppleCLCD::presentStep(bool flush)
   if (completed == 1) {
    struct fg_present_times times; fuxi_gpu_scanout_stamps(&times);
    fStage[4] = times.fence;
-   if (FlogEntry *e = flogFind(fFlogGpuID)) { struct fg_copy_stamps cs; fuxi_gpu_copy_stamps(&cs); e->fence = times.fence; e->s2s = cs.s2s_us; e->blit = cs.blit_us; e->ahead = cs.ahead; e->buf = cs.buffer; }
+   if (FlogEntry *e = flogFind(fFlogGpuID)) { struct fg_copy_stamps cs; fuxi_gpu_copy_stamps(&cs); e->fence = times.fence; e->s2s = cs.s2s_us; e->blit = cs.blit_us; e->ahead = cs.ahead; e->buf = cs.buffer; e->pk = cs.parked; }
    fGpuFrames++; fGpuTime += elapsed;
    completePresent(elapsed + fScanoutPrepare);
    scanoutLog(true, fScanoutBytes, elapsed, fScanoutPrepare);

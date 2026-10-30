@@ -1461,6 +1461,137 @@ Tests: `tools/test-fuxi-metal.py` (copy priority),
 `tools/test-fuxi-adreno.py` (copy stamps),
 `tools/test-fuxi-gpu-scanout.py` (writer record). Not yet observed.
 
+## Copy priority park (fuxigpuncimport bit 27, value 134217728, default off)
+
+Measured with `tools/fuxi-flog.py` (host-only parser for the bit-8 frame log; it
+prints the per-stage percentiles, the swap-to-START split and a replay of every
+START gap longer than one period). Two device logs, both inline mode:
+Q222 (`fuxigpuncimport=2948680`, no copy priority) and R223 (`2948728`,
+frame log + copy priority 16 + superseded skip 32).
+
+| | Q222 | R223 |
+|---|---|---|
+| client swaps, p50 interval | 74.4 Hz, 8.24 ms | 43.3 Hz, 15.6 ms |
+| shown | 32.8 Hz (56/128, 72 `P`) | 38.9 Hz (114/128, 14 `P`) |
+| swap to ready (writer retire), p50 | 13.4 ms | 34.4 ms |
+| ready to copy submit, p50 / p90 | 0.69 / 0.73 ms | 0.06 / 0.73 ms |
+| copy submit to copy start, behind a client job | 88/128, p50 6.5 ms | 108/128, p50 8.1 ms |
+| copy submit to copy start, ring idle | 40/128, 2 us | 20/128, 2 us |
+| blit | 0.56 ms | 0.55 ms |
+| fence to START (shown), p50 / avg | 38 us / 2.15 ms | 32 us / 1.39 ms |
+| copies fenced in pairs (within half a period) | 38 | 5 |
+| START gaps longer than one period: copy late / display missed / client idle | 28 / 25 / 1 | 88 / 14 / 3 |
+| copy-late cases behind a client job | 26/28 | 87/88 |
+
+Where the time goes (Q222, shown frames, average of swap to START 19.8 ms):
+render (swap to ready) 68%, ready to submit 2%, queue behind a client job 16%,
+blit 4%, fence to START 11%. The ready-to-submit time has two clusters:
+about 50 us, and about 0.7 ms when the previous copy is still running. Once a
+copy is queued it waits behind one whole client job (about 6.5 ms) in two
+thirds of the frames. That job is frame N+1, already in the in-order ring
+before frame N's writer lease ends. The copy then finishes in the same TE as
+the next one (38 pairs), and one of the two is replaced while it waits for
+START (72 `P`).
+
+Why copy priority (16) did not help, and why `released=0` (R223: per 600
+copies `refused=781 episodes=398 released=0 expired=252`, and 640/297/1/253,
+621/321/0/200, 859/419/2/313). This is a design flaw, not a counter bug, read
+from the code:
+
+- FuxiMetal `Backend::submit` takes the backend `mutex` and holds it through
+  `QueueSubmit` (tools/fuxi-metal/Backend.hpp:1662 to 2442).
+- The kernel refusal sleeps inside that ioctl, so the refused submit of job
+  N+1 holds the mutex while it sleeps.
+- Job N's retirement closure waits for its fence without the mutex, then
+  takes it (Backend.hpp:2499). The surface lease ends only after that closure
+  returns (Frontend.mm `retireCommitted`, `_lease.reset()`).
+- So the writer unlock that queues copy N cannot happen until the refusal
+  times out (one period, `expired`). Then job N+1 enters the ring ahead of
+  copy N anyway: 108/128 copies still went behind a client job.
+- The client is throttled meanwhile. Swaps fell to 43 Hz, and swap-to-ready
+  rose from 13 to 34 ms.
+
+Park removes the wait instead of bounding it. With bit 27 (and 16; inline
+512|2097152), the submit that copy priority would refuse is fully built:
+frame words, TLB invalidate after a map, import clean, and fence
+`++fg_abi_seq`. It is not written to the ring, and the ioctl returns at once.
+The mutex is free, so job N retires, its lease ends, SweetFramebuffer queues
+copy N, and `fuxi_gpu_copy` writes the parked frame right after the copy's
+words, then rings the doorbell. At most one job is parked. The other release
+paths keep the client from stalling:
+
+- **idle:** 1.5 ms (`FG_PK_IDLE_US`) after the due writer job's fence is
+  written, with no copy. This covers several submits per frame or a deferred
+  present.
+- **cap:** two panel periods after parking.
+- **submit:** the next submit rings the parked job first, so order is kept.
+- **not_due:** the due surface leaves the set, for example a dropped swap.
+- **other:** a classic-copy root switch.
+
+An idle or cap release expires that due generation, as the hold's expiry did.
+A fault discards the parked job, and its fence fails with the client. The
+2 ms watchdog stays armed while a job is parked, and `fg_abi_observe` (every
+WaitFence poll) runs the release check. Ring room for the parked frame plus
+one copy is reserved at park time (`no_room` counts the jobs that ran
+unparked instead). The kernel has no link between a submit and a surface,
+so the writer record of bit 16 remains the only trigger: a submit that
+follows an active writer lock of a due surface whose job is in the ring.
+
+Expected effect (a guess, not yet observed):
+
+- `copies_behind_client_job` near 0, with ready-to-copy-start about 2 us
+  plus the blit.
+- Fewer fence pairs and `P` fates.
+- The client no longer throttled (swap interval back near 8.3 ms).
+- The GPU idles from job N's end to copy N's submit, about 0.2 ms of writer
+  retire plus 0.05 ms, or about 0.7 ms while the previous copy still runs
+  (Q222 clusters).
+- The display-side misses in Q222 (25 gaps with a newer copy fenced in
+  time, 12 of them with another copy in flight) are not addressed.
+
+Boot value: `2948728 + 134217728 = 137166456` (frame log, copy priority,
+superseded skip, park; 9 digits). Without the frame log and skip, use
+`2948680 + 16 + 134217728 = 137166424`.
+
+Log lines:
+
+- At init: `FUXI GPU: copy_first_park=1 idle_us=1500 cap=2 periods
+  (fuxigpuncimport 134217728 with 16, inline mode)`.
+- At start: `SWEET FB: frame_log= copy_first= skip_superseded= park=
+  (fuxigpuncimport 8/16/32/134217728)`.
+- Every 600 inline copies, after the copy_first line: `FUXI GPU:
+  copy_first_park parked= released_by copy= idle= cap= submit= not_due=
+  other= no_room= writer_done_at_park= parked_us avg= max=
+  writer_done_to_release_us n= avg= max= idle_us=`.
+- Each frame-log line ends in ` pk=0|1` (the copy rang a parked job). The
+  `flog end` line adds `copies_releasing_parked_job=`.
+- `copy_first refused=` stays 0 with park on.
+
+Success criteria: `released_by copy` dominates, `idle + cap` are small, and
+`copies_behind_client_job` and `copy_late` fall.
+
+Risks:
+
+- If one frame makes several submits after its writer lock, each later
+  submit releases the parked job (`submit`) and parks itself. Only the last
+  one stays behind the copy.
+- A parked job delays the client's own next frame by up to 1.5 ms after its
+  writer job ends when no copy comes.
+- `fg_client_busy` and the 100 ms deadline are unchanged; the parked job
+  counts as in flight.
+
+Tests:
+
+- `tools/test-fuxi-metal.py` (park): needs 16, default off, no wait and no
+  refusal, copy words before the parked frame and one doorbell, idle at
+  1.5 ms then an expired generation, cap at two periods, next-submit order,
+  due surface leaving, a pending lock never parks, fault discard, counters.
+- `tools/test-fuxi-adreno.py`: a parked job is not counted ahead of the copy
+  and is flushed once after the copy's words.
+- `tools/test-fuxi-unixnu.py`: the `pk=` field and the end-line count.
+
+Not yet observed.
+
 ### Direct-DPU-scanout stage 1: read-only display SMMU survey (`fuxigpuncimport` bit 22)
 
 Bit 22 (value 4194304, so 2948728 becomes 7143032, same length) needs
