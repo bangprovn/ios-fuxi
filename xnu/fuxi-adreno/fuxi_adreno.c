@@ -179,6 +179,7 @@ static void fg_guard_exit(struct fg_guard *g) { if (g->lock) IOLockUnlock(g->loc
 #define G_RING_INDEX(w) ((w) & 8191u)
 static void fg_scm_call(uint64_t ret[4], unsigned slot, unsigned step,
     uint32_t fn, uint32_t info, uint64_t a, uint64_t b, uint64_t c);
+static void fg_irq_quiesce(void);
 #include "gpu.c"
 static unsigned fg_clock_measure;
 /* Startup diagnostics have their own fault result: an optional readback must
@@ -360,6 +361,7 @@ static void fg_fail(const char *reason, unsigned code)
  * pages still reachable by DMA; CPU fallback resumes with isolation asserted. */
 static int fg_isolate(void)
 {
+ fg_irq_quiesce();
  uint64_t v = 1;
  int good = !fg_access(GPU_REG_BASE + 0x3c45*4, &v, 1, 0);
  for (unsigned step = 1; step <= 2; step++) {
@@ -948,4 +950,5 @@ int fuxi_gpu_copy(unsigned slot, uint64_t generation, uintptr_t source, uint64_t
  return 2; /* submitted; source is owned until poll retires this fence */
 }
 #include "fuxi_gpu_abi_backend.inc"
+#include "fuxi_gpu_irq.inc"
 #endif

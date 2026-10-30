@@ -560,3 +560,139 @@ snapshots, bitmask parsing), `test-fuxi-gpu-k1.py` (handle index after churn,
 `test-fuxi-hostimport.py`, `test-fuxi-adreno.py` (fenced doorbell compiled into
 the present path), `test-fuxi-unixnu.py`. `test-fuxi-turnip-submit.py` (native
 macOS) was updated by inspection only.
+
+## GPU fence interrupt: `fuxigpuncimport` bit 26
+
+Offline, 2026-10-30. Nothing here has been run on the device. Every device
+effect below is **not yet observed**. Opt-in: add 67108864 (bit 26) to the
+`fuxigpuncimport` value. This adds one cmdline character, for example the
+current boot base 2948728 becomes 70057592. Bits 22-25 belong to other lanes
+(22 DPU SMMU survey, 23-24 reserved for DPU scanout, 25 PAC self-test) and are
+not read by this code. The other bits behave the same when bit 26 is clear.
+
+### Sources and licences
+
+| Source | Used for |
+| --- | --- |
+| UniXNU-sheng `package/GpuPowerProbe.cpp` (`gpuIrq`, `ringIdle`, `irqAndTimer`; revisions `b0ccf61`, `36ec562`), BSD-2-Clause-Patent | Handler shape: clear `RBBM_INT_0_STATUS` through `RBBM_INT_CLEAR_CMD`, then wake the waiters. Waits are at most 1000 us a slice. The SPI is masked after a run of empty interrupts (sheng uses 100k; we use 1000). |
+| UniXNU ArmCpu `armcpu_spi_attach` (`1951cc8`, not re-verified from here), BSD-2-Clause-Patent | Distributor sequence: ICENABLER and an RWP wait, IGROUPR, IPRIORITYR 0xa0, ICFGR, IROUTER set to the boot CPU's affinity, ISENABLER, then a readback in the form group\|en<<1\|edge<<2\|prio<<8. Also: mask an SPI that has no owner. |
+| Adreno740 `NativeAdrenoSubmit.cpp` @ `f53000c` (`native_adreno_fence_pending`), MIT; sheng `BootLog.c` @ `e34beda` (`[gpu pending]`) | Idea for a pending-time histogram. Our buckets are in microseconds and are our own. |
+
+The notices are kept in `xnu/fuxi-adreno/LICENSE.ArmCpu` and
+`LICENSE.UniXNU-sheng`, installed as `bsd/dev/LICENSE.*` by 0098. The code is
+`xnu/fuxi-adreno/fuxi_gpu_irq.inc`, included at the end of `fuxi_adreno.c`. No
+reference code was built or executed.
+
+### Interrupt routing on Fuxi (observed in our sources)
+
+- `pe_fiq.c` (patches 0004/0017) programs only the redistributor (SGI/PPI
+  priority 0xA0, group 1) and `GICD_CTLR` ARE_NS\|Grp1.
+- In `sleh_irq`'s SWEET branch, an INTID that is not spurious, not the vtimer and
+  not an SGI calls `cpu_data->interrupt_handler(target, refCon, nub, intid)` if
+  one is set, then EOIs (EOImode 0).
+- Before this change nothing set that handler, and SweetCPU does not use
+  IOCPUInterruptController. An SPI can therefore be enabled, given a priority,
+  configured level or edge, routed with IROUTER (ARE on, `mkadt-fuxi.py`
+  insists on GICD 0x17100000) and dispatched by the per-CPU handler.
+- The SPI is routed to CPU 0 (core 0), never to core 1, which runs the loader's
+  USB monitor. `ml_install_interrupt_handler` is run while bound to each CPU in
+  turn, ending on CPU 0, whose MPIDR (`& 0xff00ffffff`) becomes the route.
+- 0018/0065, `pe_fiq.c`, `sleh.c` and per-CPU startup are not touched.
+
+Source: SPI 300 / INTID 332, level-high (`kgsl_3d0_irq`). Only
+`RBBM_INT_0_MASK` bit 20 is unmasked (CP_CACHE_FLUSH_TS). The client frame's
+BR fence already asks for it (`0x88000031`), and the present copy's fence does
+not. The handler clears only bit 20, so the fault bits that `g3_faulted` reads
+from raw status are kept.
+
+### Behaviour
+
+- **Attach.** Happens once, at the first WaitFence that would wait. It refuses
+  and keeps polling if: the GICD does not map, ARE_NS is clear, there are too
+  few lines, the GPU is not live, MMIO fails, or RWP is stuck. On a readback
+  mismatch it masks the SPI and restores the old mask.
+- **Wait.** Read the interrupt count, then poll. If the fence is still pending
+  and its value is unwritten, sleep until the interrupt or 1 ms. If the value is
+  written but the ring is still draining, poll at `fuxigpuwaitus`; a present copy
+  queued behind raises no interrupt. A race between the count read and the
+  sleep is caught and woken at once.
+- **Storm and failure masks** (the SPI stays masked for the boot, and waiters
+  poll):
+  - why 1: 1000 empty interrupts in a row.
+  - why 2: 5000 interrupts in 100 ms.
+  - why 3: GPU isolation (`fg_isolate` → `fg_irq_quiesce`, which also waits out
+    a handler that is reading MMIO).
+  - why 4: 64 timed-out sleeps with no interrupt ever seen.
+  - Any other SPI that reaches the handler is masked and counted as `foreign`.
+- **Mask repair.** The 600-wait report re-checks `RBBM_INT_0_MASK` under the
+  GPU lock and rewrites it if a reinit cleared it (`maskfix`).
+
+### Log lines
+
+```
+FUXI GPU IRQ: attach INTID 332 cpus N mpidr 0x.. router 0x.. readback 0xa003 (grp|en<<1|edge<<2|prio<<8) int0_mask 0x..->0x100000 armed
+FUXI GPU IRQ: not attached (<reason>), WaitFence keeps polling
+FUXI GPU IRQ: 64 timed-out sleeps and no interrupt, masked; WaitFence polls
+FUXI ABI: fence pending per 600 waits us <250 N <500 N <1000 N <2000 N <4000 N <8000 N <16000 N <32000 N more N untimed N ready N irq state S why W n N empty N foreign N wakes N timeouts N races N written N maskfix N
+```
+
+- **Pending line.** Always on, whether or not the bit is set. It measures from
+  submit to the wait that saw the fence retire, for each successful WaitFence
+  or submit-embedded wait. `untimed` means the fence was not among the client's
+  last 16 submits. `ready` means it had retired at the first poll; these waits
+  are also binned.
+- **`state`.** 0 off, 1 armed, 2 attach failed, 3 masked, 4 attaching.
+- **`why`.** As listed above.
+- **Existing line.** `fence waits per 600 sleeping` is unchanged. With the bit
+  set, its `polls_avg` counts wake-ups, not 100 us polls.
+
+### Expected effect (GUESS, not yet observed)
+
+- **CPU wake-ups.** A WaitFence currently wakes every 100 us, about 80 times
+  for an 8 ms frame. With the bit it should wake about once or twice per frame,
+  plus a few polls while the ring drains. That should save CPU time and power
+  on the waiting core.
+- **Latency.** WaitFence latency should be about the same or a little lower:
+  interrupt, then wake-up, then poll, instead of waiting up to a 100 us poll
+  period. Scheduler wake-up latency is extra.
+- **Where to look.** The pending histogram is the measurement. Compare bit off
+  and bit on at the same workload. Watch the `n`, `wakes` and `timeouts` ratios.
+
+### Risks
+
+- If Gunyah does not pass SPI 332 to the NS GIC, nothing happens. The cost is
+  64 slices of 1 ms (why 4), then polling as before.
+- A source that never clears could still storm before the mask. That is
+  bounded at 5000 interrupts in 100 ms, or 1000 empty interrupts in a row.
+- Unmasking RBBM bit 20 may change GMU/IFPC power behaviour (guess).
+- The handler runs on CPU 0's interrupt stack. MMIO there is not
+  fault-contained, so it is gated by the `fg_irq_ok` handshake and
+  `fg_access_failed`, and `fg_isolate` clears it first. A GPU power collapse
+  without isolation while an interrupt is in flight is not covered.
+- The strict-flag build was approximated on the host: the source compiles and
+  assembles for arm64 under xnu's `-Weverything` list, with kernel-shaped
+  declarations. The real kernel build is CI's.
+
+Tests: `test-fuxi-gpu-irq.py` (new), `test-fuxi-adreno-abi-perf.py` (pending
+line), `test-fuxi-gpu-k1.py`, `test-fuxi-adreno.py`, `test-fuxi-metal.py`, and
+every `sync-fuxi-*.py --check`.
+
+### Later: MDSS TE / vblank for 120 Hz pacing (documentation only)
+
+The same path would serve the display. The following was not implemented, and
+the register offsets in it are unverified (GUESS).
+
+- **Which interrupt.** Qualcomm's `kalama-sde-common.dtsi` gives `mdss_mdp@ae00000`
+  `interrupts = <GIC_SPI 83 IRQ_TYPE_LEVEL_HIGH>`, which is INTID 115. MDSS is a
+  nested controller. The top-level `HW_INTR_STATUS` names the sub-block, and
+  the INTF (vsync) or pingpong/INTF TE (`rd_ptr`, tear-check) status and clear
+  registers then decide.
+- **Handler.** The handler would dispatch by `source`: 332 for the GPU, 115 for
+  MDSS. It would read the top status, read the sub-block status and clear only
+  the TE/vsync bit, then increment a vblank sequence and wake the framebuffer
+  workloop. That replaces the timer-driven present pacing.
+- **Masks and attach.** Use the same storm masks, since tear-check is level and
+  can stick if the panel stops. Use the same attach sequence with its own
+  `fg_window` for MDSS, and route it to CPU 0 as well.
+- **Before enabling.** Check the MDSS offsets in the Linux SDE driver for
+  kalama, and check that Gunyah forwards SPI 83.

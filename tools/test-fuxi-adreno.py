@@ -37,6 +37,7 @@ static uintptr_t fg_scanout_source;
 static unsigned fg_scanout_pitch,fg_scanout_sx,fg_scanout_sy,fg_scanout_dx,fg_scanout_dy,fg_scanout_w,fg_scanout_h;
 static unsigned scanoutStops,verifyBad,dcvsKicks;
 static void fg_dcvs_kick(void) {dcvsKicks++;}
+static unsigned irqQuiesces;static void fg_irq_quiesce(void) {irqQuiesces++;}
 static int fg_scanout_verify(void) {return !verifyBad;}
 static int fg_scanout_stop(const char *reason) {(void)reason;scanoutStops++;fg_scanout_writable=0;return -1;}
 #include <stdint.h>
@@ -381,7 +382,7 @@ int main(void)
  // containment reset once even if the bus drain is repeated.
  reset();fg_faults=fg_suspends=UINT64_MAX;
  fg_fail("saturated",0);assert(fg_faults==UINT64_MAX);
- assert(fg_isolate() && fg_suspends==UINT64_MAX);
+ assert(fg_isolate() && fg_suspends==UINT64_MAX && irqQuiesces);
  fg_suspends=5;assert(fg_isolate() && fg_suspends==5);
  // New handoff: an unknown DMA drain holds display ownership on both submit
  // and asynchronous retirement errors. No CPU reuse of the target is legal.

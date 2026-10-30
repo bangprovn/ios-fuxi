@@ -246,6 +246,10 @@ initializes timer/IPI delivery; `sleh_irq` delegates other INTIDs to the generic
 CPU interrupt handler. Fuxi touch, keys and UFS use polling, and no GPU DT nub,
 SPI routing/registration or GPU interrupt handler exists. This build chooses
 scheduler sleeping without introducing an unverified GIC integration.
+Later (2026-10-30) an opt-in path, `fuxigpuncimport` bit 26 (value 67108864),
+routes this SPI to CPU 0 and lets the native ABI's WaitFence sleep until the
+fence interrupt arrives. Default off. See
+[GPU fence interrupt](unixnu-port.md#gpu-fence-interrupt-fuxigpuncimport-bit-26).
 
 Present stays synchronous on the framebuffer workloop, including the sleeping
 wait, before `fuxi_display_kick`. The swap API records IDs and VSYNC notifications;
