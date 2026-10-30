@@ -191,7 +191,7 @@ public:
   * 3 printed); bit 16: the surfaces of swaps whose copy is not queued yet go to the kernel copy priority; bit 32: a ready swap with a
   * newer ready swap behind it is dropped before its copy (the newer one is copied instead). */
  struct FlogEntry { uint64_t swap, ready, submit, fence, start; uint32_t id, surface, s2s, blit, ahead, buf, te, xfer; char fate; };
- FlogEntry     fFlog[SWEET_FB_FLOG];
+ FlogEntry    *fFlog; /* SWEET_FB_FLOG entries, allocated only with bit 8 (10 KB; the object is limited to 16 KB by kalloc_type) */
  unsigned      fFlogState, fFlogN, fFlogSwaps;
  uint32_t      fFlogGpuID, fSupersededSkips;
  bool          fCopyFirst, fSkipSuperseded;
@@ -599,7 +599,8 @@ AppleCLCD::start(IOService *provider)
  fuxi_gpu_scanout_configure(fPixels, fScanout, check);
  uint32_t nc = 0;
  PE_parse_boot_argn("fuxigpuncimport", &nc, sizeof(nc));
- fFlogState = fScanout && (nc & 8u) ? 1 : 0; fCopyFirst = fScanout && (nc & 16u); fSkipSuperseded = fScanout && (nc & 32u);
+ if (fScanout && (nc & 8u)) fFlog = IONewZeroData(FlogEntry, SWEET_FB_FLOG);
+ fFlogState = fFlog ? 1 : 0; fCopyFirst = fScanout && (nc & 16u); fSkipSuperseded = fScanout && (nc & 32u);
  if (fScanout && (nc & 56u)) IOLog("SWEET FB: frame_log=%u copy_first=%u skip_superseded=%u (fuxigpuncimport 8/16/32)\n", fFlogState, fCopyFirst, fSkipSuperseded);
  if (fScanout) {
   fWriterWakeCall = thread_call_allocate(&AppleCLCD::writerWake, this);
@@ -621,6 +622,9 @@ AppleCLCD::free(void)
 #endif
  if (fLock) { IOLockLock(fLock); stopRecords(); IOLockUnlock(fLock); }
 	if (fShadow) IOFreeAligned(fShadow, (vm_size_t)fShadowBytes);
+#if defined(FUXI)
+ if (fFlog) IODeleteData(fFlog, FlogEntry, SWEET_FB_FLOG);
+#endif
 	IOMobileFramebuffer::free();
 }
 

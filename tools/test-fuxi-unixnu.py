@@ -834,7 +834,7 @@ int main(void) {
  lf.fSwapID=3000;scanOwned=scanDouble=scanTriple=true;scanAcquire=1;scanPublish=1;scanRetryResult=0;gpuMode=2;pollMode=1;
  unsigned baseRefs=refs;
  uint8_t frame[SWEET_FB_SWAP_REC_SIZE];memcpy(frame,rec,sizeof(frame));
- lf.fCopyFirst=true;lf.fFlogState=1;lf.fFlogSwaps=SWEET_FB_FLOG_WARMUP-2;
+ static AppleCLCD::FlogEntry flogBuf[SWEET_FB_FLOG];lf.fFlog=flogBuf;lf.fCopyFirst=true;lf.fFlogState=1;lf.fFlogSwaps=SWEET_FB_FLOG_WARMUP-2;
  put32(frame,0x50,2001);assert(!lf.swap(frame) && lf.fFlogState==1 && !lf.fFlogN); // last warmup swap
  assert(dueN==1 && dueIds[0]==surface.id);
  lf.presentStep(true);assert(lf.fGpuPending && dueN==0); // copy queued: no longer due
@@ -870,6 +870,7 @@ int main(void) {
  lf.presentStep(true);assert(lf.swapWait(2205,0x80000001u,0)==0 && lf.swapWait(2204,0x80000001u,0)==kIOReturnAborted);
  IOLockLock(lf.fLock);lf.stopRecords();IOLockUnlock(lf.fLock);assert(refs==baseRefs && dueN==0);
  scanDouble=scanTriple=scanOwned=scanBackReady=false;scanPublish=0;gpuMode=0;copyStamps={};
+ static_assert(sizeof(AppleCLCD)<=14*1024,"the kernel object (with its IOService base) is limited to 16 KB by kalloc_type; large buffers go on the heap"); // CI 41046931721
  puts("PASS: frame log (bit 8): warmup, per-frame fates S/P, GPU detail, one-shot summary and TE gaps; due surfaces (bit 16) follow the queue and the copy; superseded ready swap dropped before its copy (bit 32), not while a writer holds it");
  }
  {

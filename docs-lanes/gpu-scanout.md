@@ -1406,7 +1406,9 @@ independent, and with none set the behavior is unchanged.
   while waiting for START, `-` open). The summary line counts
   `copies_behind_client_job`, `submit_to_start_over_3ms`,
   `fence_pairs_within_half_period` and `start_te_gaps 1/2/3+`, which confirm
-  or refute the pairing directly.
+  or refute the pairing directly. The 10 KB log is heap-allocated only when
+  bit 8 is set, because kalloc_type limits the `AppleCLCD` object to 16 KB.
+  An inline array broke CI run 41046931721 with a static assertion.
 - **16, copy priority** (needs inline, 512|2097152; `fg_abi_copy_first`).
   `SweetFramebuffer` publishes the surfaces of queued swaps whose copy is not
   queued yet (`fuxi_gpu_present_due`, under its lock). `sweet_gpu_writer`
