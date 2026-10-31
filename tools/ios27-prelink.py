@@ -25,6 +25,7 @@ Outputs in DIR (refused if kernel.prelinked exists, unless --force):
   kernel.map.json    the matcher's pairing, reused while inputs and matcher match
   summary.json       per-root kernel references: matched, stubbed, missing, with
                      neighbour-name hints for unmatched targets (hints are guesses)
+  targets.json       per-root bound kernel references: original, native, paired name, match method
   checks.json        structural checks of the image (UniXNU check-prelink-xml rules,
                      flat root, entries, entry point, fixups)
 Preflight (before the minute-long matcher) refuses a native kernel without
@@ -322,9 +323,16 @@ def summarize(kit, cache_data, report, pairing, seen, roots):
             section, hint = where(original)
             unmatched.append({'original': hex(original), 'kind': 'stubbed' if target in stubbed else 'missing',
                               'section': section, 'neighbour_hint_guess': hint})
+        bound = []
+        for target in sorted(targets - stubbed - missing):
+            original = (target - slide) & mask
+            kind = 'functions' if hex(original) in pairing['functions'] else 'data'
+            pair = pairing[kind].get(hex(original), {})
+            bound.append({'original': hex(original), 'native': pair.get('native'), 'name': pair.get('name'),
+                          'how': pair.get('how')})
         per_root[bundle] = {'root': bundle in roots, 'kernel_targets': len(targets | stubbed | missing),
                             'matched': len(targets - stubbed - missing), 'stubbed': len(stubbed),
-                            'missing': len(missing), 'unmatched': unmatched}
+                            'missing': len(missing), 'unmatched': unmatched, 'bound': bound}
     return per_root
 
 
@@ -457,7 +465,7 @@ def main():
           f'native __DATA {facts.get("native_data_size")}')
     if a.preflight_only:
         return
-    for name in ('kernel.prelinked', 'kernel.json', 'summary.json', 'checks.json'):
+    for name in ('kernel.prelinked', 'kernel.json', 'summary.json', 'checks.json', 'targets.json'):
         (out / name).unlink(missing_ok=True)
     pairing = matching(kit, cache_data, native_data, reference_data, out / 'kernel.map.json')
     if reference_data is not None and not a.no_gap_order:
@@ -479,8 +487,9 @@ def main():
                'matcher_by_method': stats.get('functions_by_method'), 'statistics': report['statistics'],
                'distinct': {kind: len({u['original'] for r in per_root.values() for u in r['unmatched'] if u['kind'] == kind})
                             for kind in ('stubbed', 'missing')},
-               'per_root': per_root}
+               'per_root': {b: {k: v for k, v in r.items() if k != 'bound'} for b, r in per_root.items()}}
     (out / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
+    (out / 'targets.json').write_text(json.dumps({b: r['bound'] for b, r in per_root.items()}, indent=1) + '\n')
     result = checks(kit, image, report)
     (out / 'checks.json').write_text(json.dumps(result, indent=2) + '\n')
     print(f'{"bundle":58} {"refs":>5} {"match":>5} {"stub":>5} {"miss":>5}')

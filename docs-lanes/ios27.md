@@ -298,6 +298,15 @@ failed: 12` (mockfs probes the volume first). APFS logs `ARV enabled` and import
 | C | + `fuxi_root27_rwmedia=1` (IOMedia writable) | refused |
 | D | `mkadt-fuxi27.py --root-hash` | root hash import succeeds (no error); still refused |
 | E | + `mkadt-fuxi27.py --fstab` | still refused |
+| F | + `fuxi_root27_nomockfs=1` (mockfs no longer probes first) | still refused |
+| G | 16 MiB APFS ramdisk made with `newfs_apfs`, `rd=md0`, no UFS | refused at once, before APFS opens the device |
+| H | prelink binds APFS/Sandbox's 4-byte global to `_rootdev` instead of `_mountroot` | still refused |
+
+Boot G makes the refusal a global APFS gate: it does not depend on the device, the volume or the DT root
+properties. `ios27-prelink.py` now writes `targets.json` (every kernel reference of each root kext with the native
+symbol and the match method) to audit what APFS calls; 427 of APFS's 856 kernel references are bound by
+`reference-order` only, so a mis-paired policy query is one candidate (GUESS). The `_rootdev` pair (H) is kept:
+the original is a 4-byte global and `mountroot` an 8-byte pointer, so the old binding was wrong either way.
 
 Observed about the image: the IPSW OS volume is not sealed (incompat 0x8 only, no snapshots, no integrity
 metadata), like the unsealed iOS 17 OS volume UniXNU mounts as root. The iOS config has no CSR (`kern_csr.c` is

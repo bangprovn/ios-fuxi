@@ -36,6 +36,7 @@
     "0xfffffe000b9293b8": {"name": "_gIODTAAPLInterruptsKey", "confidence": "medium", "evidence": "gIODTNameKey+0x48 in both"},
     "0xfffffe000b8b3ce8": {"name": "_kext_assertions_enable", "confidence": "medium", "evidence": "debugger_current_op+0x34 in both"},
     "0xfffffe000b929a00": {"name": "_gIOMatchCategoryKey", "confidence": "high", "evidence": "__DATA,__common in both; bound by the matcher's reference-data pass against the pre-K4 kernel, lost when K4 globals shifted __common; used by IOStorageFamily"},
-    "0xfffffe000b92b500": {"name": "_gIOGeneralInterest", "confidence": "high", "evidence": "__DATA,__common in both; bound by the matcher's reference-data pass against the pre-K4 kernel, lost the same way; used by IOStorageFamily, AppleIISController, AppleM2ScalerCSCDriver"}
+    "0xfffffe000b92b500": {"name": "_gIOGeneralInterest", "confidence": "high", "evidence": "__DATA,__common in both; bound by the matcher's reference-data pass against the pre-K4 kernel, lost the same way; used by IOStorageFamily, AppleIISController, AppleM2ScalerCSCDriver"},
+    "0xfffffe000b927dcc": {"name": "_rootdev", "confidence": "medium", "evidence": "4-byte aligned (mountroot, which the matcher's reference-data pass picked, is an 8-byte function pointer and not exported); referenced only by apfs and sandbox, which both also take rootvp (0x64 above); rootdev (dev_t) is the 4-byte root global exported next to rootvp in Private.exports and no other original binds to it. With the mountroot binding apfs refused every root mount, ramdisk included (K4 boot G)"}
   }
 }
