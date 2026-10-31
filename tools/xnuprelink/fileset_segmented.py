@@ -286,6 +286,9 @@ class SegmentedEmit(Emit):
         # corecrypto authenticates the relocated __text bytes in a fileset.
         code = next(s for s in self.native.sections if s['segment'] == '__TEXT_EXEC' and s['name'] == '__text')
         seals = [s for s in self.native.sections if s['name'] == '__fips_hmacs']
+        if not seals:  # Fuxi: no in-kernel corecrypto (com.apple.kec.corecrypto is prelinked), nothing to seal
+            self.report['corecrypto_hmac_sha256'] = None
+            return
         if len(seals) != 1 or seals[0]['size'] != 32:
             raise ValueError('Expected one 32-byte corecrypto HMAC field')
         code_at = self.layout.translate(code['va']) - self.cache.base
