@@ -36,13 +36,24 @@ kernel_end past it, so the shim needs no changes: the image lands below the
 ADT and boot_args, inside topOfKernelData (never handed to the VM), and the
 ADT gets /chosen/memory-map "RAMDisk" = <phys, size> for IOFindBSDRoot to
 turn into md0 (boot with rd=md0).
+
+--prelinked FILESET (K2, docs-lanes/ios27.md#k2) packs the MH_FILESET that
+tools/ios27-prelink.py emitted from KERNEL instead of KERNEL itself. KERNEL must
+be the native kernel named in FILESET's report (FILESET with suffix .json), and
+the report must name FILESET. The root segments are copied flat, untouched:
+xnu's arm_init slides the collection itself (kernel_collection_slide over the
+root LC_DYLD_CHAINED_FIXUPS, signing the arm64e pointers), so no fixup is
+applied here and no __thread_starts is needed. An incomplete mapping (made with
+--allow-missing) is refused unless --allow-incomplete is given.
 """
-import argparse, os, struct, sys
+import argparse, hashlib, json, os, struct, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import adt  # noqa: E402
 
 LC_SEGMENT_64, LC_UNIXTHREAD, LC_DYLD_CHAINED_FIXUPS = 0x19, 0x5, 0x80000034
+LC_FILESET_ENTRY = 0x80000035
+MH_EXECUTE, MH_FILESET = 2, 12
 PAGE = 0x4000
 BOOT_LINE_LENGTH = 608
 CMDLINE = 0x48
@@ -54,7 +65,7 @@ BOOT_LINES = {1: 608, 2: 1024}
 def parse_macho(buf):
     magic, cputype, cpusub, ftype, ncmds, sizeofcmds, flags, _ = struct.unpack_from('<8I', buf, 0)
     assert magic == 0xfeedfacf, 'not a 64-bit Mach-O'
-    segs, entry, fixups, thread_starts = [], None, None, None
+    segs, entry, fixups, thread_starts, entries = [], None, None, None, {}
     off = 32
     for _ in range(ncmds):
         cmd, size = struct.unpack_from('<II', buf, off)
@@ -73,9 +84,57 @@ def parse_macho(buf):
             entry, = struct.unpack_from('<Q', buf, off + 16 + 32 * 8)
         elif cmd == LC_DYLD_CHAINED_FIXUPS:
             fixups = struct.unpack_from('<II', buf, off + 8)	# dataoff, datasize
+        elif cmd == LC_FILESET_ENTRY:
+            vmaddr, fileoff, name_at = struct.unpack_from('<QQI', buf, off + 8)
+            entries[buf[off + name_at:buf.index(b'\0', off + name_at)].decode()] = (vmaddr, fileoff)
         off += size
-    return dict(cputype=cputype, cpusub=cpusub & 0xff, segs=segs, entry=entry, fixups=fixups,
-                thread_starts=thread_starts, auth_fixups=0)
+    return dict(cputype=cputype, cpusub=cpusub & 0xff, ftype=ftype, segs=segs, entry=entry, fixups=fixups,
+                thread_starts=thread_starts, auth_fixups=0, entries=entries)
+
+
+def check_fileset(buf, m):
+    """An emitted K2 collection as arm_init expects it: flat root, kernel entry, pc in its code."""
+    if m['ftype'] != MH_FILESET:
+        raise SystemExit('--prelinked input is not an MH_FILESET')
+    if 'com.apple.kernel' not in m['entries']:
+        raise SystemExit('fileset has no com.apple.kernel entry')
+    text = m['segs'][0]
+    if text['name'] != '__TEXT' or text['fileoff'] != 0:
+        raise SystemExit('fileset root does not start with __TEXT at file offset 0')
+    for s in m['segs']:
+        if s['filesize'] and (s['vmaddr'] - text['vmaddr'] != s['fileoff'] or s['fileoff'] + s['filesize'] > len(buf)):
+            raise SystemExit(f"fileset root segment {s['name']} is not flat (va - base == file offset) inside the file")
+    va, fileoff = m['entries']['com.apple.kernel']
+    kernel = parse_macho(buf[fileoff:])
+    code = [s for s in kernel['segs'] if s['name'] == '__TEXT_EXEC']
+    if kernel['ftype'] != MH_EXECUTE or not code or m['entry'] is None:
+        raise SystemExit('fileset kernel entry is not an MH_EXECUTE with __TEXT_EXEC and a root LC_UNIXTHREAD')
+    if not code[0]['vmaddr'] <= m['entry'] < code[0]['vmaddr'] + code[0]['vmsize']:
+        raise SystemExit(f"fileset entry {m['entry']:#x} is outside the kernel's __TEXT_EXEC")
+    if not any(s['vmaddr'] <= m['entry'] < s['vmaddr'] + s['vmsize'] for s in m['segs']):
+        raise SystemExit('fileset entry is outside the root segments')
+
+
+def prelinked_report(kernel_path, fileset_path, allow_incomplete=False):
+    """The tools/ios27-prelink.py report for FILESET, checked against KERNEL and FILESET."""
+    report_path = os.path.splitext(fileset_path)[0] + '.json'
+    try:
+        report = json.load(open(report_path))
+    except (OSError, ValueError) as e:
+        raise SystemExit(f'{report_path}: no readable prelink report ({e})')
+    sha = lambda p: hashlib.sha256(open(p, 'rb').read()).hexdigest()
+    if report.get('format') != 'MH_FILESET' or report.get('inputs', {}).get('native_sha256') != sha(kernel_path):
+        raise SystemExit(f'{report_path}: not made from {kernel_path}')
+    if report.get('candidate_sha256') != sha(fileset_path):
+        raise SystemExit(f'{report_path}: does not describe {fileset_path}')
+    incomplete = not report.get('mapping_complete')
+    if incomplete and not allow_incomplete:
+        raise SystemExit(f'{fileset_path}: kext mapping incomplete (emitted with --allow-missing); '
+                         'pass --allow-incomplete to pack it anyway')
+    return dict(fileset=os.path.basename(fileset_path), mapping_complete=not incomplete,
+                stubbed=sum(len(v) for v in report.get('stubbed', {}).values()),
+                missing=sum(len(v) for v in report.get('missing', {}).values()),
+                closure=len(report.get('closure') or ()), reference=report.get('reference_sha256'))
 
 
 def apply_chained_fixups(buf, m):
@@ -163,19 +222,30 @@ def adt_dram(adt_blob):
 CPU_SUBTYPE_ARM64E = 2
 
 
-def build(kernel_path, adt_path, cmdline, ramdisk_path=None, allow_unsigned_auth=False, boot_line_length=BOOT_LINE_LENGTH):
+def build(kernel_path, adt_path, cmdline, ramdisk_path=None, allow_unsigned_auth=False, boot_line_length=BOOT_LINE_LENGTH,
+          prelinked_path=None, allow_incomplete=False):
     version = next((v for v, n in BOOT_LINES.items() if n == boot_line_length), None)
     if version is None:
         raise SystemExit(f'boot line length must be one of {sorted(BOOT_LINES.values())}')
     seg_table_off = CMDLINE + boot_line_length
+    prelinked = None
+    if prelinked_path:
+        prelinked = prelinked_report(kernel_path, prelinked_path, allow_incomplete)
+        kernel_path = prelinked_path
     buf = bytearray(open(kernel_path, 'rb').read())
     m = parse_macho(buf)
-    nfix = apply_chained_fixups(buf, m)
-    if m['auth_fixups'] and not allow_unsigned_auth:
-        raise SystemExit(f"{kernel_path}: {m['auth_fixups']} authenticated chained fixups would stay unsigned; "
-                         'link the arm64e kernel with -threaded_starts_section (patch 0115)')
-    if m['cpusub'] == CPU_SUBTYPE_ARM64E and not m['thread_starts'] and not allow_unsigned_auth:
-        raise SystemExit(f'{kernel_path}: arm64e kernel without __TEXT,__thread_starts: nothing signs its pointers')
+    if prelinked is not None or m['ftype'] == MH_FILESET:
+        if prelinked is None:
+            raise SystemExit(f'{kernel_path}: an MH_FILESET kernel is packed with --prelinked (and its native kernel)')
+        check_fileset(buf, m)
+        nfix = 0	# arm_init slides and signs the collection (kernel_collection_slide)
+    else:
+        nfix = apply_chained_fixups(buf, m)
+        if m['auth_fixups'] and not allow_unsigned_auth:
+            raise SystemExit(f"{kernel_path}: {m['auth_fixups']} authenticated chained fixups would stay unsigned; "
+                             'link the arm64e kernel with -threaded_starts_section (patch 0115)')
+        if m['cpusub'] == CPU_SUBTYPE_ARM64E and not m['thread_starts'] and not allow_unsigned_auth:
+            raise SystemExit(f'{kernel_path}: arm64e kernel without __TEXT,__thread_starts: nothing signs its pointers')
     segs = [s for s in m['segs'] if s['vmsize']]
     text = m['segs'][0]
     assert text['name'] == '__TEXT' and text['fileoff'] == 0
@@ -226,7 +296,7 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None, allow_unsigned_auth
     info = dict(version=version, cputype=hex(m['cputype']), cpusub=m['cpusub'], fixups=nfix, auth_fixups=m['auth_fixups'],
                 thread_starts=m['thread_starts'] and (hex(m['thread_starts'][0]), hex(m['thread_starts'][1])),
                 virt_base=hex(virt_base),
-                entry=hex(m['entry']), kernel_end=hex(kernel_end), ramdisk=ramdisk, size=len(out),
+                entry=hex(m['entry']), kernel_end=hex(kernel_end), ramdisk=ramdisk, prelinked=prelinked, size=len(out),
                 segs=[(s['name'], hex(s['vmaddr']), hex(s['vmsize'])) for s in segs])
     return bytes(out), info
 
@@ -240,8 +310,15 @@ if __name__ == '__main__':
                     help='pack arm64e authenticated fixups unsigned (stock VMAPPLE kernel experiments only)')
     ap.add_argument('--boot-line-length', type=int, choices=sorted(BOOT_LINES.values()), default=BOOT_LINE_LENGTH,
                     help='boot_args.CommandLine size of the kernel: 608 (xnu-8796, payload v1) or 1024 (xnu-12377, v2)')
+    ap.add_argument('--prelinked', metavar='FILESET',
+                    help='K2: pack this MH_FILESET emitted from KERNEL by tools/ios27-prelink.py (report FILESET.json)')
+    ap.add_argument('--allow-incomplete', action='store_true',
+                    help='with --prelinked: pack a fileset whose kext mapping is incomplete (--allow-missing)')
     a = ap.parse_args()
-    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, a.allow_unsigned_auth, a.boot_line_length)
+    if a.allow_incomplete and not a.prelinked:
+        ap.error('--allow-incomplete needs --prelinked')
+    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, a.allow_unsigned_auth, a.boot_line_length,
+                       a.prelinked, a.allow_incomplete)
     open(a.out, 'wb').write(blob)
     for k, v in info.items():
         if k != 'segs':

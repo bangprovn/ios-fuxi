@@ -10,7 +10,9 @@
     GICv3 intc ArmCpu accepts, /psci only with secondaries, no SHA-1-hashed chip ids, <= 16 KiB;
   - payload v2: mkpayload --boot-line-length 1024 puts the segment table at 0x448, v1 stays 0x2a8 and
     byte-identical to the default; shim/fuxi-loader/build.sh's payload check accepts both; loader.c carries
-    the v1/v2 boot_args layouts (CommandLine at 108, 736 / 1152 bytes);
+    the v1/v2 boot_args layouts (CommandLine at 108, 736 / 1152 bytes); mkpayload --prelinked packs a K2
+    MH_FILESET flat and untouched (arm_init slides it), bound to its report and native kernel;
+  - fuxi-xnu-monitor.py symbols() on thin and fileset kernels, ring size from _sweet_log_size;
   - kernel-inputs.py --variant ios27 and the CI plan/dry-run/workflow plumbing (ios27 not in all).
 
   --xnu DIR   also apply the series (xnu27/apply.sh) to a temporary worktree of DIR, a git clone of
@@ -19,6 +21,7 @@
 import argparse
 import ast
 import hashlib
+import json
 import re
 import struct
 import subprocess
@@ -200,6 +203,68 @@ def build_sh_check():
     return text.split("<<'PY'\n", 1)[1].split('\nPY\n', 1)[0]
 
 
+LINK = 0xfffffff007004000
+
+
+def fileset(flat=True, pc=LINK + 0x8010):
+    """A minimal K2 collection: flat root (__TEXT, __TEXT_EXEC), LC_UNIXTHREAD, a com.apple.kernel entry."""
+    seg = lambda name, va, size, off: struct.pack('<II16s4Q4I', 0x19, 72, name.encode(), va, size, off, size, 5, 5, 0, 0)
+    name = b'com.apple.kernel\0'.ljust(24, b'\0')
+    thread = struct.pack('<IIII', 0x5, 16 + 34 * 8 + 8, 6, 68) + bytes(32 * 8) + struct.pack('<Q', pc) + bytes(8 + 8)
+    cmds = (seg('__TEXT', LINK, 0x4000, 0) + seg('__TEXT_EXEC', LINK + 0x4000, 0x8000, 0x4000 if flat else 0x5000)
+            + thread + struct.pack('<IIQQII', 0x80000035, 32 + len(name), LINK + 0x4000, 0x4000, 32, 0) + name)
+    raw = bytearray(0xc000)
+    raw[:32 + len(cmds)] = struct.pack('<8I', 0xfeedfacf, 0x100000c, 0xc0000002, 12, 4, len(cmds), 0, 0) + cmds
+    inner = seg('__TEXT_EXEC', LINK + 0x8000, 0x4000, 0x8000)
+    raw[0x4000:0x4000 + 32 + len(inner)] = struct.pack('<8I', 0xfeedfacf, 0x100000c, 0xc0000002, 2, 1, len(inner), 0, 0) + inner
+    raw[0x5000:0x5017] = b'DEVELOPMENT_ARM64_FUXI\0'
+    return bytes(raw)
+
+
+def prelinked_check(tmp, check):
+    native = tmp / 'native'
+    native.write_bytes(b'native kernel')
+    sha = lambda b: hashlib.sha256(b).hexdigest()
+
+    def emit(blob, complete=False, native_sha=None):
+        (tmp / 'kc.prelinked').write_bytes(blob)
+        (tmp / 'kc.json').write_text(json.dumps({
+            'format': 'MH_FILESET', 'inputs': {'native_sha256': native_sha or sha(b'native kernel')},
+            'candidate_sha256': sha(blob), 'mapping_complete': complete, 'closure': ['a', 'b'],
+            'stubbed': {'a': {'0x1': 1, '0x2': 3}}, 'missing': {'b': {'0x3': 1}}, 'reference_sha256': None}))
+        return tmp / 'kc.prelinked'
+
+    def refused(*args, **kw):
+        try:
+            mkpayload.build(*args, **kw)
+        except SystemExit:
+            return True
+        return False
+
+    kc = emit(fileset())
+    assert refused(native, tmp / 'a', 'cpus=1', boot_line_length=1024, prelinked_path=kc)   # incomplete
+    blob, info = mkpayload.build(native, tmp / 'a', 'cpus=1', boot_line_length=1024, prelinked_path=kc, allow_incomplete=True)
+    assert info['fixups'] == 0 and info['entry'] == hex(LINK + 0x8010) and info['virt_base'] == hex(LINK & ~0x1ffffff)
+    assert info['prelinked'] == {'fileset': 'kc.prelinked', 'mapping_complete': False, 'stubbed': 2, 'missing': 1,
+                                 'closure': 2, 'reference': None}
+    assert [s[:2] for s in info['segs']] == [('__TEXT', hex(LINK)), ('__TEXT_EXEC', hex(LINK + 0x4000))]
+    va, vs, off, sz = struct.unpack_from('<4Q', blob, 0x448)
+    assert va == LINK and struct.unpack_from('<I', blob, off + 12)[0] == 12   # root MH_FILESET header copied untouched
+    va, vs, off, sz = struct.unpack_from('<4Q', blob, 0x468)
+    assert blob[off:off + sz] == fileset()[0x4000:0xc000]
+    (tmp / 'p').write_bytes(blob)
+    r = subprocess.run([sys.executable, '-', str(tmp / 'p')], input=check, text=True, capture_output=True)
+    assert r.returncode == 0, r.stderr
+    assert mkpayload.build(native, tmp / 'a', 'cpus=1', boot_line_length=1024, prelinked_path=emit(fileset(), True))[0] == blob
+    assert refused(kc, tmp / 'a', 'cpus=1', boot_line_length=1024)                           # fileset without --prelinked
+    assert refused(native, tmp / 'a', 'cpus=1', boot_line_length=1024, prelinked_path=emit(fileset(), True, 'f' * 64))
+    kc = emit(fileset(), True)
+    (tmp / 'kc.prelinked').write_bytes(fileset() + b'x')                                       # report names other bytes
+    assert refused(native, tmp / 'a', 'cpus=1', boot_line_length=1024, prelinked_path=kc)
+    for bad in (fileset(flat=False), fileset(pc=LINK + 0x4010)):                               # not flat; pc outside kernel code
+        assert refused(native, tmp / 'a', 'cpus=1', boot_line_length=1024, prelinked_path=emit(bad, True))
+
+
 def payload_check():
     spec_t = importlib.util.spec_from_file_location('t_arm64e', ROOT / 'tools/test-fuxi-arm64e.py')
     t = importlib.util.module_from_spec(spec_t)
@@ -233,6 +298,7 @@ def payload_check():
         struct.pack_into('<I', bad, 8, 3)
         (tmp / 'p').write_bytes(bad)
         assert subprocess.run([sys.executable, '-', str(tmp / 'p')], input=check, text=True, capture_output=True).returncode
+        prelinked_check(tmp, check)
     loader = (ROOT / 'shim/fuxi-loader/loader.c').read_text()
     for need in ('#define BOOT_LINE_V1\t\t608', '#define BOOT_LINE_V2\t\t1024',
                  '_Static_assert(BOOT_ARGS_FLAGS(BOOT_LINE_V1) + 16 == 736',
@@ -245,7 +311,9 @@ def payload_check():
     mon = (ROOT / 'tools/fuxi-xnu-monitor.py').read_text()
     assert "line = 1024 if struct.unpack_from('<I', payload, 8)[0] == 2 else 608" in mon
     print('PASS: payload v2 (cmdline[1024], segments at 0x448) and v1 (0x2a8, default byte-identical) pass the '
-          'loader build check; version 3 and an over-long v2 line are refused; loader/monitor layouts match')
+          'loader build check; version 3 and an over-long v2 line are refused; loader/monitor layouts match; '
+          '--prelinked packs a flat MH_FILESET untouched (entry in kernel __TEXT_EXEC, report bound to both inputs, '
+          'incomplete mapping only with --allow-incomplete)')
 
 
 def thin_kernel(syms, filetype=2, at=0):
