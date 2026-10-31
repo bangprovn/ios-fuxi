@@ -96,7 +96,7 @@ inline void importCheck(VkResult r,int line=__builtin_LINE()) {
  X(CreatePipelineLayout) X(DestroyPipelineLayout) X(CreateGraphicsPipelines) X(DestroyPipeline) \
  X(CreatePipelineCache) X(DestroyPipelineCache) X(GetPipelineCacheData) \
  X(CmdBindVertexBuffers) X(CmdBindIndexBuffer) X(CmdDrawIndexed) X(CmdSetViewport) X(CmdSetScissor) X(CmdPushConstants) X(CmdBeginRenderPass) X(CmdEndRenderPass) X(CmdBindPipeline) X(CmdDraw) X(CmdCopyImageToBuffer) X(CmdPipelineBarrier) X(CreateFence) X(DestroyFence) X(QueueSubmit) X(WaitForFences)
-struct Buffer { VkBuffer buffer{}; VkDeviceMemory memory{}; void *contents{};void *key{};Buffer *spare{};void *shadowKey() const{return key?key:contents;}bool shadowBacking=false,directUse=false,spareFailed=false,aliased=false; size_t length{}, allocated{},charged{},memoryBytes{},memoryOffset{},references=1;uint32_t memoryType{};bool imported=false,upload=false,poolable=false,gpuWritten=false,daWritten=false; };
+struct Buffer { VkBuffer buffer{}; VkDeviceMemory memory{}; void *contents{};void *key{};Buffer *spare{};void *shadowKey() const{return key?key:contents;}bool shadowBacking=false,directUse=false,spareFailed=false,aliased=false; size_t length{}, allocated{},charged{},memoryBytes{},memoryOffset{},references=1;uint32_t memoryType{};bool imported=false,upload=false,poolable=false,gpuWritten=false,daWritten=false;uint64_t planStamp=0; }; // planStamp: FUXI_MTL_SUBMIT_LEAN per-submit dedupe mark
 // Host ranges a submit's prepare callback will write; absent means unknown (full drain).
 struct PrepareWrite {Buffer *buffer;uint64_t offset,bytes;};
 struct Texture : TextureLevels {VkImage image{};VkDeviceMemory memory{};VkImageView view{};size_t allocated{},charged{},memoryBytes{},references=1;
@@ -106,7 +106,7 @@ struct Texture : TextureLevels {VkImage image{};VkDeviceMemory memory{};VkImageV
  VkImageTiling tiling=VK_IMAGE_TILING_OPTIMAL;VkImageLayout layout=VK_IMAGE_LAYOUT_UNDEFINED;std::array<VkImageLayout,32> levelLayouts{};void *mapped{};bool imported=false,borrowedMemory=false;
  MemoryKey recycleKey{};bool recyclable=false,slabbed=false;uint64_t memOffset{},memExtent{};SlabMemory<VkDeviceMemory>::Block slabBlock{};std::array<uint64_t,7> importKey{};bool importCached=false;
  Buffer *backingBuffer{};size_t backingOffset{},backingRow{};bool shadow=false;uint64_t shadowHash{};bool shadowHashed=false; // hash of the backing rows the last recorded refresh copied
- std::vector<VkImageView> attachmentViews;bool canGenerate=false,filterable=true,blendable=false;};
+ std::vector<VkImageView> attachmentViews;bool canGenerate=false,filterable=true,blendable=false;uint64_t planStamp=0;};
 struct Sampler {size_t references=1;VkSampler sampler{};uint32_t filters=1;float lodMin=0,lodMax=0;};
 struct VariantKey {
  std::array<uint32_t,resourceSlots*8> words{};
@@ -1690,17 +1690,18 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
  void hoistOffscreen(std::vector<Operation> &ops) {
   std::vector<PassGroup> groups;if(!buildGroups(ops,groups,true))return;
   std::vector<size_t> order;order.reserve(groups.size());unsigned moved=0,offs=0;std::map<std::string,unsigned> reasons;std::map<std::string,std::string> examples;
+  const bool note=!systemTranslationPolicy().submitLean || hoistLogged<20 || rtRenameSubmits%300==1; // FUXI_MTL_SUBMIT_LEAN: reason strings only when HoistLog prints them
   struct HoistLog {Backend &b;std::vector<PassGroup> &groups;unsigned &offs;unsigned &moved;std::map<std::string,unsigned> &reasons;std::map<std::string,std::string> &examples;
    ~HoistLog(){if(!(b.hoistLogged<20 || b.rtRenameSubmits%300==1))return;++b.hoistLogged;std::string line;for(auto &r:reasons){line+=" "+r.first+"="+std::to_string(r.second);auto e=examples.find(r.first);if(e!=examples.end())line+="["+e->second+"]";}
     fprintf(stderr,"FUXI MTL: rt hoist n=%u groups=%zu offscreen=%u moved=%u reasons:%s\n",b.hoistLogged,groups.size(),offs,moved,line.c_str());}} hoistLog{*this,groups,offs,moved,reasons,examples};
   for(size_t gi=0;gi<groups.size();++gi){auto &g=groups[gi];size_t insertAt=order.size();
-   if(g.barrier)reasons[std::string("barrier:")+barrierWhy(ops[g.first],true)]++;
-   bool offscreen=!g.barrier;if(offscreen)for(auto *t:g.targets)if(t && !smallOffscreen(t)){offscreen=false;reasons["main-or-large-group"]++;break;}
+   if(g.barrier && note)reasons[std::string("barrier:")+barrierWhy(ops[g.first],true)]++;
+   bool offscreen=!g.barrier;if(offscreen)for(auto *t:g.targets)if(t && !smallOffscreen(t)){offscreen=false;if(note)reasons["main-or-large-group"]++;break;}
    if(offscreen){++offs;size_t scanned=0;const char *why=nullptr;bool stoppedAtEnd=false;const PassGroup *blocker=nullptr;
     for(size_t k=order.size();k-->0 && scanned<256;++scanned){auto &o=groups[order[k]];if(o.barrier){why=barrierWhy(ops[o.first],true);blocker=&o;break;}if(auto *c=conflictWhy(o,g)){why=c;blocker=&o;break;}insertAt=k;}
     if(!why)stoppedAtEnd=true;
-    if(insertAt==order.size()){const char *key=why?why:"nothing-before";reasons[key]++;if(blocker&&examples.find(key)==examples.end()&&g.targets[0])examples[key]=(blocker->targets[0]?std::to_string(blocker->targets[0]->width)+"x"+std::to_string(blocker->targets[0]->height):std::string("barrier-op"))+"->"+std::to_string(g.targets[0]->width)+"x"+std::to_string(g.targets[0]->height);}
-    else if(stoppedAtEnd)reasons["moved-to-start"]++;else reasons["moved-partly"]++;}
+    if(note){if(insertAt==order.size()){const char *key=why?why:"nothing-before";reasons[key]++;if(blocker&&examples.find(key)==examples.end()&&g.targets[0])examples[key]=(blocker->targets[0]?std::to_string(blocker->targets[0]->width)+"x"+std::to_string(blocker->targets[0]->height):std::string("barrier-op"))+"->"+std::to_string(g.targets[0]->width)+"x"+std::to_string(g.targets[0]->height);}
+    else if(stoppedAtEnd)reasons["moved-to-start"]++;else reasons["moved-partly"]++;}}
    if(insertAt!=order.size())++moved;
    order.insert(order.begin()+insertAt,gi);}
   if(!moved)return;
@@ -1739,11 +1740,13 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
   const bool sequenceLog=systemTranslationPolicy().passTimes && (opSequenceSubmits++%300)==1;
   struct HoldRelease {Backend &b;std::vector<Texture *> held;~HoldRelease(){for(auto *t:held)b.destroyTextureUnlocked(t);}} renameHold{*this,{}};
   const bool rtRenaming=systemTranslationPolicy().rtRename && ops.size()>2;size_t mainBefore=0;
+  auto rewritePhase=std::make_unique<PhaseTimer>(SubPhase::rewrite);
   if(rtRenaming){if(sequenceLog)logOpSequence(ops," pre");++rtRenameSubmits;mainBefore=countMainRuns(ops);renameOffscreen(ops,renameHold.held);hoistOffscreen(ops);}
   if(systemTranslationPolicy().reorder && systemTranslationPolicy().merge && ops.size()>2)reorderPasses(ops);
   if(rtRenaming){size_t after=countMainRuns(ops);rtMainBefore+=mainBefore;rtMainAfter+=after;if(mainBefore>after)rtMergedMain+=mainBefore-after;}
   if(systemTranslationPolicy().rtShadow)rtShadowRewrite(ops);
   if(sequenceLog)logOpSequence(ops,"");
+  rewritePhase.reset();
   std::vector<HostUse> hostUses,writes,uses;
   auto addUse=[](std::vector<HostUse> &list,VkDeviceMemory memory,const void *address,size_t bytes,uint8_t kind=1,Buffer *buffer=nullptr){for(auto &old:list)if(old.memory==memory && old.address==address && old.bytes==bytes){old.kind|=kind;return;}list.push_back({memory,address,bytes,kind,buffer});};
   auto bufferUse=[&](std::vector<HostUse> &list,Buffer *b,uint8_t kind=1){if(b)addUse(list,b->memory,b->contents,b->length,kind,b);};
@@ -1843,10 +1846,12 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
    std::vector<std::array<MipRange,resourceSlots>> accessed(ops.size());
    std::vector<std::array<bool,resourceSlots>> generalSamples(ops.size());
    std::vector<Buffer *> buffers;
-   std::unordered_set<Buffer *> bufferSeen;std::unordered_set<Texture *> textureSeen;bufferSeen.reserve(ops.size()*2+8);textureSeen.reserve(ops.size()*2+8);
-   auto addBuffer=[&](Buffer *b){if(b){scanAdd(ScanKind::useProbes,1);if(bufferSeen.insert(b).second)buffers.push_back(b);}};
-   auto addTexture=[&](Texture *t){if(t){scanAdd(ScanKind::useProbes,1);if(textureSeen.insert(t).second)textures.push_back(t);}if(t && t->backingBuffer)addBuffer(t->backingBuffer);};
-   for(size_t n=0;n<ops.size();++n){PhaseTimer planPhase(SubPhase::plan);diagnosticOp=n;auto &op=ops[n];addBuffer(op.src);addBuffer(op.dst);addBuffer(op.indices);addTexture(op.texture);addTexture(op.sourceTexture);
+   // FUXI_MTL_SUBMIT_LEAN: a per-submit stamp on the object replaces the hash sets (same first-seen order); earlier buffer writers are listed instead of rescanning every earlier op.
+   const bool lean=systemTranslationPolicy().submitLean;static std::atomic<uint64_t> planStamps{0};const uint64_t stamp=lean?++planStamps:0;std::vector<size_t> dstOps;
+   std::unordered_set<Buffer *> bufferSeen;std::unordered_set<Texture *> textureSeen;if(!lean){bufferSeen.reserve(ops.size()*2+8);textureSeen.reserve(ops.size()*2+8);}
+   auto addBuffer=[&](Buffer *b){if(b){scanAdd(ScanKind::useProbes,1);if(lean?b->planStamp!=stamp:bufferSeen.insert(b).second){if(lean)b->planStamp=stamp;buffers.push_back(b);}}};
+   auto addTexture=[&](Texture *t){if(t){scanAdd(ScanKind::useProbes,1);if(lean?t->planStamp!=stamp:textureSeen.insert(t).second){if(lean)t->planStamp=stamp;textures.push_back(t);}}if(t && t->backingBuffer)addBuffer(t->backingBuffer);};
+   for(size_t n=0;n<ops.size();++n){PhaseTimer planPhase(SubPhase::plan);diagnosticOp=n;auto &op=ops[n];if(lean && n && ops[n-1].dst)dstOps.push_back(n-1);addBuffer(op.src);addBuffer(op.dst);addBuffer(op.indices);addTexture(op.texture);addTexture(op.sourceTexture);
     if(op.texture && op.texture->shadow && (op.pipeline || op.clearOnly || op.upload || op.sourceTexture || op.generateMips))throw std::runtime_error("read-only linear shadow GPU write refused");
     if(op.texture && op.dstLevel>=op.texture->levels)throw std::runtime_error("destination mip level");
     if(op.texture && op.srcLevel>=(op.sourceTexture?op.sourceTexture:op.texture)->levels)throw std::runtime_error("source mip level");
@@ -1913,7 +1918,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
      if(t && sam && !t->filterable && (sam->filters&(2u|4u|16u)))throw std::runtime_error("texture format linear filtering unavailable");
      if(sam){input.filters[i]=sam->filters;input.lodMin[i]=sam->lodMin;input.lodMax[i]=sam->lodMax;}
     }
-    FrameStageTimer pipelineTimer(timing,&FrameSample::pipe);
+    auto lookupPhase=std::make_unique<PhaseTimer>(SubPhase::planLookup);FrameStageTimer pipelineTimer(timing,&FrameSample::pipe);
     auto *requestedPipeline=op.pipeline;bool cacheDrawPlan=!systemTranslationPolicy().trace;
 #ifdef FUXI_MTL_HOST_TEST
     cacheDrawPlan=cacheDrawPlan && reuseDrawPlans;
@@ -1946,13 +1951,13 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
      }
      if(cacheDrawPlan)drawPlans.insert(requestedPipeline,input,op.pipeline,draws[n],rebase);
     }
-    pipelineTimer.stop();
+    pipelineTimer.stop();lookupPhase.reset();
 #ifdef FUXI_MTL_HOST_TEST
     if(captureDrawPlans){drawPlansForTest.emplace_back(op.pipeline,DrawOutput{});memcpy(&drawPlansForTest.back().second,&draws[n],sizeof(DrawOutput));}
 #endif
     // Analyze the final runtime variant and this draw's descriptors, not the
     // baseline shader or the order in which Metal bindings were set.
-    auto &plan=draws[n];bool skipDraw=false;
+    auto &plan=draws[n];bool skipDraw=false;auto mipPhase=std::make_unique<PhaseTimer>(SubPhase::planMip);
     for(unsigned slot=0;slot<resourceSlots;++slot){auto *sample=op.samples[slot];if(!slot && !sample)sample=op.sourceTexture;if(!sample)continue;
      auto base=op.sampleBase[slot],count=op.sampleCount[slot]?op.sampleCount[slot]:sample->levels-base;
      bool aliases=false,viewOverlap=false;for(unsigned k=0;k<op.colorCount;++k){auto *target=op.color(k).texture;if(target && (sample==target || sample->image==target->image || memoryAlias(sample,target) || hostRangesOverlap(sample->mapped,sample->allocated,target->mapped,target->allocated))){aliases=true;auto l=op.color(k).level;if(l>=base && l-base<count)viewOverlap=true;}}
@@ -2020,6 +2025,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
      auto *image=op.samples[i];if(!i && !image)image=op.sourceTexture;
      for(unsigned j=0;j<resourceSlots;++j){auto *other=op.samples[j];if(!j && !other)other=op.sourceTexture;if(other && other->image==image->image)generalSamples[n][j]=true;}
     }
+    mipPhase.reset();PhaseTimer boundsPhase(SubPhase::planBounds);
     topologyPipeline(op.pipeline,op.topology);
     for(auto *blob:op.pipeline->constantBlobs)addBuffer(blob);
     // CPU bounds check the fixed-function vertex fetches, including every index.
@@ -2032,11 +2038,13 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
     }
     // CPU index bounds are valid only for quiescent host input. A preceding GPU
     // write in this command needs readback before its values can be checked.
-    for(size_t previous=0;previous<n;++previous)if(ops[previous].dst){
+    auto earlierWriter=[&](size_t previous){
      if(ops[previous].dst==op.indices)throw std::runtime_error("GPU-written index input requires separate submission");
      for(auto &stage:op.buffers)for(auto &bound:stage)if(bound.buffer==ops[previous].dst)throw std::runtime_error("GPU-written draw buffer requires separate submission");
-    }
+    };
+    if(lean){for(auto previous:dstOps)earlierWriter(previous);}else for(size_t previous=0;previous<n;++previous)if(ops[previous].dst)earlierWriter(previous);
    }
+   auto analyzePhase=std::make_unique<PhaseTimer>(SubPhase::analyze);
    std::optional<OccPlan> occPlan;
    if(systemTranslationPolicy().occlude && occProbe()){occPlan.emplace();try{occludeAnalyze(ops,draws,*occPlan);}catch(const std::exception &e){occFail(std::string("analysis:")+e.what());occPlan.reset();}}
    // Plan only after runtime variants, access proofs and skipped draws are final.
@@ -2117,6 +2125,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
    }
    if(neutralSize){Measure measure{objectNanos,SubPhase::objects};neutralBuffer=allocateUnlocked(neutralSize);addBuffer(neutralBuffer);}
    for(auto *t:textures)oldTextures.push_back({t,t->layout,t->levelLayouts,t->defined,t->definedLevels,t->shadowHash,t->shadowHashed});
+   analyzePhase.reset();
    auto flushStart=std::chrono::steady_clock::now();auto flushPhase=std::make_unique<PhaseTimer>(SubPhase::flush);
    // Direct shared host writes are not tracked. Only Vulkan HOST_COHERENT permits omission.
    for(auto *t:textures)if(t->mapped && !coherent(t->memoryType)) {VkMappedMemoryRange r{};r.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;r.memory=t->memory;r.size=VK_WHOLE_SIZE;++flushCalls;check(FlushMappedMemoryRanges(device,1,&r));}
@@ -2256,7 +2265,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
     if(t->shadowHashed && t->shadowHash==h && t->isDefined(0)){++sampleHits;if(currentFrame){++currentFrame->shadowHashSkipped;currentFrame->shadowHashBytes+=rowBytes*t->height;}return true;}
     t->shadowHash=h;t->shadowHashed=true;++sampleCopies;sampleCopiedBytes+=rowBytes*t->height;if(currentFrame)++currentFrame->shadowHashCopied;return false;
    };
-   auto refreshImages=[&](size_t opIndex){diagnosticOp=opIndex;const auto &op=ops[opIndex];
+   auto refreshImages=[&](size_t opIndex){PhaseTimer phase(SubPhase::refresh);diagnosticOp=opIndex;const auto &op=ops[opIndex];
     // Once per run, after preceding writes and before any sample transitions.
     // Never deduplicate the transfer-destination transition with a read layout.
     auto readShadow=[&](Texture *t){if(!t || !t->shadow || std::find(refreshed.begin(),refreshed.end(),t)!=refreshed.end())return;
@@ -2297,7 +2306,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
     bool continuation=opIndex && !mergeEnds.empty() && mergeEnds[opIndex-1]>=opIndex;
     if(!continuation){boundPipeline={};boundLayout={};boundSet={};dynamicBound=false;refreshed.clear();for(size_t i=opIndex;i<=passEnd;++i)refreshImages(i);
      // One transfer-destination barrier for every shadow in the run, then the copies.
-     if(!collected.empty()){for(auto *t:collected)transition(t,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);flushImages();for(auto *t:collected)copyShadow(t);collected.clear();}
+     if(!collected.empty()){PhaseTimer phase(SubPhase::refresh);for(auto *t:collected)transition(t,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);flushImages();for(auto *t:collected)copyShadow(t);collected.clear();}
      hoisting=passEnd>opIndex;hoisted.clear();for(size_t i=opIndex;i<=passEnd;++i)prepareImages(i);hoisting=false;flushImages();diagnosticOp=opIndex;}
     if(op.generateMips){auto *t=op.texture;
      if(!t->isDefined(op.mipBase))throw std::runtime_error("undefined mip generation source");
@@ -2314,7 +2323,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
      for(unsigned i=0;i<op.colorCount;++i){auto c=op.color(i);if(!c.texture)continue;if(c.load==1 && !c.texture->isDefined(c.level))throw std::runtime_error("load undefined attachment["+std::to_string(i)+"]");
       c.texture->setDefined(c.level,c.store!=0);targets[i]=c.texture;levels[i]=c.level;targetViews[i]=attachmentView(c.texture,c.level);compactViews[used]=targetViews[i];memcpy(clears[used++].color.float32,c.clear,sizeof(c.clear));}
      bool loadElided=false;
-     if(!continuation){
+     if(!continuation){PhaseTimer passSetupPhase(SubPhase::passSetup);
      std::optional<Operation> passOp;
      if(passEnd>opIndex){passOp=op;for(unsigned i=0;i<op.colorCount;++i){auto c=passOp->color(i);if(!c.texture)continue;c.store=ops[passEnd].color(i).store;passOp->setColor(i,c);}}
      if(occPlan){uint32_t aw=boundaryPerf && passEnd>opIndex?mergeAreas[opIndex].width:(op.areaWidth?op.areaWidth:op.texture->levelWidth(op.dstLevel)),ah=boundaryPerf && passEnd>opIndex?mergeAreas[opIndex].height:(op.areaHeight?op.areaHeight:op.texture->levelHeight(op.dstLevel));
@@ -2342,7 +2351,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
      ri.renderArea={{0,0},boundaryPerf && passEnd>opIndex?mergeAreas[opIndex]:VkExtent2D{op.areaWidth?op.areaWidth:op.texture->levelWidth(op.dstLevel),op.areaHeight?op.areaHeight:op.texture->levelHeight(op.dstLevel)}};ri.clearValueCount=used;ri.pClearValues=clears;
      { // Render area = bounding box of the pass's scissors (a draw can never write outside its scissor). Only when every attachment LOADs:
        // a CLEAR or DONT_CARE load covers the whole attachment in Metal, and LOAD+STORE leaves untouched pixels as they were, so a smaller area is exact.
-      uint64_t fullPixels=uint64_t(ri.renderArea.extent.width)*ri.renderArea.extent.height;bool shrunk=false;
+      PhaseTimer areaPhase(SubPhase::area);uint64_t fullPixels=uint64_t(ri.renderArea.extent.width)*ri.renderArea.extent.height;bool shrunk=false;
       if(systemTranslationPolicy().renderArea && used){
        bool allLoad=!loadElided;for(unsigned i=0;i<op.colorCount;++i){auto c=op.color(i);if(c.texture && c.load!=1)allLoad=false;}
        uint64_t x0=UINT64_MAX,y0=UINT64_MAX,x1=0,y1=0;
@@ -2376,7 +2385,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
      if(currentFrame)++currentFrame->passes;{PhaseTimer phase(SubPhase::passes);CmdBeginRenderPass(cmd,&ri,VK_SUBPASS_CONTENTS_INLINE);}
      if(drawQ && drawInfos.size()<passStampLimit){DrawInfo m{};m.begin=true;m.passW=ri.renderArea.extent.width;m.passH=ri.renderArea.extent.height;drawInfos.push_back(m);CmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,drawQ,uint32_t(drawInfos.size()));}
      }else if(currentFrame)++currentFrame->mergedDraws;
-     if(!culledOp){
+     if(!culledOp){auto bindPhase=std::make_unique<PhaseTimer>(SubPhase::bind);
      auto pipeline=topologyPipeline(op.pipeline,op.topology,passNoFetch);
      if(pipeline!=boundPipeline){CmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline);boundPipeline=pipeline;}
      if(currentFrame)++currentFrame->draws;++cur.draws;
@@ -2441,6 +2450,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
        auto *t=d.slot==0 && !op.samples[0]?op.sourceTexture:op.samples[d.slot];if(!t)continue;uint8_t kind=t->tiling==VK_IMAGE_TILING_LINEAR?1:t->shadow?2:0;uint64_t bytes=uint64_t(t->width)*t->height*texelBytes(t->format);
        if(currentFrame){if(kind==1){++currentFrame->sampleLinear;currentFrame->sampleLinearBytes+=bytes;}else if(kind==2){++currentFrame->sampleShadow;currentFrame->sampleShadowBytes+=bytes;}else{++currentFrame->sampleOptimal;currentFrame->sampleOptimalBytes+=bytes;}}
        if(di.texCount<4){di.tex[di.texCount++]={t->width,t->height,t->format,kind,uint8_t(t->backingBuffer!=nullptr),uint8_t(t->imported || (t->backingBuffer && t->backingBuffer->imported))};}}}
+     bindPhase.reset();
      {PhaseTimer phase(SubPhase::record);for(unsigned i=0;i<draw.pushCount;++i){auto &w=draw.pushes[i];CmdPushConstants(cmd,op.pipeline->layout,w.stages,w.offset,w.size,w.bytes);}
      for(unsigned i=0;i<draw.vertexCount;++i){auto b=op.buffers[0][draw.vertexSlots[i]].buffer;VkDeviceSize offset=draw.vertexOffsets[i];CmdBindVertexBuffers(cmd,draw.vertexBindings[i],1,&b->buffer,&offset);}
      if(draw.indexed){CmdBindIndexBuffer(cmd,op.indices->buffer,draw.indexOffset,op.indexWidth==2?VK_INDEX_TYPE_UINT16:VK_INDEX_TYPE_UINT32);CmdDrawIndexed(cmd,draw.count,1,draw.first,0,0);}else CmdDraw(cmd,draw.count,1,draw.first,0);}
@@ -2568,6 +2578,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
    {auto ns=since(submitDone);++submits;submitRetireNanos+=ns;if(currentFrame)currentFrame->retireHost+=ns;}
    return;
    }
+   auto retireBuildPhase=std::make_unique<PhaseTimer>(SubPhase::retireBuild);
    for(size_t n=0;n<ops.size();++n){auto &op=ops[n];bufferUse(writes,op.dst);
     if(op.pipeline || op.clearOnly){for(unsigned i=0;i<std::min(op.colorCount,8u);++i)textureUse(writes,op.color(i).texture);}
     else if(op.texture && (op.upload || op.sourceTexture || op.generateMips))textureUse(writes,op.texture);
@@ -2625,7 +2636,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
    };
    for(auto *b:pinnedBuffers)++b->references;for(auto *t:pinnedTextures)++t->references;for(auto *p:pinnedPipelines)++p->references;for(auto *s:pinnedSamplers)++s->references;
    slot.hostUses=std::move(hostUses);slot.uses=std::move(uses);slot.writes=std::move(writes);slot.busy=true;
-   submitToQueue();if(scheduled)scheduled();
+   retireBuildPhase.reset();submitToQueue();if(scheduled)scheduled();
    submitted=false;completed=true;
    *retirement=std::move(finish);
   } catch(...) {if(submitted){poisoned=true;slot.busy=false;submitWake.notify_all();}else if(!completed){for(auto old:oldTextures){old.texture->layout=old.layout;old.texture->levelLayouts=old.levelLayouts;old.texture->defined=old.defined;old.texture->definedLevels=old.definedLevels;old.texture->shadowHash=old.shadowHash;old.texture->shadowHashed=old.shadowHashed;}clearSubmitObjects(slot);cleanup();}

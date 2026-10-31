@@ -62,15 +62,18 @@ int main(){
   assert(s.subCalls[size_t(SubPhase::other)]==1 && s.subNs[size_t(SubPhase::other)]>=4000000 && s.subNs[size_t(SubPhase::other)]+s.subNs[size_t(SubPhase::cmdBegin)]<=frameNanos(wall)); // inclusive nesting would exceed elapsed time
   assert(s.scans[size_t(ScanKind::viewProbes)]==7 && s.scans[size_t(ScanKind::boundSetMax)]==5);
   {PhaseTimer none(SubPhase::passes);} // no current frame: no accumulation, no crash
+  // every submit phase is named and reported; continuation lines stay below the device logger's ~240-char split
+  for(size_t i=0;i<size_t(SubPhase::count);++i){s.subNs[i]+=1000000*(i+1);++s.subCalls[i];}
+  assert(!strcmp(subPhaseNames[size_t(SubPhase::rewrite)],"rewrite") && !strcmp(subPhaseNames[size_t(SubPhase::bind)],"bind") && !strcmp(subPhaseNames[size_t(SubPhase::retireBuild)],"retire_build"));
   if(systemTranslationPolicy().frameTrace){
    wall=FrameClock::now();{PhaseTimer a(EncPhase::draw);std::this_thread::sleep_for(std::chrono::milliseconds(3));{PhaseTimer b(EncPhase::state);std::this_thread::sleep_for(std::chrono::milliseconds(2));}}
    drainEncodePhases(s);assert(s.encCalls[size_t(EncPhase::draw)]==1 && s.encNs[size_t(EncPhase::draw)]>=3000000 && s.encNs[size_t(EncPhase::draw)]+s.encNs[size_t(EncPhase::state)]<=frameNanos(wall) && s.encNs[size_t(EncPhase::state)]>=2000000);
    assert(encAccum.calls[size_t(EncPhase::draw)]==0);
   }
   FrameTraceWindow w;for(unsigned i=0;i<4;++i)w.add(s);
-  FILE *o=tmpfile();assert(o);w.report(o);rewind(o);char text[8192];bool sawSubmit=false,sawScan=false;
-  while(fgets(text,sizeof(text),o)){if(strstr(text,"submit phases")){sawSubmit=true;assert(strlen(text)<=401 && strstr(text,"cmd_begin=") && strstr(text,"other="));}if(strstr(text,"scan counts")){sawScan=true;assert(strlen(text)<=401 && strstr(text,"view_probes=7.0") && strstr(text,"bound_set_max=5.0"));}}
-  assert(sawSubmit && sawScan);fclose(o);
+  FILE *o=tmpfile();assert(o);w.report(o);rewind(o);char text[8192];bool sawSubmit=false,sawScan=false;size_t subFields=0;
+  while(fgets(text,sizeof(text),o)){if(strstr(text,"submit phases")){sawSubmit=true;assert(strlen(text)<=240);for(auto *name:subPhaseNames){char key[64];snprintf(key,sizeof key," %s=",name);if(strstr(text,key))++subFields;}}if(strstr(text,"scan counts")){sawScan=true;assert(strlen(text)<=401 && strstr(text,"view_probes=7.0") && strstr(text,"bound_set_max=5.0"));}}
+  assert(sawSubmit && sawScan && subFields==size_t(SubPhase::count));fclose(o);
  }
  { // per-pass GPU times: grouping by shape, ordering by total time, window reset
   PassTimes times;PassInfo big{};big.width=1080;big.height=2400;big.colors=1;big.draws=40;big.load=1;big.store=1;PassInfo small{};small.width=64;small.height=16;small.colors=1;small.draws=2;small.copies=1;small.load=2;small.store=1;PassInfo copy{};copy.kind=2;

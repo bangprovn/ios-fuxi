@@ -76,6 +76,11 @@ void main() {color=textureLod(image,vec2(0.5),constants.lod);}
         for args in ('', 'fuxigpuperf=4', controls+'fuxigpuperf=4', controls+'fuxigpuperf=5', controls+'fuxigpuperf=6'):
             assert pixels(invoke(d/'barriers', args)) == pixels(before), 'boundary controls differ: '+args
         print('PASS: CA boundary A/B pixels, exact batch counts, all independent bit combinations')
+        # FUXI_MTL_SUBMIT_LEAN: identical pixels and barrier/pass counts
+        for args in (controls+'fuxigpuperf=7', controls+'fuxigpuperf=3', ''):
+            plain, lean = (invoke(d/'barriers', args, FUXI_MTL_SUBMIT_LEAN=v) for v in '01')
+            assert pixels(plain)+re.findall(r'COUNTS .*', plain) == pixels(lean)+re.findall(r'COUNTS .*', lean), 'submit lean changed pixels/counts: '+args
+        print('PASS: FUXI_MTL_SUBMIT_LEAN keeps CA boundary pixels and barrier/pass counts')
         for extra in ('', 'fuxigpufeedback=1', 'fuxigpuoverlap=1 fuxigpusubmit=1', 'fuxigpuoverlap=1 fuxigpusubmit=1 fuxigpufeedback=1'):
             baseline = invoke(d/'test', extra)
             merged = invoke(d/'test', extra+' fuxigpumerge=1')
@@ -85,6 +90,9 @@ void main() {color=textureLod(image,vec2(0.5),constants.lod);}
                 skips = [line for line in baseline.splitlines() if line.startswith('SKIP:')]
                 print('\n'.join(skips) if skips else 'PASS: lavapipe exposes ordered attachment access; fetch clear/interleaved/mip/two-flight pixels tested')
         assert invoke(d/'test', 'fuxigpumerge=1 fuxigpusubmit=1', trace='2') == invoke(d/'test', 'fuxigpumerge=1 fuxigpusubmit=1')
+        for extra in ('', 'fuxigpumerge=1 fuxigpuoverlap=1 fuxigpusubmit=1 fuxigpufeedback=1 fuxigpuperf=7'):
+            assert invoke(d/'test', extra, FUXI_MTL_SUBMIT_LEAN='1') == invoke(d/'test', extra, FUXI_MTL_SUBMIT_LEAN='0'), 'submit lean changed merge pixels: '+extra
+        print('PASS: FUXI_MTL_SUBMIT_LEAN byte-identical render merge output')
         print('PASS: level-2 bounded CPU sampling preserves merged pixels')
         # All bits independently and together, including two flights and the
         # feedback path. Pixels must match the unchanged singleton baseline.
@@ -114,6 +122,16 @@ void main() {color=textureLod(image,vec2(0.5),constants.lod);}
         subprocess.run(common+sanitized+definitions+[str(ROOT/'tools/fuxi-metal/VariantPlanTests.cpp'), '-ldl', '-pthread', '-o', str(d/'variants')], check=True)
         print(invoke(d/'variants', 'fuxigpumerge=1 fuxigpusubmit=1', CONTROL_REQUIRE_VARIANT='1'), end='')
         print(invoke(d/'variants', 'fuxigpumerge=1 fuxigpusubmit=1 fuxigputrace=1', CONTROL_REQUIRE_VARIANT='1'), end='')
+        # FUXI_MTL_SUBMIT_LEAN on a CA-shaped submit, with and without the rename/hoist/reorder/rt-shadow rewrites; more than the 20 logged hoists, so the
+        # reason-string skip runs. Pixels, per-submit counts and the earlier-writer refusal must equal the default planner byte for byte.
+        subprocess.run(common+sanitized+definitions+[str(ROOT/'tools/fuxi-metal/SubmitLeanTests.cpp'), '-ldl', '-pthread', '-o', str(d/'lean')], check=True)
+        rewrites = dict(FUXI_MTL_RT_RENAME='1', FUXI_MTL_FRAG_RELAXED='1', FUXI_MTL_RT_SHADOW='1')
+        for args in ('', 'fuxigpumerge=1 fuxigpuoverlap=1 fuxigpusubmit=1 fuxigpuperf=7', 'fuxigpumerge=1 fuxigpuperf=3'):
+            for extra in ({}, rewrites):
+                plain = invoke(d/'lean', args, FUXI_MTL_SUBMIT_LEAN='0', **extra)
+                assert plain == invoke(d/'lean', args, FUXI_MTL_SUBMIT_LEAN='1', **extra), 'submit lean changed output: '+args+' '+str(extra)
+                assert int(re.search(r'RENAME submits=(\d+)', plain).group(1)) > (20 if extra else -1)
+        print('PASS: FUXI_MTL_SUBMIT_LEAN identical pixels, counts and refusal on the CA-shaped fixture (rewrites off/on)')
         subprocess.run(common+['-O2']+definitions+[str(ROOT/'tools/fuxi-metal/SubmitBench.cpp'), '-ldl', '-pthread', '-o', str(d/'bench')], check=True)
         for uncached in (True, False, False, True):
             overrides = {'PIPE_BENCH_UNCACHED': '1'} if uncached else {}

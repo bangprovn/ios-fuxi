@@ -59,8 +59,12 @@ inline constexpr const char *mergeSplitNames[]={"none","encoder","attachments","
 // are drained into the sample at commit; submit phases accumulate into the current sample. Disabled (no clock reads) unless frame tracing is on.
 enum class EncPhase : size_t {encBegin,encChecks,encEnd,pipeline,texSamp,bufBytes,state,draw,blit,newBuffer,newTexture,iosurface,newOther,cbMisc,count};
 inline constexpr const char *encPhaseNames[]={"enc_begin","enc_checks","enc_end","set_pipeline","set_tex_samp","set_buf_bytes","set_state","draw","blit","new_buffer","new_texture","iosurface","new_other","cb_misc"};
-enum class SubPhase : size_t {other,cmdBegin,cmdEnd,objects,descriptors,passes,barriers,record,queueSubmit,fence,wait,prepare,flush,uses,plan,pin,count};
-inline constexpr const char *subPhaseNames[]={"other","cmd_begin","cmd_end","objects","descriptors","passes","barriers","record","queue_submit","fence","wait","prepare","flush","uses","plan","pin"};
+// Finer submit attribution (exclusive like the rest): rewrite = pass rename/hoist/reorder/rt-shadow before planning; plan_lookup = draw-plan cache/translator;
+// plan_mip = sampled-attachment access proof; plan_bounds = index/vertex/earlier-writer checks; analyze = occlusion/merge/neutral; refresh = shadow refresh + hash;
+// pass_setup = render pass/framebuffer selection; area = render-area bounding; bind = per-draw pipeline/dynamic state/descriptor values/set bind; retire_build = flight use lists + retirement closure.
+enum class SubPhase : size_t {other,cmdBegin,cmdEnd,objects,descriptors,passes,barriers,record,queueSubmit,fence,wait,prepare,flush,uses,plan,pin,rewrite,planLookup,planMip,planBounds,analyze,refresh,passSetup,area,bind,retireBuild,count};
+inline constexpr const char *subPhaseNames[]={"other","cmd_begin","cmd_end","objects","descriptors","passes","barriers","record","queue_submit","fence","wait","prepare","flush","uses","plan","pin","rewrite","plan_lookup","plan_mip","plan_bounds","analyze","refresh","pass_setup","area","bind","retire_build"};
+static_assert(sizeof(subPhaseNames)/sizeof(*subPhaseNames)==size_t(SubPhase::count),"submit phase names");
 // Per-frame probe counts of per-draw linear structures: bound-set entries visited, full binding compares, view-cache entries visited, use-list entries visited, frame-cache entries visited.
 enum class ScanKind : size_t {boundSetProbes,boundSetCompares,viewProbes,useProbes,frameProbes,boundSetMax,count};
 inline constexpr const char *scanKindNames[]={"bound_set_probes","bound_set_compares","view_probes","use_list_probes","frame_probes","bound_set_max"};
@@ -241,7 +245,7 @@ public:
   auto flush=[&]{if(pending){if(len>399)len=399;line[len]=0;fprintf(out,"%s\n",line);}pending=false;};
   for(size_t i=0;i<N;++i){
    uint64_t sum=0,max=0,c=0;for(size_t k=0;k<n;++k){uint64_t v=(samples[k].*ns)[i];sum+=v;max=std::max(max,v);c+=(samples[k].*calls)[i];}
-   if(!c)continue;if(!started){head(false);started=true;}else if(len>350){flush();head(true);}
+   if(!c)continue;if(!started){head(false);started=true;}else if(len>200){flush();head(true);} // the device logger splits lines near 240 chars and drops bytes at the split
    len+=snprintf(line+len,sizeof line-size_t(len)," %s=%.2f/%.2f/%.1f",names[i],sum/double(n)/1e6,max/1e6,c/double(n));pending=true;
   }
   flush();

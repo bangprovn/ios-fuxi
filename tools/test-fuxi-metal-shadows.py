@@ -75,10 +75,13 @@ void main(){color=c.value;}
         for args in ('', 'fuxigpuoverlap=1 fuxigpusubmit=1', 'fuxigpumerge=1 fuxigpuperf=7'):
             for rt, reuse, rename in (('0', '0', '0'), ('1', '0', '0'), ('1', '1', '0'), ('0', '0', '1'), ('1', '1', '1')):
                 subprocess.run([str(d/'texture-pixels')], env=dict(texture_env, FUXI_MTL_RT_SHADOW=rt, FUXI_MTL_RT_SHADOW_REUSE=reuse, FUXI_MTL_RT_RENAME=rename, FUXI_MTL_FRAG_RELAXED=rename, FUXI_MTL_TEST_BOOTARGS='fuxigpuframetrace=1 '+args), check=True, timeout=60)
+                if rename == '1':  # FUXI_MTL_SUBMIT_LEAN: same expected pixels through rename/hoist and the stamped planner
+                    subprocess.run([str(d/'texture-pixels')], env=dict(texture_env, FUXI_MTL_SUBMIT_LEAN='1', FUXI_MTL_RT_SHADOW=rt, FUXI_MTL_RT_SHADOW_REUSE=reuse, FUXI_MTL_RT_RENAME=rename, FUXI_MTL_FRAG_RELAXED=rename, FUXI_MTL_TEST_BOOTARGS='fuxigpuframetrace=1 '+args), check=True, timeout=60)
                 subprocess.run([str(d/'texture-pixels')], env=dict(texture_env, FUXI_MTL_SAMPLE_SHADOW='1', FUXI_MTL_SAMPLE_SHADOW_MIN_PX='1', FUXI_MTL_RT_SHADOW=rt, FUXI_MTL_RT_RENAME=rename, FUXI_MTL_TEST_BOOTARGS='fuxigpuframetrace=1 '+args), check=True, timeout=60) if reuse == '0' else None
         subprocess.run(common+['-DFUXI_MTL_HOST_TEST', '-DFUXI_MTL_ICD="'+str(a.icd.resolve())+'"',
             '-DFUXI_MTL_TRANSLATOR="'+str(d/'texture-bridge.so')+'"', str(ROOT/'tools/fuxi-metal/AdmissionTests.cpp'), '-ldl', '-pthread', '-o', str(d/'admission')], check=True)
-        subprocess.run([str(d/'admission')], env=dict(texture_env, FUXI_MTL_TEST_BOOTARGS='fuxigpuframetrace=1 fuxigpuoverlap=1 fuxigpusubmit=1'), check=True, timeout=60)
+        for lean in ('0', '1'):  # FUXI_MTL_SUBMIT_LEAN keeps the earlier-writer refusals and admission results
+            subprocess.run([str(d/'admission')], env=dict(texture_env, FUXI_MTL_SUBMIT_LEAN=lean, FUXI_MTL_TEST_BOOTARGS='fuxigpuframetrace=1 fuxigpuoverlap=1 fuxigpusubmit=1'), check=True, timeout=60)
         for old in (False, True):
             extra = ['-DSHADOW_OLD_ADAPTER'] if old else []
             subprocess.run(common+extra+['-shared', '-fPIC', str(ROOT/'tools/fuxi-metal/ShadowBridge.cpp'), '-o', str(d/'bridge.so')], check=True)
