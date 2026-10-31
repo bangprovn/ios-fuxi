@@ -1,0 +1,39 @@
+{
+  "about": "Fuxi reviewed pairings for tools/ios27-prelink.py --pairs (K2, docs-lanes/ios27.md). Inputs: the 24A446 j820 kernelcache (sha256 below) and a Fuxi xnu-12377 kernel. Each original address is an unmatched kernel target that a prelinked kext calls or references. Evidence comes from function-start order and sizes in the original kernel, symbol order in our RELEASE LTO reference build, and the public xnu-12377.121.6 source; no Apple code is reproduced. Confidence: high = same position and layout, medium = order only. Darwin 26 additions that our source lacks stay unpaired (stubbed).",
+  "kernelcache_sha256": "38e6d9fa5f789b8228f4617ef4c6d2a3fd8ab564abdc9b62920f1db53fc1780a",
+  "functions": {
+    "0xfffffe000b412984": {"name": "__ZN8OSSymbol11withCStringEPKc", "confidence": "medium", "evidence": "OSSymbol.cpp order withString, withCString, withCStringNoCopy, existingSymbolForString, existingSymbolForCString; three unbound originals sit between withString and existingSymbolForCString, and this is the first. x0 at the call is a C string. The matcher bound the next one (540 bytes, call-sites) to withCString too; a copying symbol is a safe superset of NoCopy."},
+    "0xfffffe000ad94128": {"name": "_thread_tid", "confidence": "high", "evidence": "after thread_set_cpulimit: original 16, 16, 12 bytes = reference thread_tid 16, thread_set_tag 16, thread_get_tag 12"},
+    "0xfffffe000b46efe4": {"name": "__ZN9IOService18getResourceServiceEv", "confidence": "high", "evidence": "after getPMRootDomain: two 16-byte originals; reference folds getResourceService and resources at one address"},
+    "0xfffffe000b4bf9c4": {"name": "__ZN21IOSubMemoryDescriptor16getPreparationIDEv", "confidence": "high", "evidence": "between IOSubMemoryDescriptor::prepare and getPhysicalSegment, the same as the reference"},
+    "0xfffffe000af6dc88": {"name": "_throttle_lowpri_window", "confidence": "high", "evidence": "right after throttle_info_io_will_be_throttled, 20 bytes in both"},
+    "0xfffffe000b4ca1d0": {"name": "__ZN24IOCPUInterruptControllerC1Ev", "confidence": "high", "evidence": "after IOCPUInterruptController::operator new: 72, 72, 136, 136 = reference C1 72, C2 72, IOCPURunPlatformQuiesceActions 140, IOCPURunPlatformActiveActions 140"},
+    "0xfffffe000b4ca218": {"name": "__ZN24IOCPUInterruptControllerC2Ev", "confidence": "high", "evidence": "as above"},
+    "0xfffffe000b4ca260": {"name": "_IOCPURunPlatformQuiesceActions", "confidence": "high", "evidence": "as above"},
+    "0xfffffe000b4ca2e8": {"name": "_IOCPURunPlatformActiveActions", "confidence": "high", "evidence": "as above"},
+    "0xfffffe000aebdee4": {"name": "_cpu_number", "confidence": "medium", "evidence": "after cpu_to_processor: 16, 16 bytes = reference cpu_number 16, ml_get_wake_timebase 16"},
+    "0xfffffe000aebdef4": {"name": "_ml_get_wake_timebase", "confidence": "medium", "evidence": "as above"},
+    "0xfffffe000ae14d08": {"name": "_vm_map_page_size", "confidence": "medium", "evidence": "between vm_map_exec and vm_map_region_recurse_64; 32 bytes vs reference vm_map_page_size 36, between region_resolve_entry and region_resolve_done sized originals"},
+    "0xfffffe000aed453c": {"name": "__get_commpage_priv_address", "confidence": "medium", "evidence": "after commpage_populate: 16, 12 bytes = reference _get_commpage_priv_address 16, commpage_is_in_pfz64 12"},
+    "0xfffffe000b430ab8": {"name": "__ZN9IOService12Start_InvokeE5IORPCP15OSMetaClassBasePFiS2_PS_E", "confidence": "medium", "evidence": "after _ClaimSystemWakeEvent_Invoke the original has one new 416-byte function, then three 284-byte ones = reference Start_Invoke, Stop_Invoke, ClientCrashed_Invoke (292 each), then GetRegistryEntryID_Invoke"},
+    "0xfffffe000b430bd4": {"name": "__ZN9IOService11Stop_InvokeE5IORPCP15OSMetaClassBasePFiS2_PS_E", "confidence": "medium", "evidence": "as above"},
+    "0xfffffe000b417540": {"name": "__ZN11OSSerialize10setIndexedEb", "confidence": "medium", "evidence": "after binaryWithCapacity: 380, 156 bytes = reference binaryWithCapacity(unsigned, void*, void*) 252, setIndexed 180, then addBinaryObject in both"},
+    "0xfffffe000b55a1e4": {"name": "_PE_parse_boot_arg_str", "confidence": "medium", "evidence": "bootargs.c order isargsep, PE_parse_boot_arg_str, PE_get_default; 36 bytes in the original (wrapper) vs 144"},
+    "0xfffffe000b2a6d74": {"name": "_kern_stack_snapshot_with_reason", "confidence": "medium", "evidence": "the four functions before sysctl_kern_msgbuf: 172, 212, 120, 84 = reference stack_snapshot_with_config, stackshot_kern_return_to_bsd_error, microstackshot, kern_stack_snapshot_with_reason"},
+    "0xfffffe000aebbb08": {"name": "_copyinstr", "confidence": "medium", "evidence": "the function right before copyout in both"},
+    "0xfffffe000b4c8714": {"name": "__ZN5IOCPU13setPropertiesEP8OSObject", "confidence": "medium", "evidence": "IOCPU methods before IOCPU::getMetaClass: 304, 188, 20, 20 = reference setProperties 340, serializeProperties 240, getProperty 44, setProperty 32"},
+    "0xfffffe000b4c8844": {"name": "__ZNK5IOCPU19serializePropertiesEP11OSSerialize", "confidence": "medium", "evidence": "as above"},
+    "0xfffffe000b4c8900": {"name": "__ZNK5IOCPU11getPropertyEPK8OSSymbol", "confidence": "medium", "evidence": "as above"},
+    "0xfffffe000b4c8914": {"name": "__ZN5IOCPU11setPropertyEPK8OSSymbolP8OSObject", "confidence": "medium", "evidence": "as above"},
+    "0xfffffe000b5a3ba8": {"name": "_get_lockdown_mode_state", "confidence": "guess", "evidence": "a new 16-byte Darwin 26 function before lockdown_mode_init, called by AppleImage4; bound to the lockdown state getter, which returns 0 here (lockdown off)"}
+  },
+  "data": {
+    "0xfffffe0007f07468": {"name": "__ZN9IOService9metaClassE", "confidence": "high", "evidence": "OSNumber::metaClass+0x10; the reference has IOService::metaClass at the same offset"},
+    "0xfffffe0007f07470": {"name": "__ZN8OSString9metaClassE", "confidence": "high", "evidence": "OSNumber::metaClass+0x18, same offset in the reference"},
+    "0xfffffe0007f07488": {"name": "__ZN15IORegistryEntry9metaClassE", "confidence": "high", "evidence": "OSData::metaClass+0x8, same offset in the reference"},
+    "0xfffffe0007ed04f0": {"name": "__ZN5IOCPU9metaClassE", "confidence": "high", "evidence": "IOPlatformIO MetaClass vtable+0x88, same offset in the reference"},
+    "0xfffffe0007f07698": {"name": "__ZN24IOBufferMemoryDescriptor9metaClassE", "confidence": "high", "evidence": "IOPMServiceInterestNotifier MetaClass vtable+0xc0, same offset in the reference"},
+    "0xfffffe000b9293b8": {"name": "_gIODTAAPLInterruptsKey", "confidence": "medium", "evidence": "gIODTNameKey+0x48 in both"},
+    "0xfffffe000b8b3ce8": {"name": "_kext_assertions_enable", "confidence": "medium", "evidence": "debugger_current_op+0x34 in both"}
+  }
+}

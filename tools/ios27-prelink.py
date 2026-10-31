@@ -166,6 +166,104 @@ def matching(kit, cache_data, native_data, reference_data, map_path):
     return pairing
 
 
+def gap_order(kit, cache_data, native_data, reference_data, pairing):
+    """Fuxi addition, not XnuPrelink: pair the original kernel functions the matcher left unbound by
+    source order between two bound neighbours. For an unbound original function F between bound
+    functions P and N (P and N named through the native kernel), the RELEASE reference is cut at the
+    same two names. When both gaps hold the same number of function starts, F takes the reference
+    function at its own index, provided that name exists in the native kernel, is not bound already
+    and the two sizes are within a factor of two (our RELEASE build differs from Apple's, e.g. by 24
+    bytes in OSTypeAlloc factories, so sizes cannot be equal). Adds entries 'how': 'fuxi-gap-order'
+    to a copy of the pairing; the cached matcher map is left as the matcher wrote it."""
+    kc_image = kit[0]
+    cache = kc_image.Image(cache_data)
+    original = kc_image.Image(cache_data, cache.entries['com.apple.kernel'][1])
+    reference, native = kc_image.Image(reference_data), kc_image.Image(native_data)
+    ref_at, native_at = {}, {}
+    for address, names in reference.symbols().items():
+        for name in names:
+            ref_at.setdefault(name, address)
+    for address, names in native.symbols().items():
+        for name in names:
+            native_at.setdefault(name, address)
+    ref_names = defaultdict(list)
+    for name, address in ref_at.items():
+        ref_names[address].append(name)
+    code = [(s['va'], s['va'] + s['size']) for s in original.sections
+            if s['segment'] == '__TEXT_EXEC' and s['name'] == '__text']
+    starts = sorted(a for a in set(original.function_starts()) if any(b <= a < e for b, e in code))
+    ref_starts = sorted(set(reference.function_starts()))
+    functions = dict(pairing['functions'])
+    bound = sorted((int(k, 16), v.get('name')) for k, v in functions.items())
+    bound_at = [a for a, _ in bound]
+    taken = {v.get('name') for v in functions.values() if v.get('name')}
+
+    def size(table, address):
+        i = bisect.bisect_left(table, address)
+        return table[i + 1] - address if i + 1 < len(table) and table[i] == address else None
+
+    added, refused = {}, defaultdict(int)
+    for address in starts:
+        if hex(address) in functions:
+            continue
+        i = bisect.bisect_left(bound_at, address)
+        if i == 0 or i >= len(bound):
+            refused['edge'] += 1
+            continue
+        (low, low_name), (high, high_name) = bound[i - 1], bound[i]
+        if low_name not in ref_at or high_name not in ref_at:
+            refused['unnamed neighbour'] += 1
+            continue
+        gap = starts[bisect.bisect_right(starts, low):bisect.bisect_left(starts, high)]
+        ref_gap = ref_starts[bisect.bisect_right(ref_starts, ref_at[low_name]):bisect.bisect_left(ref_starts, ref_at[high_name])]
+        if len(gap) != len(ref_gap):
+            refused['gap count'] += 1
+            continue
+        target = ref_gap[gap.index(address)]
+        names = [n for n in ref_names.get(target, ()) if n in native_at and n not in taken]
+        a, b = size(starts, address), size(ref_starts, target)
+        if not names:
+            refused['no free native name'] += 1
+            continue
+        if not a or not b or max(a, b) > 2 * min(a, b):
+            refused['size'] += 1
+            continue
+        taken.update(names)
+        added[hex(address)] = {'native': hex(native_at[names[0]]), 'name': names[0], 'addend': 0,
+                               'how': 'fuxi-gap-order', 'sizes': [a, b]}
+    result = dict(pairing, functions={**functions, **added})
+    result['stats'] = dict(pairing['stats'], functions_matched=len(result['functions']),
+                           functions_by_method={**pairing['stats'].get('functions_by_method', {}),
+                                                'fuxi-gap-order': len(added)})
+    return result, added, dict(refused)
+
+
+def reviewed_pairs(kit, native_data, cache_data, pairing, path):
+    """Fuxi addition: reviewed original -> native-symbol pairs (tools/ios27-prelink-pairs.json) for
+    targets the matcher and the source-order pass leave open. A pair replaces any existing binding."""
+    spec = json.loads(Path(path).read_text())
+    if spec['kernelcache_sha256'] != hashlib.sha256(cache_data).hexdigest():
+        raise SystemExit(f'{path}: written for another kernelcache')
+    native_at = {}
+    for address, names in kit[0].Image(native_data).symbols().items():
+        for name in names:
+            native_at.setdefault(name, address)
+    result = dict(pairing, functions=dict(pairing['functions']), data=dict(pairing['data']))
+    applied = {}
+    for kind in ('functions', 'data'):
+        for original, entry in spec.get(kind, {}).items():
+            if entry['name'] not in native_at:
+                raise SystemExit(f'{path}: {entry["name"]} is not in the native kernel')
+            row = {'native': hex(native_at[entry['name']]), 'name': entry['name'],
+                   'how': 'fuxi-reviewed', 'confidence': entry.get('confidence')}
+            if kind == 'functions':
+                row['addend'] = 0
+            previous = result[kind].get(original)
+            result[kind][original] = row
+            applied[original] = {'name': entry['name'], 'replaced': previous and previous.get('name')}
+    return result, applied
+
+
 def emit(kit, cache_data, native_data, pairing, roots, initializers, allow_missing):
     """emit_images with every kernel-facing reference recorded per owner (no behaviour change)."""
     segmented = kit[4]
@@ -326,6 +424,9 @@ def main():
     ap.add_argument('--kit', type=Path, default=KIT, help='XnuPrelink copy (default tools/xnuprelink)')
     ap.add_argument('--trial', action='store_true', help='continue past preflight failures (counts only, not for boot)')
     ap.add_argument('--preflight-only', action='store_true')
+    ap.add_argument('--pairs', default=str(ROOT / 'tools/ios27-prelink-pairs.json'),
+                    help='reviewed original->native pairs (Fuxi); pass an empty string to skip')
+    ap.add_argument('--no-gap-order', action='store_true', help='skip the Fuxi source-order pass (needs --reference)')
     ap.add_argument('--force', action='store_true', help='replace kernel.prelinked and its reports in OUT')
     a = ap.parse_args()
     kit = load_kit(a.kit.resolve())
@@ -359,6 +460,14 @@ def main():
     for name in ('kernel.prelinked', 'kernel.json', 'summary.json', 'checks.json'):
         (out / name).unlink(missing_ok=True)
     pairing = matching(kit, cache_data, native_data, reference_data, out / 'kernel.map.json')
+    if reference_data is not None and not a.no_gap_order:
+        pairing, added, refused = gap_order(kit, cache_data, native_data, reference_data, pairing)
+        (out / 'gap-order.json').write_text(json.dumps({'added': added, 'refused': refused}, indent=2) + '\n')
+        print(f'gap order (Fuxi): {len(added)} functions paired by source order; refused {refused}')
+    if a.pairs:
+        pairing, applied = reviewed_pairs(kit, native_data, cache_data, pairing, a.pairs)
+        (out / 'reviewed-pairs.json').write_text(json.dumps(applied, indent=2) + '\n')
+        print(f'reviewed pairs (Fuxi): {len(applied)} from {a.pairs}')
     image, report, seen = emit(kit, cache_data, native_data, pairing, roots, initializers, a.allow_missing)
     report.update(kernelcache=str(a.kernelcache.resolve()), native=str(a.kernel.resolve()),
                   map=str((out / 'kernel.map.json').resolve()), trial=a.trial, preflight_failures=failures)
