@@ -18,7 +18,7 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         d=Path(tmp);conf=d/'smoke.conf'
         compiler=['xcrun','clang++'] if os.uname().sysname=='Darwin' else ['clang++']
-        for name in ('ClientGateTests','BackboardGateTests','TextureLevelsTests','MipAccessTests','SurveyTests','ClientSetupTests','NativeSelectionTests','SurfaceLeaseTests','TranslationPolicyTests','CompileBoostTests','FrameTraceTests','FrameCPUTests','OperationAPITests','FrontendEncodingTests','TransientMemoryTests','SlabMemoryTests','DrawPlanTests','DrawPlanCacheTests','ShadowRangesTests','PrewarmStoreTests','SpirvRelaxTests','SpirvLoopsTests','SpirvUnrollTests','SpirvHalfRoundTests','OcclusionProofTests'):
+        for name in ('ClientGateTests','BackboardGateTests','TextureLevelsTests','MipAccessTests','SurveyTests','ClientSetupTests','NativeSelectionTests','SurfaceLeaseTests','TranslationPolicyTests','CompileBoostTests','FrameTraceTests','FrameCPUTests','OperationAPITests','FrontendEncodingTests','TransientMemoryTests','SlabMemoryTests','DrawPlanTests','DrawPlanCacheTests','ShadowRangesTests','PrewarmStoreTests','SpirvRelaxTests','SpirvLoopsTests','SpirvUnrollTests','SpirvHalfRoundTests','OcclusionProofTests','MemoryTypeTests'):
             subprocess.run([*compiler,'-std=c++17','-Wall','-Wextra','-Werror','-pthread',
                             '-fsanitize=address,undefined',str(ROOT/'tools/fuxi-metal'/(name+'.cpp')),
                             '-o',str(d/name)],check=True)
@@ -46,6 +46,10 @@ def main():
                         e.pop(k,None)
                         if v is not None:e[k]=v
                     subprocess.run([str(d/name),'split',*want],env=e,check=True,timeout=15)
+                for env,want in ((None,'0'),('1','1'),('0','0'),('2','0'),('1 ','0'),('','0')):
+                    e=dict(os.environ);e.pop('FUXI_MTL_BUFFER_CACHED',None)
+                    if env is not None:e['FUXI_MTL_BUFFER_CACHED']=env
+                    subprocess.run([str(d/name),'cached',want],env=e,check=True,timeout=15)
             if not a.compile_only and name == 'FrameTraceTests':
                 subprocess.run([str(d/name)],env=dict(os.environ,FUXI_MTL_TEST_BOOTARGS='fuxigpumerge=1 fuxigpuoverlap=1'),check=True,timeout=15)
             if not a.compile_only and name == 'FrameCPUTests':

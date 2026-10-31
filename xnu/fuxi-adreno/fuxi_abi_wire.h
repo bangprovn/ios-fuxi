@@ -70,7 +70,7 @@ static inline int fg_abi_range(uint64_t iova, uint64_t bytes)
 }
 static inline int fg_abi_alloc_valid(uint64_t bytes, unsigned align, unsigned contiguous)
 {
- return bytes && !(bytes&4095) && bytes <= FG_ABI_MAX_BYTES && align >= 12 && align <= 24 && contiguous <= 1;
+ return bytes && !(bytes&4095) && bytes <= FG_ABI_MAX_BYTES && align >= 12 && align <= 24 && contiguous <= 3; /* bit1: cached-coherent, further gated by the client */
 }
 static inline int fg_abi_import_valid(uint64_t address, uint64_t bytes)
 {

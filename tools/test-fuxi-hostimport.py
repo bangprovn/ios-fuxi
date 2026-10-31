@@ -47,6 +47,7 @@ static void IOLockLock(int *){}
 static void IOLockUnlock(int *){}
 static void IOLog(const char *,...){}
 static void abiTrace(const char *,int,int){}
+static void cboStat(int,uint64_t){}
 static bool pmap_valid_page(ppnum_t p) {return p!=0x12345;}
 constexpr unsigned VM_WIMG_MASK=255,VM_WIMG_DEFAULT=2,VM_WIMG_WCOMB=6;
 static unsigned hostCache=VM_WIMG_DEFAULT;

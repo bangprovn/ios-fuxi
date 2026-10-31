@@ -21,7 +21,8 @@
 /* A subrange keeps the BO's managed-page descriptor/pager identity. Never
  * reconstruct a physical descriptor over wired managed RAM. The extra backing
  * reference owns the matched prepare until the final CPU mapping disappears.
- * Both mappings keep the buffer's Normal NC/write-combine cache policy. */
+ * Both mappings keep the buffer's cache policy: Normal NC/write-combine, or
+ * default write-back for a cached-coherent BO (fuxigpuncimport bit 29). */
 class FuxiAdrenoBoView : public IOSubMemoryDescriptor {
  OSDeclareDefaultStructors(FuxiAdrenoBoView)
  IOBufferMemoryDescriptor *backing_ = nullptr;
@@ -55,6 +56,14 @@ static void abiStat(unsigned slot, uint64_t ticks) {
 static uint64_t splitSum[FG_SPLIT_SUMS], splitLockMax, splitBlameMax[17];
 static unsigned splitN, splitBlameN[17], splitLastSel;
 static void abiSplitReport(const uint64_t *sum, unsigned n, uint64_t lockMax, const unsigned *bn, const uint64_t *bm);
+/* Cached-coherent BOs (fuxigpuncimport bit 29), under statLock: allocations, frees and refusals in the 600-submit window, live count/bytes. */
+static uint64_t cboAllocs, cboFrees, cboRefused, cboLive, cboLiveBytes;
+static void cboStat(int alloc, uint64_t bytes) {
+ if (!statLock) return;
+ IOLockLock(statLock);
+ if (alloc>0) { cboAllocs++; cboLive++; cboLiveBytes+=bytes; } else if (!alloc) { cboFrees++; cboLive--; cboLiveBytes-=bytes; } else cboRefused++;
+ IOLockUnlock(statLock);
+}
 static void abiSplit(unsigned slot, uint64_t v) {
  if (!statLock) return;
  uint64_t sum[FG_SPLIT_SUMS], lockMax=0, bm[17]; unsigned n=0, bn[17], report=0;
@@ -160,7 +169,7 @@ class FuxiAdrenoUserClient : public IOUserClient {
   IOBufferMemoryDescriptor *memory;
   IOMemoryDescriptor *importMemory;
   IOMemoryMap *importMap;
-  bool importRo;
+  bool importRo, cached;
   FuxiAdrenoBoView *view;
   uint64_t handle, bytes, allocated, iova;
   uint32_t token, leases, metadataBytes;
@@ -282,6 +291,7 @@ class FuxiAdrenoUserClient : public IOUserClient {
   if (b.importMemory && b.importMap->wireRange(kIODirectionNone,0,b.bytes)!=kIOReturnSuccess)
    return kIOReturnIOError;
   wired_-=b.allocated;
+  if (b.cached) cboStat(0,b.allocated);
   if (b.importMemory) {
    b.importMap->release();
    b.importMemory->complete(); b.importMemory->release();
@@ -295,19 +305,22 @@ class FuxiAdrenoUserClient : public IOUserClient {
  }
  IOReturn allocate(const NativeAdrenoAbiBoAlloc &r, NativeAdrenoAbiBoAllocReply &out) {
   if (!fg_abi_alloc_valid(r.bytes,r.align_log2,r.contiguous)) return kIOReturnBadArgument;
+  /* NativeAdrenoAllocCachedCoherent only once the kernel reported it (the verdict is latched, so this never flips back). */
+  const bool contiguous=r.contiguous&NativeAdrenoAllocContiguous, cached=r.contiguous&NativeAdrenoAllocCachedCoherent;
+  if (cached && fuxi_gpu_abi_cached_coherent(0)!=1) { cboStat(-1,0); return kIOReturnBadArgument; }
   uint64_t allocated=(r.bytes+16383)&~UINT64_C(16383);
   if (wired_>FG_ABI_MAX_WIRED_BYTES || allocated>FG_ABI_MAX_WIRED_BYTES-wired_ ||
       nextToken_==UINT32_MAX || nextHandle_==UINT64_MAX) return kIOReturnNoResources;
   Bo *b=freeSlot();
   if (!b) return kIOReturnNoResources;
   uint64_t mask=((UINT64_C(1)<<FG_ABI_PA_BITS)-1)&~((UINT64_C(1)<<r.align_log2)-1);
-  IOOptionBits options=kIODirectionInOut|kIOMemoryMapperNone|kIOMemoryKernelUserShared|kIOMapWriteCombineCache;
+  IOOptionBits options=kIODirectionInOut|kIOMemoryMapperNone|kIOMemoryKernelUserShared|(cached ? 0 : kIOMapWriteCombineCache);
   /* Contiguous-first only when required or at most 1 MiB: a failed large contiguous search scans all
    * of RAM and runs zone_gc (observed 50-58 ms per attempt), and nothing maps large GPU pages. */
   uint64_t tMem=mach_absolute_time();
-  IOBufferMemoryDescriptor *memory=r.contiguous || allocated<=FG_ABI_CONTIG_TRY_BYTES ?
+  IOBufferMemoryDescriptor *memory=contiguous || allocated<=FG_ABI_CONTIG_TRY_BYTES ?
       IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,options|kIOMemoryPhysicallyContiguous,allocated,mask) : NULL;
-  if (!memory && !r.contiguous) memory=IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,options,allocated,mask);
+  if (!memory && !contiguous) memory=IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,options,allocated,mask);
   if (!memory) return kIOReturnNoMemory;
   if (memory->prepare()!=kIOReturnSuccess) { memory->release(); return kIOReturnNoMemory; }
   abiStat(FG_ABI_STAT_ALLOCMEM,mach_absolute_time()-tMem);
@@ -322,7 +335,7 @@ class FuxiAdrenoUserClient : public IOUserClient {
    step=length>allocated-off ? allocated-off : length;
    step&=~UINT64_C(16383);
    valid=pa && !(pa&16383) && step>=16384 && step<=(UINT64_C(1)<<FG_ABI_PA_BITS) && pa<=(UINT64_C(1)<<FG_ABI_PA_BITS)-step &&
-       (!off ? !(pa&((UINT64_C(1)<<r.align_log2)-1)) : !r.contiguous || pa==first+off);
+       (!off ? !(pa&((UINT64_C(1)<<r.align_log2)-1)) : !contiguous || pa==first+off);
    if (!valid) break;
    if (!off) first=pa;
   }
@@ -342,8 +355,9 @@ class FuxiAdrenoUserClient : public IOUserClient {
    if (view) view->release();
    memory->complete(); memory->release(); return kIOReturnNoMemory;
   }
-  b->memory=memory; b->view=view; b->bytes=r.bytes; b->allocated=allocated;
+  b->memory=memory; b->view=view; b->bytes=r.bytes; b->allocated=allocated; b->cached=cached;
   b->handle=nextHandle_++; b->token=nextToken_++; wired_+=allocated;
+  if (cached) cboStat(1,allocated);
   bound(*b);
   out.handle=b->handle;
   return kIOReturnSuccess;
@@ -425,8 +439,12 @@ class FuxiAdrenoUserClient : public IOUserClient {
   if (method==NativeAdrenoMethodGetDeviceInfo) {
    /* A740 C510v2, SM8550 UBWC4; programmed UCHE ranges are checked at
     * publication. Catalog/UBWC configuration provenance is in metal.md. */
+   /* fuxigpuncimport bit 29: the self-test may run here (Turnip reads the flag once, before any import); an inconclusive run (GPU busy)
+    * is retried twice, 2 ms apart, then reported off for this open. */
+   int cc=fuxi_gpu_abi_cached_coherent(1);
+   for (unsigned i=0;cc<0 && i<2;i++) { IOSleep(2); cc=fuxi_gpu_abi_cached_coherent(1); }
    *static_cast<NativeAdrenoAbiDeviceInfo *>(out)={0x43050a01,3u<<20,0x1000000,
-       0x1fffffffff000ULL,FG_ABI_VA_START,FG_ABI_VA_SIZE,16,6,1,4,NativeAdrenoDeviceClientIova,0};
+       0x1fffffffff000ULL,FG_ABI_VA_START,FG_ABI_VA_SIZE,16,6,1,4,NativeAdrenoDeviceClientIova|(cc==1 ? (uint32_t)NativeAdrenoDeviceCachedCoherent : 0u),0};
    return kIOReturnSuccess;
   }
   if (method==NativeAdrenoMethodWaitFence) {
@@ -460,10 +478,11 @@ class FuxiAdrenoUserClient : public IOUserClient {
   if (method==NativeAdrenoMethodBoMap) {
    const auto &r=*static_cast<const NativeAdrenoAbiBoMap *>(in);
    Bo *b=find(r.handle);
-   if (!b || b->iova || (b->importMemory && (r.writeback || r.shareability!=2)) || (r.reserved & ~(uint32_t)NativeAdrenoMapGpuOnly) ||
+   if (!b || b->iova || (b->importMemory && (r.writeback || r.shareability!=2)) || (b->cached && (r.writeback!=1 || r.shareability!=3)) ||
+       (r.reserved & ~(uint32_t)NativeAdrenoMapGpuOnly) ||
        !fg_abi_map_valid(r.iova,b->bytes,r.permissions,r.writeback,r.shareability,0))
     return kIOReturnBadArgument;
-   unsigned gpuOnly=(r.reserved & NativeAdrenoMapGpuOnly) ? FG_ABI_IMPORT_GPU_ONLY : 0; /* imports only: allocated BOs are NC on both sides */
+   unsigned gpuOnly=(r.reserved & NativeAdrenoMapGpuOnly) ? FG_ABI_IMPORT_GPU_ONLY : 0; /* imports only: allocated BOs are NC on both sides, or WB/coherent (cached) */
    uint64_t deadline; clock_interval_to_deadline(150,NSEC_PER_MSEC,&deadline);
    int s;
    uint64_t tMap=mach_absolute_time(), tTry;
@@ -615,7 +634,7 @@ public:
   *memory=nullptr;
   IOLockLock(lock_);
   if (live_) for (auto &b:bos_) if (b.handle && b.token==token && b.leases) {
-   b.view->retain(); *memory=b.view; *options=kIOMapAnywhere|kIOMapWriteCombineCache; break;
+   b.view->retain(); *memory=b.view; *options=kIOMapAnywhere|(b.cached ? kIOMapDefaultCache : kIOMapWriteCombineCache); break;
   }
   IOReturn rc=*memory ? kIOReturnSuccess : kIOReturnNotFound;
   abiTrace("cpu-map",pid_,rc);
@@ -749,6 +768,9 @@ static void abiSplitReport(const uint64_t *sum, unsigned n, uint64_t lockMax, co
      (unsigned)(cs.bkt_kib[3]/ok),T1(cs.bkt_ns[3],ok));
  IOLog("FUXI GPU ABI: submit_split top3 kb/perm %u/%u %u/%u %u/%u (perm 1 read 3 write, +16 gpu_only)\n",
      (unsigned)cs.top_kib[0],cs.top_perm[0],(unsigned)cs.top_kib[1],cs.top_perm[1],(unsigned)cs.top_kib[2],cs.top_perm[2]);
+ { uint64_t c[5]; int on=fuxi_gpu_abi_cached_coherent(0)==1;
+   IOLockLock(statLock); c[0]=cboAllocs; c[1]=cboFrees; c[2]=cboRefused; c[3]=cboLive; c[4]=cboLiveBytes; cboAllocs=cboFrees=cboRefused=0; IOLockUnlock(statLock);
+   if (on || c[0] || c[2] || c[3]) IOLog("FUXI GPU ABI: cached BOs per %u submits enabled %d allocs %llu frees %llu refused %llu live %llu live_kb %llu\n",n,on,c[0],c[1],c[2],c[3],c[4]>>10); }
  #undef T1
  #undef U10
  uint64_t lm; absolutetime_to_nanoseconds(lockMax,&lm);

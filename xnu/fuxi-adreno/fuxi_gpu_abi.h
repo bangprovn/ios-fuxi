@@ -32,6 +32,9 @@ int fuxi_gpu_abi_queue_enabled(void);
 int fuxi_gpu_abi_roimport(void);
 int fuxi_gpu_abi_pace(void);
 int fuxi_gpu_abi_start(void);
+/* fuxigpuncimport bit 29 (536870912, needs 64): 1 cached-coherent BOs on (sticky for the boot), 0 off, -1 self-test not conclusive yet.
+ * probe=1 may run the coherent-import self-test now (GetDeviceInfo); probe=0 only reads the verdict (BoAlloc). */
+int fuxi_gpu_abi_cached_coherent(int probe);
 /* Queued submits, deepest chain, queue refusals for a waiting present, refusals for a full chain/ring. */
 void fuxi_gpu_abi_queue_stats(uint32_t q[6]);
 /* submit_split window (see fuxi_gpu_abi_backend.inc), taken and cleared by the caller's 600-submit report. */

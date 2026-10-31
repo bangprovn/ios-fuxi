@@ -39,6 +39,7 @@
 #include "PixelFormats.hpp"
 #include "ObjectCache.hpp"
 #include "HostImportRange.hpp"
+#include "MemoryTypes.hpp"
 #include <functional>
 #include <memory>
 #include <optional>
@@ -576,7 +577,8 @@ public:
    ci.usage=VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT|VK_BUFFER_USAGE_VERTEX_BUFFER_BIT|VK_BUFFER_USAGE_INDEX_BUFFER_BIT|VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT|VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
    check(CreateBuffer(device,&ci,nullptr,&b->buffer));
    VkMemoryRequirements req{};GetBufferMemoryRequirements(device,b->buffer,&req);b->allocated=req.size;
-   uint32_t type=0;while(type<memory.memoryTypeCount && (!(req.memoryTypeBits&(1u<<type)) || !(memory.memoryTypes[type].propertyFlags&VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))) ++type;
+   auto flagsOf=[&](uint32_t t){return uint32_t(memory.memoryTypes[t].propertyFlags);};const bool cachedPref=systemTranslationPolicy().bufferCached;
+   uint32_t type=bufferMemoryType(memory.memoryTypeCount,req.memoryTypeBits,cachedPref,flagsOf);logBufferMemoryType(stderr,cachedPref,memory.memoryTypeCount,flagsOf,type);
    if(type==memory.memoryTypeCount) throw std::runtime_error("no host-visible memory");
    VkMemoryAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;ai.allocationSize=req.size;ai.memoryTypeIndex=type;b->memoryType=type;
    reserveMemoryUnlocked(ai.allocationSize);b->charged=ai.allocationSize;

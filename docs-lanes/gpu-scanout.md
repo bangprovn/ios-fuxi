@@ -2172,3 +2172,46 @@ Risks (guesses, none observed):
 - **Park interplay** (bit 27): unchanged. A direct frame never queues a copy,
   so there is nothing to park.
 - **After a fault,** the panel keeps the faulted frame until the next copy.
+
+## Cached-coherent BOs (`fuxigpuncimport` bit 29, value 536870912, default off)
+
+MTLBuffer memory is Turnip type 0: CPU write-combine, GPU non-cacheable. CPU
+reads of it (index scans, readbacks) are uncached. Bit 29, together with the
+coherent-import self-test (bit 64), lets the kernel hand out IO-coherent
+write-back BOs:
+
+- Kernel: `fuxi_gpu_abi_cached_coherent()` latches "enabled" for the boot only
+  when bit 29 and 64 are set, the GPU is not poisoned and the self-test passed
+  with the wb-ish variant (`fg_abi_coh==1 && fg_abi_coh_wb`). GetDeviceInfo
+  runs the self-test early if needed (it would otherwise wait for the first
+  import), retrying twice 2 ms apart while busy, and then reports
+  `NativeAdrenoDeviceCachedCoherent`. BoAlloc takes
+  `NativeAdrenoAllocCachedCoherent` (bit 1 of `contiguous`) only after that:
+  the BO is allocated without write-combine, must be BoMap'ed writeback=1
+  shareability=3 (the self-test's attributes), and its CPU token maps
+  `kIOMapDefaultCache`. Otherwise every path is unchanged.
+- Turnip (`tools/patches/mesa-fuxi-cached-coherent.patch`): with the flag, the
+  existing DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT|HOST_CACHED type is backed
+  by such BOs. Query pools (`tu_bo_init_new_cached`) also use it.
+- FuxiMetal: `FUXI_MTL_BUFFER_CACHED=1` (default off) picks that type for
+  MTLBuffer-backed buffers when allowed, else the first host-visible type as
+  before. Textures and host imports are unchanged.
+
+Boot value: 502070904 + 536870912 = `fuxigpuncimport=1038941816` (10 digits,
+one more character). Bits 0-28 are all taken and the current bits plus bit 29
+exceed 999999999, so 9 digits needs dropping a current bit.
+
+Logs: `FUXI GPU ABI: cached-coherent BOs enabled reason=selftest-wb-ish-pass`
+or `... disabled reason=bit29-off|no-selftest-bit64|gpu-poisoned|selftest-pending|selftest-refused|selftest-not-wb`
+(each reason once); every 600 submits while enabled or active
+`FUXI GPU ABI: cached BOs per 600 submits enabled E allocs A frees F refused R live L live_kb K`;
+Turnip `FUXI KMD: cached-coherent memory type exposed (...)`; FuxiMetal
+`FUXI MTL: policy buffer_cached=N memory_types=0:DL|HV|HC,1:DL|HV|HC|HCA` and
+`FUXI MTL: buffer memory type=T flags=... cached=N`.
+
+Risks (guesses, none observed): the self-test proves CP reads/writes of a
+write-back inner-shareable page. Shader (UCHE/TP) reads of such pages are
+inferred from imports already in use, not proven. If coherency fails, the GPU
+reads stale vertex/index/uniform bytes: visual corruption, not memory
+corruption. CPU write-back mappings of GPU-written buffers rely on the same
+snooping in the other direction.

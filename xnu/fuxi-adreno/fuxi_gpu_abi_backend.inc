@@ -47,10 +47,13 @@ static uint64_t fg_abi_map_work;
  * job runs, see fg_abi_map_locked); 512 queue a submit behind a running job (see fg_abi_submit_locked). Parsed once in fg_abi_init. 1048576
  * (scanout copy-source pre-clean) is parsed by fuxi_gpu_scanout_configure. 67108864 (bit 26): WaitFence sleeps on the GPU fence interrupt (fuxi_gpu_irq.inc).
  * 134217728 (bit 27, needs 16): park the job copy priority would refuse and ring it behind the copy (fg_pk_park). 268435456 (bit 28, with 8):
- * the frame log starts at the first burst of not-shown frames (parsed by SweetFramebuffer). */
+ * the frame log starts at the first burst of not-shown frames (parsed by SweetFramebuffer). 536870912 (bit 29, needs 64): cached-coherent BOs
+ * (fuxi_gpu_abi_cached_coherent). */
 static unsigned fg_irq_want;
 static unsigned fg_abi_coh_wb; /* the passing variant mapped the data page cacheable write-back, inner-shareable: imports are then mapped that way */
 static unsigned fg_abi_coh, fg_abi_coh_tries; /* coh: 0 untested, 1 proven coherent, 2 refused */
+static unsigned fg_abi_cbo, fg_abi_cbo_on; /* bit 29 asked; latched on once the wb-ish self-test passed (never cleared until init) */
+static const char *fg_abi_cbo_said;
 /* The submit record holds up to NativeAdrenoAbiMaxBuffers IBs; one frame is then one ring prologue and one CP context reset. */
 _Static_assert(FG_ABI_FRAME_WORDS+8 < 8192, "one frame must fit the idle ring");
 static uint32_t fg_abi_words[FG_ABI_FRAME_WORDS];
@@ -528,7 +531,7 @@ static int fg_abi_init(void)
 {
  unsigned bits=0;
  (void)PE_parse_boot_argn("fuxigpuncimport",&bits,sizeof(bits));
- fg_abi_ncimport=bits&1; fg_wptr_fence=(bits>>1)&1; fg_abi_unstick=(bits>>2)&1; fg_abi_cohtest=(bits>>6)&1; fg_abi_tlbpages=(bits>>7)&1; fg_abi_mapwait=(bits>>8)&1; fg_abi_queue=(bits>>9)&1; fg_abi_roimport=(bits>>10)&1; fg_abi_pace=(bits>>11)&1; fg_abi_hold=(bits>>12)&1; fg_abi_start=(bits>>13)&1; fg_abi_probe=(bits>>14)&1; fg_abi_spin=(bits>>15)&1; fg_abi_mid=(bits>>16)&1; fg_abi_ar=(bits>>17)&1; fg_abi_hard=(bits>>18)&1; fg_abi_dirty=(bits>>19)&1; fg_abi_inline=((bits>>21)&1) && ((bits>>9)&1); fg_abi_cf=fg_abi_inline && ((bits>>4)&1); fg_abi_pk=fg_abi_cf && ((bits>>27)&1); fg_irq_want=(bits>>26)&1; fg_cf_reset(); fg_pk_reset(); fg_inl_ready=fg_root_client=fg_inl_busy=fg_inl_fbmask=0; fg_abi_hold_since=0; fg_abi_present_wait=0; memset(fg_abi_q_stats,0,sizeof(fg_abi_q_stats));
+ fg_abi_ncimport=bits&1; fg_wptr_fence=(bits>>1)&1; fg_abi_unstick=(bits>>2)&1; fg_abi_cohtest=(bits>>6)&1; fg_abi_tlbpages=(bits>>7)&1; fg_abi_mapwait=(bits>>8)&1; fg_abi_queue=(bits>>9)&1; fg_abi_roimport=(bits>>10)&1; fg_abi_pace=(bits>>11)&1; fg_abi_hold=(bits>>12)&1; fg_abi_start=(bits>>13)&1; fg_abi_probe=(bits>>14)&1; fg_abi_spin=(bits>>15)&1; fg_abi_mid=(bits>>16)&1; fg_abi_ar=(bits>>17)&1; fg_abi_hard=(bits>>18)&1; fg_abi_dirty=(bits>>19)&1; fg_abi_cbo=(bits>>29)&1; fg_abi_cbo_on=0; fg_abi_cbo_said=NULL; fg_abi_inline=((bits>>21)&1) && ((bits>>9)&1); fg_abi_cf=fg_abi_inline && ((bits>>4)&1); fg_abi_pk=fg_abi_cf && ((bits>>27)&1); fg_irq_want=(bits>>26)&1; fg_cf_reset(); fg_pk_reset(); fg_inl_ready=fg_root_client=fg_inl_busy=fg_inl_fbmask=0; fg_abi_hold_since=0; fg_abi_present_wait=0; memset(fg_abi_q_stats,0,sizeof(fg_abi_q_stats));
  if (fg_abi_pk) printf("FUXI GPU: copy_first_park=1 idle_us=%u cap=2 periods (fuxigpuncimport 134217728 with 16, inline mode)\n", FG_PK_IDLE_US);
  fg_abi_coh=fg_abi_coh_tries=0;
  for (unsigned i=0;i<sizeof(fg_abi_used)/sizeof(fg_abi_used[0]);i++) fg_abi_used[i]=0;
@@ -1194,6 +1197,22 @@ static void fg_abi_coh_probe(void)
   if (!coh_def || fg_abi_poisoned) break;
  }
  fg_abi_coh=2;
+}
+/* Cached-coherent BOs (fuxigpuncimport bit 29, value 536870912, default off; needs the self-test bit 64). On only when the wb-ish variant
+ * of the coherent-import self-test passed: the GPU then maps such a BO exactly like a proven import (MAIR index 1 write-back,
+ * inner-shareable leaves) and the CPU keeps XNU's default write-back mapping, the policy of the user pages that test covers (its probe page
+ * is a cacheable kernel page). No clean or invalidate is needed or done. The verdict is latched for the boot: a Turnip that saw the flag
+ * keeps getting cached BOs. GetDeviceInfo may run the self-test early (probe=1), since Turnip reads the flag once, before any import. */
+int fuxi_gpu_abi_cached_coherent(int probe)
+{
+ FG_GUARD;
+ if (fg_abi_cbo_on) return 1;
+ const char *why=!fg_abi_cbo ? "bit29-off" : !fg_abi_cohtest ? "no-selftest-bit64" : NULL;
+ if (!why && probe && !fg_abi_coh) fg_abi_coh_probe();
+ if (!why) why=fg_abi_poisoned ? "gpu-poisoned" : !fg_abi_coh ? "selftest-pending" : fg_abi_coh==2 ? "selftest-refused" : !fg_abi_coh_wb ? "selftest-not-wb" : NULL;
+ if (!why) { fg_abi_cbo_on=1; printf("FUXI GPU ABI: cached-coherent BOs enabled reason=selftest-wb-ish-pass\n"); return 1; }
+ if (why!=fg_abi_cbo_said) { fg_abi_cbo_said=why; printf("FUXI GPU ABI: cached-coherent BOs disabled reason=%s\n",why); }
+ return fg_abi_cbo && fg_abi_cohtest && !fg_abi_coh && !fg_abi_poisoned ? -1 : 0;
 }
 int fuxi_gpu_abi_poll(uint64_t fence)
 {

@@ -16,6 +16,7 @@ WIRE = r'''
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 #include "fuxi_abi_wire.h"
 #define SZ(t,n) static_assert(sizeof(t)==n,#t)
 SZ(NativeAdrenoAbiBoAllocReply,8); SZ(NativeAdrenoAbiBoMapReply,8);
@@ -43,6 +44,16 @@ int main() {
  assert((max|0xfff)-min+1==0x300000);
  assert(info.chip_id==0x43050a01 && info.gmem_base==min &&
      info.gmem_bytes==(max|0xfff)-min+1 && info.gmem_bytes==3u*1024*1024);
+ /* fuxigpuncimport bit 29: the flag follows the backend verdict; an inconclusive self-test is asked twice more, 2 ms apart, then reported off. */
+ assert(info.flags==NativeAdrenoDeviceClientIova && ccCalls==1 && !sleeps);
+ static_assert(NativeAdrenoAllocContiguous==1 && NativeAdrenoAllocCachedCoherent==2,"alloc bits");
+ const int seqs[4][3]={{1,1,1},{-1,-1,-1},{-1,1,1},{0,0,0}};
+ for(unsigned c=0;c<4;c++) {
+  memcpy(ccSeq,seqs[c],sizeof(ccSeq));ccCalls=sleeps=0;info={};
+  assert(!deviceQuery(NativeAdrenoMethodGetDeviceInfo,nullptr,&info));
+  assert(info.flags==(NativeAdrenoDeviceClientIova|((c==0||c==2)?NativeAdrenoDeviceCachedCoherent:0u)));
+  assert(ccCalls==(c==1?3u:c==2?2u:1u) && sleeps==ccCalls-1);
+ }
  const unsigned is[]={0,0,16,32,8,3104,16,0,0,80,80,8,8,8,16,0,16};
  const unsigned os[]={0,24,8,8,0,8,0,8,16,0,80,8,0,16,0,64,8};
  for(unsigned s=1;s<=16;s++) {assert(fg_abi_input_size(s)==is[s]);assert(fg_abi_output_size(s)==os[s]);}
@@ -59,7 +70,7 @@ int main() {
  assert(!fg_abi_range(0x20000001,4096)); assert(!fg_abi_range(0x20000000,4095));
  for(unsigned align=0;align<32;align++)
   for(unsigned contig=0;contig<4;contig++)
-   assert(fg_abi_alloc_valid(4096,align,contig)==(align>=12 && align<=24 && contig<=1));
+   assert(fg_abi_alloc_valid(4096,align,contig)==(align>=12 && align<=24 && contig<=3)); /* bit1 cached-coherent, gated by the client */
  assert(!fg_abi_alloc_valid(0,12,0)); assert(!fg_abi_alloc_valid(4097,12,0));
  assert(fg_abi_alloc_valid(1u<<28,24,1)); assert(!fg_abi_alloc_valid((1u<<28)+4096,12,0));
  for(unsigned perm=0;perm<8;perm++) for(unsigned wb=0;wb<3;wb++) for(unsigned sh=0;sh<5;sh++)
@@ -909,6 +920,38 @@ int main(void) {
   assert(!fuxi_gpu_abi_map_import(va,source,16384,3) && cacheClean==(mode==1?256u:768u));cohMode=0;
  }
  puts("PASS: coherent self-test (pass skips maintenance; stale/partial/hang/fault/busy/occupied stay on the clean+invalidate path; probe window left unmapped)");
+ /* Cached-coherent BOs (bit 29, needs 64): on only after the wb-ish variant passed; latched; never probes without both bits. */
+ for(unsigned arg=0;arg<3;arg++) {
+  seed();ncimportArg=arg==0?64u:arg==1?536870912u:0u;assert(fg_abi_init());cohMode=6;
+  assert(fg_abi_cbo==(arg==1) && fuxi_gpu_abi_cached_coherent(1)==0 && !doorbells && !fg_abi_coh);
+  assert(strstr(lastLog,arg==1?"cached-coherent BOs disabled reason=no-selftest-bit64":"cached-coherent BOs disabled reason=bit29-off"));
+  unsigned lines=logLines;assert(fuxi_gpu_abi_cached_coherent(1)==0 && logLines==lines); /* one line per reason */
+  cohMode=0;
+ }
+ for(unsigned mode=1;mode<=6;mode++) {
+  if(mode==3||mode==4) continue;
+  seed();ncimportArg=536870912u|64u;assert(fg_abi_init() && fg_abi_cbo && fg_abi_cohtest);
+  assert(fuxi_gpu_abi_cached_coherent(0)==-1 && !doorbells && strstr(lastLog,"cached-coherent BOs disabled reason=selftest-pending"));
+  cohMode=mode;
+  int on=fuxi_gpu_abi_cached_coherent(1);
+  assert(on==(mode==6) && fg_abi_coh==(mode==1||mode==6?1u:2u) && fg_abi_coh_wb==(mode==6));
+  assert(strstr(lastLog,mode==6?"cached-coherent BOs enabled reason=selftest-wb-ish-pass":mode==1?"cached-coherent BOs disabled reason=selftest-not-wb":"cached-coherent BOs disabled reason=selftest-refused"));
+  unsigned before=doorbells;cohMode=0;
+  assert(fuxi_gpu_abi_cached_coherent(1)==on && fuxi_gpu_abi_cached_coherent(0)==on && doorbells==before); /* verdict final, no re-probe */
+  assert(!fuxi_gpu_abi_map_import(va,source,16384,3) && doorbells==before);
+  if(mode==6) {uint64_t lf=*fg_abi_leaf(va);assert((lf&(1u<<2)) && ((lf>>8)&3)==3);
+   /* A cached BO maps through the ordinary allocated-BO path with the import's proven attributes. */
+   assert(!fuxi_gpu_abi_map(va+0x10000,source,16384,3,1,3));lf=*fg_abi_leaf(va+0x10000);assert((lf&(1u<<2)) && ((lf>>8)&3)==3);
+   cacheClean=cacheInvalidate=0;assert(!fuxi_gpu_abi_submit(addresses,sizes,1,&fence));complete();assert(!fuxi_gpu_abi_poll(fence));
+   fg_abi_poisoned=1;assert(fuxi_gpu_abi_cached_coherent(0)==1);fg_abi_poisoned=0; /* latched */
+   assert(!fuxi_gpu_abi_unmap(va+0x10000,16384));}
+  assert(!fuxi_gpu_abi_unmap(va,16384));
+ }
+ /* GPU busy at GetDeviceInfo: inconclusive (-1) until the self-test's third try, then off for the boot. */
+ seed();ncimportArg=536870912u|64u;assert(fg_abi_init());fg_busy=1;
+ assert(fuxi_gpu_abi_cached_coherent(1)==-1 && fuxi_gpu_abi_cached_coherent(1)==-1 && fuxi_gpu_abi_cached_coherent(1)==0 && fg_abi_coh==2 && !doorbells);
+ assert(strstr(lastLog,"cached-coherent BOs disabled reason=selftest-refused"));fg_busy=0;
+ puts("PASS: cached-coherent BOs (bit 29 with 64): enabled only after the wb-ish self-test pass, latched, one log line per reason, no probe without both bits");
 
 
  /* One 128-IB frame is one submission: a single prologue, 128 IB packets, one doorbell, across the ring wrap. */
@@ -1020,7 +1063,10 @@ def main():
         client=(HEADERS/'FuxiAdrenoUserClient.cpp').read_text()
         query=client[client.index(' IOReturn run('):client.index('  if (method==NativeAdrenoMethodWaitFence)')]
         query=query.replace(' IOReturn run(', 'static int deviceQuery(')+' (void)in;return -1;\n}\n'
-        wire.write_text(WIRE.replace('int main() {', 'static constexpr int kIOReturnSuccess=0;\n'+query+'\nint main() {'))
+        stubs=('static constexpr int kIOReturnSuccess=0;\nstatic int ccSeq[3]={0,0,0};static unsigned ccCalls,sleeps;\n'
+               'static int fuxi_gpu_abi_cached_coherent(int probe){assert(probe==1 && ccCalls<3);return ccSeq[ccCalls++];}\n'
+               'static void IOSleep(unsigned ms){assert(ms==2);sleeps++;}\n')
+        wire.write_text(WIRE.replace('int main() {', stubs+query+'\nint main() {'))
         backend = (HEADERS/'fuxi_gpu_abi_backend.inc').read_text()
         backend = re.sub(r'__asm__ volatile\("dsb sy" ::: "memory"\);', '(void)0;', backend)
         backend = backend.replace('__asm__ volatile("dc ivac, %0" :: "r"(p) : "memory");', 'host_cache(p,1);')
