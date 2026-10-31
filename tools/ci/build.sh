@@ -5,10 +5,12 @@ root=$(cd "$(dirname "$0")/../.." && pwd)
 usage() {
     cat <<'HELP'
 Usage: tools/ci/build.sh TARGET [--dry-run]
-Targets: kernel-metal4, kernel-wlan6g, kernel-metal4e, metal, nativemetal, mesa, tools
+Targets: kernel-metal4, kernel-wlan6g, kernel-metal4e, kernel-ios27, metal, nativemetal, mesa, tools
        tools/ci/build.sh --plan KERNEL METAL MESA TOOLS [NATIVEMETAL]
-KERNEL: none|metal4|wlan6g|metal4e|all; remaining plan arguments: true|false
+KERNEL: none|metal4|wlan6g|metal4e|ios27|all; remaining plan arguments: true|false
 metal4e is the opt-in arm64e build of the metal4 kernel (FUXI_ARM64E=1, patch 0115); all does not include it.
+ios27 is the iOS 27 kernel (xnu-12377 + xnu27/series, tools/ci/build-xnu27.sh): it
+needs Xcode 26 or newer with ld-classic, ignores FUXI_IIG_MODE; all does not include it.
 Outputs: tools/out/ci/TARGET/ (explicit allowlist, logs, SHA256SUMS)
 Caches: deps/ci-downloads/; isolated build directories: deps/ci-work-TARGET/
 Requires a Mac with preinstalled Xcode 15.4 (kernel) or a selected full Xcode
@@ -24,7 +26,7 @@ case "$1" in
     -h|--help) [[ $# == 1 ]] || die 'unexpected help arguments'; usage; exit 0 ;;
     --plan)
         [[ $# == 5 || $# == 6 ]] || die '--plan needs KERNEL METAL MESA TOOLS [NATIVEMETAL]'
-        case "$2" in none|metal4|wlan6g|metal4e|all) ;; *) die 'invalid kernel selection' ;; esac
+        case "$2" in none|metal4|wlan6g|metal4e|ios27|all) ;; *) die 'invalid kernel selection' ;; esac
         for flag in "$3" "$4" "$5" "${6:-false}"; do
             [[ $flag == true || $flag == false ]] || die 'plan flags must be true or false'
         done
@@ -32,7 +34,7 @@ case "$1" in
 import json, sys
 kernel, *flags = sys.argv[1:]
 targets = ["kernel-" + v for v in ("metal4", "wlan6g") if kernel in (v, "all")]
-targets += ["kernel-metal4e"] if kernel == "metal4e" else []
+targets += ["kernel-" + kernel] if kernel in ("metal4e", "ios27") else []
 targets += [t for t, f in zip(("metal", "mesa", "tools", "nativemetal"), flags) if f == "true"]
 if not targets:
     raise SystemExit("Select at least one target")
@@ -42,7 +44,7 @@ PY
 esac
 target=$1
 shift
-case "$target" in kernel-metal4|kernel-wlan6g|kernel-metal4e|metal|nativemetal|mesa|tools) ;; *) die "unknown target: $target" ;; esac
+case "$target" in kernel-metal4|kernel-wlan6g|kernel-metal4e|kernel-ios27|metal|nativemetal|mesa|tools) ;; *) die "unknown target: $target" ;; esac
 dry=false
 if [[ $# == 1 && $1 == --dry-run ]]; then dry=true; shift; fi
 [[ $# == 0 ]] || die 'unexpected arguments'
@@ -52,6 +54,17 @@ iig_mode=${FUXI_IIG_MODE:-xcode}
 case "$iig_mode" in xcode|capture|replay) ;; *) die "unknown FUXI_IIG_MODE: $iig_mode" ;; esac
 if $dry; then
     printf 'target=%s\nartifact=fuxi-%s\noutput=tools/out/ci/%s\n' "$target" "$target" "$target"
+    if [[ $target == kernel-ios27 ]]; then
+        # shellcheck source=xnu27/sources.env
+        source "$root/xnu27/sources.env"
+        printf 'pins: %s=%s trustcache=%s=%s availability=%s libplatform=%s libdispatch=%s\n' "$XNU27_TAG" "$XNU27_SHA" \
+            "$XNU27_TRUSTCACHE_TAG" "$XNU27_TRUSTCACHE_SHA" "$AVAILABILITYVERSIONS_SHA" "$LIBPLATFORM_SHA" "$LIBDISPATCH_SHA"
+        printf 'kernel: arm64e FUXI (BCM2837 layer) DEVELOPMENT, %s patches, Xcode >= 26 + ld-classic, iig from Xcode\n' \
+            "$(grep -cv '^#' "$root/xnu27/series")"
+        echo 'outputs: mach.development.fuxi(.unstripped) fuxi27.adt fuxi27-cpus7.adt cmdline.txt cmdline-cpus7.txt kernel-arch.txt'
+        echo 'No downloads, builds, signing or packing in dry-run mode.'
+        exit 0
+    fi
     [[ $target != kernel-* ]] || printf 'iig=%s cache=%s\n' "$iig_mode" "${FUXI_IIG_CACHE:-xnu/iig-pregen}"
     printf 'pins: dxb=%s mesa=%s metal2vulkan=%s rust=%s\n' "$DXB_SHA" "$MESA_SHA" "$M2V_SHA" "$RUST_VERSION"
     if [[ $target == kernel-metal4e ]]; then
@@ -171,13 +184,16 @@ setup() {
     local cmd
     for cmd in cmake ninja; do command -v "$cmd" >/dev/null || die "runner lacks $cmd"; done
     case "$target" in
+        kernel-ios27) command -v unifdef >/dev/null || die 'runner lacks unifdef' ;;
         kernel-*) command -v jq >/dev/null || die 'runner lacks jq'
                   install_gum; install_bash ;;
         mesa) command -v pkg-config >/dev/null || die 'runner lacks pkg-config'
               install_glslang ;;
         tools) install_glslang ;;
     esac
-    if [[ $target == kernel-* ]]; then
+    if [[ $target == kernel-ios27 ]]; then
+        [[ -n ${DEVELOPER_DIR:-} ]] || die 'kernel-ios27 needs DEVELOPER_DIR (Xcode 26 or newer)'
+    elif [[ $target == kernel-* ]]; then
         export DEVELOPER_DIR=${DEVELOPER_DIR:-/Applications/Xcode_15.4.app/Contents/Developer}
     else
         export DEVELOPER_DIR=${DEVELOPER_DIR:-$(xcode-select -p)}
@@ -185,7 +201,12 @@ setup() {
     [[ -d $DEVELOPER_DIR ]] || die 'required full Xcode is missing; never download Xcode in CI'
     xcodebuild -version
     xcrun --sdk iphoneos --show-sdk-path
-    if [[ $target == kernel-* ]]; then
+    if [[ $target == kernel-ios27 ]]; then
+        local major
+        major=$(xcodebuild -version | sed -n '1s/^Xcode \([0-9]*\).*/\1/p')
+        [[ ${major:-0} -ge 26 ]] || die 'kernel-ios27 needs Xcode 26 or newer (xnu-12377 iig and SDK)'
+        xcrun --find iig
+    elif [[ $target == kernel-* ]]; then
         echo "IIG mode: $iig_mode"
         if [[ $iig_mode == replay ]]; then
             # Newer iig emits an IORPC ABI XNU 8796 lacks: never run it, replay
@@ -288,6 +309,30 @@ if m['cpusub'] != mkpayload.CPU_SUBTYPE_ARM64E or not m['thread_starts']:
     raise SystemExit('metal4e kernel is not arm64e with __TEXT,__thread_starts')
 PY
     fi
+}
+
+# iOS 27 kernel: Apple open-source checkouts at xnu27/sources.env, then
+# tools/ci/build-xnu27.sh. No KDK, IPSW, kernelcache or Apple binary is fetched.
+kernel_ios27() {
+    python3 tools/test-fuxi-ios27.py
+    python3 tools/test-fuxi-arm64e.py
+    # shellcheck source=xnu27/sources.env
+    source xnu27/sources.env
+    local apple=https://github.com/apple-oss-distributions
+    source_checkout xnu-12377 "$apple/xnu.git" "$XNU27_SHA" "$work/src/xnu"
+    source_checkout AvailabilityVersions "$apple/AvailabilityVersions.git" "$AVAILABILITYVERSIONS_SHA" "$work/src/AvailabilityVersions"
+    source_checkout libplatform "$apple/libplatform.git" "$LIBPLATFORM_SHA" "$work/src/libplatform"
+    source_checkout libdispatch "$apple/libdispatch.git" "$LIBDISPATCH_SHA" "$work/src/libdispatch"
+    # Only EXTERNAL_HEADERS/TrustCache of the older tag (dropped after it).
+    local tc=$work/src/trustcache
+    git init -q "$tc"
+    git -C "$tc" remote add origin "$apple/xnu.git"
+    git -C "$tc" sparse-checkout set --no-cone /EXTERNAL_HEADERS/TrustCache/
+    git -C "$tc" fetch --no-tags --depth 1 --filter=blob:none origin "$XNU27_TRUSTCACHE_SHA"
+    git -C "$tc" checkout -q --detach FETCH_HEAD
+    [[ $(git -C "$tc" rev-parse HEAD) == "$XNU27_TRUSTCACHE_SHA" && -d $tc/EXTERNAL_HEADERS/TrustCache ]] || die 'TrustCache headers missing'
+    shasum -a 256 xnu27/series xnu27/patches/*/*.patch xnu27/components/*/*.cpp > "$out/xnu27-SHA256SUMS.txt"
+    bash tools/ci/build-xnu27.sh "$work/src" "$out"
 }
 
 mesa_source() {
@@ -406,6 +451,7 @@ build() {
     printf 'Repository: %s\nTarget: %s\n' "$(git rev-parse HEAD)" "$target"
     cat tools/ci/pins.env
     case "$target" in
+        kernel-ios27) kernel_ios27 ;;
         kernel-*) kernel ;;
         metal|nativemetal) metal ;;
         mesa) mesa ;;

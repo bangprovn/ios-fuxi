@@ -1,0 +1,119 @@
+#!/bin/bash
+# Build the iOS 27 kernel (xnu-12377.121.6 + xnu27/series, MACHINE_CONFIGS=FUXI,
+# arm64e) from source checkouts already in WORK, the way UniXNU's
+# build-xnu-4k-baseline.sh builds sheng's (docs-lanes/ios27.md). Mac only.
+#
+#   build-xnu27.sh WORK OUT
+#
+# WORK must hold clean checkouts at the xnu27/sources.env pins: xnu,
+# AvailabilityVersions, libplatform, libdispatch and trustcache (xnu-8796.101.5,
+# EXTERNAL_HEADERS/TrustCache only). tools/ci/build.sh kernel-ios27 fetches them.
+# OUT receives mach.development.fuxi(.unstripped), fuxi27.adt, cmdline*.txt and
+# kernel-arch.txt. Nothing Apple-binary is fetched: no KDK, IPSW or kernelcache.
+set -euo pipefail
+root=$(cd "$(dirname "$0")/../.." && pwd)
+work=$(cd "${1:?Usage: build-xnu27.sh WORK OUT}" && pwd)
+out=${2:?Usage: build-xnu27.sh WORK OUT}
+mkdir -p "$out"
+out=$(cd "$out" && pwd)
+die() { echo "build-xnu27: $*" >&2; exit 2; }
+[[ $(uname -s) == Darwin ]] || die 'needs macOS with Xcode'
+# shellcheck source=xnu27/sources.env
+source "$root/xnu27/sources.env"
+xnu=$work/xnu fake=$work/fakeroot obj=$work/obj sym=$work/sym dst=$work/dst
+jobs=$(sysctl -n hw.logicalcpu)
+for name in xnu AvailabilityVersions libplatform libdispatch trustcache; do
+    [[ -d $work/$name/.git ]] || die "missing checkout $work/$name"
+done
+[[ $(git -C "$xnu" rev-parse HEAD) == "$XNU27_SHA" ]] || die 'xnu is not at XNU27_SHA'
+git -C "$xnu" diff --quiet || die 'xnu checkout is not clean'
+
+# ld-classic emits __TEXT,__thread_starts, which a standalone arm64e kernel
+# needs (UniXNU arm64e-threaded-starts.patch). Fail before a long build.
+xcodebuild -version
+ldc=$(xcrun -sdk iphoneos -find ld-classic) || die 'this Xcode has no ld-classic (needed for -threaded_starts_section)'
+echo "ld-classic: $ldc"
+
+bash "$root/xnu27/apply.sh" "$xnu"
+cp -R "$work/trustcache/EXTERNAL_HEADERS/TrustCache" "$xnu/EXTERNAL_HEADERS/"
+
+mkdir -p "$fake" "$obj" "$sym" "$dst"
+make -C "$work/AvailabilityVersions" install -j"$jobs" OBJROOT="$work/av-obj" SYMROOT="$work/av-sym" \
+    DSTROOT="$fake" CMAKE="$(command -v cmake)" NINJA="$(command -v ninja)"
+export XNU_AVAILABILITY_PL=$fake/usr/local/libexec/availability.pl
+[[ -x $XNU_AVAILABILITY_PL ]] || die 'AvailabilityVersions did not install availability.pl'
+export KERNEL_SDKROOT=$fake
+mkdir -p "$fake/usr/local/include/kernel" "$fake/usr/local/include/os" "$obj/EXPORT_HDRS/libsa" \
+    "$fake/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform"
+cp -R "$work/libplatform/include/." "$fake/usr/local/include/"
+cp -R "$work/libplatform/private/." "$fake/usr/local/include/"
+cp -R "$work/libplatform/private/platform/." \
+    "$fake/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform/"
+for header in "$work"/libdispatch/os/*.h; do
+    unifdef -DKERNEL=1 -DOS_FIREHOSE_SPI=1 -DOS_VOUCHER_ACTIVITY_SPI_TYPES=1 -UOS_VOUCHER_ACTIVITY_SPI \
+        -o "$fake/usr/local/include/os/$(basename "$header")" "$header" || [[ $? == 1 ]]
+done
+
+common=(ARCH_CONFIGS=ARM64 MACHINE_CONFIGS=FUXI KERNEL_CONFIGS=DEVELOPMENT
+        RC_DARWIN_KERNEL_VERSION="$XNU27_DARWIN" RC_ProjectSourceVersion="${XNU27_TAG#xnu-}"
+        MAKEJOBS=-j"$jobs" OBJROOT="$obj" SYMROOT="$sym")
+make -C "$xnu" installhdrs SDKROOT=macosx "${common[@]}" DSTROOT="$fake"
+
+# libfirehose_kernel from libdispatch, against the headers just installed.
+python3 - "$work/libdispatch/xcodeconfig/libfirehose_kernel.xcconfig" "$xnu/EXTERNAL_HEADERS" <<'PY'
+from pathlib import Path
+import sys
+p, ext = Path(sys.argv[1]), sys.argv[2]
+s = p.read_text()
+s = s.replace('$(SDKROOT)/System/Library/Frameworks/Kernel.framework', '$(FAKEROOT_DIR)/System/Library/Frameworks/Kernel.framework')
+s = s.replace('$(SDKROOT)/usr/local/include', '$(FAKEROOT_DIR)/usr/local/include')
+lines = s.splitlines()
+hits = [i for i, l in enumerate(lines) if l.startswith('HEADER_SEARCH_PATHS =')]
+if not hits:
+    raise SystemExit('libfirehose_kernel.xcconfig has no HEADER_SEARCH_PATHS')
+for i in hits:
+    lines[i] += f' $(SDKROOT)/usr/include $(FAKEROOT_DIR)/usr/local/include {ext}'
+p.write_text('\n'.join(lines) + '\n')
+PY
+xcodebuild install -project "$work/libdispatch/libdispatch.xcodeproj" -target libfirehose_kernel \
+    -configuration Release -sdk iphoneos -jobs "$jobs" ARCHS=arm64e VALID_ARCHS=arm64e ONLY_ACTIVE_ARCH=NO \
+    IPHONEOS_DEPLOYMENT_TARGET="$XNU27_IOS_VERSION" CODE_SIGNING_ALLOWED=NO GCC_TREAT_WARNINGS_AS_ERRORS=NO \
+    OBJROOT="$work/firehose-obj" SYMROOT="$work/firehose-sym" DSTROOT="$fake" FAKEROOT_DIR="$fake"
+lib=$fake/usr/local/lib/kernel
+[[ -f $lib/liblibfirehose_kernel.a ]] && cp "$lib/liblibfirehose_kernel.a" "$lib/libfirehose_kernel.a"
+xcrun lipo -info "$lib/libfirehose_kernel.a"
+
+# UniXNU's arm64e/ipados-27 build: BCM2837-style layer, 4K, no LTO; FUXI wraps it.
+# PAN instructions need armv8.1 in the three files that use them (native-arm-pan).
+make -C "$xnu" build SDKROOT=iphoneos "${common[@]}" DSTROOT="$dst" \
+    ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG=arm64e LARGE_MEMORY_DEFINE=-UARM_LARGE_MEMORY \
+    ARM64_LINK_ADDR=0xfffffff007004000 ARM64_PLKSEG_ADDR=0xfffffff004004000 \
+    DEPLOYMENT_TARGET_FLAGS="-miphoneos-version-min=$XNU27_IOS_VERSION -DXNU_TARGET_OS_IOS" \
+    DEPLOYMENT_LINKER_FLAGS="-Wl,-ios_version_min,$XNU27_IOS_VERSION" \
+    BUILD_LTO=0 BOUND_CHECKS=0 BUILD_WERROR=0 XNU_KERNEL_CHAINED_FIXUPS=0 \
+    CFLAGS_EXTRA="-Wno-reserved-identifier -Wno-pre-c11-compat -Wno-missing-designated-field-initializers -Wno-suggest-override -Wno-unnecessary-virtual-specifier -Wno-suggest-destructor-override -Wno-ms-bitfield-padding -DXNU_NATIVE_PAN=1" \
+    copyio.o_CFLAGS_ADD=-march=armv8.1-a pcb.o_CFLAGS_ADD=-march=armv8.1-a platform_tests.o_CFLAGS_ADD=-march=armv8.1-a \
+    ubc_subr.o_CFLAGS_ADD=-DXNU_NATIVE_CS_HASH_CACHE=1
+
+kdir=$obj/DEVELOPMENT_ARM64_FUXI
+[[ -f $kdir/mach.development.fuxi ]] || die "no $kdir/mach.development.fuxi"
+cp "$kdir/mach.development.fuxi" "$out/"
+for raw in "$kdir/mach.development.fuxi.unstripped" "$kdir/mach.development.fuxi.unstripped.noctf"; do
+    [[ -f $raw ]] && { cp "$raw" "$out/mach.development.fuxi.unstripped"; break; }
+done
+[[ -f $out/mach.development.fuxi.unstripped ]] || die 'no unstripped kernel'
+# The loader build accepts a 12377 payload only with this object-path identity.
+grep -q DEVELOPMENT_ARM64_FUXI "$out/mach.development.fuxi" || die 'kernel lacks the DEVELOPMENT_ARM64_FUXI identity'
+python3 - "$out/mach.development.fuxi" "$root/tools" <<'PY' | tee "$out/kernel-arch.txt"
+import re, sys
+sys.path.insert(0, sys.argv[2])
+import mkpayload
+buf = open(sys.argv[1], 'rb').read()
+m = mkpayload.parse_macho(buf)
+version = re.search(rb'Darwin Kernel Version [^\0]*', buf)
+print(version.group().decode(errors='replace') if version else 'no version string')
+print(f"cputype={m['cputype']:#x} cpusub={m['cpusub']} thread_starts={m['thread_starts']} chained_fixups={bool(m['fixups'])}")
+if m['cpusub'] != mkpayload.CPU_SUBTYPE_ARM64E or not m['thread_starts']:
+    raise SystemExit('ios27 kernel is not arm64e with __TEXT,__thread_starts')
+PY
+python3 "$root/tools/ci/kernel-inputs.py" --variant ios27 --out "$out"

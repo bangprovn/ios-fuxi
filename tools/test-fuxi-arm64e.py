@@ -292,7 +292,7 @@ def ci():
     assert 'python3 tools/test-fuxi-arm64e.py' in body
     assert "xcrun --sdk macosx --find ld-classic" in text
     wf = (ROOT/'.github/workflows/fuxi-build.yml').read_text()
-    assert 'options: [none, metal4, wlan6g, metal4e, all]' in wf and 'default: metal4\n' in wf
+    assert 'options: [none, metal4, wlan6g, metal4e, ios27, all]' in wf and 'default: metal4\n' in wf
     print('PASS: CI kernel=metal4e plans kernel-metal4e only (not in all); metal4/wlan6g/all plans unchanged')
 
 

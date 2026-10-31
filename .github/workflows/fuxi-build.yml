@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       kernel:
-        description: Kernel/boot-argument profiles (current source, WLAN opt-in; metal4e = opt-in arm64e build, not in all)
+        description: Kernel/boot-argument profiles (current source, WLAN opt-in; metal4e = opt-in arm64e build; ios27 = iOS 27 kernel, Xcode 26+ on macos-26; neither in all)
         type: choice
-        options: [none, metal4, wlan6g, metal4e, all]
+        options: [none, metal4, wlan6g, metal4e, ios27, all]
         default: metal4
       metal:
         description: Signed FuxiMetal, smoke, own metallib and pinned metal2vulkan
@@ -71,11 +71,12 @@ jobs:
     name: ${{ matrix.target }}
     # Xcode 15 iig matches XNU 8796's IORPC ABI; never silently use Xcode 16.
     # Newer runners need iig_mode=replay; see xnu/README.md (macos-14 retirement).
+    # kernel-ios27 (xnu-12377) uses the selected Xcode 26+ iig and ignores iig_mode.
     runs-on: ${{ inputs.runner }}
     permissions:
       contents: read
       actions: read
-    timeout-minutes: 120
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
@@ -94,7 +95,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: deps/ci-downloads
-          key: fuxi-source-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ hashFiles('tools/ci/pins.env', 'tools/ci/build.sh') }}
+          key: fuxi-source-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ hashFiles('tools/ci/pins.env', 'tools/ci/build.sh', 'xnu27/sources.env') }}
       - uses: actions/cache@v4
         if: matrix.target == 'metal' || matrix.target == 'nativemetal'
         with:
@@ -106,18 +107,18 @@ jobs:
           ls -d /Applications/Xcode*.app
           [[ -d $DEVELOPER_DIR ]] || { echo "::error::Xcode $XCODE_VERSION is not installed on $ImageOS"; exit 1; }
           [[ -z $IIG_RUN || $FUXI_IIG_MODE == replay ]] || { echo '::error::iig_run needs iig_mode=replay'; exit 1; }
-          [[ $TARGET != kernel-* || $FUXI_IIG_MODE == replay || $(xcodebuild -version | head -1) == 'Xcode 15.'* ]] ||
+          [[ $TARGET != kernel-* || $TARGET == kernel-ios27 || $FUXI_IIG_MODE == replay || $(xcodebuild -version | head -1) == 'Xcode 15.'* ]] ||
             { echo "::error::kernel iig_mode=$FUXI_IIG_MODE needs Xcode 15; use iig_mode=replay"; exit 1; }
       # Only XNU-derived iig outputs (APSL source text, hash manifest); no tool binaries.
       - uses: actions/download-artifact@v4
-        if: startsWith(matrix.target, 'kernel-') && inputs.iig_mode == 'replay' && inputs.iig_run != ''
+        if: startsWith(matrix.target, 'kernel-') && matrix.target != 'kernel-ios27' && inputs.iig_mode == 'replay' && inputs.iig_run != ''
         with:
           pattern: fuxi-iig-pregen-*
           path: deps/iig-pregen-download
           run-id: ${{ inputs.iig_run }}
           github-token: ${{ github.token }}
       - name: Choose pregenerated iig outputs
-        if: startsWith(matrix.target, 'kernel-') && inputs.iig_mode == 'replay' && inputs.iig_run != ''
+        if: startsWith(matrix.target, 'kernel-') && matrix.target != 'kernel-ios27' && inputs.iig_mode == 'replay' && inputs.iig_run != ''
         run: |
           set -- deps/iig-pregen-download/*/
           [[ -f $1/manifest.json ]] || { echo "::error::run $IIG_RUN has no fuxi-iig-pregen-* artifact"; exit 1; }
@@ -134,7 +135,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
       - uses: actions/upload-artifact@v4
-        if: startsWith(matrix.target, 'kernel-') && inputs.iig_mode != 'xcode'
+        if: startsWith(matrix.target, 'kernel-') && matrix.target != 'kernel-ios27' && inputs.iig_mode != 'xcode'
         with:
           name: fuxi-iig-pregen-${{ matrix.target }}
           path: tools/out/ci/${{ matrix.target }}/iig-pregen/
