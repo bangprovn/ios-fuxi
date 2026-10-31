@@ -29,7 +29,8 @@
  *                 enable it, 0x100 decode BHI error words and scan RDDM text
  *   fuxiwlanqrtr=1  W11 capability-only diagnostic; =2 W12 setup; =3 W13 small-chunk negotiation; =4 W14 downloads; =5 W15 config/mode
  *   fuxiwlanp18=N  stock firmware opt-ins, default 0: 1 HOST_CAP as CNSS sends it, 2 QDSS config
- *                 after M3_INFO, 4 force and scan a dump at a FW_READY or MODE timeout
+ *                 after M3_INFO, 4 force and scan a dump at a FW_READY or MODE timeout,
+ *                 8 cold boot calibration instead of mission mode, then stop
  *   fuxiwlanw15=1  W15 only: omit WLAN_CFG shadow-v3 TLV (default 0)
  *   fuxiwlanw16=N  qrtr=5 only: 1 larger IPCR, 2 doorbell redrive, 3 both,
  *                 4 diagnostics only; all include MODE context diagnostics
@@ -763,7 +764,9 @@ static unsigned wl17_bits;
 #define WL18_STOCKCAP 1u
 #define WL18_QDSS 2u
 #define WL18_FORCERDDM 4u
+#define WL18_CAL 8u
 static unsigned wl18_bits;
+static bool wl18_cal_done;
 static unsigned wl17_phy17_len;
 static uint64_t wl17_phy17_val;
 
@@ -1035,10 +1038,10 @@ wl_probe_configure(void)
 	wl18_bits = 0;
 	{
 		int bits = 0;
-		if (PE_parse_boot_argn("fuxiwlanp18", &bits, sizeof(bits)) && wl_w12 && bits > 0 && bits <= 7) {
+		if (PE_parse_boot_argn("fuxiwlanp18", &bits, sizeof(bits)) && wl_w12 && bits > 0 && bits <= 15) {
 			wl18_bits = (unsigned)bits;
-			printf("FUXI WLAN: P18 bits %#x (stockcap %u qdss %u forcerddm %u)\n", wl18_bits,
-			    !!(wl18_bits & WL18_STOCKCAP), !!(wl18_bits & WL18_QDSS), !!(wl18_bits & WL18_FORCERDDM));
+			printf("FUXI WLAN: P18 bits %#x (stockcap %u qdss %u forcerddm %u cal %u)\n", wl18_bits,
+			    !!(wl18_bits & WL18_STOCKCAP), !!(wl18_bits & WL18_QDSS), !!(wl18_bits & WL18_FORCERDDM), !!(wl18_bits & WL18_CAL));
 		}
 	}
 	wl15_variant = 0;
@@ -4188,6 +4191,7 @@ wl_qmi_w12(const uint8_t *p, unsigned len)
 		if (wl_w15 && wl12_stage >= WL15_INI) { wl15_elapsed(wl15_step(true)); }
 		return 0;
 	}
+	if (msg == 0x3e) { wl18_cal_done = true; }
 	if (wl_w15 && wl12_stage >= WL15_INI) {
 		/* Observe only after provisioning: never act on a fresh memory or
 		 * readiness indication, and never let it complete a transaction. */
@@ -4551,6 +4555,44 @@ wl14_download(const char *name, struct wl_dma *d, unsigned stage)
 	return 0;
 }
 
+/* CNSS cold boot calibration: report with no stored file, mode CALIBRATION,
+ * CAL_DONE indication (0x3e, about 5.5 s in Android's log), mode OFF. This is
+ * the radio's first real work. The power cycle that follows on Android is not
+ * done here. */
+static int
+wl18_cal(void)
+{
+	static struct wl12_encoder e;
+	bzero(&e, sizeof(e)); e.len = 7;
+	wl18_cal_done = false;
+	if (wl12_tlv(&e, 1, 0, 1) || wl12_tlv(&e, 0x12, 0, 8) || wl12_send(&e, 0x26, WL15_INI) ||
+	    wl12_wait(0, "P18 CAL_REPORT reply") || wl_w11_wait(3, "P18 CAL_REPORT TX drain")) { return 1; }
+	printf("FUXI WLAN: P18 cal report ok\n");
+	bzero(&e, sizeof(e)); e.len = 7;
+	if (wl12_tlv(&e, 1, 7, 4) || wl12_tlv(&e, 0x10, 0, 1) || wl_rails_on(2, "late before WLAN_MODE") ||
+	    wl12_send(&e, 0x22, WL15_MODE) || wl12_wait(0, "P18 MODE CALIBRATION reply") ||
+	    wl_w11_wait(3, "P18 MODE TX drain") || wl_w11_guard()) { return 1; }
+	wl15_elapsed("mode calibration accepted");
+	wl12_stage = WL15_OBSERVE;
+	unsigned ms = 0;
+	for (; ms < 30000 && !wl18_cal_done; ms += 10) {
+		if (wl_w11_events()) { return 1; }
+		wl_sleep(10);
+	}
+	wl15_elapsed(wl18_cal_done ? "CAL_DONE" : "CAL_DONE timeout");
+	wl_wlfw_diagnostics("P18 calibration");
+	if (!wl18_cal_done) {
+		wl18_force_rddm();
+		return wl_w11_fail("P18 CAL_DONE timeout");
+	}
+	printf("FUXI WLAN: P18 CAL_DONE after %u ms\n", ms);
+	bzero(&e, sizeof(e)); e.len = 7;
+	if (wl12_tlv(&e, 1, 4, 4) || wl12_tlv(&e, 0x10, 0, 1) || wl12_send(&e, 0x22, WL15_MODE) ||
+	    wl12_wait(0, "P18 MODE OFF reply") || wl_w11_wait(3, "P18 MODE OFF TX drain")) { return 1; }
+	printf("FUXI WLAN: P18 mode off ok; stop before the power cycle\n");
+	return wl_w11_guard();
+}
+
 /* CNSS order: M3_INFO, then this. total_size counts what remains on each
  * segment and a refusal does not stop the start. */
 static int
@@ -4649,6 +4691,10 @@ wl_w14_run(void)
 	if (wl18_bits) { wl_wlfw_diagnostics("P18 after M3"); }
 	wl12_stage = WL14_READY;
 	if (wl12_wait(3, "W14 FW_READY indication") || wl_w11_guard()) { return 1; }
+	if (wl_w15 && (wl18_bits & WL18_CAL)) {
+		printf("FUXI WLAN: P18 fw ready; cold boot calibration\n");
+		return wl18_cal();
+	}
 	if (wl_w15) {
 		printf("FUXI WLAN: W15 fw ready; starting WLAN INI/CFG/MODE\n");
 		wl12_stage = WL15_INI;
