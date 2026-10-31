@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Wrap tools/sweet-init.S into a static, ad-hoc signed arm64 Mach-O executable.
 
-  mkinit.py OBJECT OUT [ENTITLEMENTS.plist]   (OBJECT: clang -target arm64-apple-ios16.0 -c sweet-init.S)
+  mkinit.py [--arm64e] OBJECT OUT [ENTITLEMENTS.plist]   (OBJECT: clang -target arm64-apple-ios16.0 -c sweet-init.S)
+
+--arm64e marks the header CPU_SUBTYPE_ARM64E | PTRAUTH_ABI (0x80000002), the subtype of iOS 27 platform
+binaries (clang -target arm64e-apple-ios27.0 for the object); the code itself uses no pointer authentication.
 
 No available linker produces static iOS executables on Linux, and the program
 is a single position-independent __text section, so the executable is laid
@@ -19,6 +22,7 @@ requires a code signature when code-signing enforcement is on.
 import hashlib, struct, sys
 
 MH_MAGIC_64, CPU_TYPE_ARM64, MH_EXECUTE, MH_NOUNDEFS = 0xfeedfacf, 0x0100000c, 2, 1
+CPU_SUBTYPE_ARM64E_PTRAUTH = 0x80000002
 LC_SEGMENT_64, LC_SYMTAB, LC_UNIXTHREAD, LC_CODE_SIGNATURE = 0x19, 0x2, 0x5, 0x1d
 ARM_THREAD_STATE64, ARM_THREAD_STATE64_COUNT = 6, 68
 VM_PROT_R, VM_PROT_X = 1, 4
@@ -97,7 +101,7 @@ def code_signature(image, code_limit, text_size, entitlements=None):
             struct.pack('>IIII', 0, sb_hdr, 5, sb_hdr + len(cd)) + cd + ent_blob)
 
 
-def build(obj, entitlements=None):
+def build(obj, entitlements=None, arm64e=False):
     code, start = text_of(obj)
     assert CODE_OFF + len(code) <= SEG, 'code does not fit in one __TEXT page'
     sect = struct.pack('<16s16sQQIIIIIIII', b'__text', b'__TEXT', BASE + CODE_OFF, len(code),
@@ -117,7 +121,7 @@ def build(obj, entitlements=None):
         struct.pack('<4I', LC_CODE_SIGNATURE, 16, SEG, sig_size),
     ]
     lc = b''.join(cmds)
-    header = struct.pack('<8I', MH_MAGIC_64, CPU_TYPE_ARM64, 0, MH_EXECUTE, len(cmds), len(lc),
+    header = struct.pack('<8I', MH_MAGIC_64, CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64E_PTRAUTH if arm64e else 0, MH_EXECUTE, len(cmds), len(lc),
                          MH_NOUNDEFS, 0)
     assert 32 + len(lc) <= CODE_OFF
     image = bytearray(SEG)
@@ -129,8 +133,9 @@ def build(obj, entitlements=None):
 
 
 if __name__ == '__main__':
-    # mkinit.py OBJ OUT [ENTITLEMENTS.plist]
-    ents = open(sys.argv[3], 'rb').read() if len(sys.argv) > 3 else None
-    out = build(open(sys.argv[1], 'rb').read(), ents)
-    open(sys.argv[2], 'wb').write(out)
-    print(f'{sys.argv[2]}: {len(out)} bytes')
+    # mkinit.py [--arm64e] OBJ OUT [ENTITLEMENTS.plist]
+    argv = [a for a in sys.argv[1:] if a != '--arm64e']
+    ents = open(argv[2], 'rb').read() if len(argv) > 2 else None
+    out = build(open(argv[0], 'rb').read(), ents, '--arm64e' in sys.argv[1:])
+    open(argv[1], 'wb').write(out)
+    print(f'{argv[1]}: {len(out)} bytes')
