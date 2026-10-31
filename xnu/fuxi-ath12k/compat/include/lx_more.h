@@ -122,6 +122,14 @@ struct ath12k_base;
 bool fa_stage_htc_ready(struct ath12k_base *ab);	/* src/fa_hif.c: stops ath12k_core_start at stage 1 */
 bool fa_stage_registered(struct ath12k_base *ab);	/* src/fa_hif.c: stops the hardware group's start at stage 2 */
 void fa_wmi_event(u32 id, u32 length);			/* src/fa_hif.c: the order firmware's WMI events come in */
+bool fa_stage_up(struct ath12k_base *ab);		/* src/fa_hif.c: stage 4's scan, and the stop of the group's start after it */
+void fa_wmi_command(struct ath12k_base *ab, u32 id, int result);	/* src/fa_hif.c: stage 4, what was sent; a timeout is evidence */
+void fa_vdev_created(struct ath12k_base *ab, unsigned vdev);		/* src/fa_hif.c: stage 4, credits, and the settle knob */
+void fa_scan_vdev_ready(struct ath12k_base *ab, unsigned vdev, unsigned link);	/* src/fa_hif.c: stage 4, credits */
+bool fa_scan_on_link_zero(struct ath12k_base *ab);	/* src/fa_hif.c: only when upstream's scan link cannot make a vdev */
+bool fa_knob_no_hw_mode(void);				/* src/fa_hif.c: fuxiath12kq */
+bool fa_knob_no_idle_ps(void);				/* src/fa_hif.c: fuxiath12kq */
+bool fa_no_11d_scan(void);				/* src/fa_hif.c: says so; always true where it is asked */
 bool fa_refuse_eht(void);				/* src/fa_80211.c: says so once; always true */
 
 /* --- the six functions LinuxKPI 15.1 lacks (design section 4) */

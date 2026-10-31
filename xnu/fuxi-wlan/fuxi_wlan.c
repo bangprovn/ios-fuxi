@@ -100,8 +100,12 @@ void fuxi_wlan_init(void);
 /*
  *   fuxiath12k=N  kernel-metal4wifi only: hand the chip to Linux ath12k at FW_READY. N>0 alone
  *                 implies the working recipe as defaults, each still overridable. Stage 1 stops
- *                 after HTC ready, stage 2 after WMI ready, hw_mode and mac registration, each then
- *                 contains. N above the last stage built runs that stage, and says so.
+ *                 after HTC ready, stage 2 after WMI ready, hw_mode and mac registration, stage 4
+ *                 after one scan, each then contains. Stage 4 is the only one that uses the radio's
+ *                 RF and logs SSIDs, and only N exactly 4 runs it: any other N runs stage 2 at most,
+ *                 and says so.
+ *   fuxiath12kq=MASK  with fuxiath12k=4: 0x1 no idle power save, 0x2 no hw mode command, 0x8 settle
+ *                 after vdev create, 0x10 passive scan. Read and logged by the driver domain.
  *   fuxiwifimac=aa:bb:cc:dd:ee:ff  with fuxiath12k: the radio's address, instead of the locally
  *                 administered default. Malformed, all-zero or group addresses are refused, and say so.
  */
@@ -951,7 +955,6 @@ static const char *const wl_vec_names[] = {"off", "early", "rddm"};
 #ifdef FUXI_ATH12K
 /* Design R7: the working recipe does not fit the 608-byte command line, so fuxiath12k>0 alone
  * makes it the default for each argument that is absent. Absent fuxiath12k changes nothing. */
-#define WL_FA_STAGE_MOST 2
 static unsigned wl_fa_stage;
 static bool wl_fa_started;
 static struct fa_caps wl_fa_caps;
@@ -968,9 +971,9 @@ wl_fa_configure(void)
 {
 	int stage = 0;
 	if (PE_parse_boot_argn("fuxiath12k", &stage, sizeof(stage)) && stage > 0) {
-		wl_fa_stage = stage > WL_FA_STAGE_MOST ? WL_FA_STAGE_MOST : (unsigned)stage;
-		printf("FUXI ATH12K: fuxiath12k=%d, recipe defaults on, running stage %u; stage %d is the last one built\n",
-		    stage, wl_fa_stage, WL_FA_STAGE_MOST);
+		wl_fa_stage = stage == 1 || stage == 4 ? (unsigned)stage : 2;
+		printf("FUXI ATH12K: fuxiath12k=%d, recipe defaults on, running stage %u; stages built are 1, 2 and 4\n",
+		    stage, wl_fa_stage);
 	}
 }
 
@@ -4898,11 +4901,20 @@ fuxi_ath12k_firmware_stop(void)
 /* Only asks: the one abort is fw_thread's, after fa_firmware_ready() has returned. */
 void fuxi_ath12k_contain(void) { wl_keep = false; }
 
+/* Set once the transport or its guard has failed; the poll thread stops servicing MHI then. */
+int fuxi_ath12k_mhi_failed(void) { return wl_w11_error; }
+
+/* Once per boot, whoever asks first: the driver's restart, stage 4's evidence, or the hand-off's failure.
+ * A firmware already in RDDM is read as it is. Either way the upload's text is scanned (P17 ERRDEC). */
+static bool wl_fa_rddm_asked;
 void
 fuxi_ath12k_force_rddm(void)
 {
 	fuxi_ath12k_mhi_lock();
-	wl18_force_rddm();
+	if (!wl_fa_rddm_asked) {
+		wl_fa_rddm_asked = true;
+		if (wl_mrd(wl_bhi+0x28) == 3) { wl_wlfw_diagnostics("ATH12K hand-off"); } else { wl18_force_rddm(); }
+	}
 	fuxi_ath12k_mhi_unlock();
 }
 
@@ -4921,7 +4933,7 @@ wl_fa_handoff(void)
 	if (e) {
 		printf("FUXI ATH12K: hand-off failed %d; contain\n", e);
 		/* A WMI timeout says nothing by itself: the firmware's dump gives its assert, or that it had none. */
-		if (wl_mrd(wl_bhi+0x28) == 3) { wl_wlfw_diagnostics("ATH12K hand-off"); } else { fuxi_ath12k_force_rddm(); }
+		fuxi_ath12k_force_rddm();
 		return wl_w11_fail("ath12k hand-off");
 	}
 	printf("FUXI ATH12K: stage %u done; containment follows\n", wl_fa_stage);

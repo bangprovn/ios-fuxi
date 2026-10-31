@@ -55,6 +55,7 @@
         "fuxi_ath12k_firmware_start",
         "fuxi_ath12k_firmware_stop",
         "fuxi_ath12k_force_rddm",
+        "fuxi_ath12k_mhi_failed",
         "fuxi_ath12k_mhi_service",
         "fuxi_ath12k_read32",
         "fuxi_ath12k_write32",

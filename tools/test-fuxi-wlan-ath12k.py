@@ -85,6 +85,14 @@ int fa_firmware_ready(const struct fa_caps *caps, unsigned stage) {
     unsigned long long again=0;assert(!lx_os_radio_memory(4096,&again));
     if(fa_case==1)return -5;
     if(fa_case==3){setreg(WL_BAR0+wl_bhi+0x28,3);return -5;}
+    /* Stage 4's evidence asks for the dump from its own thread, with the rings stopped, before any MODE off. */
+    if(fa_case==4){
+        assert(!fuxi_ath12k_mhi_failed());
+        setreg(WL_BAR0+wl_bhi+0x28,3);
+        fuxi_ath12k_force_rddm();fuxi_ath12k_force_rddm();
+        assert(!mode_offs);
+        return -5;
+    }
     struct fa_wlan_cfg cfg=stock_cfg();
     /* Refusals never reach the wire. */
     unsigned before=seen15;
@@ -108,7 +116,7 @@ void fa_stop(void) { fa_stops++; assert(!mhi_depth); }
 void fa_set_radio_mac(const unsigned char *mac) { memcpy(seen_mac,mac,6); macs_set++; }
 
 static void boot_fa(unsigned c,bool keep) {
-    fa_case=c;fa_entries=fa_stops=mode_offs=macs_set=0;fa_result=0;pool=NULL;
+    fa_case=c;fa_entries=fa_stops=mode_offs=macs_set=0;fa_result=0;pool=NULL;wl_fa_rddm_asked=false;
     memset(&seen_caps,0,sizeof(seen_caps));
     /* The peer speaks W15 as configured by the test's own arguments, not the recipe, whose values have
      * their own table test below: the stage turns on after configuration, before the conversation. */
@@ -136,12 +144,17 @@ int main(void) {
 
     /* fuxiath12k>0 alone is the recipe of design section 5, argument by argument. */
     ath12k_arg=1;wl_fa_configure();assert(wl_fa_stage==1);
-    assert(strstr(logbuf,"fuxiath12k=1, recipe defaults on, running stage 1; stage 2 is the last one built"));
+    assert(strstr(logbuf,"fuxiath12k=1, recipe defaults on, running stage 1; stages built are 1, 2 and 4"));
     ath12k_arg=2;wl_fa_configure();assert(wl_fa_stage==2);
-    assert(strstr(logbuf,"fuxiath12k=2, recipe defaults on, running stage 2; stage 2 is the last one built"));
-    /* Above the last one built: runs that one, and says so. */
+    assert(strstr(logbuf,"fuxiath12k=2, recipe defaults on, running stage 2; stages built are 1, 2 and 4"));
+    ath12k_arg=4;wl_fa_configure();assert(wl_fa_stage==4);
+    assert(strstr(logbuf,"fuxiath12k=4, recipe defaults on, running stage 4; stages built are 1, 2 and 4"));
+    /* The scan, its SSID lines and all RF need exactly 4. Anything else not built runs stage 2, and says so. */
+    ath12k_arg=3;wl_fa_configure();assert(wl_fa_stage==2);
+    assert(strstr(logbuf,"fuxiath12k=3, recipe defaults on, running stage 2; stages built are 1, 2 and 4"));
+    ath12k_arg=5;wl_fa_configure();assert(wl_fa_stage==2);
     ath12k_arg=7;wl_fa_configure();assert(wl_fa_stage==2);
-    assert(strstr(logbuf,"fuxiath12k=7, recipe defaults on, running stage 2; stage 2 is the last one built"));
+    assert(strstr(logbuf,"fuxiath12k=7, recipe defaults on, running stage 2; stages built are 1, 2 and 4"));
     const struct {const char *name;int v;} numbers[]={{"fuxiwlan",1},{"fuxiwlanclk",1},{"fuxiwlanqrtr",5},
         {"fuxiwlanmlo",0x1c1},{"fuxiwlanp18",6},{"fuxiwlankeep",1}};
     for(unsigned i=0;i<6;i++){assert(wl_fa_recipe_arg(numbers[i].name,&number,sizeof(number)) && number==numbers[i].v);}
@@ -186,6 +199,25 @@ int main(void) {
         assert(strstr(logbuf,"FUXI ATH12K: stage 2 done; containment follows"));
     }
     contain_fa();
+    /* So does stage 4: the scan and its evidence are in the object; this file sees a stage that came back. */
+    fa_stage_wanted=4;
+    boot_fa(0,true);
+    {
+        int e=finish_step();assert(!e && fa_entries==1 && !wl_keep && wl_w11_ok && fa_stops==1);
+        assert(strstr(logbuf,"FUXI ATH12K: hand-off stage 4 chip 0x2"));
+        assert(strstr(logbuf,"FUXI ATH12K: stage 4 done; containment follows"));
+    }
+    contain_fa();
+    /* The firmware died under stage 4: read once, not asked again by the hand-off's failure, then contained. */
+    boot_fa(4,true);loglen=0;logbuf[0]=0;
+    assert(finish_step() && fa_entries==1 && fa_stops==1 && !wl_keep && !mode_offs);
+    {
+        unsigned reads=0;
+        for(const char *at=logbuf;(at=strstr(at,"ATH12K hand-off diagnostic"))!=NULL;at++)reads++;
+        assert(reads==1 && strstr(logbuf,"FUXI ATH12K: hand-off failed -5; contain") && !strstr(logbuf,"P18 before SYS_ERR"));
+        assert(fuxi_ath12k_mhi_failed());
+    }
+    setreg(WL_BAR0+wl_bhi+0x28,2);contain_fa();
     fa_stage_wanted=1;
     /* The address: the default, a good one, and each kind that is refused. */
     {
@@ -250,7 +282,7 @@ int main(void) {
         uint8_t q[]={4,0,0,0x3e,0,7,0,0x10,4,0,1,2,3,4};
         assert(!wl_qmi_w12(q,sizeof(q)) && strstr(logbuf,"msg 0x3e unknown TLV 0x10 bytes 4"));
     }
-    puts("ATH12K hand-off: recipe defaults, stages 1 and 2 and above, station address, CAP data, pool map, exact INI/CFG/MODE, ath12k tables, mode off, fa_stop before containment, RDDM on failure, pool kept, off by default, CAL_DONE size");
+    puts("ATH12K hand-off: recipe defaults, stages 1, 2 and 4 and what else runs 2, station address, CAP data, pool map, exact INI/CFG/MODE, ath12k tables, mode off, fa_stop before containment, RDDM once on failure, pool kept, off by default, CAL_DONE size");
     return 0;
 }
 '''

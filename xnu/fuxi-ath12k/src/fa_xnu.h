@@ -49,10 +49,11 @@ void	*fuxi_ath12k_bar(unsigned long *length);	/* BAR0 mapped contiguously for 0x
 unsigned fuxi_ath12k_read32(unsigned offset);		/* below 0x100000 of BAR0, fault contained */
 void	 fuxi_ath12k_write32(unsigned offset, unsigned value);
 void	 fuxi_ath12k_mhi_service(void);			/* MHI events and guard, at most every 10 ms */
+int	 fuxi_ath12k_mhi_failed(void);			/* the transport or its guard has failed: firmware or link gone */
 int	 fuxi_ath12k_firmware_start(const struct fa_wlan_cfg *cfg, unsigned mode);	/* INI, CFG, MODE */
 void	 fuxi_ath12k_firmware_stop(void);		/* MODE off */
 void	 fuxi_ath12k_contain(void);			/* containment is wanted when fw_thread gets back */
-void	 fuxi_ath12k_force_rddm(void);			/* wl18_force_rddm */
+void	 fuxi_ath12k_force_rddm(void);			/* once: read RDDM if it is there, else wl18_force_rddm */
 
 /* bsd/dev/fuxi_ath12k_os.c owes these, for fuxi_wlan.c: the MHI lock of design section 2. */
 void	 fuxi_ath12k_mhi_lock(void);

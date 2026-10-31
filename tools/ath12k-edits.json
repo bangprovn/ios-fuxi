@@ -272,6 +272,70 @@
       "file": "wmi.c",
       "find": "\tif (!skb_pull(skb, sizeof(struct wmi_cmd_hdr)))\n\t\tgoto out;\n\n\tswitch (id) {\n\t\t/* Process all the WMI events here */\n",
       "replace": "\tif (!skb_pull(skb, sizeof(struct wmi_cmd_hdr)))\n\t\tgoto out;\n\n\tfa_wmi_event(id, skb->len);\n\n\tswitch (id) {\n\t\t/* Process all the WMI events here */\n"
+    },
+    {
+      "id": "ath12k-stage-up",
+      "why": "Design M4: the scan runs where everything is up, at the end of the hardware group's start, and stops through its error label: ath12k_core_hw_group_stop() (unregister, data rings, destroy), then the caller's ath12k_core_stop() and MODE off. Nothing it needs takes ag->mutex, which is held here.",
+      "tree": "ath12k",
+      "file": "core.c",
+      "find": "\t\tmutex_unlock(&ab->core_lock);\n\t}\n\n\treturn 0;\n\nerr:\n\tath12k_core_hw_group_stop(ag);\n",
+      "replace": "\t\tmutex_unlock(&ab->core_lock);\n\t}\n\n\tif (fa_stage_up(ag->ab[0])) {\n\t\tret = -ECANCELED;\n\t\tgoto err;\n\t}\n\n\treturn 0;\n\nerr:\n\tath12k_core_hw_group_stop(ag);\n"
+    },
+    {
+      "id": "ath12k-knob-hw-mode",
+      "why": "Design section 6, fuxiath12kq: whether the hw mode command is what upsets a firmware at its first radio work. Without the knob, as upstream.",
+      "tree": "ath12k",
+      "file": "core.c",
+      "find": "\tif (ab->hw_params->single_pdev_only) {\n\t\tret = ath12k_wmi_set_hw_mode(ab, WMI_HOST_HW_MODE_DBS);\n",
+      "replace": "\tif (ab->hw_params->single_pdev_only && !fa_knob_no_hw_mode()) {\n\t\tret = ath12k_wmi_set_hw_mode(ab, WMI_HOST_HW_MODE_DBS);\n"
+    },
+    {
+      "id": "ath12k-knob-idle-ps",
+      "why": "Design section 6, fuxiath12kq: whether idle power save, asked for right before the first vdev, is what upsets a firmware. Without the knob, as upstream.",
+      "tree": "ath12k",
+      "file": "mac.c",
+      "find": "\tif (ab->hw_params->idle_ps) {\n\t\tret = ath12k_wmi_pdev_set_param(ar, WMI_PDEV_PARAM_IDLE_PS_CONFIG,\n",
+      "replace": "\tif (ab->hw_params->idle_ps && !fa_knob_no_idle_ps()) {\n\t\tret = ath12k_wmi_pdev_set_param(ar, WMI_PDEV_PARAM_IDLE_PS_CONFIG,\n"
+    },
+    {
+      "id": "ath12k-vdev-created",
+      "why": "Design M4: the place where the peach port's firmware stops giving credits. The boot shows the level right after WMI_VDEV_CREATE, before the parameters that follow it, and the settle knob waits here.",
+      "tree": "ath12k",
+      "file": "mac.c",
+      "find": "\tath12k_dbg(ab, ATH12K_DBG_MAC, \"vdev %pM created, vdev_id %d\\n\",\n\t\t   vif->addr, arvif->vdev_id);\n",
+      "replace": "\tath12k_dbg(ab, ATH12K_DBG_MAC, \"vdev %pM created, vdev_id %d\\n\",\n\t\t   vif->addr, arvif->vdev_id);\n\tfa_vdev_created(ab, arvif->vdev_id);\n"
+    },
+    {
+      "id": "ath12k-scan-vdev-ready",
+      "why": "Design M4: the credit level once the vdev's parameters have gone too, before the scan command.",
+      "tree": "ath12k",
+      "file": "mac.c",
+      "find": "\t\t\tath12k_warn(ar->ab, \"unable to create scan vdev %d\\n\", ret);\n\t\t\tath12k_mac_unassign_link_vif(arvif);\n\t\t\treturn ret;\n\t\t}\n",
+      "replace": "\t\t\tath12k_warn(ar->ab, \"unable to create scan vdev %d\\n\", ret);\n\t\t\tath12k_mac_unassign_link_vif(arvif);\n\t\t\treturn ret;\n\t\t}\n\t\tfa_scan_vdev_ready(ar->ab, arvif->vdev_id, arvif->link_id);\n"
+    },
+    {
+      "id": "ath12k-scan-link",
+      "why": "Design section 4 keeps upstream's scan link 15 first. Link 15 has no link configuration, so ath12k_mac_setup_vdev_params_mbssid() returns -ENOLINK unless the firmware has WMI_TLV_SERVICE_MBSS_PARAM_IN_VDEV_START_SUPPORT: certain to fail, so only then the interface's own link 0 is used. fa_hif.c logs which.",
+      "tree": "ath12k",
+      "file": "mac.c",
+      "find": "\tscan_links_map = ~ahvif->links_map & ATH12K_SCAN_LINKS_MASK;\n",
+      "replace": "\tif (!ahvif->links_map && fa_scan_on_link_zero(ar->ab))\n\t\treturn 0;\n\n\tscan_links_map = ~ahvif->links_map & ATH12K_SCAN_LINKS_MASK;\n"
+    },
+    {
+      "id": "ath12k-no-11d",
+      "why": "Design M4 sends nothing beyond what the one scan needs. With PREPARING left unset, hw_scan does not start the firmware's periodic 11d country scan, whose answer could also change the regulatory domain under this stage. This code is only reached on stage 4.",
+      "tree": "ath12k",
+      "file": "mac.c",
+      "find": "\t\tif (test_bit(WMI_TLV_SERVICE_11D_OFFLOAD, ab->wmi_ab.svc_map) &&\n\t\t    ahvif->vdev_type == WMI_VDEV_TYPE_STA &&\n\t\t    ahvif->vdev_subtype == WMI_VDEV_SUBTYPE_NONE) {\n\t\t\treinit_completion(&ar->completed_11d_scan);\n\t\t\tar->state_11d = ATH12K_11D_PREPARING;\n\t\t}\n\t\tbreak;\n\tcase WMI_VDEV_TYPE_MONITOR:\n",
+      "replace": "\t\tif (test_bit(WMI_TLV_SERVICE_11D_OFFLOAD, ab->wmi_ab.svc_map) &&\n\t\t    ahvif->vdev_type == WMI_VDEV_TYPE_STA &&\n\t\t    ahvif->vdev_subtype == WMI_VDEV_SUBTYPE_NONE && !fa_no_11d_scan()) {\n\t\t\treinit_completion(&ar->completed_11d_scan);\n\t\t\tar->state_11d = ATH12K_11D_PREPARING;\n\t\t}\n\t\tbreak;\n\tcase WMI_VDEV_TYPE_MONITOR:\n"
+    },
+    {
+      "id": "ath12k-wmi-command",
+      "why": "Design M4: a firmware that stops answering shows only as a timeout here. Stage 4 notes each command and result, and takes a timeout as the firmware's death; stages 1 and 2 return at once.",
+      "tree": "ath12k",
+      "file": "wmi.c",
+      "find": "\tif (ret == -EAGAIN)\n\t\tath12k_warn(wmi_ab->ab, \"wmi command %d timeout\\n\", cmd_id);\n",
+      "replace": "\tif (ret == -EAGAIN)\n\t\tath12k_warn(wmi_ab->ab, \"wmi command %d timeout\\n\", cmd_id);\n\tfa_wmi_command(wmi_ab->ab, cmd_id, ret);\n"
     }
   ]
 }

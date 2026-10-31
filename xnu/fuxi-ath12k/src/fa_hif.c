@@ -12,6 +12,13 @@
  * Stages: 1 stops after HTC ready, 2 after WMI ready, hw_mode and mac registration. A stage stop goes
  * through ath12k's own error path. Stage 2 takes the data rings no further: hif_irq_enable and
  * ath12k_core_pdev_create() are after it, and no interface exists, so nothing can transmit or scan.
+ * Stage 4 goes on through both, runs one scan from fa_80211.c, and stops at the end of the hardware
+ * group's start through the same error path, which then also undoes the data rings.
+ *
+ * Firmware-death evidence, stage 4 only: every WMI command and event is noted, and a WMI timeout, an HTC
+ * credit stall, a transport failure or a scan that does not end logs the credits and the last of both.
+ * It also sets ATH12K_FLAG_CRASH_FLUSH, ath12k's own way of failing all further commands at once. fw_thread
+ * then stops the rings and forces RDDM through the existing path, before any MODE off.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -52,6 +59,24 @@ _Static_assert(ATH12K_MAX_SPT_ENTRIES * 8 == ATH12K_PAGE_SIZE, "fuxi-ath12k R2: 
 #define FA_IDLE_AFTER		100		/* quiet rounds before backing off */
 #define FA_WMI_EVENTS_SAID	64		/* of the first ones: which, and how long */
 
+#define FA_STAGE_SCAN		4		/* the only stage that touches the radio's RF */
+
+/* fuxiath12kq=MASK, stage 4 only, each one idea for hunting a dying firmware (design section 6). */
+#define FA_KNOB_NO_IDLE_PS	0x01u		/* do not ask for idle power save in ops.start */
+#define FA_KNOB_NO_HW_MODE	0x02u		/* do not send WMI_PDEV_SET_HW_MODE */
+#define FA_KNOB_ONE_CREDIT	0x04u		/* the design's "one credit": not built, its bit kept */
+#define FA_KNOB_SETTLE		0x08u		/* wait after the vdev create command, before its first set_param */
+#define FA_KNOB_PASSIVE		0x10u		/* passive scan: nothing is sent over the air */
+#define FA_SETTLE_MS		1000u
+
+#define FA_CREDIT_STALL_NS	(10 * 1000000000ull)	/* of no WMI credit at all, while a scan runs and nothing else is asked */
+#define FA_RECENT		16		/* commands and events kept for the evidence */
+
+struct fa_recent {
+	u32 id, value;				/* command and its result, or event and its bytes */
+	unsigned long long at;
+};
+
 static struct {
 	struct ath12k_base *ab;
 	spinlock_t window_lock;
@@ -62,6 +87,13 @@ static struct {
 	volatile bool dead;			/* fa_stop(): no more register access */
 	unsigned stage;
 	bool stage_hit;
+	int stage_error;			/* what stage 4 came to */
+	unsigned knobs;
+	volatile bool trouble;			/* the firmware is taken as dead */
+	bool rddm_asked;
+	unsigned long long credits_gone;	/* since when the WMI endpoint has had none; 0: it has some */
+	struct fa_recent commands[FA_RECENT], events[FA_RECENT];
+	unsigned command_count, event_count, mgmt_count;
 } hif;
 
 /* ---- registers: pci.c:1150-1242 without wake calls ------------------------------------------------- */
@@ -200,6 +232,7 @@ static void
 hif_irq_enable(struct ath12k_base *ab)
 {
 	hif.data = true;
+	lx_tell("FUXI ATH12K: data rings join the poll\n");
 }
 
 static void
@@ -285,12 +318,252 @@ fa_stage_htc_ready(struct ath12k_base *ab)
 	return (true);
 }
 
+/* ---- stage 4: what the firmware did last, and what follows when it stops --------------------------------- */
+
+static void
+recent_note(struct fa_recent *recent, unsigned *count, u32 id, u32 value)
+{
+	unsigned long long now = lx_os_nanoseconds();
+
+	lx_os_lock();
+	recent[*count % FA_RECENT] = (struct fa_recent){ .id = id, .value = value, .at = now };
+	*count += 1;
+	lx_os_unlock();
+}
+
+static void
+recent_say(const char *what, const struct fa_recent *from, unsigned count)
+{
+	struct fa_recent recent[FA_RECENT];
+	unsigned long long now = lx_os_nanoseconds();
+	unsigned first = count > FA_RECENT ? count - FA_RECENT : 0;
+
+	lx_os_lock();
+	memcpy(recent, from, sizeof(recent));
+	lx_os_unlock();
+	for (unsigned i = first; i < count; i++) {
+		const struct fa_recent *one = &recent[i % FA_RECENT];
+
+		lx_tell("FUXI ATH12K: M4 last %s %#x value %d, %llu ms ago\n", what, one->id, (int)one->value, (now - one->at) / 1000000ull);
+	}
+}
+
+static int
+wmi_credits(struct ath12k_base *ab)
+{
+	return (ab->htc.endpoint[ab->wmi_ab.wmi[0].eid].tx_credits);
+}
+
+void
+fa_m4_credits(const char *when)
+{
+	struct ath12k_base *ab = hif.ab;
+
+	lx_tell("FUXI ATH12K: M4 credits %s: wmi %d of %d, commands %u events %u mgmt rx %u\n", when, wmi_credits(ab),
+	    ab->htc.total_transmit_credits, hif.command_count, hif.event_count, hif.mgmt_count);
+}
+
+/* Design R6: what the data path has left to receive into, against what the ring holds. */
+void
+fa_m4_rx_ring(const char *when)
+{
+	struct ath12k_base *ab = hif.ab;
+	struct dp_rxdma_ring *ring = &ath12k_ab_to_dp(ab)->rx_refill_buf_ring;
+	struct hal_srng *srng = &ab->hal.srng_list[ring->refill_buf_ring.ring_id];
+	unsigned rings, slots;
+	int free;
+
+	spin_lock_bh(&srng->lock);
+	free = ath12k_hal_srng_src_num_free(ab, srng, true);
+	spin_unlock_bh(&srng->lock);
+	lx_pool_peaks(&rings, &slots);
+	lx_tell("FUXI ATH12K: M4 rx refill ring %s: %d free of %u entries, bufs max %d, pool peak %u/%u\n", when, free, srng->num_entries,
+	    ring->bufs_max, rings, slots);
+}
+
+/* The first reason gets the whole account; the others a line. From any thread: nothing here waits. */
+void
+fa_m4_evidence(const char *why)
+{
+	struct ath12k_base *ab = hif.ab;
+	bool first;
+
+	lx_os_lock();
+	first = !hif.trouble;
+	hif.trouble = true;
+	lx_os_unlock();
+	if (!first) {
+		lx_tell("FUXI ATH12K: M4 trouble again: %s\n", why);
+		return;
+	}
+	set_bit(ATH12K_FLAG_CRASH_FLUSH, &ab->dev_flags);
+	lx_tell("FUXI ATH12K: M4 trouble: %s\n", why);
+	fa_m4_credits("at the trouble");
+	recent_say("command", hif.commands, hif.command_count);
+	recent_say("event", hif.events, hif.event_count);
+}
+
+/* Asked between the steps and while waiting, on fw_thread. True once the firmware is taken as dead. */
+bool
+fa_m4_trouble(void)
+{
+	if (hif.trouble) {
+		return (true);
+	}
+	if (fuxi_ath12k_mhi_failed() != 0) {
+		fa_m4_evidence("MHI transport failure");
+	} else if (wmi_credits(hif.ab) > 0) {
+		hif.credits_gone = 0;
+	} else if (hif.credits_gone == 0) {
+		hif.credits_gone = lx_os_nanoseconds();
+	} else if (lx_os_nanoseconds() - hif.credits_gone >= FA_CREDIT_STALL_NS) {
+		fa_m4_evidence("HTC credit stall");
+	}
+	return (hif.trouble);
+}
+
+/* While the scan runs, each frame would be two lines: the credits have been said by now. */
+void
+fa_m4_scan_started(void)
+{
+	ath12k_debug_mask &= ~ATH12K_DBG_HTC;
+}
+
+/*
+ * On fw_thread, once: rings first, because SYS_ERR would have the poll thread read a chip that is going away,
+ * and no more register access afterwards. fuxi_ath12k_force_rddm() reads a firmware that is in RDDM already, or
+ * asks for it, and scans the upload for the assert text. Nothing is sent to it after this: no MODE off either.
+ */
+void
+fa_m4_firmware_dead(void)
+{
+	if (hif.rddm_asked) {
+		return;
+	}
+	hif.rddm_asked = true;
+	lx_tell("FUXI ATH12K: M4 firmware taken as dead: rings stopped, RDDM next\n");
+	fa_hif_quiesce();
+	hif.dead = true;
+	fuxi_ath12k_force_rddm();
+}
+
+static bool
+knob(unsigned bit, const char *what)
+{
+	if ((hif.knobs & bit) == 0) {
+		return (false);
+	}
+	lx_tell("FUXI ATH12K: M4 knob: %s\n", what);
+	return (true);
+}
+
+/* tools/ath12k-edits.json, ath12k-knob-hw-mode. */
+bool
+fa_knob_no_hw_mode(void)
+{
+	return (knob(FA_KNOB_NO_HW_MODE, "no WMI_PDEV_SET_HW_MODE"));
+}
+
+/* tools/ath12k-edits.json, ath12k-knob-idle-ps. */
+bool
+fa_knob_no_idle_ps(void)
+{
+	return (knob(FA_KNOB_NO_IDLE_PS, "no idle power save"));
+}
+
+/* tools/ath12k-edits.json, ath12k-no-11d: only the one scan asked for, not the firmware's periodic country scan. */
+bool
+fa_no_11d_scan(void)
+{
+	lx_tell("FUXI ATH12K: M4 no 11d scan: the firmware's country scan is left off\n");
+	return (true);
+}
+
+/* tools/ath12k-edits.json, ath12k-vdev-created: right after WMI_VDEV_CREATE, before its burst of parameters. */
+void
+fa_vdev_created(struct ath12k_base *ab, unsigned vdev)
+{
+	lx_tell("FUXI ATH12K: M4 vdev %u created\n", vdev);
+	fa_m4_credits("after vdev create");
+	if (knob(FA_KNOB_SETTLE, "settle after vdev create")) {
+		lx_pause_ms(FA_SETTLE_MS);
+		fa_m4_credits("after the settle");
+	}
+}
+
+/* tools/ath12k-edits.json, ath12k-scan-vdev-ready: its parameters went through too. */
+void
+fa_scan_vdev_ready(struct ath12k_base *ab, unsigned vdev, unsigned link)
+{
+	lx_tell("FUXI ATH12K: M4 scan vdev %u ready on link %u\n", vdev, link);
+	fa_m4_credits("after the vdev's parameters");
+}
+
+/*
+ * tools/ath12k-edits.json, ath12k-scan-link. Upstream scans on link 15 (design section 4), which has no link
+ * configuration; without this service mac.c's ath12k_mac_setup_vdev_params_mbssid() then refuses it with -ENOLINK.
+ * So only then the scan goes on the interface's own link 0, where the same vdev has what it asks for.
+ */
+bool
+fa_scan_on_link_zero(struct ath12k_base *ab)
+{
+	bool lacks = !test_bit(WMI_TLV_SERVICE_MBSS_PARAM_IN_VDEV_START_SUPPORT, ab->wmi_ab.svc_map);
+
+	lx_tell("FUXI ATH12K: M4 firmware %s service 253, scan on link %s\n", lacks ? "lacks" : "has", lacks ? "0" : "15 as upstream");
+	return (lacks);
+}
+
+/* tools/ath12k-edits.json, ath12k-wmi-command: at the end of ath12k_wmi_cmd_send(). Stages 1 and 2 keep nothing. */
+void
+fa_wmi_command(struct ath12k_base *ab, u32 id, int result)
+{
+	if (hif.stage != FA_STAGE_SCAN) {
+		return;
+	}
+	recent_note(hif.commands, &hif.command_count, id, (u32)result);
+	if (result == -EAGAIN) {
+		fa_m4_evidence("WMI command timeout");
+	}
+}
+
+/*
+ * tools/ath12k-edits.json, ath12k-stage-up: core.c asks at the end of the hardware group's start, with the data
+ * rings set up and joined to the poll. The rings stop after the scan, as at stage 2, before the radio goes.
+ */
+bool
+fa_stage_up(struct ath12k_base *ab)
+{
+	struct ath12k *ar = ath12k_ah_to_ar(ath12k_ag_to_ah(ab->ag, 0), 0);
+
+	if (hif.stage != FA_STAGE_SCAN) {
+		return (false);
+	}
+	lx_tell("FUXI ATH12K: M4 firmware services 11d %d eth offload %d reg ext %d\n", test_bit(WMI_TLV_SERVICE_11D_OFFLOAD, ab->wmi_ab.svc_map),
+	    test_bit(WMI_TLV_SERVICE_ETH_OFFLOAD, ab->wmi_ab.svc_map), ath12k_wmi_supports_6ghz_cc_ext(ar));
+	fa_m4_rx_ring("before the scan");
+	hif.stage_error = fa_m4_station(ath12k_ar_to_hw(ar), (hif.knobs & FA_KNOB_PASSIVE) != 0);
+	lx_memory_say();
+	fa_hif_quiesce();
+	hif.stage_hit = true;
+	return (true);
+}
+
 /* tools/ath12k-edits.json, ath12k-wmi-event-log. Nothing else shows how far a silent firmware got. */
 void
 fa_wmi_event(u32 id, u32 length)
 {
 	static unsigned said;			/* (one poll thread) */
 
+	if (hif.stage == FA_STAGE_SCAN) {
+		recent_note(hif.events, &hif.event_count, id, length);
+		if (id == WMI_MGMT_RX_EVENTID) {
+			hif.mgmt_count++;	/* one for each frame heard: only counted */
+			return;
+		}
+		if (id == WMI_SCAN_EVENTID || id == WMI_CHAN_INFO_EVENTID) {
+			return;			/* several per channel, each with its ATH12K_DBG_WMI line */
+		}
+	}
 	if (said < FA_WMI_EVENTS_SAID) {
 		said++;
 		lx_tell("FUXI ATH12K: wmi event %#x bytes %u%s\n", id, length, said == FA_WMI_EVENTS_SAID ? " (said for the last time)" : "");
@@ -319,11 +592,15 @@ fa_stage_registered(struct ath12k_base *ab)
 	if (ab->wmi_ready && ab->wlan_init_status == 0) {
 		lx_tell("FUXI ATH12K: M2 WMI ready mac %02x:%02x:%02x:%02x:%02x:%02x macs %d %s pool peak %u/%u\n",
 		    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], ab->num_radios,
+		    (hif.knobs & FA_KNOB_NO_HW_MODE) != 0 ? "hw_mode skipped" :
 		    ab->hw_params->single_pdev_only ? "hw_mode sent" : "hw_mode none", rings, slots);
 	} else {
 		lx_tell("FUXI ATH12K: M2 not proven: ready event %d init status %u\n", ab->wmi_ready, ab->wlan_init_status);
 	}
 	lx_memory_say();
+	if (hif.stage == FA_STAGE_SCAN) {
+		return (false);			/* it goes on: fa_stage_up() */
+	}
 	fa_hif_quiesce();
 	hif.stage_hit = true;
 	return (true);
@@ -361,6 +638,14 @@ fa_firmware_ready(const struct fa_caps *caps, unsigned stage)
 	if (stage >= 2) {
 		/* All one-time at this stage, no data path: what WMI_INIT and the regulatory domain did. */
 		ath12k_debug_mask |= ATH12K_DBG_WMI | ATH12K_DBG_REG | ATH12K_DBG_BOOT;
+	}
+	if (stage == FA_STAGE_SCAN) {
+		/* Vdev and scan steps. ATH12K_DBG_MGMT stays off: it would be a line for each frame heard. */
+		ath12k_debug_mask |= ATH12K_DBG_MAC;
+		hif.knobs = lx_os_option("fuxiath12kq");
+		lx_tell("FUXI ATH12K: M4 knobs %#x: no idle ps %d no hw mode %d settle %d passive %d%s\n", hif.knobs,
+		    (hif.knobs & FA_KNOB_NO_IDLE_PS) != 0, (hif.knobs & FA_KNOB_NO_HW_MODE) != 0, (hif.knobs & FA_KNOB_SETTLE) != 0,
+		    (hif.knobs & FA_KNOB_PASSIVE) != 0, (hif.knobs & FA_KNOB_ONE_CREDIT) != 0 ? "; one credit is not built" : "");
 	}
 
 	ab = ath12k_core_alloc(&device, 0, ATH12K_BUS_PCI);
@@ -419,8 +704,8 @@ fa_firmware_ready(const struct fa_caps *caps, unsigned stage)
 
 	error = ath12k_core_qmi_firmware_ready(ab);
 	if (error == -ECANCELED && hif.stage_hit) {
-		/* core.c went down its normal error path: HIF stopped, DP down, mode off. */
-		return (0);
+		/* core.c went down its normal error path: HIF stopped, DP down, mode off unless the firmware is dead. */
+		return (hif.stage_error);
 	}
 	if (error != 0) {
 		lx_tell("FUXI ATH12K: firmware ready path failed: %d\n", error);
