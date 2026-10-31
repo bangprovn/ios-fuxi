@@ -600,21 +600,25 @@ fk_flick(int x0, int y0, int x1, int y1, unsigned ms)
 	sweet_hid_touch(0, 0, x1, y1);
 }
 
-/* Swipe up from the bottom edge and hold still until the switcher opens. */
+/*
+ * A person's switcher swipe in the logs: about 280 ms over about 430 px from the
+ * bottom edge, slowing to the release. hold_ms adds a pause before the release.
+ */
 static void
-fk_switcher(void)
+fk_switcher(unsigned hold_ms)
 {
-	for (int i = 0; i <= 40; ++i) {
+	for (int i = 0; i <= 34; ++i) {
+		int left = 34 - i, done = 34 * 34 - left * left;
 		fuxi_perf_input();
-		sweet_hid_touch(0, 1, 540, 2390 - 750 * i / 40);
+		sweet_hid_touch(0, 1, 680 + 60 * done / (34 * 34), 2375 - 430 * done / (34 * 34));
 		fk_script_sleep(8);
 	}
-	for (int i = 0; i < 90; ++i) {
+	for (unsigned i = 0; i < hold_ms / 8u; ++i) {
 		fuxi_perf_input();
-		sweet_hid_touch(0, 1, 540, 1640);
+		sweet_hid_touch(0, 1, 740, 1945);
 		fk_script_sleep(8);
 	}
-	sweet_hid_touch(0, 0, 540, 1640);
+	sweet_hid_touch(0, 0, 740, 1945);
 	fk_script_sleep(1500);
 }
 
@@ -668,11 +672,11 @@ fk_human(void *arg, wait_result_t wr)
 		}
 		fk_human_shot(&shot, "settings");
 		printf("FUXI HUMAN: switcher\n");
-		fk_switcher();
+		fk_switcher(0);
 		fk_human_shot(&shot, "switcher-from-app");
 		fk_tour_home();
 		fk_tour_home();
-		fk_switcher();
+		fk_switcher(400);
 		fk_human_shot(&shot, "switcher-from-home");
 		fk_tour_home();
 		if (loop == 1 && fk_human_shots) {
