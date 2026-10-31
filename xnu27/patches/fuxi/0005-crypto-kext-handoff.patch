@@ -1,0 +1,80 @@
+diff --git a/libkern/crypto/corecrypto_rand.c b/libkern/crypto/corecrypto_rand.c
+index 3ff4197..aa29043 100644
+--- a/libkern/crypto/corecrypto_rand.c
++++ b/libkern/crypto/corecrypto_rand.c
+@@ -75,6 +75,17 @@ fuxi_kmem_random64(struct fuxi_kmem_rng *rng)
+ 	value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+ 	return value ^ (value >> 31);
+ }
++
++/*
++ * The kmem RNG backend is chosen once, when crypto_random_kmem_ctx_size()
++ * sizes the per-CPU contexts (vm_map_store, EARLY_BOOT). A prelinked
++ * com.apple.kec.corecrypto starts in InitIOKit, before that, and supplies the
++ * real generator; without it the contexts stay SplitMix64 even if a kext
++ * registers later, so a kext function never sees a context it did not size.
++ */
++#include <libkern/libkern.h>
++static bool fuxi_kmem_builtin;
++#define FUXI_KMEM_BUILTIN() (fuxi_kmem_builtin || !g_crypto_funcs)
+ #endif /* FUXI */
+ 
+ void
+@@ -84,7 +95,7 @@ crypto_random_generate(
+ 	size_t random_size)
+ {
+ #if defined(FUXI)
+-	if (!g_crypto_funcs) {
++	if (FUXI_KMEM_BUILTIN()) {
+ 		uint8_t *out = random;
+ 		while (random_size > 0) {
+ 			uint64_t value = fuxi_kmem_random64((struct fuxi_kmem_rng *)ctx);
+@@ -106,7 +117,7 @@ crypto_random_uniform(
+ 	uint64_t *random)
+ {
+ #if defined(FUXI)
+-	if (!g_crypto_funcs) {
++	if (FUXI_KMEM_BUILTIN()) {
+ 		/* Reject the incomplete residue interval to avoid modulo bias. */
+ 		const uint64_t threshold = -bound % bound;
+ 		uint64_t value;
+@@ -124,9 +135,14 @@ size_t
+ crypto_random_kmem_ctx_size(void)
+ {
+ #if defined(FUXI)
+-	if (!g_crypto_funcs) {
++	if (FUXI_KMEM_BUILTIN()) {
++		if (!fuxi_kmem_builtin) {
++			fuxi_kmem_builtin = true;
++			printf("FUXI crypto: kmem RNG built-in (no corecrypto registered)\n");
++		}
+ 		return sizeof(struct fuxi_kmem_rng);
+ 	}
++	printf("FUXI crypto: kmem RNG from corecrypto\n");
+ #endif
+ 	return g_crypto_funcs->random_kmem_ctx_size_fn();
+ }
+@@ -136,7 +152,7 @@ crypto_random_kmem_init(
+ 	crypto_random_ctx_t ctx)
+ {
+ #if defined(FUXI)
+-	if (!g_crypto_funcs) {
++	if (FUXI_KMEM_BUILTIN()) {
+ 		((struct fuxi_kmem_rng *)ctx)->state = early_random();
+ 		return;
+ 	}
+diff --git a/osfmk/prng/prng_random.c b/osfmk/prng/prng_random.c
+index 0aa41d3..aa9eb56 100644
+--- a/osfmk/prng/prng_random.c
++++ b/osfmk/prng/prng_random.c
+@@ -622,7 +622,9 @@ static void
+ fuxi_prng_startup(void)
+ {
+ 	if (prng_ready) {
+-		return; /* a corecrypto kext started before EARLY_BOOT registered its own */
++		/* a corecrypto kext started before EARLY_BOOT registered its own */
++		kprintf("FUXI PRNG: corecrypto registered the kernel PRNG; built-in DRBG unused\n");
++		return;
+ 	}
+ 	/* The boot seed must exist before registration erases the early DRBG. */
+ 	(void)early_random();

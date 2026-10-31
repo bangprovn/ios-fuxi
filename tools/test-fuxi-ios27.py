@@ -47,8 +47,8 @@ def layout():
     listed = series()
     files = sorted(p.relative_to(X27 / 'patches').as_posix() for p in (X27 / 'patches').rglob('*.patch'))
     assert sorted(listed) == files and len(set(listed)) == len(listed), 'series and patches/ differ'
-    assert listed[-4:] == ['fuxi/0001-machine-config.patch', 'fuxi/0002-builtin-crypto.patch',
-                           'fuxi/0003-console.patch', 'fuxi/0004-components.patch']
+    assert listed[-5:] == ['fuxi/0001-machine-config.patch', 'fuxi/0002-builtin-crypto.patch',
+                           'fuxi/0003-console.patch', 'fuxi/0004-components.patch', 'fuxi/0005-crypto-kext-handoff.patch']
     assert listed[0] == 'unixnu/bcm2837-machine-config.patch' and len([p for p in listed if p.startswith('unixnu/')]) == 51
     for bad in ('source-corecrypto14-bootstrap', 'zzz-boot-progress', 'offline-', 'zzw', 'zzy'):
         assert not any(bad in p for p in listed), bad
@@ -82,8 +82,15 @@ def layout():
     for f in ('libkern/crypto/corecrypto_rand.c', 'libkern/crypto/corecrypto_sha2.c', 'osfmk/prng/prng_random.c'):
         hunk = crypto.split(f'+++ b/{f}\n', 1)[1].split('\ndiff --git', 1)[0]
         assert '+#if FUXI' in hunk or '+#if defined(FUXI)' in hunk, f
-    print(f'PASS: series = {len(listed)} committed patches (51 UniXNU verbatim, sheng, sm8550, 4 Fuxi), notices and '
-          'component hashes present, no corecrypto source, monitor symbol contract kept')
+    # K2: a prelinked com.apple.kec.corecrypto supplies crypto; the fallback never registers the crypto table
+    # (register_crypto_functions stays the kext's single call) and the kmem RNG backend is latched once.
+    handoff = (X27 / 'patches/fuxi/0005-crypto-kext-handoff.patch').read_text()
+    for t in (crypto, handoff):
+        assert 'register_crypto_functions' not in t and 'XNU_SOURCE_CORECRYPTO14' not in t
+    assert handoff.count('+\tif (FUXI_KMEM_BUILTIN()) {') == 4 and '+static bool fuxi_kmem_builtin;' in handoff
+    assert 'FUXI crypto: kmem RNG from corecrypto' in handoff and 'built-in DRBG unused' in handoff
+    print(f'PASS: series = {len(listed)} committed patches (51 UniXNU verbatim, sheng, sm8550, 5 Fuxi), notices and '
+          'component hashes present, no corecrypto source, monitor symbol contract kept, kext crypto handoff latched')
 
 
 def apply_check(xnu):
