@@ -18,14 +18,28 @@ import usb.util
 
 MON_FIELDS = 'magic delegate active usb_mpidr launch stage boot_args entry deadline image end'.split()
 WANTED = {'_fuxi_early_status', '_sweet_log_ring', '_sweet_log_total'}
+OPTIONAL = {'_sweet_log_size'}  # xnu27 fuxi/0006: ring size (absent: the 4 MiB xnu-8796 ring)
+RING_DEFAULT = 0x400000
 
 
 def symbols(path):
     b = path.read_bytes()
-    magic, cpu, _, _, count, _, _, _ = struct.unpack_from('<8I', b)
+    magic, cpu, _, filetype, count, _, _, _ = struct.unpack_from('<8I', b)
     if magic != 0xfeedfacf or cpu != 0x100000c:
         raise ValueError('expected an arm64 Mach-O kernel')
     offset = 32
+    if filetype == 12:  # K2 MH_FILESET (tools/ios27-prelink.py): symbols live in the com.apple.kernel entry
+        for _ in range(count):
+            command, size = struct.unpack_from('<II', b, offset)
+            if command == 0x80000035:
+                fileoff, name = struct.unpack_from('<QI', b, offset + 16)[0], struct.unpack_from('<I', b, offset + 24)[0]
+                if b[offset + name:b.index(b'\0', offset + name)] == b'com.apple.kernel':
+                    break
+            offset += size
+        else:
+            raise ValueError('fileset has no com.apple.kernel entry')
+        count = struct.unpack_from('<I', b, fileoff + 16)[0]
+        offset = fileoff + 32
     result = {}
     for _ in range(count):
         command, size = struct.unpack_from('<II', b, offset)
@@ -37,10 +51,10 @@ def symbols(path):
                     continue
                 name_start = strings + nameoff
                 name = b[name_start:b.find(b'\0', name_start)].decode(errors='replace')
-                if name in WANTED:
+                if name in WANTED | OPTIONAL:
                     result[name] = value
         offset += size
-    if result.keys() != WANTED:
+    if not WANTED <= result.keys():
         raise ValueError(f'missing XNU diagnostic symbols: {WANTED - result.keys()}')
     return result
 
@@ -174,7 +188,7 @@ def main():
     if 'fuxiperf=1' in cmdline.split() and (args.cpu_level or args.cpu_at):
         ap.error('fuxiperf=1 owns EPSS: do not pass --cpu-level or --cpu-at')
     offsets = {name: value - virt for name, value in symbols(args.kernel).items()}
-    if any(not 0 <= off < size - 0x400000 for off in offsets.values()):
+    if any(not 0 <= off < size - RING_DEFAULT for off in offsets.values()):
         ap.error('symbol outside XNU window')
     devices = list(usb.core.find(find_all=True, idVendor=0x1209, idProduct=0x0001))
     devices = [d for d in devices if usb.util.get_string(d, d.iProduct) == 'Fuxi hardware probe']
@@ -365,7 +379,7 @@ def main():
         png=b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',1080,2400,8,2,0,0,0))
         png+=chunk(b'IDAT',zlib.compress(b''.join(rows),6))+chunk(b'IEND',b'')
         (args.out/(name+'.png')).write_bytes(png)
-    tour_tail, tour_done = b'', set()
+    tour_tail, tour_done, ring = b'', set(), None
     with (args.out / 'progress.jsonl').open('w') as progress, (args.out / 'boot.log').open('wb') as log:
         while time.monotonic() < until:
             status = monitor()
@@ -382,9 +396,13 @@ def main():
                 start = max(last_total, total - 65536)
                 if start > last_total:
                     status['missed_console_bytes'] = start - last_total
+                if ring is None:
+                    ring = struct.unpack('<Q', read_ram(offsets['_sweet_log_size'], 8))[0] if '_sweet_log_size' in offsets else RING_DEFAULT
+                    if not 0x10000 <= ring <= RING_DEFAULT or ring & (ring - 1):
+                        raise ValueError(f'invalid console ring size: {ring:#x}')
                 while start < total:
-                    index = start % 0x400000
-                    length = min(total-start, 0x400000-index)
+                    index = start % ring
+                    length = min(total-start, ring-index)
                     data = read_ram(offsets['_sweet_log_ring']+index, length)
                     log.write(data)
                     tour_tail = (tour_tail+data)[-4096:] if args.tour_shots else b''

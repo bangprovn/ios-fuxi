@@ -1,0 +1,20 @@
+diff --git a/osfmk/arm64/fuxi_console.c b/osfmk/arm64/fuxi_console.c
+index a9bca31..4b325e9 100644
+--- a/osfmk/arm64/fuxi_console.c
++++ b/osfmk/arm64/fuxi_console.c
+@@ -21,7 +21,14 @@ volatile struct fuxi_early_record fuxi_early_status __attribute__((aligned(64),
+ 	0x4655584900000000ULL, "not entered"
+ };
+ 
+-#define SWEET_LOG_SIZE (4u << 20)
++/*
++ * 256 KiB, not the xnu-8796 kernel's 4 MiB: a K2 fileset places native __DATA
++ * in the 0x1e8000 bytes the original kernel's data used before the first
++ * retained kext (tools/ios27-prelink.py). The monitor reads at most 64 KiB
++ * behind the writer per poll and takes the size from _sweet_log_size.
++ */
++#define SWEET_LOG_SIZE (256u << 10)
++const uint64_t sweet_log_size __attribute__((used)) = SWEET_LOG_SIZE;
+ static char sweet_log_ring[SWEET_LOG_SIZE] __attribute__((aligned(64), used));
+ static uint64_t _Atomic sweet_log_total __attribute__((aligned(64), used));
+ 

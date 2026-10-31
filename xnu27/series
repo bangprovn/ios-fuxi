@@ -70,3 +70,4 @@ fuxi/0002-builtin-crypto.patch
 fuxi/0003-console.patch
 fuxi/0004-components.patch
 fuxi/0005-crypto-kext-handoff.patch
+fuxi/0006-log-ring-fileset.patch

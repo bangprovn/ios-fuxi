@@ -23,17 +23,19 @@ Nothing on this page has run on the device: device effects are not yet observed.
 | Layer | Origin | Licence | Content |
 |---|---|---|---|
 | `patches/unixnu/` (51) | UniXNU `88604d0` `patches/xnu-12377/`, verbatim | BSD-2-Clause-Patent | arm64e + ipados-27 profile series minus the exclusions below |
-| `patches/sheng/` | UniXNU-sheng `5b7d83c` (feat/ipados27-gpu-parity) | BSD-2-Clause-Patent | CPU/MMU subset of `zzzz-sheng-ipados27-bringup` + `zzye-sheng-cpu-idle`: T0SZ 17 (47-bit user VA), TCR KVA entry, 16-bit ASID, sigp recover, WFE idle, pmap WIMG, builtin boot-args |
+| `patches/sheng/` | UniXNU-sheng `5b7d83c` (feat/ipados27-gpu-parity) | BSD-2-Clause-Patent | CPU/MMU subset of `zzzz-sheng-ipados27-bringup` + `zzye-sheng-cpu-idle`: T0SZ 17 (47-bit user VA), TCR KVA entry, 16-bit ASID, sigp recover, WFE idle, pmap WIMG, builtin boot-args; `sheng-kernel-stack-shift` (the `unixnu_kernel_stack_shift` symbol XnuPrelink's reviewed 24A446 sites name) |
 | `patches/sm8550/` | UniXNU-sm8550-common `23b2049` | BSD-2-Clause-Patent | `native-smp-secondary` start.s MPIDR mask |
 | `patches/fuxi/0001` | ours | APSL file headers | `MACHINE_CONFIGS=FUXI` wrapping BCM2837 (`-DFUXI=1`, 8 CPUs/2 clusters, mockfs in MASTER) |
 | `patches/fuxi/0002` | ours (xnu-8796 patch 0014) | APSL file headers | HMAC-SHA256 DRBG, SHA-256/512 via xnu's in-tree `ccsha*_ltc_di`, SplitMix64 kmem RNG, all only while no corecrypto is registered |
 | `patches/fuxi/0003` | ours (xnu-8796 framebuffer console) | APSL file headers | `fuxi_early_status`, 4 MiB `sweet_log_ring`, start.s/arm_init/bsd_init stage marks, fbcon on the ABL splash buffer |
 | `patches/fuxi/0004` + `components/` | UniXNU ArmCpu `4bd3230`, ArmDTPlatform `417ff95` | BSD-2-Clause-Patent | GICv3/timer/PSCI CPU driver and DT platform expert, compiled into the kernel |
+| `patches/fuxi/0005` | ours | APSL file headers | K2 crypto handoff: the kmem RNG backend is latched once (built-in or corecrypto), log lines say which; the fallback never calls `register_crypto_functions` |
+| `patches/fuxi/0006` | ours | APSL file headers | K2: `sweet_log_ring` 256 KiB (native `__DATA` must fit the fileset gap), size exported as `sweet_log_size` |
 
 Left out of the UniXNU series: `source-corecrypto14-bootstrap` (see below), `offline-*` and `zzz-boot-progress`
 (sheng offline tooling; `zzz-boot-progress` depends on them), `zzw*`/`zzy*` (sandbox grants, GPU addon mount,
 staged apps, cryptex view, launch constraints: userland milestones). Notices: `xnu27/NOTICE`, README credits.
-`tools/test-fuxi-ios27.py --xnu DIR` applies the full series to a fresh xnu-12377.121.6 (OBSERVED: 57 patches apply).
+`tools/test-fuxi-ios27.py --xnu DIR` applies the full series to a fresh xnu-12377.121.6 (OBSERVED: 60 patches apply).
 
 ### corecrypto (licence blocker, decision needed)
 

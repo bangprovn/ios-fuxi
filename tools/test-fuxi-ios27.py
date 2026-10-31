@@ -4,7 +4,7 @@
   - xnu27/series lists exactly the committed patches, the UniXNU layers keep their origin/licence notices,
     UniXNU's source-corecrypto patch and any corecrypto source stay out, the component sources match the
     sha256 table, and the Fuxi patches keep the USB-monitor symbol contract (_fuxi_early_status,
-    _sweet_log_ring 4 MiB, _sweet_log_total) and gate their crypto/console code on FUXI;
+    _sweet_log_ring, 256 KiB since fuxi/0006 and exported as _sweet_log_size, _sweet_log_total) and gate their crypto/console code on FUXI;
   - mkadt-fuxi27.py builds the tree ArmDTPlatform/ArmCpu/12377 read: 256-byte random-seed, sha2-384,
     kernel-ctrr-to-be-enabled 0, a valid CHRP NVRAM bank, cpu nodes ('cpu' + u32 MPIDR), /arm-io ranges and a
     GICv3 intc ArmCpu accepts, /psci only with secondaries, no SHA-1-hashed chip ids, <= 16 KiB;
@@ -17,6 +17,7 @@
               apple-oss-distributions/xnu containing xnu-12377.121.6 (ac9718f), and check the result
 """
 import argparse
+import ast
 import hashlib
 import re
 import struct
@@ -47,8 +48,9 @@ def layout():
     listed = series()
     files = sorted(p.relative_to(X27 / 'patches').as_posix() for p in (X27 / 'patches').rglob('*.patch'))
     assert sorted(listed) == files and len(set(listed)) == len(listed), 'series and patches/ differ'
-    assert listed[-5:] == ['fuxi/0001-machine-config.patch', 'fuxi/0002-builtin-crypto.patch',
-                           'fuxi/0003-console.patch', 'fuxi/0004-components.patch', 'fuxi/0005-crypto-kext-handoff.patch']
+    assert listed[-6:] == ['fuxi/0001-machine-config.patch', 'fuxi/0002-builtin-crypto.patch',
+                           'fuxi/0003-console.patch', 'fuxi/0004-components.patch', 'fuxi/0005-crypto-kext-handoff.patch',
+                           'fuxi/0006-log-ring-fileset.patch']
     assert listed[0] == 'unixnu/bcm2837-machine-config.patch' and len([p for p in listed if p.startswith('unixnu/')]) == 51
     for bad in ('source-corecrypto14-bootstrap', 'zzz-boot-progress', 'offline-', 'zzw', 'zzy'):
         assert not any(bad in p for p in listed), bad
@@ -77,6 +79,13 @@ def layout():
     assert re.search(r'^\+static uint64_t _Atomic sweet_log_total', console, re.M)
     size = re.search(r'^\+#define SWEET_LOG_SIZE\s+(.+)$', console, re.M).group(1)
     assert eval(size.split('/*')[0].replace('u', '').replace('U', '')) == 0x400000, size
+    # K2: the native __DATA must fit the fileset gap before the first retained kext __DATA (0x1e8000 on 24A446),
+    # so fuxi/0006 shrinks the ring and exports its size for tools/fuxi-xnu-monitor.py.
+    ring = (X27 / 'patches/fuxi/0006-log-ring-fileset.patch').read_text()
+    size = re.search(r'^\+#define SWEET_LOG_SIZE\s+(.+)$', ring, re.M).group(1)
+    assert eval(size.split('/*')[0].replace('u', '').replace('U', '')) == 0x40000, size
+    assert re.search(r'^-#define SWEET_LOG_SIZE \(4u << 20\)$', ring, re.M)
+    assert '+const uint64_t sweet_log_size __attribute__((used)) = SWEET_LOG_SIZE;' in ring
     assert re.search(r'^\+\tchar text\[120\];', console, re.M)
     crypto = (X27 / 'patches/fuxi/0002-builtin-crypto.patch').read_text()
     for f in ('libkern/crypto/corecrypto_rand.c', 'libkern/crypto/corecrypto_sha2.c', 'osfmk/prng/prng_random.c'):
@@ -94,7 +103,7 @@ def layout():
     for sym in ('+unixnu_fileset_unmapped(uint64_t arg0, uint64_t arg1)', 'SECURITY_READ_ONLY_LATE(uint32_t) unixnu_kernel_stack_shift;',
                 '"_NativePrelinkEarlySecurityInit"', 'trust_cache_mut_rt_reserved', '-Wl,-threaded_starts_section'):
         assert sym in allp, sym
-    print(f'PASS: series = {len(listed)} committed patches (51 UniXNU verbatim, 2 sheng, sm8550, 5 Fuxi), notices and '
+    print(f'PASS: series = {len(listed)} committed patches (51 UniXNU verbatim, 2 sheng, sm8550, 6 Fuxi), notices and '
           'component hashes present, no corecrypto source, monitor symbol contract kept, kext crypto handoff latched')
 
 
@@ -239,6 +248,62 @@ def payload_check():
           'loader build check; version 3 and an over-long v2 line are refused; loader/monitor layouts match')
 
 
+def thin_kernel(syms, filetype=2, at=0):
+    """A minimal arm64 Mach-O carrying only LC_SYMTAB with external N_SECT symbols; `at` = its file offset in a
+    fileset (LC_SYMTAB offsets are whole-file offsets there)."""
+    strtab = b'\0' + b''.join(n.encode() + b'\0' for n in syms)
+    nlist, off = b'', 1
+    for n, v in syms.items():
+        nlist += struct.pack('<IBBHQ', off, 0x0f, 1, 0, v)
+        off += len(n) + 1
+    symoff = at + 32 + 24
+    hdr = struct.pack('<8I', 0xfeedfacf, 0x100000c, 0x80000002, filetype, 1, 24, 0, 0)
+    cmd = struct.pack('<6I', 2, 24, symoff, len(syms), symoff + len(nlist), len(strtab))
+    return hdr + cmd + nlist + strtab
+
+
+def monitor_check():
+    tree = ast.parse((ROOT / 'tools/fuxi-xnu-monitor.py').read_text())
+    keep = {'WANTED', 'OPTIONAL', 'RING_DEFAULT'}
+    nodes = [n for n in tree.body if (isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id in keep for t in n.targets))
+             or (isinstance(n, ast.FunctionDef) and n.name == 'symbols')]
+    ns = {'struct': struct}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), '<monitor symbols>', 'exec'), ns)
+    old = {'_fuxi_early_status': 0xfffffff007800000, '_sweet_log_ring': 0xfffffff007900000, '_sweet_log_total': 0xfffffff007d00000}
+    new = dict(old, _sweet_log_size=0xfffffff007010000)
+    with tempfile.TemporaryDirectory() as tmp:
+        k = Path(tmp) / 'k'
+        k.write_bytes(thin_kernel(dict(old, _other=1)))
+        assert ns['symbols'](k) == old
+        k.write_bytes(thin_kernel(new))
+        assert ns['symbols'](k) == new
+        k.write_bytes(thin_kernel({'_sweet_log_ring': 1}))
+        try:
+            ns['symbols'](k)
+            raise AssertionError('missing symbols accepted')
+        except ValueError:
+            pass
+        # MH_FILESET: two LC_FILESET_ENTRY commands; the symbols come from the com.apple.kernel entry's LC_SYMTAB.
+        inner = thin_kernel(new, at=0x8000)
+        names = [b'com.apple.kec.corecrypto\0', b'com.apple.kernel\0']
+        cmds, base = b'', 0x4000
+        for i, name in enumerate(names):
+            size = (32 + len(name) + 7) & ~7
+            cmds += struct.pack('<IIQQI', 0x80000035, size, 0xfffffff007004000 + i * 0x4000, base * (i + 1), 32, ) + b'\0' * 4
+            cmds += name.ljust(size - 32, b'\0')
+        hdr = struct.pack('<8I', 0xfeedfacf, 0x100000c, 0xc0000002, 12, len(names), len(cmds), 0, 0)
+        blob = bytearray((hdr + cmds).ljust(0x8000, b'\0'))
+        other = thin_kernel({'_sweet_log_ring': 5}, at=0x4000)  # the corecrypto entry: the wrong place to look
+        blob[0x4000:0x4000 + len(other)] = other
+        blob += inner
+        k.write_bytes(bytes(blob))
+        assert ns['symbols'](k) == new
+    mon = (ROOT / 'tools/fuxi-xnu-monitor.py').read_text()
+    assert 'index = start % ring' in mon and '% 0x400000' not in mon
+    print('PASS: monitor symbols() reads thin kernels (with and without _sweet_log_size) and the com.apple.kernel '
+          'entry of an MH_FILESET; the ring size comes from _sweet_log_size')
+
+
 def ci():
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp)
@@ -285,6 +350,7 @@ def main():
     layout()
     adt_check()
     payload_check()
+    monitor_check()
     ci()
     if args.xnu:
         apply_check(args.xnu.resolve())
