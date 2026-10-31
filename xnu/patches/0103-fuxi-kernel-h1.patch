@@ -230,7 +230,7 @@
  	unsigned errors = 0;
  	(void)arg;
  	(void)result;
-@@ -236,38 +313,447 @@
+@@ -236,38 +313,448 @@
  	}
  	for (;;) {
  		uint8_t pon = 0, gpio = 1;
@@ -514,10 +514,11 @@
 + * fuxihuman=S: S seconds after the key thread starts, a finger-like workload:
 + * eased flicks of varying length instead of fk_swipe's constant speed, home
 + * pages, scrolling inside Settings, the app switcher (swipe up and hold), then
-+ * Clock and Photos. fuxihumann=N loops (default 10, at most 100). With
++ * Safari and Photos. fuxihumann=N loops (default 10, at most 100). With
 + * fuxitourhold=H the first loop also stops for H seconds at "FUXI TOUR: shot"
-+ * lines (fuxi-xnu-monitor.py --tour-shots). Tap targets match the stock iOS 16
-+ * home layout at 1080x2400. Device tests only (synthetic touch).
++ * lines (fuxi-xnu-monitor.py --tour-shots). Tap targets match this root's first
++ * home page at 1080x2400 (Photos, Settings; dock Phone, Safari), not the tour's
++ * layout. Device tests only (synthetic touch).
 + */
 +static unsigned fk_human_loops = 10;
 +static bool fk_human_shots;
@@ -594,7 +595,7 @@
 +		printf("FUXI HUMAN: settings\n");
 +		fk_tour_home();
 +		fk_tour_home();
-+		fk_tap(670, 1710);
++		fk_tap(150, 570);
 +		fk_script_sleep(1800);
 +		for (unsigned i = 0; i < 6; ++i) {
 +			if (i % 2 == 0) {
@@ -614,18 +615,18 @@
 +		fk_human_shot(&shot, "switcher-from-home");
 +		fk_tour_home();
 +		if (loop == 1 && fk_human_shots) {
-+			fk_tap(150, 2230);              /* Phone, in the dock */
++			fk_tap(280, 2247);              /* Phone, in the dock */
 +			fk_script_sleep(5000);
 +			fk_tour_shot(&shot, "phone");
 +			fk_tour_home();
 +		}
 +		printf("FUXI HUMAN: apps\n");
-+		fk_tap(670, 1140);                      /* Clock */
++		fk_tap(540, 2247);                      /* Safari */
 +		fk_script_sleep(2000);
-+		fk_flick(900, 2100, 300, 2100, 180);
++		fk_flick(540, 1600, 560, 700, 180);
 +		fk_script_sleep(1000);
 +		fk_tour_home();
-+		fk_tap(670, 860);                       /* Photos */
++		fk_tap(150, 285);                       /* Photos */
 +		fk_script_sleep(2500);
 +		fk_flick(540, 700, 560, 1800, 150);
 +		fk_script_sleep(1000);
@@ -696,7 +697,7 @@
  }
  
  void
-@@ -289,5 +775,236 @@
+@@ -289,5 +776,236 @@
  	} else {
  		printf("FUXI KEYS: kernel_thread_start failed\n");
  	}
