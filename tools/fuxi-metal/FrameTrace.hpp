@@ -15,7 +15,19 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 namespace fuxi {
+// The device logger splits lines near 240 chars and drops bytes at the split: print text (one line) in pieces of at most 200 chars cut
+// before a space, each continuation as '<tag><rest>' (rest starts with the space). Deleting every '\n<tag>' gives back the line.
+inline void wrapLine(FILE *out,const char *text,const char *tag) {
+ size_t len=strlen(text),at=0,tagLen=strlen(tag);if(len && text[len-1]=='\n')--len;
+ for(bool first=true;at<len;first=false){
+  size_t room=first?200:200-tagLen,take=len-at;
+  if(take>room){take=room;while(take>1 && text[at+take]!=' ')--take;if(take<=1)take=room;}
+  fprintf(out,"%s%.*s\n",first?"":tag,int(take),text+at);at+=take;
+ }
+}
 using FrameClock=std::chrono::steady_clock;
 inline uint64_t frameNanos(FrameClock::time_point start) {
  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(FrameClock::now()-start).count());
@@ -59,8 +71,12 @@ inline constexpr const char *mergeSplitNames[]={"none","encoder","attachments","
 // are drained into the sample at commit; submit phases accumulate into the current sample. Disabled (no clock reads) unless frame tracing is on.
 enum class EncPhase : size_t {encBegin,encChecks,encEnd,pipeline,texSamp,bufBytes,state,draw,blit,newBuffer,newTexture,iosurface,newOther,cbMisc,count};
 inline constexpr const char *encPhaseNames[]={"enc_begin","enc_checks","enc_end","set_pipeline","set_tex_samp","set_buf_bytes","set_state","draw","blit","new_buffer","new_texture","iosurface","new_other","cb_misc"};
-enum class SubPhase : size_t {other,cmdBegin,cmdEnd,objects,descriptors,passes,barriers,record,queueSubmit,fence,wait,prepare,flush,uses,plan,pin,count};
-inline constexpr const char *subPhaseNames[]={"other","cmd_begin","cmd_end","objects","descriptors","passes","barriers","record","queue_submit","fence","wait","prepare","flush","uses","plan","pin"};
+// Finer submit attribution (exclusive like the rest): rewrite = pass rename/hoist/reorder/rt-shadow before planning; plan_lookup = draw-plan cache/translator;
+// plan_mip = sampled-attachment access proof; plan_bounds = index/vertex/earlier-writer checks; analyze = occlusion/merge/neutral; refresh = shadow refresh + hash;
+// pass_setup = render pass/framebuffer selection; area = render-area bounding; bind = per-draw pipeline/dynamic state/descriptor values/set bind; retire_build = flight use lists + retirement closure.
+enum class SubPhase : size_t {other,cmdBegin,cmdEnd,objects,descriptors,passes,barriers,record,queueSubmit,fence,wait,prepare,flush,uses,plan,pin,rewrite,planLookup,planMip,planBounds,analyze,refresh,passSetup,area,bind,retireBuild,rwHoist,rwReorder,rwShadow,setup,recLoop,tail,count};
+inline constexpr const char *subPhaseNames[]={"other","cmd_begin","cmd_end","objects","descriptors","passes","barriers","record","queue_submit","fence","wait","prepare","flush","uses","plan","pin","rewrite","plan_lookup","plan_mip","plan_bounds","analyze","refresh","pass_setup","area","bind","retire_build","rw_hoist","rw_reorder","rw_shadow","setup","rec_loop","tail"};
+static_assert(sizeof(subPhaseNames)/sizeof(*subPhaseNames)==size_t(SubPhase::count),"submit phase names");
 // Per-frame probe counts of per-draw linear structures: bound-set entries visited, full binding compares, view-cache entries visited, use-list entries visited, frame-cache entries visited.
 enum class ScanKind : size_t {boundSetProbes,boundSetCompares,viewProbes,useProbes,frameProbes,boundSetMax,count};
 inline constexpr const char *scanKindNames[]={"bound_set_probes","bound_set_compares","view_probes","use_list_probes","frame_probes","bound_set_max"};
@@ -241,7 +257,7 @@ public:
   auto flush=[&]{if(pending){if(len>399)len=399;line[len]=0;fprintf(out,"%s\n",line);}pending=false;};
   for(size_t i=0;i<N;++i){
    uint64_t sum=0,max=0,c=0;for(size_t k=0;k<n;++k){uint64_t v=(samples[k].*ns)[i];sum+=v;max=std::max(max,v);c+=(samples[k].*calls)[i];}
-   if(!c)continue;if(!started){head(false);started=true;}else if(len>350){flush();head(true);}
+   if(!c)continue;if(!started){head(false);started=true;}else if(len>200){flush();head(true);} // the device logger splits lines near 240 chars and drops bytes at the split
    len+=snprintf(line+len,sizeof line-size_t(len)," %s=%.2f/%.2f/%.1f",names[i],sum/double(n)/1e6,max/1e6,c/double(n));pending=true;
   }
   flush();
@@ -256,9 +272,17 @@ public:
   if(len>399)len=399;line[len]=0;fprintf(out,"%s\n",line);
  }
  void report(FILE *out=stderr) {
+  char *text=nullptr;size_t size=0;FILE *line=open_memstream(&text,&size); // the main line, wrapped at 200 chars
+  flockfile(out);
+  reportMain(line?line:out);
+  if(line){fclose(line);wrapLine(out,text?text:"","FUXI MTL: frame trace+");free(text);}
+  reportPhases(out);
+  funlockfile(out);
+  count=wallMax=draws=passes=encodeUnknown=gpuUnavailable=mergedDraws=0;mergeSplits.fill(0);counts={};totals={};cpus.fill(0);cadence.fill(0);
+ }
+ void reportMain(FILE *out) {
   auto p=[&](uint64_t FrameSample::*field,unsigned percent){return percentile(field,percent)/1e6;};
   double n=count?double(count):1;
-  flockfile(out); // Keep the histogram on the same line as its percentiles.
   fprintf(out,"FUXI MTL: frame trace n=%llu samples=%llu wall=%.3f/%.3f/%.3f ms cpu_before_commit=%.3f/%.3f shadow_copy=%.3f/%.3f lease_lock=%.3f/%.3f backend_submit=%.3f/%.3f gpu_wait=%.3f/%.3f gpu_exec=%.3f/%.3f draws/frame=%.2f render_passes/frame=%.2f pipelines/frame=%.2f descriptors/frame=%.2f allocations/frame=%.2f cpu_hist=",
    (unsigned long long)count,(unsigned long long)std::min<uint64_t>(count,capacity),
    p(&FrameSample::wall,50),p(&FrameSample::wall,90),wallMax/1e6,
@@ -300,9 +324,6 @@ public:
   stage("pipe_cpu",&FrameSample::pipeCPU);stage("desc_cpu",&FrameSample::descCPU);stage("record_cpu",&FrameSample::recordCPU);stage("flush_cpu",&FrameSample::flushCPU);stage("kernel_io_cpu",&FrameSample::kernelIOCPU);stage("queue_submit_cpu",&FrameSample::queueSubmitCPU);
   fprintf(out," cpu_sampled_submits/frame=%.2f cpu_omitted_submits/frame=%.2f",totals.cpuSampledSubmits/n,totals.cpuOmittedSubmits/n);
   fputc('\n',out);
-  reportPhases(out);
-  funlockfile(out);
-  count=wallMax=draws=passes=encodeUnknown=gpuUnavailable=mergedDraws=0;mergeSplits.fill(0);counts={};totals={};cpus.fill(0);cadence.fill(0);
  }
 };
 }

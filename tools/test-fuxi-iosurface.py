@@ -29,6 +29,7 @@ struct IOLock {bool held=false;};
 static void IOLockLock(IOLock *p) {assert(!p->held);p->held=true;}
 static void IOLockUnlock(IOLock *p) {assert(p->held);p->held=false;}
 static IOLock surfaceLock,*sweet_surface_lock=&surfaceLock;
+static unsigned displayWakes;static void sweet_display_wake() {assert(!surfaceLock.held);displayWakes++;} /* fuxiearly bit 2: the last display drop wakes lease waiters */
 struct Buffer {alignas(8) uint8_t bytes[64]={};void *getBytesNoCopy(){return bytes;}};
 struct OSObject {void free(){}};
 struct SweetSurface : OSObject {
@@ -83,8 +84,8 @@ int main() {
  assert(trap(first,false,1,0)==kIOReturnBadArgument && s.displayUses==4 && shared(b)==(1ull<<32)+5);
  assert(first.clientClose()==0 && first.terminated && shared(b)==5 && !a.surface);
  assert(second.clientClose()==0 && second.terminated && shared(b)==4 && !c.surface && s.put==2 && s.released==2);
- for(unsigned i=0;i<4;i++)sweet_surface_display_drop(&s);
- assert(shared(b)==0);sweet_surface_display_drop(&s);assert(shared(b)==0);
+ for(unsigned i=0;i<4;i++){sweet_surface_display_drop(&s);assert(displayWakes==(i==3));}
+ assert(shared(b)==0);sweet_surface_display_drop(&s);assert(shared(b)==0 && displayWakes==1);
  // Both aggregate counters saturate by refusal, never wrap or falsely report idle.
  a.surface=&s;a.uses[1]=0;a.uses[0]=s.useCounts[0]=SWEET_SURFACE_USE_MAX;aRefs.values.push_back(&a);
  sweet_surface_use_publish(&s);assert(trap(first,true,1,0)==kIOReturnBadArgument && shared(b)==SWEET_SURFACE_USE_MAX);

@@ -2851,3 +2851,87 @@ path (`shadowed` argument), after which the buffer is a plain shadow backing and
 renameable. The policy init logs `FUXI MTL: policy shadow_rename=N source=boot|env|none`,
 and `rename_declined=off,not_backing,direct_use,texture,budget,other` counts conflicting
 writes that could not be renamed.
+
+## Rolled uber-shader loops (FUXI_MTL_SPIRV_UNROLL, default off, not yet observed on device)
+
+Evidence (boots L217/M218/N219, `FUXI_MTL_PIPELINE_STATS=1` + `FUXI_MTL_GPU_DRAW_TIMES=1`; those boots carried leftover
+knobs, but the ir3 counts are the same in all three). Of ~116 pipelines, the 6 that keep loops after Turnip
+(`Loops=3`) compile to 1553-1784 ir3 instructions. Every other `fixed_frag_lph_cph` variant compiles to 43-568 and has no
+loops. Those 6 take 45-55% of the sampled top-pass draw time, and in M218's heavy samples (top pass >= 2 ms) pipes
+71/3a/6f alone take 64%. Measured over the scissor area, pipe 3a costs ~4000 ns/kpx and pipe 71 2000-2400. Their
+loop-free sibling 32 (same SPIR-V shape, 270 ir3) costs ~370. The loopy variants are the ones whose colour program is set: `fc_color_opcodes0` uchar3 = 05 01 06 and
+`fc_color_inputs0`=3. Each has `loops_dontunroll=2`. Those two loops are metal2vulkan's roll pass (`spirv/roll`, above
+24576 inlined instructions). It writes identical regions once as a k-trip loop marked DontUnroll and chooses each trip's
+constants by OpSelect on the trip index. So the per-trip opcode switch no longer folds: the driver keeps the loop and
+every switch arm (INFERRED from the stats; the SPIR-V was not inspected).
+
+`FUXI_MTL_SPIRV_UNROLL=1` turns DontUnroll into Unroll on fragment loops that contain no image instruction, right before
+vkCreateShaderModule. Only the LoopControl word changes. Loops that sample (metal2vulkan's anisotropic taps) are kept.
+NIR (`nir_opt_loop_unroll`) force-unrolls an Unroll loop when its trip count is known and no inner loop remains. Mode `2`
+also marks the plain loops nested inside a flipped loop. The translation, recipes and prewarm stay as they are. Changed
+modules are new driver-cache keys, so the first boot compiles cold.
+
+Logs:
+- `FUXI MTL: policy spirv_unroll=N`.
+- One `spirv unroll pipe= fh= mode= loops= dont_unroll= flipped= nested= kept_sampling= create_ms= rc=` line for each
+  pipeline it touches.
+- `fh=` (a hash of the translated fragment SPIR-V, which does not depend on the knob) on the `pipeline stats` and
+  `gpu draw top` lines, plus `unroll=`.
+- Every 20 draw-time samples, `gpu draw pipes window=all|heavy` lists the top 8 pipelines over all passes, with
+  `ms/sample`, `share_pct` and `ns_per_kpx` (heavy = a sampled submit with >= 4 ms of draws). This lets two boots be
+  compared per pipeline by `fh`.
+
+Device check:
+- `pipeline exec ... name=FS` for the six loopy `fh` values should drop to `Loops=0` and a few hundred instructions.
+- Their `gpu draw pipes` ms/sample should fall.
+- `create_ms` shows the compile cost.
+
+## Half rounding in fragment shaders (FUXI_MTL_HALF_ROUND, default off, not yet observed on device)
+
+Evidence (boot K240, `SPIRV_UNROLL=2`, `PIPELINE_STATS=1`, `GPU_DRAW_TIMES=1`). Every heavy pipe already runs at
+`Max_Waves_Per_Core=16` with 6 full registers (3d and 1f: 12 waves, 8 registers), so register pressure is not what
+limits them. Pipe 33 (fullscreen, one draw per frame, 0.84 ms per heavy sample, 14% of heavy draw time) costs about
+1 ir3 instruction per ns per kpx, like 3d and 1f, which is consistent with being ALU bound (INFERRED). On those pipes
+COV is 14-19% of the instructions.
+
+The translator notes say `NativeHalfQuantize`: without shaderFloat16, metal2vulkan (`lower/arith/narrow.rs`, Device
+form) rounds every `half` result as
+`Select(FOrdEqual(Quantize(x),0), RoundEven(x*2^24)*2^-24, Quantize(x))`. ir3 lowers `fquantize2f16` to two covs, and
+the whole idiom to about 7 instructions: two covs, cmps, two muls, rnd and sel. Across all 116 K240 fragment pipelines,
+cat3 >= COV/2 and cat2 >= 2*COV (one exception, with 4 COVs). If every COV pair is one idiom, it is up to 66% of all
+fragment instructions, and 112-157 of pipe 33's 238 (INFERRED; the SPIR-V was not dumped). On A7xx, Turnip reports
+`shaderDenormFlushToZeroFloat16`, so the quantize flushes half denormals and only the select keeps them.
+
+The pass (`SpirvHalfRound.hpp`) runs on the fragment module before `SPIRV_UNROLL` and composes with it. It rewrites
+the Select, or a bare quantize, as an `OpCopyObject`, adds no ids and leaves the dead pieces to the driver's DCE:
+- `1`, exact: removes roundings of values already on the half grid. These are results of other roundings,
+  half-grid constants, UnpackHalf2x16, moves, negation, abs, min, max, clamp, select and phi of such values, and
+  floor, ceil, trunc, round and sign of them. A bare quantize is removed only when its input is never a denormal. On
+  lavapipe the pixels are identical byte for byte.
+- `2`, flush: mode 1, and every other idiom becomes `Quantize(x)` (2 covs instead of 7 instructions). The result
+  differs only where |x| < 2^-14, where it gives 0 instead of a half denormal. A later division or amplification can
+  make that visible.
+- `3`, f32: mode 1, and every idiom and bare quantize becomes x, so the half arithmetic runs in f32. This is a
+  deliberate trade-off. Real iPhones compute `half` in f16 hardware, so this is more precise than Metal, never
+  overflows to infinity at 65520, and does not match Metal bit for bit.
+
+`FUXI_MTL_HALF_ROUND_PIPES=fh,fh,...` limits modes 2 and 3 to the listed fragment hashes. The other pipelines get mode
+1, and a malformed entry ends the list.
+
+Measured on lavapipe with the metal2vulkan-shaped shader in `test-fuxi-metal-occlude.py` (38 quantizes, 36 idioms,
+352256 bytes over 87 scenarios):
+- Mode 1: 0 bytes differ.
+- Mode 2: 0 bytes differ without the shader's deliberate denormal amplifier (`alpha += (a*3e-6)*1000`). With it,
+  max 2 and 3.6% of bytes.
+- Mode 3: max 1 LSB on 1.2% of bytes (colour channels).
+
+Logs:
+- `FUXI MTL: policy half_round=N half_round_pipes=all|<list>`.
+- One line for each pipeline: `half round pipe= fh= mode= lossy= quantize= idioms=before->after
+  quantize_live=before->after bare= exact= exact_bare= flushed= dropped= dropped_bare= words= create_ms= rc=
+  pipelines= sites_total=`.
+
+Device check (with `SPIRV_UNROLL=2 PIPELINE_STATS=1 GPU_DRAW_TIMES=1`):
+- `pipeline exec name=FS` COV, cat2, cat3 and Instruction_Count for pipes 33/3d/1f, matched by `fh` against K240.
+- `gpu draw pipes window=heavy` ms/sample.
+- Panel Hz, and visual checks: blur, vibrancy, Control Center.

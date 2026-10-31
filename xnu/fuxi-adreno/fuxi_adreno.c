@@ -885,7 +885,7 @@ int fuxi_gpu_copy(unsigned slot, uint64_t generation, uintptr_t source, uint64_t
     unsigned width, unsigned height, struct fg_times *t)
 {
  FG_GUARD;
- if (fg_scanout_owned && !fg_scanout_writable) return 0;
+ if (fg_scanout_owned && (!fg_scanout_writable || fg_scanout_fifo_q)) return 0; /* fuxiearly bit 4: no free buffer while a frame is queued */
  unsigned inl = fg_abi_inline && fg_inl_usable(); /* the client root is installed and stays: queue the copy in it */
  if (!inl && fg_client_busy) fg_abi_present_wait = 1;
  if (!fuxi_gpu_ready() || fg_busy || (!inl && fg_client_busy) || slot >= FG_CACHE_SLOTS || fg_generation[slot] != generation) return 0;

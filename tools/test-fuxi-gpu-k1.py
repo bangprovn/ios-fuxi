@@ -15,13 +15,13 @@ host = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(host)
 
 BUFFER = r'''
-static unsigned segMode,segCalls;
+static unsigned segMode,segCalls,lastBufOptions;
 constexpr unsigned kIOMemoryKernelUserShared=64,kIOMapWriteCombineCache=128,kIOMemoryPhysicallyContiguous=256;
 struct IOBufferMemoryDescriptor: IOMemoryDescriptor {
  void *data=nullptr;
  ~IOBufferMemoryDescriptor() override {free(data);}
  static IOBufferMemoryDescriptor *inTaskWithPhysicalMask(task_t task,unsigned options,uint64_t n,uint64_t mask) {
-  assert(task==kernel_task && mask && (options&kIOMapWriteCombineCache));
+  assert(task==kernel_task && mask);lastBufOptions=options;
   if(fail==15 || (fail==16 && (options&kIOMemoryPhysicallyContiguous)))return nullptr;
   auto *m=new IOBufferMemoryDescriptor;m->length=n;m->data=calloc(1,n);assert(m->data);return m;
  }
@@ -52,7 +52,12 @@ static int fuxi_gpu_abi_available() {return available;}
 static int fuxi_gpu_abi_timestamp(uint64_t *t) {*t=0;if(!timeRc)*t=gpuTicks;return timeRc;}
 static int fuxi_gpu_abi_status(uint64_t *f,uint64_t *s) {*f=*s=0;if(!statusRc){*f=gpuFaults;*s=gpuSuspends;}return statusRc;}
 static int fuxi_gpu_abi_poll(uint64_t) {return 0;}
-static unsigned lastMapPerms;static int fuxi_gpu_abi_map(uint64_t,uintptr_t,uint64_t,unsigned p,unsigned,unsigned) {lastMapPerms=p;return 0;}
+static unsigned lastMapPerms,lastMapWb,lastMapSh;static int fuxi_gpu_abi_map(uint64_t,uintptr_t,uint64_t,unsigned p,unsigned wb,unsigned sh) {lastMapPerms=p;lastMapWb=wb;lastMapSh=sh;return 0;}
+static int ccState;static unsigned ccProbes,ccReads,sleeps,cbo[3];
+static int fuxi_gpu_abi_cached_coherent(int probe) {if(probe)ccProbes++;else ccReads++;return ccState;}
+static void IOSleep(unsigned) {sleeps++;}
+#define cboStat(k,n) (cbo[(k)+1]++,(void)(n))
+using UInt32=uint32_t;constexpr int kIOReturnNotFound=10;
 static int fuxi_gpu_abi_map_import(uint64_t,uintptr_t,uint64_t,unsigned) {return 0;}
 static uint64_t fuxi_gpu_abi_map_work() {return 0;}
 static bool queueOn;static int fuxi_gpu_abi_queue_enabled() {return queueOn;}
@@ -240,9 +245,35 @@ int main() {
    assert(!call(d,3,&mp,&mr) && mr.iova==0x20010000 && !(lastMapPerms&FG_ABI_IMPORT_GPU_ONLY));
    NativeAdrenoAbiBoFree fr{h2.handle};d.find(h2.handle)->iova=0;assert(!call(d,4,&fr,nullptr));}
   NativeAdrenoAbiParams qp{};assert(!call(d,1,nullptr,&qp) && qp.flags==(NativeAdrenoParamsHostImport|NativeAdrenoParamsImportGpuOnly));
+  // Cached-coherent BOs (fuxigpuncimport bit 29): GetDeviceInfo reports the backend verdict; BoAlloc bit 1 only while it is on; the BO is
+  // write-back on the CPU (no write-combine flag), must be mapped writeback=1 shareability=3, and its CPU token maps with the default cache.
+  {NativeAdrenoAbiDeviceInfo di{};ccState=0;assert(!call(d,15,nullptr,&di) && di.flags==NativeAdrenoDeviceClientIova && ccProbes==1 && !sleeps);
+   ccState=-1;assert(!call(d,15,nullptr,&di) && di.flags==NativeAdrenoDeviceClientIova && ccProbes==4 && sleeps==2);
+   ccState=1;assert(!call(d,15,nullptr,&di) && di.flags==(NativeAdrenoDeviceClientIova|NativeAdrenoDeviceCachedCoherent) && ccProbes==5 && sleeps==2);
+   NativeAdrenoAbiBoAlloc ca{65536,12,NativeAdrenoAllocCachedCoherent};NativeAdrenoAbiBoAllocReply ch{};
+   ccState=0;assert(call(d,2,&ca,&ch)==kIOReturnBadArgument && cbo[0]==1 && !cbo[2]);
+   ccState=-1;assert(call(d,2,&ca,&ch)==kIOReturnBadArgument && cbo[0]==2);
+   ca.contiguous=4;ccState=1;assert(call(d,2,&ca,&ch)==kIOReturnBadArgument && cbo[0]==2);
+   ca.contiguous=NativeAdrenoAllocCachedCoherent;assert(!call(d,2,&ca,&ch) && !(lastBufOptions&kIOMapWriteCombineCache) && cbo[2]==1);
+   Client::Bo *cb=d.find(ch.handle);assert(cb && cb->cached);
+   NativeAdrenoAbiBoMap cm{ch.handle,0x20100000,3,0,2,0};NativeAdrenoAbiBoMapReply cr{};
+   assert(call(d,3,&cm,&cr)==kIOReturnBadArgument);cm.writeback=1;assert(call(d,3,&cm,&cr)==kIOReturnBadArgument);cm.writeback=0;cm.shareability=3;assert(call(d,3,&cm,&cr)==kIOReturnBadArgument);
+   cm.writeback=1;assert(!call(d,3,&cm,&cr) && lastMapWb==1 && lastMapSh==3 && cb->iova==0x20100000);
+   NativeAdrenoAbiBoCpuMap cc{ch.handle};NativeAdrenoAbiBoCpuMapReply cv{};assert(!call(d,13,&cc,&cv));
+   IOOptionBits mo=0;IOMemoryDescriptor *mm=nullptr;assert(!d.clientMemoryForType(cv.token,&mo,&mm) && mm && mo==(kIOMapAnywhere|kIOMapDefaultCache));
+   NativeAdrenoAbiBoCpuUnmap cu{ch.handle,cv.token,0};assert(!call(d,14,&cu,nullptr));
+   // Bits 0+1: contiguous and cached; an uncached BO keeps write-combine everywhere.
+   NativeAdrenoAbiBoAlloc cc2{16384,12,NativeAdrenoAllocContiguous|NativeAdrenoAllocCachedCoherent};NativeAdrenoAbiBoAllocReply c2{};
+   assert(!call(d,2,&cc2,&c2) && (lastBufOptions&kIOMemoryPhysicallyContiguous) && !(lastBufOptions&kIOMapWriteCombineCache) && cbo[2]==2);
+   NativeAdrenoAbiBoAlloc nc{16384,12,0};NativeAdrenoAbiBoAllocReply n2{};assert(!call(d,2,&nc,&n2) && (lastBufOptions&kIOMapWriteCombineCache) && !d.find(n2.handle)->cached && cbo[2]==2);
+   NativeAdrenoAbiBoMap nm{n2.handle,0x20200000,3,0,2,0};assert(!call(d,3,&nm,&cr) && !lastMapWb && lastMapSh==2);
+   NativeAdrenoAbiBoCpuMap nmap{n2.handle};assert(!call(d,13,&nmap,&cv));assert(!d.clientMemoryForType(cv.token,&mo,&mm) && mo==(kIOMapAnywhere|kIOMapWriteCombineCache));
+   NativeAdrenoAbiBoCpuUnmap nu{n2.handle,cv.token,0};assert(!call(d,14,&nu,nullptr));
+   NativeAdrenoAbiBoFree f1{ch.handle},f2{c2.handle},f3{n2.handle};assert(!call(d,4,&f1,nullptr) && !call(d,4,&f2,nullptr) && !call(d,4,&f3,nullptr) && cbo[1]==2);
+   ccState=0;}
   inputOverride=0;submitRc=-1;b->iova=0;assert(!d.clientClose());
  }
- puts("PASS: actual methods 7/8 dispatch/errors/lengths, 1024 BO allocation/refusal/reuse/close, handle index after churn, 128-IB and legacy 416-byte submit records, shared wired quota, metadata refusal and CPU leases");
+ puts("PASS: actual methods 7/8 dispatch/errors/lengths, 1024 BO allocation/refusal/reuse/close, handle index after churn, 128-IB and legacy 416-byte submit records, shared wired quota, metadata refusal and CPU leases, cached-coherent BOs (device-info flag, gated alloc, WB map attrs, default-cache CPU token)");
 }
 '''
 
@@ -259,13 +290,17 @@ static unsigned peakBos;
 
 def main():
     source = (ROOT/'xnu/fuxi-adreno/FuxiAdrenoUserClient.cpp').read_text()
-    prefix = host.PREFIX.replace('#include <cstdio>', '#include <cstdio>\n#include <cstdlib>')
+    prefix = host.PREFIX.replace('#include <cstdio>', '#include <cstdio>\n#include <cstdlib>').replace('static void cboStat(int,uint64_t){}', '')\
+        .replace(' assert(va==0x20000000 && bytes==32768);', ' assert((va==0x20000000 && bytes==32768) || (va>=0x20100000 && va<0x20300000)); /* the latter: cached-BO block */')
     start = prefix.index('struct IOBufferMemoryDescriptor {')
     end = prefix.index('static int fuxi_gpu_abi_unmap', start)
     prefix = prefix[:start]+BUFFER+prefix[end:]
     helper = (ROOT/'xnu/fuxi-adreno/fuxi_adreno_host.c').read_text()
     helper = helper[helper.index('bool fuxi_adreno_host_page_ok('):helper.index('#endif')]
     bo = source[source.index(' enum {MaxBos='):source.index(' task_t task_')]
+    # The view model is not a descriptor: hand its pointer back without the IOKit retain (the test only reads the options).
+    memory = host.method(source, 'clientMemoryForType').replace(' override', '').replace('b.view->retain(); *memory=b.view;', '*memory=(IOMemoryDescriptor *)b.view;')
+    assert '*memory=(IOMemoryDescriptor *)b.view;' in memory
     close = host.method(source, 'clientClose').replace(' override', '').replace('openLock);', '&openLock);')
     external = host.method(source, 'externalMethod').replace(' override', '')
     # find() is pointer-returning, so use its adjacent source boundaries.
@@ -283,7 +318,7 @@ def main():
  uint32_t nextToken_=1;bool queues_[8]={true};
  int *lock_=&clientLock;bool live_=true;int pid_=0;
  void terminate(){} void result(){}
- '''+find+wait+''.join(host.method(source, n) for n in ('allocate', 'importHost', 'drop', 'run'))+close+external+TEST
+ '''+find+wait+''.join(host.method(source, n) for n in ('allocate', 'importHost', 'drop', 'run'))+memory+close+external+TEST
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp)/'k1.cpp';path.write_text(model)
         exe = path.with_suffix('')

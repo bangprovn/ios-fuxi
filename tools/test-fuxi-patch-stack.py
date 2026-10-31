@@ -64,8 +64,13 @@ def main():
     assert 'BSD-2-Clause-Patent' in text and '+      uint64_t slice = 100000000; /* 100 ms */' in text
     turnip = (ROOT/'tools/build-fuxi-turnip.py').read_text()
     order = [turnip.index(f"'tools/patches/{n}'") for n in ('mesa-fuxi-smoke.patch', 'mesa-fuxi-hostimport.patch',
-             'mesa-fuxi-ir3-round-default.patch', 'mesa-fuxi-fence-wait-100ms.patch')]
-    assert order == sorted(order), 'the 100 ms slice patch must apply after mesa-fuxi-smoke.patch'
+             'mesa-fuxi-ir3-round-default.patch', 'mesa-fuxi-fence-wait-100ms.patch', 'mesa-fuxi-cached-coherent.patch')]
+    assert order == sorted(order), 'the 100 ms slice patch must apply after mesa-fuxi-smoke.patch, the cached-coherent patch last'
+    cached = (ROOT/'tools/patches/mesa-fuxi-cached-coherent.patch').read_text()
+    assert all(s in cached for s in ('NativeAdrenoAllocCachedCoherent', '.writeback = cached ? 1u : 0u', '.shareability = cached ? 3u : 2u',
+               'bo->darwin_cached ? kIOMapDefaultCache : kIOMapWriteCombineCache')), 'cached-coherent BO flags'
+    abi = (ROOT/'xnu/fuxi-adreno/NativeAdrenoABI.h').read_text()
+    assert 'NativeAdrenoAllocCachedCoherent = 2' in abi
     print(f'PASS: {len(patches)} patch files well formed; draw-path patches 0009-0015 carry origin/licence; build recipes list them')
 
 

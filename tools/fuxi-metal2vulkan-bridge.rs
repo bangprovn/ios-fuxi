@@ -872,7 +872,8 @@ fn baseline_state()->BindState {
 fn reflect_textures(pipeline:&metal2vulkan::pipeline::RenderPipeline,state:&mut BindState,baseline:bool)->Result<(),String> {
  for (slot,interface) in &pipeline.interface.slots {
   if let metal2vulkan::pipeline::SlotInterface::Texture(texture)=interface {
-   if slot.stage!=Stage::Fragment || slot.index>=SLOTS || !matches!(texture.texture_type,TextureType::Type1D|TextureType::Type2D){return Err("bounded fragment texture dimension".into());}
+   // FuxiMetal binds 1D, 2D and 3D sampled views (Backend viewTypeFor); arrays and cubes stay refused.
+   if slot.stage!=Stage::Fragment || slot.index>=SLOTS || !matches!(texture.texture_type,TextureType::Type1D|TextureType::Type2D|TextureType::Type3D){return Err(format!("bounded fragment texture dimension stage={:?} slot={} type={:?}",slot.stage,slot.index,texture.texture_type));}
    if let Some(table)=state.stages.get_mut(&slot.stage) {if let Some(BoundTexture::Texture{facts,..})=table.textures.get_mut(&slot.index){
     facts.texture_type=texture.texture_type;
     if baseline {facts.pixel_format=match texture.sampled_type {metal2vulkan::pipeline::SampledType::Float=>PixelFormat::BGRA8Unorm,metal2vulkan::pipeline::SampledType::Uint=>PixelFormat::R32Uint,metal2vulkan::pipeline::SampledType::Sint=>PixelFormat::R32Sint,_=>return Err("unsupported texture numeric type".into())};}
@@ -889,7 +890,7 @@ fn reflect_textures(pipeline:&metal2vulkan::pipeline::RenderPipeline,state:&mut 
  for (slot,interface) in &pipeline.interface.slots {
   if slot.stage==Stage::Fragment && slot.class==SlotClass::Texture && slot.index==index {
    if let metal2vulkan::pipeline::SlotInterface::Texture(texture)=interface {
-    return match texture.texture_type {TextureType::Type1D=>0,TextureType::Type2D=>2,_=>u32::MAX};
+    return match texture.texture_type {TextureType::Type1D=>0,TextureType::Type2D=>2,TextureType::Type3D=>7,_=>u32::MAX};
    }
   }
  }

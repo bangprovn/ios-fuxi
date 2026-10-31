@@ -29,9 +29,10 @@ static unsigned delays;static uint64_t delayUs;
 static void delay(unsigned n) {delays++;delayUs+=n;now+=n*1000;}
 static unsigned sleeps;
 static void IOSleep(unsigned ms) {assert(ms==1);sleeps++;now+=1000000;}
-static char logs[8][400];static unsigned logCount;
-static void IOLog(const char *fmt,...) {va_list ap;va_start(ap,fmt);assert(logCount<8);vsnprintf(logs[logCount++],400,fmt,ap);va_end(ap);}
+static char logs[10][400];static unsigned logCount;
+static void IOLog(const char *fmt,...) {va_list ap;va_start(ap,fmt);assert(logCount<10);vsnprintf(logs[logCount++],400,fmt,ap);va_end(ap);}
 static uint32_t splitWhy[5]={1,2,3,4,5};
+static int ccOn;static int fuxi_gpu_abi_cached_coherent(int probe) {assert(!probe);return ccOn;}
 static IOLock *openLock;
 enum { FG_IRQ_N, FG_IRQ_EMPTY, FG_IRQ_FOREIGN, FG_IRQ_WAKES, FG_IRQ_TIMEOUTS, FG_IRQ_RACES, FG_IRQ_MASKFIX, FG_IRQ_WRITTEN, FG_IRQ_STATS };
 static unsigned irqStatCalls;
@@ -101,6 +102,13 @@ int main() {
  for(unsigned l=0;l<8;l++)assert(strlen(logs[l])<300);
  assert(strstr(logs[7],"lock_ max 6.4 ms") && strstr(logs[7]," submit 1/6.4") && !strstr(logs[7]," wait "));
  logCount=0;abiSplit(FG_SPLIT_DONE,0);assert(!logCount); // restarted
+ // Cached-coherent BOs (fuxigpuncimport bit 29): silent while off with no activity; once on, one line per window; window counts reset, live kept.
+ cboStat(1,65536);cboStat(1,16384);cboStat(0,16384);cboStat(-1,0);ccOn=1;
+ for(unsigned i=1;i<FG_SPLIT_WINDOW;i++)abiSplit(FG_SPLIT_DONE,0);
+ assert(logCount==9 && !strcmp(logs[7],"FUXI GPU ABI: cached BOs per 600 submits enabled 1 allocs 2 frees 1 refused 1 live 1 live_kb 64\n") && strstr(logs[8],"lock_ max"));
+ logCount=0;for(unsigned i=0;i<FG_SPLIT_WINDOW;i++)abiSplit(FG_SPLIT_DONE,0);
+ assert(logCount==9 && !strcmp(logs[7],"FUXI GPU ABI: cached BOs per 600 submits enabled 1 allocs 0 frees 0 refused 0 live 1 live_kb 64\n"));
+ ccOn=0;cboStat(0,65536);logCount=0;for(unsigned i=0;i<FG_SPLIT_WINDOW;i++)abiSplit(FG_SPLIT_DONE,0);assert(logCount==8); /* off, nothing live, no allocs: silent */
  // Fence pending histogram: submit-to-retire bins, untimed (no submit time), ready (retired at the first poll); IRQ counters read outside openLock.
  static IOLock pendLock;openLock=&pendLock;logCount=0;tickScale=1;
  static const uint64_t pendNs[6]={100000,300000,700000,3000000,40000000,0};
@@ -109,7 +117,7 @@ int main() {
  assert(!strcmp(logs[0],"FUXI ABI: fence pending per 600 waits us <250 100 <500 100 <1000 100 <2000 0 <4000 100 <8000 0 <16000 0 <32000 0 more 100 untimed 100 ready 50"
   " irq state 3 why 4 n 1 empty 2 foreign 3 wakes 4 timeouts 5 races 6 written 8 maskfix 7\n"));
  pendStat(5,4,false);assert(logCount==1); // window restarted; a retire stamp before the submit stamp counts as untimed
- puts("PASS: ABI stat aggregation/window reset/log format, sleep slices and sleep accounting, submit_split report, fence pending histogram");
+ puts("PASS: ABI stat aggregation/window reset/log format, sleep slices and sleep accounting, submit_split report (cached-BO line), fence pending histogram");
 }
 '''
 

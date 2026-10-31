@@ -93,12 +93,22 @@ static unsigned fg_scanout_dpu_stage3; /* bits 22+23+24: stage 2 keeps the trans
 /* Buffers 3..3+FG_DD_SLOTS_N-1 are direct slots. fg_dd_geo: VIG0 holds the slot geometry; fg_dd_ga: A's SRC_IMG_SIZE, SRC_XY, YSTRIDE0. */
 static unsigned fg_dd_on, fg_dd_dead, fg_dd_geo, fg_dd_ga[3];
 static uintptr_t fg_dd_va[FG_DD_SLOTS_N];
+/* fuxiearly bit 4 (value 4, default off; needs fuxiscantriple=1): present FIFO. A copy that finishes while the previous frame is ready
+ * but not STARTed is queued behind it (fifo_q, buffer fifo_buf) instead of replacing it, when that frame has been ready for less than a
+ * panel period (it STARTs at the next TE, so the queued one shows one TE later than a replacement would) and the third buffer holds
+ * it. The START of the ready frame promotes the queued one (ready, back_ready, a fresh ready_at and the publish token), and the next
+ * START shows it. While one is queued no buffer is free: acquire refuses a new copy (full_waits), which bounds the queue to one frame.
+ * Off with autorefresh (bit 131072) or direct scanout (bit 24). Offer fate 3: queued behind the waiting frame; 4: queued, and this offer
+ * STARTed the waiting frame. The TE spin thread does not START the promoted frame while its predecessor's START is still unreported.
+ * Stats (queued, promoted, dropped, full_waits, spin_held, stale_replaced) per 600 STARTs. Not yet observed on device. */
+static unsigned fg_scanout_fifo, fg_scanout_fifo_q, fg_scanout_fifo_buf, fg_scanout_fifo_st[6];
 static unsigned fg_scanout_target(void)
 {
  for (unsigned i = 0; i < (fg_scanout_triple_requested ? 3u : 2u); i++)
-  if (i != fg_scanout_front && (!fg_scanout_back_ready || i != fg_scanout_ready)) return i;
+  if (i != fg_scanout_front && (!fg_scanout_back_ready || i != fg_scanout_ready) && (!fg_scanout_fifo_q || i != fg_scanout_fifo_buf)) return i;
  return fg_scanout_front ^ 1u;
 }
+int fuxi_gpu_scanout_fifo(void) { return fg_scanout_fifo; }
 static unsigned fg_scanout_pa(unsigned buffer) { return buffer >= 3 ? FG_DPU_IOVA + (buffer - 3)*FG_DD_SLOT_BYTES : 0xb8000000u + buffer*0xa00000u; }
 static uintptr_t fg_scanout_pixels_at(unsigned buffer) { return buffer == 2 ? fg_scanout_pixels_c : buffer ? fg_scanout_pixels_b : fg_scanout_pixels; }
 static int fg_scanout_acquire(unsigned publication);
@@ -127,6 +137,9 @@ void fuxi_gpu_scanout_configure(uintptr_t pixels, unsigned enabled, unsigned che
   fg_scanout_triple_requested = fg_scanout_double_requested && triple;
   fg_scanout_panel120_requested = PE_parse_boot_argn("fuxipanel120", &panel120, sizeof(panel120)) && panel120 == 1;
   fg_scanout_te_mode = PE_parse_boot_argn("fuxiscante", &te, sizeof(te)) && te == 1;
+  unsigned early = 0;
+  fg_scanout_fifo = PE_parse_boot_argn("fuxiearly", &early, sizeof(early)) && (early & 4u) && fg_scanout_triple_requested;
+  if (early & 4u) printf("FUXI SCANOUT: present fifo=%u (fuxiearly bit 4%s)\n", fg_scanout_fifo, fg_scanout_fifo ? "" : " needs fuxiscandouble=1 fuxiscantriple=1");
   /* The TE gate needs no floor unless one is given explicitly. */
   if (fg_scanout_te_mode) fg_scanout_drain_us = 0;
   if (PE_parse_boot_argn("fuxiscandrain", &drain, sizeof(drain)) && drain >= 4000 && drain <= FG_SCAN_DRAIN_US) {
@@ -384,6 +397,7 @@ static void fg_scanout_spin_run(thread_call_param_t a, thread_call_param_t b)
     if (hard && fg_scanout_starts == serial && fg_scanout_back_ready) fg_scanout_spin_stat[FG_SPIN_WAIT_DONE]++;
     unsigned ov = hard && fg_scanout_overlap_ok();
     if (fg_scanout_starts != serial || fg_scanout_failed || !fg_scanout_back_ready || (fg_busy && !ov)) result = fg_scanout_back_ready ? FG_SPIN_RACED : FG_SPIN_NO_BACK;
+    else if (fg_scanout_fifo && fg_scanout_async_published) { result = FG_SPIN_RACED; fg_scanout_fifo_st[4]++; } /* bit 4: one START unreported at a time */
     else if (fg_scanout_copy_open && !ov) { result = FG_SPIN_COPY_OPEN; if (hard) fg_scanout_spin_stat[FG_SPIN_COPY_SAME]++; }
     else if (fg_scanout_publish() == 1) {
      fg_scanout_async_published = 1; fg_scanout_spin_stolen = !ov; published = 1; result = FG_SPIN_PUBLISHED;
@@ -1596,6 +1610,7 @@ static int fg_scanout_stop(const char *reason)
      !fg_scanout_address(0xb8000000u))
   printf("FUXI SCANOUT: restore A failed; panel held, reboot required\n");
  fg_scanout_back_ready = 0;
+ if (fg_scanout_fifo_q) { fg_scanout_fifo_st[2]++; fg_scanout_fifo_q = 0; }
  fg_scanout_failed = 1;
  fg_scanout_writable = 0;
  return -1;
@@ -1847,6 +1862,7 @@ static int fg_scanout_acquire(unsigned publication)
   return 1;
  }
  if (fg_scanout_double_active && !publication) {
+  if (fg_scanout_fifo_q) { fg_scanout_fifo_st[3]++; return 0; } /* bit 4: front, ready and queued fill all three buffers */
   if (fg_scanout_back_ready && !fg_scanout_triple_requested) return 0;
   fg_scanout_copy = fg_scanout_target();
   fg_scanout_writable = 1;
@@ -1963,7 +1979,7 @@ int fuxi_gpu_scanout_cpu_acquire(void)
  if ((fg_scanout_ar_on() || fg_scanout_ar_state == 4) && fg_scanout_ar_disable(0, FG_AR_OFF_CPU, "cpu fallback") < 0) return -1;
  int writable = fg_scanout_acquire(1);
  if (writable != 1 || !fg_scanout_double_active) return writable;
- unsigned newest = fg_scanout_back_ready ? (fg_scanout_triple_requested ? fg_scanout_ready : fg_scanout_front ^ 1u) : fg_scanout_front;
+ unsigned newest = fg_scanout_fifo_q ? fg_scanout_fifo_buf : fg_scanout_back_ready ? (fg_scanout_triple_requested ? fg_scanout_ready : fg_scanout_front ^ 1u) : fg_scanout_front;
  if (newest >= 3 && newest < 3 + FG_DD_SLOTS_N && fg_dd_va[newest - 3]) {
   /* Bit 24: the newest frame is a slot's surface (retained by SweetSurface while slotted): its crop to A. */
   const uint8_t *sp = (const uint8_t *)fg_dd_va[newest - 3];
@@ -1976,6 +1992,7 @@ int fuxi_gpu_scanout_cpu_acquire(void)
  }
  if (!fg_scanout_address(0xb8000000u)) return fg_scanout_stop("CPU restore A");
  if (fg_scanout_back_ready) fg_scanout_ready_drops++;
+ if (fg_scanout_fifo_q) { fg_scanout_fifo_st[2]++; fg_scanout_fifo_q = 0; }
  fg_scanout_back_ready = fg_scanout_double_active = fg_scanout_front = 0;
  if (fg_dd_on || fg_dd_dead) (void)fg_dd_mask();
  if (fg_scanout_reentries < 4) printf("FUXI SCANOUT: double CPU fallback, drained; single buffer A until the next GPU frame\n");
@@ -2061,6 +2078,13 @@ static int fg_scanout_publish(void)
  fg_scanout_last_start = now;
  if (fg_scanout_ready_at) { fg_scanout_r2s += now - fg_scanout_ready_at; fg_scanout_r2s_n++; }
  fg_scanout_ready_at = fg_scanout_charged_at = 0;
+ if (fg_scanout_fifo_q && fg_scanout_double_active) {
+  /* Bit 4: the queued frame is the ready one now; it may START from the next TE (the token goes with it, as after an unstarted offer).
+   * The copy index moves to the free buffer, so nothing can be written into the promoted frame before the next acquire. */
+  fg_scanout_ready = fg_scanout_fifo_buf; fg_scanout_back_ready = 1; fg_scanout_fifo_q = 0; fg_scanout_writable = 1;
+  fg_scanout_copy = fg_scanout_target();
+  fg_scanout_ready_at = now; fg_scanout_fifo_st[1]++;
+ }
  fg_scanout_te_frames = fg_scanout_last_count = count >> 16;
  fg_copy_log.te = count >> 16;
  if (++fg_scanout_starts % 600 == 0) {
@@ -2159,6 +2183,11 @@ static int fg_scanout_publish(void)
        fg_scanout_flips, fg_scanout_ready_drops, fg_scanout_retries, current, expected,
        fg_scanout_current_match, fg_scanout_current_mismatch, triple);
    fg_scanout_buffer_flips[0] = fg_scanout_buffer_flips[1] = fg_scanout_buffer_flips[2] = 0;
+   if (fg_scanout_fifo) {
+    unsigned *f = fg_scanout_fifo_st;
+    printf("FUXI SCANOUT: fifo queued=%u promoted=%u dropped=%u full_waits=%u spin_held=%u stale_replaced=%u\n", f[0], f[1], f[2], f[3], f[4], f[5]);
+    for (unsigned i = 0; i < 6; i++) f[i] = 0;
+   }
    fg_scanout_flips = fg_scanout_ready_drops = fg_scanout_retries = 0;
   }
   fg_scanout_wait_ring = fg_scanout_wait_floor = fg_scanout_wait_xfer = fg_scanout_wait_te = 0;
@@ -2203,6 +2232,14 @@ int fuxi_gpu_scanout_async_take(void)
  unsigned a = fg_scanout_async_published; fg_scanout_async_published = 0;
  return a != 0;
 }
+/* Bit 4: queue this copy behind the ready frame instead of replacing it (see fg_scanout_fifo). */
+static unsigned fg_scanout_fifo_ok(void)
+{
+ if (!fg_scanout_fifo || !fg_scanout_triple_requested || !fg_scanout_double_active || !fg_scanout_back_ready || fg_scanout_fifo_q) return 0;
+ if (fg_abi_ar || fg_dd_on || fg_dd_dead || fg_scanout_ready >= 3 || fg_scanout_copy >= 3 || fg_scanout_copy == fg_scanout_ready || fg_scanout_copy == fg_scanout_front) return 0;
+ if (!fg_scanout_ready_at || rsr("cntpct_el0") - fg_scanout_ready_at >= rsr("cntfrq_el0")*fg_scanout_period_us/1000000) { fg_scanout_fifo_st[5]++; return 0; }
+ return 1;
+}
 int fuxi_gpu_scanout_publish(void)
 {
  if (!fuxi_gpu_scanout_owned()) { fg_scanout_offer_fate = 0; return 0; }
@@ -2214,7 +2251,9 @@ int fuxi_gpu_scanout_publish(void)
  if (fg_scanout_failed || fg_busy || !fg_scanout_writable) { (void)fg_dd_mask(); fg_scanout_refused("publish"); return -1; }
  if (fg_dd_lost) { fg_dd_lost = 0; (void)fg_dd_mask(); return 2; } /* a bank fault dropped this present's queued slot: nothing new to offer */
  if (fg_scanout_async_published) fg_scanout_async_published = 0; /* the waiting frame was STARTed during this copy (fate 1): this offer replaces its record */
- if (fg_scanout_double_active) {
+ unsigned queue = fg_scanout_fifo_ok();
+ if (queue) { fg_scanout_fifo_buf = fg_scanout_copy; fg_scanout_fifo_q = 1; fg_scanout_fifo_st[0]++; fg_scanout_offer_fate = 3; }
+ else if (fg_scanout_double_active) {
   if (fg_scanout_back_ready && fg_scanout_triple_requested) fg_scanout_ready_drops++;
   fg_scanout_ready = fg_scanout_triple_requested ? fg_scanout_copy : fg_scanout_front ^ 1u;
   fg_scanout_back_ready = 1;
@@ -2232,6 +2271,11 @@ int fuxi_gpu_scanout_publish(void)
   fg_scanout_kick_why = 0;
   if (fg_abi_hard) { unsigned line, start; fg_scanout_offer_xfer = fg_scanout_read(FG_SCAN_CTL+0x1c, &start) && fg_scanout_read(FG_SCAN_INTF+0x2b0, &line) && ((start & 1) || ((line & 65535) != 0 && (line & 65535) < 2400)); }
   fg_scanout_spin_kick(0);
+ }
+ if (queue) {
+  if (r == 1) fg_scanout_offer_fate = 4; /* the waiting frame STARTed now; the queued one was promoted and waits */
+  else if (r < 0) { if (fg_scanout_fifo_q) fg_scanout_fifo_st[2]++; fg_scanout_fifo_q = 0; fg_scanout_offer_fate = 2; }
+  return r < 0 ? r : 2;
  }
  return r;
 }

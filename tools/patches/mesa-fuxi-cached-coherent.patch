@@ -1,0 +1,75 @@
+turnip/darwin: back the HOST_CACHED memory type with cached-coherent BOs.
+
+When the NativeAdreno kernel reports NativeAdrenoDeviceCachedCoherent
+(fuxigpuncimport bit 29 and its write-back coherent-import self-test passed),
+Turnip already exposes DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT|HOST_CACHED.
+Allocations of that type now ask BoAlloc for NativeAdrenoAllocCachedCoherent,
+GPU-map it writeback=1 shareability=3 and CPU-map it default-cache instead of
+write-combine. Other types and host imports are unchanged. Applied after
+mesa-fuxi-fence-wait-100ms.patch.
+
+--- a/src/freedreno/vulkan/tu_knl.h
++++ b/src/freedreno/vulkan/tu_knl.h
+@@ -63,6 +63,8 @@ struct tu_bo {
+     * CPU mapping (IOConnectMapMemory64 memory type). */
+    uint64_t darwin_handle;
+    uint32_t darwin_token;
++   /* Allocated NativeAdrenoAllocCachedCoherent: CPU write-back, GPU IO-coherent; darwin_bo_map maps it default-cache. */
++   bool darwin_cached;
+ #endif
+ 
+    bool implicit_sync : 1;
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -365,7 +365,10 @@ darwin_bo_init(struct tu_device *dev, struct vk_object_base *base,
+    if (result != VK_SUCCESS)
+       return result;
+ 
+-   NativeAdrenoAbiBoAlloc alloc = {.bytes = size, .align_log2 = 12, .contiguous = 0};
++   /* The HOST_CACHED type exists only when the kernel reported NativeAdrenoDeviceCachedCoherent (its coherent-import self-test
++    * passed with write-back attributes): such a BO is CPU write-back and GPU-mapped writeback/inner-shareable, no cache maintenance. */
++   const bool cached = (mem_property & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) && dev->physical_device->has_cached_coherent_memory;
++   NativeAdrenoAbiBoAlloc alloc = {.bytes = size, .align_log2 = 12, .contiguous = cached ? (uint32_t)NativeAdrenoAllocCachedCoherent : 0u};
+    NativeAdrenoAbiBoAllocReply reply = {};
+    kern_return_t kr = dw_call(NativeAdrenoMethodBoAlloc, &alloc, sizeof(alloc), &reply, sizeof(reply));
+    if (kr != KERN_SUCCESS) {
+@@ -377,8 +380,8 @@ darwin_bo_init(struct tu_device *dev, struct vk_object_base *base,
+       .handle = reply.handle,
+       .iova = iova,
+       .permissions = (flags & TU_BO_ALLOC_GPU_READ_ONLY) ? 1u : 3u,
+-      .writeback = 0,
+-      .shareability = 2,
++      .writeback = cached ? 1u : 0u,
++      .shareability = cached ? 3u : 2u,
+    };
+    NativeAdrenoAbiBoMapReply mapped = {};
+    kr = dw_call(NativeAdrenoMethodBoMap, &map, sizeof(map), &mapped, sizeof(mapped));
+@@ -403,6 +406,7 @@ darwin_bo_init(struct tu_device *dev, struct vk_object_base *base,
+       .unique_id = reply.handle,
+    };
+    bo->darwin_handle = reply.handle;
++   bo->darwin_cached = cached;
+ 
+    tu_dump_bo_init(dev, bo);
+    TU_RMV(bo_allocate, dev, bo);
+@@ -496,8 +500,9 @@ darwin_bo_map(struct tu_device *dev, struct tu_bo *bo, void *placed_addr)
+    mach_vm_size_t length = 0;
+    /* IOUserClient::mapClientMemory64 takes the cache mode from THESE flags, not from the descriptor the driver returns, so a plain
+     * kIOMapAnywhere would give a cached mapping of memory the GPU reads non-cacheable. Write combine is Normal non-cacheable: the
+-    * GPU sees CPU writes after a barrier, and memcpy/unaligned stores stay legal (device-memory mappings fault on those). */
+-   uint32_t options = (placed_addr ? 0 : kIOMapAnywhere) | kIOMapWriteCombineCache;
++    * GPU sees CPU writes after a barrier, and memcpy/unaligned stores stay legal (device-memory mappings fault on those).
++    * A cached-coherent BO is the exception: the kernel made it write-back and IO-coherent, so it is mapped default-cache. */
++   uint32_t options = (placed_addr ? 0 : kIOMapAnywhere) | (bo->darwin_cached ? kIOMapDefaultCache : kIOMapWriteCombineCache);
+    kr = IOConnectMapMemory64(dw.conn, reply.token, mach_task_self(), &address, &length, options);
+    if (kr != KERN_SUCCESS || !address || length < bo->size) {
+       NativeAdrenoAbiBoCpuUnmap undo = {.handle = bo->darwin_handle, .token = reply.token};
+@@ -1092,6 +1097,8 @@ tu_knl_darwin_load(struct tu_instance *instance)
+    device->has_preemption = false;
+    device->is_perf_cntr_selectable = false;
+    device->has_cached_coherent_memory = !!(info->flags & NativeAdrenoDeviceCachedCoherent);
++   if (device->has_cached_coherent_memory)
++      mesa_logi("FUXI KMD: cached-coherent memory type exposed (DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT|HOST_CACHED)");
+    device->has_host_import = !!(dw.params.flags & NativeAdrenoParamsHostImport);
+    device->submitqueue_priority_count = 1;
+ 

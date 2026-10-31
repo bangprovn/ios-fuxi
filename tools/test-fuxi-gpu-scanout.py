@@ -107,7 +107,7 @@ static uint64_t fg_dpu_page_pa(uintptr_t va) {
 static unsigned dpuCleans;
 static void fg_dpu_clean(uintptr_t va,unsigned bytes) {(void)va;(void)bytes;dpuCleans++;}
 static void (*startHook)(void);
-static unsigned modelDrain,modelTe,modelPanel120,modelDouble,modelTriple,parseDouble,parseTriple,modelNc;
+static unsigned modelDrain,modelTe,modelPanel120,modelDouble,modelTriple,parseDouble,parseTriple,modelNc,modelEarly;
 static uint8_t modelB[4320u*2400],modelC[4320u*2400];
 static unsigned failBMap,failCMap;
 static uintptr_t fuxi_gpu_nc_pointer(uint64_t pa,uint64_t size) {
@@ -119,7 +119,7 @@ static unsigned fg_scanout_double_for_model(void);
 static int PE_parse_boot_argn(const char *name,void *value,int size) {
  if(!strcmp(name,"fuxiscandouble"))parseDouble++;if(!strcmp(name,"fuxiscantriple"))parseTriple++;
  unsigned v=!strcmp(name,"fuxiscante")?modelTe:!strcmp(name,"fuxiscandrain")?modelDrain:
-     !strcmp(name,"fuxipanel120")?modelPanel120:!strcmp(name,"fuxiscandouble")?modelDouble:!strcmp(name,"fuxiscantriple")?modelTriple:!strcmp(name,"fuxigpuncimport")?modelNc:0;
+     !strcmp(name,"fuxipanel120")?modelPanel120:!strcmp(name,"fuxiscandouble")?modelDouble:!strcmp(name,"fuxiscantriple")?modelTriple:!strcmp(name,"fuxigpuncimport")?modelNc:!strcmp(name,"fuxiearly")?modelEarly:0;
  if(!v || size<4)return 0;*(unsigned *)value=v;return 1;
 }
 static int fg_abi_live_for_scanout(void) {return abiLive;}
@@ -193,6 +193,7 @@ static void reset(void) {
  dpuAllocCount=dpuFrees=dpuAllocFail=dpuPageFail=dpuCleans=0;
  fg_scanout_double_requested=fg_scanout_double_active=fg_scanout_double_initialized=fg_scanout_front=0;
  parseDouble=parseTriple=0;
+ modelEarly=fg_scanout_fifo=fg_scanout_fifo_q=fg_scanout_fifo_buf=0;memset(fg_scanout_fifo_st,0,sizeof(fg_scanout_fifo_st));
  fg_scanout_triple_requested=modelTriple=failCMap=fg_scanout_ready=fg_scanout_copy=0;
  memset(fg_scanout_buffer_flips,0,sizeof(fg_scanout_buffer_flips));
  fg_scanout_back_ready=fg_scanout_flips=fg_scanout_ready_drops=fg_scanout_retries=0;
@@ -822,6 +823,46 @@ static void triple_setup(uint8_t *panel) {
  assert(!fuxi_gpu_scanout_acquire());intf[0x298/4]=(1u<<16)|2500;
  assert(fuxi_gpu_scanout_acquire()==1 && fuxi_gpu_scanout_triple());
  assert(!memcmp(panel,modelB,sizeof(modelB)) && !memcmp(panel,modelC,sizeof(modelC)));
+}
+static void fifo_setup(uint8_t *panel,unsigned early) {
+ reset();modelDouble=modelTriple=modelTe=1;modelEarly=early;intf[0x2b0/4]=2400;
+ fuxi_gpu_scanout_configure((uintptr_t)panel,1,0);
+ assert(!fuxi_gpu_scanout_acquire());intf[0x298/4]=(1u<<16)|2500;
+ assert(fuxi_gpu_scanout_acquire()==1 && fuxi_gpu_scanout_triple());
+ assert(fg_scanout_copy==1 && fuxi_gpu_scanout_publish()==1 && fg_scanout_front==1);
+}
+// fuxiearly bit 4: a copy finishing while the previous frame waits for START queues behind it (bounded to one), START promotes it.
+static void fifo_tests(uint8_t *panel) {
+ reset();modelDouble=1;modelEarly=4;fuxi_gpu_scanout_configure((uintptr_t)panel,1,0);assert(!fuxi_gpu_scanout_fifo()); // needs triple
+ fifo_setup(panel,3);assert(!fuxi_gpu_scanout_fifo());
+ fifo_setup(panel,7);assert(fuxi_gpu_scanout_fifo());
+ ctl[0x1c/4]=1;intf[0x2b0/4]=100; // a transfer is running: offers wait for START
+ assert(fuxi_gpu_scanout_acquire()==1 && fg_scanout_copy==0 && fuxi_gpu_scanout_publish()==2 && fg_scanout_ready==0 && !fuxi_gpu_scanout_offer_fate());
+ assert(fuxi_gpu_scanout_acquire()==1 && fg_scanout_copy==2);
+ assert(fuxi_gpu_scanout_publish()==2 && fuxi_gpu_scanout_offer_fate()==3 && fg_scanout_fifo_q && fg_scanout_fifo_buf==2);
+ assert(fg_scanout_ready==0 && fg_scanout_back_ready && !fg_scanout_ready_drops && fg_scanout_fifo_st[0]==1);
+ assert(!fuxi_gpu_scanout_acquire() && fg_scanout_fifo_st[3]==1); // no free buffer: refused, bounded to one
+ ctl[0x1c/4]=0;intf[0x2b0/4]=2400;intf[0x298/4]+=1u<<16;unsigned s0=starts;
+ assert(fuxi_gpu_scanout_retry()==1 && starts==s0+1 && fg_scanout_front==0); // START of the waiting frame promotes the queued one
+ assert(!fg_scanout_fifo_q && fg_scanout_ready==2 && fg_scanout_back_ready && fg_scanout_writable && fg_scanout_copy==1 && fg_scanout_fifo_st[1]==1);
+ ctl[0x1c/4]=0;intf[0x298/4]+=1u<<16;assert(fuxi_gpu_scanout_retry()==1 && fg_scanout_front==2 && !fg_scanout_back_ready && starts==s0+2);
+ // Ready for a panel period or longer: replaced as before (counted).
+ ctl[0x1c/4]=1;intf[0x2b0/4]=100;
+ assert(fuxi_gpu_scanout_acquire()==1 && fuxi_gpu_scanout_publish()==2 && fg_scanout_back_ready);unsigned r=fg_scanout_ready;
+ ticks+=fg_scanout_period_us;
+ assert(fuxi_gpu_scanout_acquire()==1 && fuxi_gpu_scanout_publish()==2 && fuxi_gpu_scanout_offer_fate()==2 && !fg_scanout_fifo_q);
+ assert(fg_scanout_ready!=r && fg_scanout_ready_drops==1 && fg_scanout_fifo_st[5]==1);
+ // The offer itself STARTs the waiting frame (fate 4): the queued copy is promoted and waits.
+ ctl[0x1c/4]=0;intf[0x2b0/4]=2400;intf[0x298/4]+=1u<<16;r=fg_scanout_ready;s0=starts;
+ assert(fuxi_gpu_scanout_acquire()==1);unsigned q=fg_scanout_copy;
+ assert(fuxi_gpu_scanout_publish()==2 && fuxi_gpu_scanout_offer_fate()==4 && starts==s0+1 && fg_scanout_front==r);
+ assert(fg_scanout_ready==q && fg_scanout_back_ready && !fg_scanout_fifo_q && fg_scanout_fifo_st[0]==2 && fg_scanout_fifo_st[1]==2);
+ // A frame still queued at stop is dropped with it.
+ ctl[0x1c/4]=1;intf[0x2b0/4]=100;
+ assert(fuxi_gpu_scanout_acquire()==1 && fuxi_gpu_scanout_publish()==2 && fuxi_gpu_scanout_offer_fate()==3 && fg_scanout_fifo_q);
+ assert(fg_scanout_stop("fifo test")==-1 && !fg_scanout_fifo_q && fg_scanout_fifo_st[2]==1);
+ modelEarly=0;ctl[0x1c/4]=1;intf[0x2b0/4]=2400;
+ puts("PASS: present FIFO (fuxiearly bit 4): triple only, queue behind a fresh waiting frame, full refusal, promotion at START, stale replaced, offer-STARTed, stop drop");
 }
 static void triple_tests(uint8_t *panel) {
  for(unsigned d=0;d<3;d++)for(unsigned t=0;t<3;t++) {
@@ -1463,6 +1504,7 @@ int main(void) {
  assert(fuxi_gpu_scanout_publish()==1 && !fg_scanout_iv[0] && !fg_scanout_iv[1] && fg_scanout_starts%600==0);
  panel120_tests(panel);
  triple_tests(panel);
+ fifo_tests(panel);
  double_tests(panel);
  mid_tests(panel);
  ar_tests(panel);
@@ -1631,6 +1673,9 @@ int main(void) {
             'sweet_surface_gpu_poll', 'sweet_surface_present_begin', 'sweet_surface_present_end',
             'sweet_surface_writer_serial', 'sweet_surface_present_notify', 'sweet_surface_present_reading', 'sweet_direct_reading', 'sweet_direct_nap', 'sweet_gpu_writer', 'sweet_surface_direct', 'sweet_surface_gpu_stats',
             'IOSurfaceRootUserClient::trapLock', 'IOSurfaceRootUserClient::trapUnlock'))
+        # fuxiearly bit 2: the writer lease's display wait (its statics too), ahead of sweet_gpu_writer.
+        display_wait = source[source.index('#define SWEET_DISPLAY_WAIT_MS'):source.index('/* AvoidSync reserves a pending producer')]
+        funcs = funcs.replace('static bool sweet_gpu_writer(', display_wait + 'static bool sweet_gpu_writer(', 1)
         stubs = '''
 #include <cstdarg>
 #define FUXI 1
@@ -1653,7 +1698,8 @@ static int fuxi_gpu_scanout_direct_queue(unsigned slot,uint64_t key,const uint64
  assert(slot==directSlot);directQueues++;directQueuedKey=key;directNullPages=!pages;directPagesN=n;directVa=va;directFence=fence;
  if(pages)memcpy(directPages,pages,n*8);return directQueueResult;}
 static void nanoseconds_to_absolutetime(uint64_t ns,uint64_t *t) {*t=ns/1000;}
-static int IOLockSleepDeadline(IOLock *,void *,uint64_t,int) {directNaps++;if(directNaps>=3)directBusy=0;ticks+=300;return 0;}
+static SweetSurface *displayHeld;static void (*sleepHook)();
+static int IOLockSleepDeadline(IOLock *,void *,uint64_t,int) {if(sleepHook){sleepHook();return 0;}directNaps++;if(directNaps>=3)directBusy=0;ticks+=300;return 0;}
 #define kIOSurfaceLockReadOnly 1
 #define kIOReturnNotFound 3
 #define kIOReturnNotReady 4
@@ -1837,9 +1883,34 @@ static int IOLog(const char *format,...) {va_list args;va_start(args,format);vsn
  puts("PASS: bit 24 SweetSurface: eligibility refusals, writer fence, page list per miss, hit without pages/clean, display-read nap and 100 ms bound, LRU give-back, off/fault drain");
  }
 '''
+        extra += r'''
+ // fuxiearly bit 2: a writer lease waits while a queued swap still holds the surface for display (not off, not with a writer outstanding),
+ // bounded by 25 ms; a quarantine during the wait refuses; the display drop wakes only when someone waits.
+ {
+ IOMemoryDescriptor hm;SweetSurface held;held.memory=&hm;held.displayUses=1;displayHeld=&held;
+ int naps=directNaps;unsigned wakes=lockWakes;uint32_t w=9,t=9;uint64_t sum=9,max=9;
+ assert(sweet_gpu_writer(&held,true) && sweet_gpu_writer(&held,false) && directNaps==naps); // off: no wait
+ sweet_surface_display_wait_stats(&w,&t,&sum,&max);assert(!w && !t && !sum && !max);
+ sweet_surface_display_wait(true);sleepHook=[](){displayHeld->displayUses=0;};
+ uint64_t epoch=held.gpuWriterEpoch;
+ assert(sweet_gpu_writer(&held,true,true) && !held.displayUses && held.gpuWriterEpoch==epoch+1 && !sweet_display_waiters);
+ held.displayUses=1;sleepHook=[](){assert(!"no wait with a writer outstanding");};
+ assert(sweet_gpu_writer(&held,true) && sweet_gpu_writer(&held,false) && sweet_gpu_writer(&held,false));
+ sweet_surface_display_wait_stats(&w,&t,&sum,&max);assert(w==1 && !t && sum && max==sum);
+ sleepHook=nullptr;naps=directNaps;epoch=held.gpuWriterEpoch;uint64_t before=ticks;
+ assert(sweet_gpu_writer(&held,true) && held.gpuWriterEpoch==epoch+1 && directNaps>naps && held.displayUses==1);
+ sweet_surface_display_wait_stats(&w,&t,&sum,&max);assert(w==1 && t==1 && max>=25000 && ticks-before>=25000);
+ assert(sweet_gpu_writer(&held,false));
+ sleepHook=[](){displayHeld->gpuQuarantined=true;};assert(!sweet_gpu_writer(&held,true));sleepHook=nullptr;
+ sweet_display_wake();assert(lockWakes==wakes);
+ sweet_display_waiters=1;sweet_display_wake();assert(lockWakes==wakes+1);sweet_display_waiters=0;
+ sweet_surface_display_wait(false);sweet_surface_display_wait_stats(&w,&t,&sum,&max);held.displayUses=0;
+ puts("PASS: writer lease display wait (fuxiearly bit 2): off/no wait, wait until the display drop, none with a writer outstanding, 25 ms bound, quarantine, wake only with waiters");
+ }
+'''
         model = cache.MODEL.replace(' IOLockFree(sweet_gpu_lock);', extra + ' IOLockFree(sweet_gpu_lock);')
         model = model.replace('assert(sweet_surface_gpu_poll(&elapsed)==1);IOLockLock(p);', 'if(sweet_present_count)sweet_surface_present_end();else assert(sweet_surface_gpu_poll(&elapsed)==1);IOLockLock(p);')
-        compile_run(tmp, 'cache', cache.PREFIX.replace(' uint64_t getLength()', ' uint64_t phys=0;uint64_t getPhysicalSegment(uint64_t off,uint64_t *len,int){*len=4096;return phys+off/4096*8192;}\n uint64_t getLength()').replace('uint64_t gpuReadyTime=0;', 'uint32_t id=0,gpuLockSeq=0,gpuWriterFence=0,width=0,height=0;uint64_t gpuReadyTime=0,gpuWriterSerial=0,gpuWriterEpoch=0,gpuCleanSerial=0,gpuCleanEpoch=0;bool gpuCleanValid=false;') + stubs + declarations + funcs + model, cpp=True)
+        compile_run(tmp, 'cache', cache.PREFIX.replace('static void IOLockWakeup(IOLock *p,void *,bool) { assert(p->held); }', 'static unsigned lockWakes;static void IOLockWakeup(IOLock *p,void *,bool) { assert(p->held);lockWakes++; }').replace(' uint64_t getLength()', ' uint64_t phys=0;uint64_t getPhysicalSegment(uint64_t off,uint64_t *len,int){*len=4096;return phys+off/4096*8192;}\n uint64_t getLength()').replace('uint64_t gpuReadyTime=0;', 'uint32_t id=0,gpuLockSeq=0,gpuWriterFence=0,width=0,height=0;uint64_t gpuReadyTime=0,gpuWriterSerial=0,gpuWriterEpoch=0,gpuCleanSerial=0,gpuCleanEpoch=0;bool gpuCleanValid=false;uint32_t displayUses=0;') + stubs + declarations + funcs + model, cpp=True)
         source = (ROOT / 'xnu/fuxi-unixnu/SweetFramebuffer.cpp').read_text()
         declaration = source[source.index('class AppleCLCD :'):source.index('OSDefineMetaClassAndStructors(AppleCLCD')]
         declaration = declaration.replace(': public IOMobileFramebuffer', '').replace('OSDeclareDefaultStructors(AppleCLCD);', 'public:')
@@ -1849,7 +1920,7 @@ static int IOLog(const char *format,...) {va_list args;va_start(args,format);vsn
             'AppleCLCD::vsyncFired', 'AppleCLCD::scanoutLog', 'get32', 'AppleCLCD::observeRecord', 'AppleCLCD::recordDone', 'AppleCLCD::consumeRecord', 'AppleCLCD::retireEarly', 'AppleCLCD::releaseRecord',
             'AppleCLCD::swapWait', 'AppleCLCD::stopRecords',
             'AppleCLCD::writerRetired', 'AppleCLCD::writerWake', 'AppleCLCD::writerWakeAction',
-            'AppleCLCD::presentStep', 'AppleCLCD::stageStats', 'AppleCLCD::completePresent', 'AppleCLCD::presentStats', 'AppleCLCD::presentNext', 'AppleCLCD::swap', 'AppleCLCD::present'))
+            'AppleCLCD::presentStep', 'AppleCLCD::fifoDrop', 'AppleCLCD::stageStats', 'AppleCLCD::completePresent', 'AppleCLCD::presentStats', 'AppleCLCD::presentNext', 'AppleCLCD::swap', 'AppleCLCD::present'))
         methods = re.sub(r'__asm__ volatile\s*\([^;]*\);', '(void)0;', methods)
         extra = '''
  // Pending render: retain the exact swap through idle ticks, CPU fallback and failure.

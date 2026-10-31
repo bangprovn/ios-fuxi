@@ -50,10 +50,14 @@ enum {
  * render targets). The kernel then cleans the range once at map, skips the per-submit clean and the retirement invalidate, and
  * invalidates it once at unmap. Ignored for allocated BOs. A kernel that does not report NativeAdrenoParamsImportGpuOnly refuses it. */
 enum { NativeAdrenoMapGpuOnly = 1 };
+/* BoAlloc.contiguous bits. NativeAdrenoAllocCachedCoherent is accepted only while GetDeviceInfo reports NativeAdrenoDeviceCachedCoherent
+ * (refused otherwise): the BO is then CPU write-back cacheable (BoCpuMap must be mapped default/copyback, not write-combine) and must be
+ * BoMap'ed writeback=1 shareability=3, the attributes the kernel's coherent-import self-test proved; no cache maintenance either way. */
+enum { NativeAdrenoAllocContiguous = 1, NativeAdrenoAllocCachedCoherent = 2 };
 struct NativeAdrenoAbiBoAlloc {
     uint64_t bytes;               /* 4KiB multiple, <= max_bo_bytes */
     uint32_t align_log2;          /* 12..24 */
-    uint32_t contiguous;          /* 1 requires one raw physical span */
+    uint32_t contiguous;          /* bit0 requires one raw physical span; bit1 NativeAdrenoAllocCachedCoherent */
 };
 struct NativeAdrenoAbiBoAllocReply {
     uint64_t handle;              /* opaque to userspace, nonzero */
@@ -144,7 +148,7 @@ struct NativeAdrenoAbiStatus {
  * them from the pinned sources (a6xx catalog, UBWC config, the programmed UCHE ranges), never from a guess. */
 enum {
     NativeAdrenoDeviceClientIova = 1,     /* flags: the client chooses BO addresses (BoMap iova) */
-    NativeAdrenoDeviceCachedCoherent = 2  /* flags: unused until IO-coherent BO memory exists */
+    NativeAdrenoDeviceCachedCoherent = 2  /* flags: BoAlloc takes NativeAdrenoAllocCachedCoherent (IO-coherent write-back BOs) */
 };
 struct NativeAdrenoAbiDeviceInfo {
     uint32_t chip_id;             /* ADRENO_CHIPID, e.g. 0x43050a01 */

@@ -18,7 +18,7 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         d=Path(tmp);conf=d/'smoke.conf'
         compiler=['xcrun','clang++'] if os.uname().sysname=='Darwin' else ['clang++']
-        for name in ('ClientGateTests','BackboardGateTests','TextureLevelsTests','MipAccessTests','SurveyTests','ClientSetupTests','NativeSelectionTests','SurfaceLeaseTests','TranslationPolicyTests','CompileBoostTests','FrameTraceTests','FrameCPUTests','OperationAPITests','FrontendEncodingTests','TransientMemoryTests','SlabMemoryTests','DrawPlanTests','DrawPlanCacheTests','ShadowRangesTests','PrewarmStoreTests','SpirvRelaxTests','SpirvLoopsTests','OcclusionProofTests'):
+        for name in ('ClientGateTests','BackboardGateTests','TextureLevelsTests','MipAccessTests','SurveyTests','ClientSetupTests','NativeSelectionTests','SurfaceLeaseTests','TranslationPolicyTests','CompileBoostTests','FrameTraceTests','FrameCPUTests','OperationAPITests','FrontendEncodingTests','TransientMemoryTests','SlabMemoryTests','DrawPlanTests','DrawPlanCacheTests','ShadowRangesTests','PrewarmStoreTests','SpirvRelaxTests','SpirvLoopsTests','SpirvUnrollTests','SpirvHalfRoundTests','OcclusionProofTests','MemoryTypeTests'):
             subprocess.run([*compiler,'-std=c++17','-Wall','-Wextra','-Werror','-pthread',
                             '-fsanitize=address,undefined',str(ROOT/'tools/fuxi-metal'/(name+'.cpp')),
                             '-o',str(d/name)],check=True)
@@ -26,10 +26,34 @@ def main():
             if not a.compile_only and name == 'FrameTraceTests':
                 subprocess.run([str(d/name)],env=dict(os.environ,FUXI_MTL_TEST_BOOTARGS='fuxigpuoverlap=1'),check=True,timeout=15)
             if not a.compile_only and name == 'TranslationPolicyTests':
+                # FUXI_MTL_HALF_ROUND: modes 1-3 only; lossy for every pipeline unless FUXI_MTL_HALF_ROUND_PIPES lists fh hashes (a malformed entry ends the list)
+                for mode,pipes,fh,want in (('0',None,'1','1'),('1',None,'1','1'),('3',None,'abc','1'),('4',None,'1','1'),('2','abc,0x12','12','1'),('2','abc,12','13','0'),('3','abc,zz,12','12','0'),('3','abc,zz','abc','1')):
+                    e=dict(os.environ,FUXI_MTL_HALF_ROUND=mode);e.pop('FUXI_MTL_HALF_ROUND_PIPES',None)
+                    if pipes is not None:e['FUXI_MTL_HALF_ROUND_PIPES']=pipes
+                    subprocess.run([str(d/name),'half',mode if mode in ('1','2','3') else '0',fh,want],env=e,check=True,timeout=15)
                 for args,env,want in (('',None,'0'),('','1','1'),('','0','0'),('fuxigpurename=1',None,'1'),('fuxigpurename=0','1','0')):
                     e=dict(os.environ,FUXI_MTL_TEST_BOOTARGS=args);e.pop('FUXI_MTL_SHADOW_RENAME',None)
                     if env is not None:e['FUXI_MTL_SHADOW_RENAME']=env
                     subprocess.run([str(d/name),'rename',want],env=e,check=True,timeout=15)
+                for env,want in ((None,'0'),('1','1'),('0','0'),('2','2'),('3','0'),('1 ','0'),('2 ','0'),('','0')):
+                    e=dict(os.environ);e.pop('FUXI_MTL_SUBMIT_LEAN',None)
+                    if env is not None:e['FUXI_MTL_SUBMIT_LEAN']=env
+                    subprocess.run([str(d/name),'lean',want],env=e,check=True,timeout=15)
+                # FUXI_MTL_SPLIT_SUBMIT: exactly "1"; _US 0..100000 (default 400), _MAX 2..8 (default 3); malformed values keep the default
+                for on,us,mx,want in ((None,None,None,('0','400','3')),('1',None,None,('1','400','3')),('2','0','2',('0','0','2')),('1','100000','8',('1','100000','8')),('1 ','100001','9',('0','400','3')),('1','-1','1',('1','400','3')),('1','5x','04',('1','400','4'))):
+                    e=dict(os.environ)
+                    for k,v in (('FUXI_MTL_SPLIT_SUBMIT',on),('FUXI_MTL_SPLIT_SUBMIT_US',us),('FUXI_MTL_SPLIT_SUBMIT_MAX',mx)):
+                        e.pop(k,None)
+                        if v is not None:e[k]=v
+                    subprocess.run([str(d/name),'split',*want],env=e,check=True,timeout=15)
+                for env,want in ((None,'0'),('1','1'),('0','0'),('2','0'),('1 ','0'),('','0')):
+                    e=dict(os.environ);e.pop('FUXI_MTL_BUFFER_CACHED',None)
+                    if env is not None:e['FUXI_MTL_BUFFER_CACHED']=env
+                    subprocess.run([str(d/name),'cached',want],env=e,check=True,timeout=15)
+                for env,want in ((None,'0'),('1','1'),('0','0'),('2','0'),('1 ','0'),('','0')):
+                    e=dict(os.environ);e.pop('FUXI_MTL_FETCH_SPLIT',None)
+                    if env is not None:e['FUXI_MTL_FETCH_SPLIT']=env
+                    subprocess.run([str(d/name),'fetchsplit',want],env=e,check=True,timeout=15)
             if not a.compile_only and name == 'FrameTraceTests':
                 subprocess.run([str(d/name)],env=dict(os.environ,FUXI_MTL_TEST_BOOTARGS='fuxigpumerge=1 fuxigpuoverlap=1'),check=True,timeout=15)
             if not a.compile_only and name == 'FrameCPUTests':

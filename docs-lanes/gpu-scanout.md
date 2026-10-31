@@ -1253,6 +1253,46 @@ waiters wake about one copy (about 1.3 ms) earlier. A failed copy replays the
 record as before. Waiters with flags bit 0 still wait for Shown. New stats
 field: `early_retires=N` on the `SWEET FB: stats` line. Not yet observed.
 
+`fuxiearly` is a bit mask (each bit default off; with none set nothing changes):
+
+- 1: the early retire above.
+- 2: admission retire. SwapWait(flags 0) succeeds from the swap itself
+  (`SwapConsumed` at admission). V251 showed CA SwapWait mode 0 polling about
+  2.0 times per swap light and 3.6-4.5 times heavy (observed); that CA then
+  skips its heartbeat is inferred. Correctness moves to the writer lease: the
+  first lease of a surface (AvoidSync pending leases too) waits while a queued
+  swap still holds it for display (`displayUses`), instead of bumping the
+  writer epoch, which would stale the record and drop it. Never with a writer
+  outstanding (the record could not be copied); the display never waits for
+  an unstarted writer; the last display drop wakes waiters under the writer
+  lock; 25 ms bound, then today's stale-and-drop. Risk: a commit thread can
+  block up to 25 ms; CA may allocate more surfaces.
+- 4: present FIFO (needs `fuxiscandouble=1 fuxiscantriple=1`). A copy that
+  finishes while the previous frame is ready but not STARTed is queued behind
+  it when that frame has been ready for less than one panel period, instead of
+  replacing it (the `replaced` not-shown path). The START promotes it, the
+  next START shows it: at most one TE later than a replacement. While one is
+  queued no buffer is free (acquire refuses, bounding the queue to one frame).
+  Offer fates 3 (queued) and 4 (queued, and the offer STARTed the waiting
+  frame). Off with autorefresh or direct scanout.
+- 8: per-job GPU stamps (`FUXI GPU ABI: job_stamps ...` below). Off, the
+  client ring and fence page are byte-identical to the build before it.
+
+Logs: `SWEET FB: swapwait busy_mode0= busy_mode1= timeouts= busy_per_swap_x1000=
+busy_swap_max= intervals_1= busy_before_1= intervals_2plus= busy_before_2plus=`
+(always; per 600 shown frames: SwapWait polls answered Busy, and how many 1- and
+2+-vsync swap intervals had one before the swap), `SWEET FB: early admit_retires=
+writer_display_waits= timeouts= wait_us avg= max= fifo_queued= fifo_started_at_offer=
+fifo_dropped=` (bits 2 or 4), `FUXI SCANOUT: present fifo=N` at configure and
+`FUXI SCANOUT: fifo queued= promoted= dropped= full_waits= spin_held=
+stale_replaced=` per 600 STARTs (bit 4), and `FUXI GPU ABI: job_stamps per 600
+jobs submit_to_start_us ... exec_us ... end_to_observed_us ... no_stamp` (bit 8,
+announced once by `FUXI GPU ABI: job_stamps on`: CP_REG_TO_MEM of the always-on
+counter at the start and end of every client job, 12 ring words). SweetFramebuffer lines over 200 characters (stats, stages,
+flog, unshown paths, presents) and FuxiMetal frame trace lines are wrapped: a
+continuation starts with `<tag>+`; `tools/fuxi-flog.py` joins them. None of
+this is observed on device yet.
+
 ### Direct scanout: why it is not ported
 
 NativeMobileDisplay (`sheng-dpu-scanout=2`) programs VIG0/VIG1 source address
@@ -2172,3 +2212,46 @@ Risks (guesses, none observed):
 - **Park interplay** (bit 27): unchanged. A direct frame never queues a copy,
   so there is nothing to park.
 - **After a fault,** the panel keeps the faulted frame until the next copy.
+
+## Cached-coherent BOs (`fuxigpuncimport` bit 29, value 536870912, default off)
+
+MTLBuffer memory is Turnip type 0: CPU write-combine, GPU non-cacheable. CPU
+reads of it (index scans, readbacks) are uncached. Bit 29, together with the
+coherent-import self-test (bit 64), lets the kernel hand out IO-coherent
+write-back BOs:
+
+- Kernel: `fuxi_gpu_abi_cached_coherent()` latches "enabled" for the boot only
+  when bit 29 and 64 are set, the GPU is not poisoned and the self-test passed
+  with the wb-ish variant (`fg_abi_coh==1 && fg_abi_coh_wb`). GetDeviceInfo
+  runs the self-test early if needed (it would otherwise wait for the first
+  import), retrying twice 2 ms apart while busy, and then reports
+  `NativeAdrenoDeviceCachedCoherent`. BoAlloc takes
+  `NativeAdrenoAllocCachedCoherent` (bit 1 of `contiguous`) only after that:
+  the BO is allocated without write-combine, must be BoMap'ed writeback=1
+  shareability=3 (the self-test's attributes), and its CPU token maps
+  `kIOMapDefaultCache`. Otherwise every path is unchanged.
+- Turnip (`tools/patches/mesa-fuxi-cached-coherent.patch`): with the flag, the
+  existing DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT|HOST_CACHED type is backed
+  by such BOs. Query pools (`tu_bo_init_new_cached`) also use it.
+- FuxiMetal: `FUXI_MTL_BUFFER_CACHED=1` (default off) picks that type for
+  MTLBuffer-backed buffers when allowed, else the first host-visible type as
+  before. Textures and host imports are unchanged.
+
+Boot value: 502070904 + 536870912 = `fuxigpuncimport=1038941816` (10 digits,
+one more character). Bits 0-28 are all taken and the current bits plus bit 29
+exceed 999999999, so 9 digits needs dropping a current bit.
+
+Logs: `FUXI GPU ABI: cached-coherent BOs enabled reason=selftest-wb-ish-pass`
+or `... disabled reason=bit29-off|no-selftest-bit64|gpu-poisoned|selftest-pending|selftest-refused|selftest-not-wb`
+(each reason once); every 600 submits while enabled or active
+`FUXI GPU ABI: cached BOs per 600 submits enabled E allocs A frees F refused R live L live_kb K`;
+Turnip `FUXI KMD: cached-coherent memory type exposed (...)`; FuxiMetal
+`FUXI MTL: policy buffer_cached=N memory_types=0:DL|HV|HC,1:DL|HV|HC|HCA` and
+`FUXI MTL: buffer memory type=T flags=... cached=N`.
+
+Risks (guesses, none observed): the self-test proves CP reads/writes of a
+write-back inner-shareable page. Shader (UCHE/TP) reads of such pages are
+inferred from imports already in use, not proven. If coherency fails, the GPU
+reads stale vertex/index/uniform bytes: visual corruption, not memory
+corruption. CPU write-back mappings of GPU-written buffers rely on the same
+snooping in the other direction.

@@ -76,6 +76,11 @@ void main() {color=textureLod(image,vec2(0.5),constants.lod);}
         for args in ('', 'fuxigpuperf=4', controls+'fuxigpuperf=4', controls+'fuxigpuperf=5', controls+'fuxigpuperf=6'):
             assert pixels(invoke(d/'barriers', args)) == pixels(before), 'boundary controls differ: '+args
         print('PASS: CA boundary A/B pixels, exact batch counts, all independent bit combinations')
+        # FUXI_MTL_SUBMIT_LEAN: identical pixels and barrier/pass counts
+        for args in (controls+'fuxigpuperf=7', controls+'fuxigpuperf=3', ''):
+            plain, lean = (invoke(d/'barriers', args, FUXI_MTL_SUBMIT_LEAN=v) for v in '01')
+            assert pixels(plain)+re.findall(r'COUNTS .*', plain) == pixels(lean)+re.findall(r'COUNTS .*', lean), 'submit lean changed pixels/counts: '+args
+        print('PASS: FUXI_MTL_SUBMIT_LEAN keeps CA boundary pixels and barrier/pass counts')
         for extra in ('', 'fuxigpufeedback=1', 'fuxigpuoverlap=1 fuxigpusubmit=1', 'fuxigpuoverlap=1 fuxigpusubmit=1 fuxigpufeedback=1'):
             baseline = invoke(d/'test', extra)
             merged = invoke(d/'test', extra+' fuxigpumerge=1')
@@ -85,6 +90,9 @@ void main() {color=textureLod(image,vec2(0.5),constants.lod);}
                 skips = [line for line in baseline.splitlines() if line.startswith('SKIP:')]
                 print('\n'.join(skips) if skips else 'PASS: lavapipe exposes ordered attachment access; fetch clear/interleaved/mip/two-flight pixels tested')
         assert invoke(d/'test', 'fuxigpumerge=1 fuxigpusubmit=1', trace='2') == invoke(d/'test', 'fuxigpumerge=1 fuxigpusubmit=1')
+        for extra in ('', 'fuxigpumerge=1 fuxigpuoverlap=1 fuxigpusubmit=1 fuxigpufeedback=1 fuxigpuperf=7'):
+            assert invoke(d/'test', extra, FUXI_MTL_SUBMIT_LEAN='1') == invoke(d/'test', extra, FUXI_MTL_SUBMIT_LEAN='0'), 'submit lean changed merge pixels: '+extra
+        print('PASS: FUXI_MTL_SUBMIT_LEAN byte-identical render merge output')
         print('PASS: level-2 bounded CPU sampling preserves merged pixels')
         # All bits independently and together, including two flights and the
         # feedback path. Pixels must match the unchanged singleton baseline.
@@ -103,6 +111,37 @@ void main() {color=textureLod(image,vec2(0.5),constants.lod);}
         merged = invoke(d/'test', 'fuxigpumerge=1 fuxigpuoverlap=1 fuxigpusubmit=1 fuxigpuperf=3', MERGE_TEST_NO_ORDER='1')
         assert baseline == merged, 'no-extension fallback pixels differ'
         print('PASS: extension-hidden fallback keeps ordinary merge/shadow pixels; fetch skipped')
+        # FUXI_MTL_FETCH_SPLIT: CA-shaped passes mixing fetch (programmable blend with the destination) and SRC_ALPHA-blended draws. Pixels equal knob off,
+        # alone and with FUXI_MTL_NOFETCH_RP; with merging, every fetch draw after a non-fetch draw of its pass gets exactly one by-region in-pass barrier.
+        subprocess.run(common+sanitized+definitions+[str(ROOT/'tools/fuxi-metal/FetchSplitTests.cpp'), '-ldl', '-pthread', '-o', str(d/'fetchsplit')], check=True)
+        def fetch_split(args, split, nofetch='0', **extra):
+            p = subprocess.run([str(d/'fetchsplit')], env=dict(env, FUXI_MTL_TEST_BOOTARGS='fuxigpuframetrace=1 '+args, FUXI_MTL_FETCH_SPLIT=split, FUXI_MTL_NOFETCH_RP=nofetch, **extra), text=True, capture_output=True, timeout=120)
+            assert p.returncode == 0, (args, split, nofetch, p.stdout[-2000:], p.stderr[-4000:])
+            assert 'AddressSanitizer' not in p.stderr and 'runtime error:' not in p.stderr, p.stderr
+            assert 'FUXI MTL: policy fetch_split=%s' % ('1' if split == '1' else '0') in p.stderr, p.stderr[-2000:]
+            return p
+        fetch_pixels = lambda out: [line for line in out.splitlines() if line.startswith('PIXELS ')]
+        for args in ('', 'fuxigpumerge=1', 'fuxigpumerge=1 fuxigpuoverlap=1 fuxigpusubmit=1 fuxigpuperf=7', 'fuxigpumerge=1 fuxigpuperf=3'):
+            ref = fetch_split(args, '0')
+            if 'SKIP:' in ref.stdout:
+                print(ref.stdout.strip())
+                break
+            assert len(fetch_pixels(ref.stdout)) == 7 and all(' issued=0 in_pass=0' in l for l in ref.stdout.splitlines() if l.startswith('FETCHSPLIT '))
+            assert 'blend_order_flag=0' not in ref.stderr
+            for nofetch in ('0', '1'):
+                for extra in ({}, dict(FUXI_MTL_GPU_PASS_TIMES='1', FUXI_MTL_GPU_DRAW_TIMES='1')):
+                    p = fetch_split(args, '1', nofetch, **extra)
+                    assert fetch_pixels(p.stdout) == fetch_pixels(ref.stdout), 'fetch split changed pixels: %r nofetch=%s %r' % (args, nofetch, extra)
+                    assert 'framebuffer fetch plan mask=0 ordered=1 blend_order_flag=0' in p.stderr and 'framebuffer fetch plan mask=1 ordered=1 blend_order_flag=1' in p.stderr
+                    issued = sum(int(x) for x in re.findall(r'FETCHSPLIT \S+ .* issued=(\d+)', p.stdout))
+                    assert (issued == 0) == ('fuxigpumerge=1' not in args), (args, issued)
+                    if nofetch == '0':
+                        assert fetch_pixels(fetch_split(args, '0', '1').stdout) == fetch_pixels(ref.stdout)
+            print('PASS: FUXI_MTL_FETCH_SPLIT pixels identical %r (alone, with NOFETCH_RP, with pass/draw times); in-pass barriers=%d' % (args, issued))
+        for extra in ('', 'fuxigpumerge=1 fuxigpuoverlap=1 fuxigpusubmit=1 fuxigpufeedback=1 fuxigpuperf=7'):
+            assert invoke(d/'test', extra, FUXI_MTL_FETCH_SPLIT='1') == invoke(d/'test', extra), 'fetch split changed render merge output: '+extra
+            assert pixels(invoke(d/'barriers', extra, FUXI_MTL_FETCH_SPLIT='1')) == pixels(invoke(d/'barriers', extra)), 'fetch split changed barrier fixture pixels: '+extra
+        print('PASS: FUXI_MTL_FETCH_SPLIT keeps render merge (fetch-normal interleaved, mip view, two flights) and CA boundary outputs')
         for bad in ('0', 'bad', '1 fuxigpumerge=1'):
             invoke(d/'test', 'fuxigpumerge='+bad)
         print('PASS: disabled/malformed/duplicate boot tokens preserve default pass counts')
@@ -114,6 +153,51 @@ void main() {color=textureLod(image,vec2(0.5),constants.lod);}
         subprocess.run(common+sanitized+definitions+[str(ROOT/'tools/fuxi-metal/VariantPlanTests.cpp'), '-ldl', '-pthread', '-o', str(d/'variants')], check=True)
         print(invoke(d/'variants', 'fuxigpumerge=1 fuxigpusubmit=1', CONTROL_REQUIRE_VARIANT='1'), end='')
         print(invoke(d/'variants', 'fuxigpumerge=1 fuxigpusubmit=1 fuxigputrace=1', CONTROL_REQUIRE_VARIANT='1'), end='')
+        # FUXI_MTL_SUBMIT_LEAN on a CA-shaped submit, with and without the rename/hoist/reorder/rt-shadow rewrites; more than the 20 logged hoists, so the
+        # reason-string skip runs. Pixels, per-submit counts and the earlier-writer refusal must equal the default planner byte for byte.
+        subprocess.run(common+sanitized+definitions+[str(ROOT/'tools/fuxi-metal/SubmitLeanTests.cpp'), '-ldl', '-pthread', '-o', str(d/'lean')], check=True)
+        rewrites = dict(FUXI_MTL_RT_RENAME='1', FUXI_MTL_FRAG_RELAXED='1', FUXI_MTL_RT_SHADOW='1')
+        for args in ('', 'fuxigpumerge=1 fuxigpuoverlap=1 fuxigpusubmit=1 fuxigpuperf=7', 'fuxigpumerge=1 fuxigpuperf=3'):
+            for extra in ({}, rewrites):
+                plain = invoke(d/'lean', args, FUXI_MTL_SUBMIT_LEAN='0', **extra)
+                for level in '12':
+                    assert plain == invoke(d/'lean', args, FUXI_MTL_SUBMIT_LEAN=level, **extra), 'submit lean '+level+' changed output: '+args+' '+str(extra)
+                assert int(re.search(r'RENAME submits=(\d+)', plain).group(1)) > (20 if extra else -1)
+                assert int(re.search(r'hoisted=(\d+)', plain).group(1)) > (20 if extra else -1)
+        # =2 with robustBufferAccess enabled skips the CPU index scan of the in-range indexed draws: same output, and the skip is logged.
+        robust = dict(rewrites, FUXI_MTL_ROBUST='1')
+        assert invoke(d/'lean', 'fuxigpumerge=1 fuxigpuperf=7', FUXI_MTL_SUBMIT_LEAN='0', **robust) == invoke(d/'lean', 'fuxigpumerge=1 fuxigpuperf=7', FUXI_MTL_SUBMIT_LEAN='2', **robust), 'submit lean 2 changed robust output'
+        p = subprocess.run([str(d/'lean')], env=dict(env, FUXI_MTL_TEST_BOOTARGS='fuxigpuframetrace=1 fuxigpumerge=1', FUXI_MTL_SUBMIT_LEAN='2', **robust), text=True, capture_output=True, timeout=90)
+        assert p.returncode == 0 and 'policy submit_lean=2' in p.stderr and 'index scan skipped (robust_buffer=1)' in p.stderr, p.stderr[-2000:]
+        print('PASS: FUXI_MTL_SUBMIT_LEAN=1/2 identical pixels, counts and refusal on the CA-shaped fixture (rewrites off/on)')
+        # FUXI_MTL_SPLIT_SUBMIT: chunked recording/queueing (every pass end, up to 8 chunks) leaves pixels, pass/draw/barrier counts, overlap retirement,
+        # early release and the drained-failure path identical; only CHUNKS lines (QueueSubmit counts) differ. Fault modes run in their own processes.
+        recorded = ['-DFUXI_MTL_HOST_TEST', '-DFUXI_MTL_ICD="'+str(d/'proxy.so')+'"', '-DFUXI_MTL_TRANSLATOR="'+str(d/'bridge.so')+'"'] # submit counter, fence faults, blending control
+        subprocess.run(common+sanitized+recorded+[str(ROOT/'tools/fuxi-metal/SplitSubmitTests.cpp'), '-ldl', '-pthread', '-o', str(d/'split')], check=True)
+        chunked = dict(FUXI_MTL_SPLIT_SUBMIT='1', FUXI_MTL_SPLIT_SUBMIT_US='0', FUXI_MTL_SPLIT_SUBMIT_MAX='8')
+        timed = dict(FUXI_MTL_GPU_PASS_TIMES='1', FUXI_MTL_GPU_DRAW_TIMES='1')
+        strip = lambda output: [line for line in output.splitlines() if not line.startswith('CHUNKS ')]
+        for args in ('', 'fuxigpumerge=1 fuxigpuoverlap=1 fuxigpusubmit=1 fuxigpuperf=7', 'fuxigpumerge=1 fuxigpuperf=3'):
+            for extra in ({}, dict(rewrites, **timed)):
+                plain = invoke(d/'split', args, FUXI_MTL_SPLIT_SUBMIT='0', **extra)
+                for limit in ('2', '3', '8'):
+                    split = invoke(d/'split', args, **dict(chunked, FUXI_MTL_SPLIT_SUBMIT_MAX=limit), **extra)
+                    assert strip(plain) == strip(split), 'split submit changed output: '+args+' '+str(extra)+' max='+limit
+                    counts = [int(x) for x in re.findall(r'CHUNKS sync frame=\d+ queue_submits=(\d+)', split)]
+                    assert len(counts) == 6 and all(1 < c <= int(limit) for c in counts) and 'CHUNKS drained failed=1' in split, split
+                assert re.findall(r'CHUNKS sync frame=\d+ queue_submits=(\d+)', plain) == ['1']*6 and 'CHUNKS drained failed=0' in plain
+        for mode in ('lost', 'timeout', 'chunk', 'drain'):
+            for knob in ({'FUXI_MTL_SPLIT_SUBMIT': '0'}, chunked):
+                print(invoke(d/'split', 'fuxigpunoslab=1', cli=(mode,), **knob), end='')
+        controls = 'fuxigpumerge=1 fuxigpusubmit=1 fuxigpuoverlap=1 '
+        for args in (controls+'fuxigpuperf=7', controls+'fuxigpuperf=3', ''):
+            plain, split = invoke(d/'barriers', args), invoke(d/'barriers', args, **chunked)
+            assert pixels(plain)+re.findall(r'COUNTS .*', plain) == pixels(split)+re.findall(r'COUNTS .*', split), 'split submit changed barrier pixels/counts: '+args
+        for extra in ('', 'fuxigpumerge=1 fuxigpuoverlap=1 fuxigpusubmit=1 fuxigpufeedback=1 fuxigpuperf=7'):
+            # RenderMergeTests asserts one QueueSubmit per submit, which a split frame breaks by design; its lean twin has no such assert
+            for level in '012':
+                assert invoke(d/'lean', extra, FUXI_MTL_SUBMIT_LEAN=level, **chunked) == invoke(d/'lean', extra), 'split submit changed lean fixture output: lean='+level+' '+extra
+        print('PASS: FUXI_MTL_SPLIT_SUBMIT identical pixels/counts (sync, two flights, early release, drained failure; barrier/lean 0/1/2 fixtures), faults poison')
         subprocess.run(common+['-O2']+definitions+[str(ROOT/'tools/fuxi-metal/SubmitBench.cpp'), '-ldl', '-pthread', '-o', str(d/'bench')], check=True)
         for uncached in (True, False, False, True):
             overrides = {'PIPE_BENCH_UNCACHED': '1'} if uncached else {}

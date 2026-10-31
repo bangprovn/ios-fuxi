@@ -28,20 +28,20 @@ on:
         description: Hosted macOS image (macos-14 is unsupported from 2026-11-02)
         type: choice
         options: [macos-14, macos-15, macos-26]
-        default: macos-14
+        default: macos-15
       xcode:
         description: Preinstalled Xcode version (/Applications/Xcode_VERSION.app); 15.x only on macos-14
         type: string
-        default: '15.4'
+        default: '16.2'
       iig_mode:
         description: Kernel iig - xcode (Xcode 15 iig), capture (also archive iig-pregen), replay (pregenerated outputs, any Xcode)
         type: choice
         options: [xcode, capture, replay]
-        default: xcode
+        default: replay
       iig_run:
         description: replay - ID of a capture run with fuxi-iig-pregen-* artifacts (empty uses committed xnu/iig-pregen/)
         type: string
-        default: ''
+        default: '41098982212'
 
 permissions:
   contents: read

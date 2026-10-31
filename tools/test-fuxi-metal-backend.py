@@ -3,6 +3,7 @@
 import argparse
 import importlib.util
 import os
+import re
 from pathlib import Path
 import subprocess
 import tempfile
@@ -74,12 +75,17 @@ def main():
         subprocess.run(flags+['-shared','-fPIC',str(d/'proxy.cpp'),'-ldl','-o',str(d/'proxy.so')],check=True)
         subprocess.run(flags+['-fsanitize=address,undefined','-DFUXI_MTL_HOST_TEST','-DFUXI_MTL_ICD="'+str(d/'proxy.so')+'"',
             '-I'+str(ROOT/'tools'),str(d/'test.cpp'),'-ldl','-pthread','-o',str(d/'test')],check=True)
-        env=dict(os.environ,SOFTWARE_ICD=str(a.icd),ASAN_OPTIONS='detect_leaks=0',FUXI_MTL_TEST_BOOTARGS='')
-        for extra,expected in (({},0),({'FUXI_MTL_TEST_BOOTARGS':'fuxigpuframetrace=1'},0),({'FUXI_MTL_TEST_BOOTARGS':'fuxigpuframetrace=2'},0),({'TIMEOUT':'1'},1),({'LOST':'1'},1),({'BAD_FILL':'1'},1)):
+        env=dict(os.environ,SOFTWARE_ICD=str(a.icd),ASAN_OPTIONS='detect_leaks=0',FUXI_MTL_TEST_BOOTARGS='');env.pop('FUXI_MTL_BUFFER_CACHED',None)
+        for extra,expected in (({},0),({'FUXI_MTL_BUFFER_CACHED':'1'},0),({'FUXI_MTL_TEST_BOOTARGS':'fuxigpuframetrace=1'},0),({'FUXI_MTL_TEST_BOOTARGS':'fuxigpuframetrace=2'},0),({'TIMEOUT':'1'},1),({'LOST':'1'},1),({'BAD_FILL':'1'},1)):
             p=subprocess.run([str(d/'test')],env=dict(env,**extra),text=True,capture_output=True,timeout=30)
             assert p.returncode==expected,(extra,p.stdout,p.stderr)
             assert 'AddressSanitizer' not in p.stderr and 'runtime error:' not in p.stderr,p.stderr
-            if expected==0:print(p.stdout,end='')
+            if expected==0:
+                print(p.stdout,end='')
+                # Buffer memory-type choice logged once (lavapipe: every type is host cached, so both settings pick the first host-visible type).
+                cached='1' if extra.get('FUXI_MTL_BUFFER_CACHED')=='1' else '0'
+                assert p.stderr.count('FUXI MTL: policy buffer_cached=')==1 and 'FUXI MTL: policy buffer_cached='+cached+' memory_types=0:' in p.stderr,p.stderr
+                assert re.search(r'FUXI MTL: buffer memory type=\d+ flags=\S*HV\S* cached=[01]\n',p.stderr),p.stderr
             else:assert 'FAIL' in p.stderr,p.stderr
         print('PASS: injected fence timeout, device loss, last-byte corruption stop execution')
 if __name__=='__main__':main()
