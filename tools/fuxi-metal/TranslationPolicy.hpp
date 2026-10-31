@@ -29,13 +29,31 @@ inline TranslationPolicy translationPolicy(const char *args) {
  return {translationOption(args,"fuxigpustages="),translationOption(args,"fuxigputrace="),translationOption(args,"fuxigpuasync="),translationOption(args,"fuxicompileboost="),translationFrameTrace(args)!=0,translationOption(args,"fuxigpupipelined="),translationOption(args,"fuxigpuskip="),translationOption(args,"fuxigpufeedback="),translationOption(args,"fuxigpuoverlap="),translationOption(args,"fuxigpusubmit="),translationOption(args,"fuxigpugmem="),translationOption(args,"fuxigpumerge="),translationPerf(args),translationFrameTrace(args)==2};
 }
 inline bool earlyScheduledWait(const TranslationPolicy &p,bool scanout,bool quiet,const char *process) {return p.overlap && p.submitFast && scanout && quiet && process && !strcmp(process,"backboardd");}
+// fmtl=<hex> on the boot line sets FUXI_MTL_* switches, so trying one needs no root write. A variable already set wins.
+inline void applyBootOptions(const char *args) {
+ static const struct {const char *name,*value;} bits[]={{"FUXI_MTL_ORDER_FETCH_ONLY","1"},{"FUXI_MTL_NOFETCH_RP","1"},{"FUXI_MTL_OCCLUDE","1"},{"FUXI_MTL_DRAW_AREA","1"},
+  {"FUXI_MTL_EARLY_RELEASE","1"},{"FUXI_MTL_SAMPLE_SHADOW","1"},{"FUXI_MTL_SPIRV_UNROLL","1"},{"FUXI_MTL_SPIRV_UNROLL","2"},{"FUXI_MTL_HALF_ROUND","1"},{"FUXI_MTL_HALF_ROUND","2"},
+  {"FUXI_MTL_HALF_ROUND","3"},{"FUXI_MTL_SUBMIT_LEAN","1"},{"FUXI_MTL_SUBMIT_LEAN","2"},{"FUXI_MTL_SPLIT_SUBMIT","1"},{"FUXI_MTL_FETCH_SPLIT","1"},{"FUXI_MTL_BUFFER_CACHED","1"}};
+ for(const char *p=args;*p;){
+  p+=strspn(p," 	
+");size_t n=strcspn(p," 	
+");
+  if(n>5 && !strncmp(p,"fmtl=",5)){
+   unsigned long mask=strtoul(p+5,nullptr,16);
+   for(size_t i=0;i<sizeof(bits)/sizeof(bits[0]);++i)if(mask>>i&1)setenv(bits[i].name,bits[i].value,0);
+   fprintf(stderr,"FUXI MTL: boot options fmtl=%lx
+",mask);return;
+  }
+  p+=n;
+ }
+}
 inline TranslationPolicy systemTranslationPolicy() {
  static const auto policy=[] {
   char args[4096]={};
 #ifdef FUXI_MTL_HOST_TEST
   const char *test=getenv("FUXI_MTL_TEST_BOOTARGS");if(test)snprintf(args,sizeof(args),"%s",test);
 #else
-  systemString("kern.bootargs",args,sizeof(args));
+  systemString("kern.bootargs",args,sizeof(args));applyBootOptions(args);
 #endif
   bool stages=false,trace=false,async=false;
   TranslationPolicy p{translationOption(args,"fuxigpustages=",&stages),translationOption(args,"fuxigputrace=",&trace),translationOption(args,"fuxigpuasync=",&async),translationOption(args,"fuxicompileboost="),translationFrameTrace(args)!=0,translationOption(args,"fuxigpupipelined="),translationOption(args,"fuxigpuskip="),translationOption(args,"fuxigpufeedback="),translationOption(args,"fuxigpuoverlap="),translationOption(args,"fuxigpusubmit="),translationOption(args,"fuxigpugmem="),translationOption(args,"fuxigpumerge="),translationPerf(args),translationFrameTrace(args)==2};
