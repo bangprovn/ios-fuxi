@@ -29,7 +29,7 @@
  	sweet_sample_start();
 --- a/bsd/dev/fuxi_wlan.c
 +++ b/bsd/dev/fuxi_wlan.c
-@@ -0,0 +1,5315 @@
+@@ -0,0 +1,5406 @@
 +/*
 + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
 + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -60,6 +60,8 @@
 + *                 align to 2^n of size, 0x40 read-only PMK8550 gpio3 sleep clock log, 0x80 also
 + *                 enable it, 0x100 decode BHI error words and scan RDDM text
 + *   fuxiwlanqrtr=1  W11 capability-only diagnostic; =2 W12 setup; =3 W13 small-chunk negotiation; =4 W14 downloads; =5 W15 config/mode
++ *   fuxiwlanp18=N  stock firmware opt-ins, default 0: 1 HOST_CAP as CNSS sends it, 2 QDSS config
++ *                 after M3_INFO, 4 force and scan a dump at a FW_READY or MODE timeout
 + *   fuxiwlanw15=1  W15 only: omit WLAN_CFG shadow-v3 TLV (default 0)
 + *   fuxiwlanw16=N  qrtr=5 only: 1 larger IPCR, 2 doorbell redrive, 3 both,
 + *                 4 diagnostics only; all include MODE context diagnostics
@@ -787,6 +789,13 @@
 +#define WL17_ERRDEC 0x100u
 +#define WL17_MASK 0x1fcu
 +static unsigned wl17_bits;
++/* P18: the phone's own firmware has only ever seen CNSS (Android). Facts from
++ * the CNSS source (cnss_wlfw_host_cap_send_sync, cnss_wlfw_qdss_dnld_send_sync,
++ * kalama chip_cfg@1) and Linux mhi_force_rddm_mode; no code taken from them. */
++#define WL18_STOCKCAP 1u
++#define WL18_QDSS 2u
++#define WL18_FORCERDDM 4u
++static unsigned wl18_bits;
 +static unsigned wl17_phy17_len;
 +static uint64_t wl17_phy17_val;
 +
@@ -899,7 +908,7 @@
 +static uint64_t wl_target_total;
 +static struct wl_dma wl_ipcr;
 +/* W14 inputs are retained through keep/containment, including partial reads. */
-+static struct wl_dma wl14_regdb, wl14_bdf, wl14_m3;
++static struct wl_dma wl14_regdb, wl14_bdf, wl14_m3, wl14_qdss;
 +static char wl14_bdf_name[65]; /* one extra byte detects XNU string truncation */
 +#define WL14_FILE_MAX (1024u * 1024u)
 +#define WL14_M3_MAX (2u * 1024u * 1024u)
@@ -1053,6 +1062,15 @@
 +				    !!(wl17_bits & WL17_DMAALIGN), !!(wl17_bits & WL17_CLKCHECK), !!(wl17_bits & WL17_CLKON),
 +				    !!(wl17_bits & WL17_ERRDEC), !wl_variant_invalid);
 +			}
++		}
++	}
++	wl18_bits = 0;
++	{
++		int bits = 0;
++		if (PE_parse_boot_argn("fuxiwlanp18", &bits, sizeof(bits)) && wl_w12 && bits > 0 && bits <= 7) {
++			wl18_bits = (unsigned)bits;
++			printf("FUXI WLAN: P18 bits %#x (stockcap %u qdss %u forcerddm %u)\n", wl18_bits,
++			    !!(wl18_bits & WL18_STOCKCAP), !!(wl18_bits & WL18_QDSS), !!(wl18_bits & WL18_FORCERDDM));
 +		}
 +	}
 +	wl15_variant = 0;
@@ -2142,7 +2160,7 @@
 +static vm_offset_t
 +wl_owned_alias(uint64_t pa, unsigned bytes, bool tables_only)
 +{
-+	struct wl_dma *bufs[] = { &wl_tables, &wl_image, &wl_vectors, &wl_contexts, &wl_rddm, &wl_rxvectors, &wl_msi_sink, &wl_amss, &wl_ipcr, &wl14_regdb, &wl14_bdf, &wl14_m3 };
++	struct wl_dma *bufs[] = { &wl_tables, &wl_image, &wl_vectors, &wl_contexts, &wl_rddm, &wl_rxvectors, &wl_msi_sink, &wl_amss, &wl_ipcr, &wl14_regdb, &wl14_bdf, &wl14_m3, &wl14_qdss };
 +	unsigned fixed = sizeof(bufs)/sizeof(bufs[0]);
 +	for (unsigned i = 0; i < (tables_only ? 1u : fixed + WL_TARGET_MAX); i++) {
 +		struct wl_dma *d = i < fixed ? bufs[i] : &wl_target[i-fixed];
@@ -3872,6 +3890,21 @@
 +{
 +	/* ath12k_qmi_host_cap_send: fresh boot cal_done=0, memory mode=0,
 +	 * internal clock bits 1/2/3, hw_params CNSS feature bits 3/4. */
++	if (wl18_bits & WL18_STOCKCAP) {
++		/* No nm_modem: this board feeds the external sleep clock. ddr_range
++		 * is a fixed array of three {start, size}; only the first is used. */
++		if (wl12_tlv(e, 0x10, 1, 4) || wl12_tlv(e, 0x14, 1, 1) || wl12_tlv(e, 0x16, 1, 1) ||
++		    wl12_tlv(e, 0x17, 1, 1) || wl12_tlv(e, 0x1a, 0, 1)) { return 1; }
++		if (e->len > sizeof(e->data)-51) { return wl_w11_fail("HOST_CAP ddr_range bounds"); }
++		e->data[e->len++] = 0x1f; wl_put16(e->data+e->len, 48); e->len += 2;
++		bzero(e->data+e->len, 48);
++		wl_put32(e->data+e->len, (uint32_t)wl_iova_base); wl_put32(e->data+e->len+4, (uint32_t)(wl_iova_base >> 32));
++		wl_put32(e->data+e->len+8, (uint32_t)(wl_iova_end-wl_iova_base));
++		e->len += 48;
++		if (wl12_tlv(e, 0x20, 1, 4)) { return 1; }
++		printf("FUXI WLAN: P18 host cap CNSS profile ddr_range %#llx size %#llx feature_list 0x4\n",
++		    (unsigned long long)wl_iova_base, (unsigned long long)(wl_iova_end-wl_iova_base));
++	} else
 +	if (wl12_tlv(e, 0x10, 1, 4) || wl12_tlv(e, 0x13, 0x0e, 1) ||
 +	    wl12_tlv(e, 0x14, 1, 1) || wl12_tlv(e, 0x16, 1, 1) ||
 +	    wl12_tlv(e, 0x17, 1, 1) || wl12_tlv(e, 0x1a, 0, 1) ||
@@ -3897,7 +3930,7 @@
 +	if (wl12_mlo_variant || wl17_bits) {
 +		printf("FUXI WLAN: W12 host cap MLO TLVs %s num_phy %u\n", mlo ? "present" : "omitted", wl12_num_phy);
 +	}
-+	if (wl12_tlv(e, 0x27, 0x18, 8)) { return 1; }
++	if (wl12_tlv(e, 0x27, (wl18_bits & WL18_STOCKCAP) ? 0x4 : 0x18, 8)) { return 1; }
 +	if (wl17_bits & WL17_HOSTMEM) {
 +		printf("FUXI WLAN: P17 host cap vendor TLV 0x33 host-memory-on-demand = 1 appended after 0x27\n");
 +		return wl12_tlv(e, 0x33, 1, 1);
@@ -4155,6 +4188,8 @@
 +			if (wl_get16(v) || wl_get16(v+2)) {
 +				if (wl13_delayed && msg == 0x36 && !wl_get16(v+2)) {
 +					printf("FUXI WLAN: W13 delayed RESPOND_MEM result %u error 0 accepted (ath12k)\n", wl_get16(v));
++				} else if (msg == 0x44) {
++					printf("FUXI WLAN: P18 QDSS refused result %u error %u; CNSS goes on too\n", wl_get16(v), wl_get16(v+2));
 +				} else { return wl_w11_fail("WLFW setup rejected"); }
 +			}
 +		} else if (!indication && msg == 0x20 && type == 0x10) {
@@ -4169,6 +4204,10 @@
 +				printf("FUXI WLAN: W14 share_mem %u type %u start %#llx size %#llx (never dereferenced)\n",
 +				    i, wl_get32(q), wl_get64(q+4), wl_get64(q+12));
 +			}
++		} else if (!indication && msg == 0x25 && type == 0x10 && n == 8) {
++			uint64_t host_bdf = wl_get64(v);
++			printf("FUXI WLAN: P18 host_bdf_data %#llx HW_XPA %u CBC_FILE %u\n",
++			    (unsigned long long)host_bdf, (unsigned)(host_bdf & 1), (unsigned)((host_bdf >> 1) & 1));
 +		} else {
 +			printf("FUXI WLAN: %s msg %#x unknown TLV %#x bytes %u\n", lane, msg, type, n);
 +		}
@@ -4250,7 +4289,7 @@
 +		printf("FUXI WLAN: P17 rddm scan unavailable (no RX sink; needs fuxiwlanvec=rddm)\n"); return;
 +	}
 +	uint32_t st = 0; unsigned waited = 0, before = fw_faults;
-+	for (; waited < 100; waited++) {
++	for (; waited < 300; waited++) {
 +		st = wl_mrd(wl_bhie+0x78);
 +		if (fw_faults != before || (st >> 30) >= 2) { break; }
 +		wl_sleep(10);
@@ -4371,6 +4410,30 @@
 +	printf("FUXI WLAN: W15 pending RX QMI headers %u (snapshot only)\n", pending);
 +}
 +
++/* Linux mhi_force_rddm_mode: request SYS_ERR through MHICTRL, then wait for EE
++ * RDDM. The RX table goes in again first, as mhi_rddm_prepare does, because the
++ * POR write came before the chip reset. ERRDEC scans the upload for text. */
++static void
++wl18_force_rddm(void)
++{
++	if (!(wl18_bits & WL18_FORCERDDM) || !wl_rddm.va || !wl_rxvectors.va || !wl_bhie || fw_faults) { return; }
++	wl_wlfw_diagnostics("P18 before SYS_ERR");
++	uint32_t seq; read_random(&seq, sizeof(seq)); seq &= WL_SEQ_MASK; if (!seq) { seq = 1; }
++	wl_mwr(wl_bhie+0x64, (uint32_t)(wl_rxvectors.iova >> 32));
++	wl_mwr(wl_bhie+0x60, (uint32_t)wl_rxvectors.iova);
++	wl_mwr(wl_bhie+0x68, (WL_RDDM_SIZE/WL_CHUNK)*sizeof(struct wl_vector));
++	wl_mwr(wl_bhie+0x70, (wl_mrd(wl_bhie+0x70) & ~WL_SEQ_MASK) | seq);
++	wl_mwr(0x38, (wl_mrd(0x38) & ~0xff00u) | 0xff00u);
++	uint32_t ee = 0; unsigned ms = 0;
++	for (; ms < 5000 && !fw_faults; ms += 10) {
++		ee = wl_mrd(wl_bhi+0x28);
++		if (ee == 3) { break; }
++		wl_sleep(10);
++	}
++	printf("FUXI WLAN: P18 SYS_ERR requested EE %#x MHISTATUS %#x after %u ms faults %u\n", ee, wl_mrd(0x48), ms, fw_faults);
++	wl_wlfw_diagnostics("P18 after SYS_ERR");
++}
++
 +static int
 +wl12_wait(unsigned what, const char *stage)
 +{
@@ -4391,6 +4454,7 @@
 +	printf("FUXI WLAN: %s timeout %s (10000 ms); contain, no retry\n", wl_w15 && wl12_stage >= WL15_INI ? "W15" : "W12", stage);
 +	if (wl_w15 && wl12_stage == WL15_MODE) { wl15_timeout_snapshot(); }
 +	if (wl12_stage == WL12_RESPOND) { wl13_respond_diagnostics(); }
++	if (wl12_stage == WL14_READY || wl12_stage == WL15_MODE) { wl18_force_rddm(); }
 +	return wl_w11_fail(stage);
 +}
 +
@@ -4519,6 +4583,30 @@
 +	return 0;
 +}
 +
++/* CNSS order: M3_INFO, then this. total_size counts what remains on each
++ * segment and a refusal does not stop the start. */
++static int
++wl18_qdss(void)
++{
++	unsigned size = 0;
++	if (wl14_read("qdss_trace_config_v2.cfg", &wl14_qdss, WL14_FILE_MAX, &size)) { return 1; }
++	const uint8_t *data = (const void *)wl14_qdss.va;
++	static struct wl12_encoder e;
++	for (unsigned off = 0, seg = 0; off < size; seg++) {
++		unsigned n = size-off > WL14_SEG ? WL14_SEG : size-off;
++		bzero(&e, sizeof(e)); e.len = 7;
++		if (wl12_tlv(&e, 0x10, size-off, 4) || wl12_tlv(&e, 0x11, seg, 4)) { return wl_w11_fail("P18 QDSS bounds"); }
++		e.data[e.len++] = 0x12; wl_put16(e.data+e.len, n+2); e.len += 2;
++		wl_put16(e.data+e.len, n); e.len += 2;
++		memcpy(e.data+e.len, data+off, n); e.len += n;
++		if (wl12_tlv(&e, 0x13, off+n == size, 1) || wl12_send(&e, 0x44, WL14_M3) ||
++		    wl12_wait(0, "P18 QDSS reply") || wl_w11_wait(3, "P18 QDSS TX drain")) { return 1; }
++		printf("FUXI WLAN: P18 qdss seg %u bytes %u remaining %u\n", seg, n, size-off);
++		off += n;
++	}
++	return 0;
++}
++
 +/* Firmware-start QMI only: no CE allocation, register programming, HTC or WMI.
 + * Adapted from Linux ath12k qmi.c (BSD-3-Clause-Clear), v6.12,
 + * ath12k_qmi_firmware_start: INI -> CFG -> MODE, one reply at a time. */
@@ -4584,10 +4672,13 @@
 +	bzero(&e, sizeof(e)); e.len = 7;
 +	wl14_ready = wl14_init_done = false;
 +	printf("FUXI WLAN: W14 M3 DMA IOVA %#llx bytes %u Normal-NC mapped\n", wl14_m3.iova, size);
++	if (wl18_bits) { wl_wlfw_diagnostics("P18 before M3"); }
 +	if (wl12_tlv(&e, 1, wl14_m3.iova, 8) || wl12_tlv(&e, 2, size, 4) ||
 +	    wl12_send(&e, 0x3c, WL14_M3) || wl12_wait(0, "W14 M3_INFO reply") ||
 +	    wl_w11_wait(3, "W14 M3 TX drain")) { return 1; }
 +	printf("FUXI WLAN: W14 m3 ok\n");
++	if ((wl18_bits & WL18_QDSS) && wl18_qdss()) { return 1; }
++	if (wl18_bits) { wl_wlfw_diagnostics("P18 after M3"); }
 +	wl12_stage = WL14_READY;
 +	if (wl12_wait(3, "W14 FW_READY indication") || wl_w11_guard()) { return 1; }
 +	if (wl_w15) {
@@ -5061,7 +5152,7 @@
 +		wl_dma_free(&wl_msi_sink); wl_dma_free(&wl_tables);
 +		wl_dma_free(&wl_rxvectors); wl_dma_free(&wl_rddm);
 +		for (unsigned i = 0; i < WL_TARGET_MAX; i++) { wl_dma_free(&wl_target[i]); }
-+		wl_dma_free(&wl14_regdb); wl_dma_free(&wl14_bdf); wl_dma_free(&wl14_m3);
++		wl_dma_free(&wl14_regdb); wl_dma_free(&wl14_bdf); wl_dma_free(&wl14_m3); wl_dma_free(&wl14_qdss);
 +		wl_dma_free(&wl_ipcr);
 +		wl_dma_free(&wl_contexts); wl_dma_free(&wl_vectors); wl_dma_free(&wl_amss); wl_dma_free(&wl_image);
 +		printf("FUXI WLAN: abort buffers freed\n");
