@@ -292,7 +292,8 @@ OS_STUBS = {
     'sys/errno.h': '#define ENOMEM 12\n#define EAGAIN 35\n',
     'sys/random.h': 'void read_random(void *, unsigned);typedef unsigned u_int;\n',
     'sys/systm.h': 'int printf(const char *, ...);void panic(const char *, ...) __attribute__((noreturn));\n'
-                   '#define __unused __attribute__((unused))\n#define __dead2 __attribute__((noreturn))\n',
+                   '#ifndef __unused\n#define __unused __attribute__((unused))\n#endif\n'
+                   '#ifndef __dead2\n#define __dead2 __attribute__((noreturn))\n#endif\n',
 }
 
 
