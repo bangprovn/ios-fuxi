@@ -5,7 +5,7 @@
 #include <cassert>
 int main(int argc,char **argv){
  if(argc==5 && !strcmp(argv[1],"half")){auto p=fuxi::systemTranslationPolicy();assert(p.halfRound==unsigned(atoi(argv[2])) && fuxi::halfRoundLossy(p,uint32_t(strtoul(argv[3],nullptr,16)))==(argv[4][0]=='1'));return 0;} // FUXI_MTL_HALF_ROUND(_PIPES)
- if(argc==3 && !strcmp(argv[1],"lean")){assert(fuxi::systemTranslationPolicy().submitLean==(argv[2][0]=='1'));return 0;} // FUXI_MTL_SUBMIT_LEAN: exactly "1" enables
+ if(argc==3 && !strcmp(argv[1],"lean")){auto q=fuxi::systemTranslationPolicy();assert(q.submitLeanLevel==unsigned(argv[2][0]-'0') && q.submitLean==(q.submitLeanLevel!=0));return 0;} // FUXI_MTL_SUBMIT_LEAN: exactly "1" or "2"
  if(argc==3 && !strcmp(argv[1],"rename")){assert(fuxi::systemTranslationPolicy().shadowRename==(argv[2][0]=='1'));return 0;}
  if(argc==2){auto p=fuxi::systemTranslationPolicy();assert(p.stages==(argv[1][0]=='1') && p.trace==(argv[1][1]=='1') && p.async==(argv[1][2]=='1') && p.compileBoost==(argv[1][3]=='1'));if(strlen(argv[1])==6)assert(p.frameTrace==(argv[1][4]=='1') && p.pipelined==(argv[1][5]=='1'));return 0;}
  using namespace fuxi;

@@ -1,7 +1,9 @@
 /* Public Metal ordinals; bounded intersection of the pinned translator's exact
  * mappings and Turnip's fd6 vertex formats. No SDK or third-party source. */
 #pragma once
+#include <algorithm>
 #include <cstdint>
+#include <cstring>
 namespace fuxi {
 struct VertexFormatInfo {const char *name;uint32_t bytes;};
 inline VertexFormatInfo vertexFormatInfo(uint64_t format) {
@@ -51,5 +53,13 @@ inline bool vertexFetchFits(uint64_t length,uint64_t boundOffset,uint32_t last,u
  if(!bytes || !stride || stride>256 || offset>256-bytes || boundOffset>length)return false;
  // Subtraction avoids wrapping a malformed bound offset; last*stride fits u64.
  return uint64_t(last)*stride+offset+bytes<=length-boundOffset;
+}
+// Largest index of count width-byte (2 or 4) little-endian indices at p, skipping the all-ones restart value when restart; 0 when none.
+// Equal to reading each index with its own memcpy. Chunked bulk copies: the source may be uncached host-visible memory, where wide loads are far cheaper.
+inline uint32_t indexMax(const uint8_t *p,uint32_t count,uint32_t width,bool restart) {
+ uint32_t last=0;
+ if(width==2){uint16_t v[1024];for(uint32_t i=0;i<count;){uint32_t n=std::min<uint32_t>(count-i,1024);memcpy(v,p+uint64_t(i)*2,size_t(n)*2);i+=n;for(uint32_t k=0;k<n;++k)if(!(restart && v[k]==UINT16_MAX))last=std::max<uint32_t>(last,v[k]);}}
+ else {uint32_t v[512];for(uint32_t i=0;i<count;){uint32_t n=std::min<uint32_t>(count-i,512);memcpy(v,p+uint64_t(i)*4,size_t(n)*4);i+=n;for(uint32_t k=0;k<n;++k)if(!(restart && v[k]==UINT32_MAX))last=std::max(last,v[k]);}}
+ return last;
 }
 }

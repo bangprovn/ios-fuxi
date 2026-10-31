@@ -35,7 +35,7 @@ def main():
                     e=dict(os.environ,FUXI_MTL_TEST_BOOTARGS=args);e.pop('FUXI_MTL_SHADOW_RENAME',None)
                     if env is not None:e['FUXI_MTL_SHADOW_RENAME']=env
                     subprocess.run([str(d/name),'rename',want],env=e,check=True,timeout=15)
-                for env,want in ((None,'0'),('1','1'),('0','0'),('2','0'),('1 ','0'),('','0')):
+                for env,want in ((None,'0'),('1','1'),('0','0'),('2','2'),('3','0'),('1 ','0'),('2 ','0'),('','0')):
                     e=dict(os.environ);e.pop('FUXI_MTL_SUBMIT_LEAN',None)
                     if env is not None:e['FUXI_MTL_SUBMIT_LEAN']=env
                     subprocess.run([str(d/name),'lean',want],env=e,check=True,timeout=15)

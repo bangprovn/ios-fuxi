@@ -3,6 +3,9 @@
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <vector>
+#include <algorithm>
 int main() {
  unsigned accepted=0;
  for(unsigned format=0;format<256;++format) {
@@ -34,5 +37,13 @@ int main() {
  assert(!fuxi::vertexFetchFits(64,UINT64_MAX,0,16,0,27));
  assert(!fuxi::vertexFetchFits(64,0,0,0,0,27));
  assert(!fuxi::vertexFetchFits(64,0,0,16,0,55));
+ // indexMax equals the per-index memcpy scan (FUXI_MTL_SUBMIT_LEAN), across chunk edges, both widths, restart on/off, unaligned bases
+ {std::vector<uint8_t> bytes(4*3000+8);uint32_t seed=7;auto rnd=[&]{seed=seed*1664525u+1013904223u;return seed;};
+  auto reference=[&](const uint8_t *p,uint32_t count,uint32_t width,bool restart){uint32_t last=0;for(uint32_t i=0;i<count;++i){uint32_t index=0;memcpy(&index,p+uint64_t(width)*i,width);if(restart && index==(width==2?UINT16_MAX:UINT32_MAX))continue;last=std::max(last,index);}return last;};
+  unsigned cases=0;for(int round=0;round<200;++round){for(auto &b:bytes)b=uint8_t(rnd()%5==0?0xff:rnd());
+   for(uint32_t width:{2u,4u})for(bool restart:{false,true})for(uint32_t count:{0u,1u,6u,511u,512u,513u,1023u,1024u,1025u,2049u,uint32_t(rnd()%3000)}){uint32_t base=rnd()%8;
+    assert(fuxi::indexMax(bytes.data()+base,count,width,restart)==reference(bytes.data()+base,count,width,restart));++cases;}}
+  std::vector<uint8_t> ones(64,0xff);assert(fuxi::indexMax(ones.data(),16,2,true)==0 && fuxi::indexMax(ones.data(),16,2,false)==UINT16_MAX && fuxi::indexMax(ones.data(),16,4,true)==0 && fuxi::indexMax(ones.data(),16,4,false)==UINT32_MAX);
+  printf("PASS: indexMax equals the per-index scan (%u cases)\n",cases);}
  puts("PASS: 52 exact vertex widths, descriptor and fetch bounds, half4 quad and offset overflow");
 }

@@ -1561,13 +1561,15 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
     catch(const std::exception &e){rtRefused.insert(key);fprintf(stderr,"FUXI MTL: render target shadow refused: %s\n",e.what());return -1;}}
    it->second.used=rtSubmits;
    entries.push_back({l,it->second.s,false,reuse && it->second.clean,key});return int(entries.size()-1);};
-  std::vector<Operation> out;out.reserve(ops.size()+8);
+  // FUXI_MTL_SUBMIT_LEAN: ops are rewritten in place and the copies are spliced in afterwards (none moved when they all land at the end).
+  const bool lean=systemTranslationPolicy().submitLean;std::vector<Operation> out;if(!lean)out.reserve(ops.size()+8);std::vector<std::pair<size_t,Operation>> inserts;size_t at=0;
+  auto emit=[&](Operation c){if(lean)inserts.emplace_back(at,c);else out.push_back(c);};
   auto copyOp=[](Texture *dst,Texture *src){Operation c{};c.texture=dst;c.sourceTexture=src;return c;};
   auto bytesOf=[&](Texture *t){return uint64_t(t->width)*t->height*texelBytes(t->format);};
-  auto syncOut=[&](Entry &e,bool final){if(!e.newer)return;out.push_back(copyOp(e.l,e.s));e.newer=false;e.valid=true;++rtShadowOut;if(!final)++rtShadowSyncs;
+  auto syncOut=[&](Entry &e,bool final){if(!e.newer)return;emit(copyOp(e.l,e.s));e.newer=false;e.valid=true;++rtShadowOut;if(!final)++rtShadowSyncs;
    if(currentFrame){++currentFrame->rtOut;if(!final)++currentFrame->rtSyncs;currentFrame->rtBytes+=bytesOf(e.l);}};
-  for(const auto &original:ops){
-   Operation op=original;const bool render=op.pipeline || op.clearOnly;
+  for(at=0;at<ops.size();++at){
+   std::optional<Operation> copy;if(!lean)copy.emplace(ops[at]);Operation &op=lean?ops[at]:*copy;const bool render=op.pipeline || op.clearOnly;
    // Anything aliasing a shadowed image's memory other than its own target/sample role needs the linear bytes current first.
    for(auto &e:entries){
     Buffer *buf=e.l->backingBuffer;auto aliases=[&](Texture *t){return t && (t==e.l || (t->backingBuffer && t->backingBuffer==buf));};
@@ -1588,7 +1590,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
    if(render){
     for(unsigned i=0;i<std::min(op.colorCount,8u);++i){auto c=op.color(i);if(!eligible(c.texture))continue;int ei=entryFor(c.texture);if(ei<0)continue;auto &e=entries[ei];
      if(!e.newer){bool full=(!op.areaWidth || op.areaWidth==c.texture->width) && (!op.areaHeight || op.areaHeight==c.texture->height);
-      if(!e.valid && (c.load==1 || !full)){out.push_back(copyOp(e.s,e.l));++rtShadowIn;if(currentFrame){++currentFrame->rtIn;currentFrame->rtBytes+=bytesOf(e.l);}}
+      if(!e.valid && (c.load==1 || !full)){emit(copyOp(e.s,e.l));++rtShadowIn;if(currentFrame){++currentFrame->rtIn;currentFrame->rtBytes+=bytesOf(e.l);}}
       else if(!e.valid){++rtShadowInSkipped;if(currentFrame)++currentFrame->rtInSkipped;}
       else if(c.load==1 || !full){++rtShadowReused;}
       e.newer=true;e.valid=false;}
@@ -1596,10 +1598,15 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
     for(auto &e:entries)if(e.newer){for(auto &s:op.samples)if(s==e.l)s=e.s;if(op.sourceTexture==e.l)op.sourceTexture=e.s;}
    }else for(auto &e:entries){ // a non-render use of the linear image itself (copy, blit, readback, mip) was synced above; writes made the shadow stale
     if(op.texture==e.l && (op.upload || op.sourceTexture || op.generateMips))e.valid=false;}
-   out.push_back(std::move(op));
+   if(!lean)out.push_back(std::move(op));
   }
-  for(auto &e:entries){syncOut(e,true);auto it=rtShadows.find(e.key);if(it!=rtShadows.end())it->second.clean=reuse && e.valid;}
+  at=ops.size();for(auto &e:entries){syncOut(e,true);auto it=rtShadows.find(e.key);if(it!=rtShadows.end())it->second.clean=reuse && e.valid;}
   for(auto it=rtShadows.begin();it!=rtShadows.end();){if(it->second.used+900<rtSubmits){destroyTextureUnlocked(it->second.s);it=rtShadows.erase(it);}else ++it;}
+  if(!lean){ops.swap(out);return;}
+  if(inserts.empty())return;
+  if(inserts.front().first==ops.size()){for(auto &x:inserts)ops.push_back(std::move(x.second));return;}
+  out.reserve(ops.size()+inserts.size());size_t k=0;
+  for(size_t i=0;i<=ops.size();++i){while(k<inserts.size() && inserts[k].first==i)out.push_back(std::move(inserts[k++].second));if(i<ops.size())out.push_back(std::move(ops[i]));}
   ops.swap(out);
  }
 
@@ -1686,7 +1693,15 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
  bool evictIdleSampleShadow(uint64_t idle) {auto best=sampleShadows.end();for(auto i=sampleShadows.begin();i!=sampleShadows.end();++i)if(i->second.t->references==1 && submits-i->second.used>=idle && (best==sampleShadows.end() || i->second.used<best->second.used))best=i;if(best==sampleShadows.end())return false;auto *t=best->second.t;sampleShadows.erase(best);destroyTextureUnlocked(t);++sampleShadowEvicted;return true;}
  void expireSampleShadows(uint64_t idle) {if(sampleShadows.empty())return;for(;;){bool any=false;for(auto &e:sampleShadows)if(e.second.t->references==1 && submits-e.second.used>=idle*5){any=true;break;}if(!any || !evictIdleSampleShadow(idle*5))return;}}
  void releaseSampleShadows() {auto all=std::move(sampleShadows);sampleShadows.clear();for(auto &e:all)destroyTextureUnlocked(e.second.t);}
- std::atomic<uint64_t> sampleShadowReused{0},sampleShadowCapped{0},sampleShadowEvicted{0},sampleShadowCreated{0},sampleShadowRefused{0},sampleShadowBytes{0},sampleHits{0},sampleCopies{0},sampleInvalidations{0},sampleHashedBytes{0},sampleCopiedBytes{0},sampleHashNs{0};unsigned hoistLogged=0;std::atomic<uint64_t> relaxedPipelines{0},relaxedMarks{0},unrolledPipelines{0},unrolledLoops{0},halfPipelines{0},halfSites{0};
+ std::atomic<uint64_t> sampleShadowReused{0},sampleShadowCapped{0},sampleShadowEvicted{0},sampleShadowCreated{0},sampleShadowRefused{0},sampleShadowBytes{0},sampleHits{0},sampleCopies{0},sampleInvalidations{0},sampleHashedBytes{0},sampleCopiedBytes{0},sampleHashNs{0};unsigned hoistLogged=0;uint64_t leanIndexSkips=0;std::atomic<uint64_t> relaxedPipelines{0},relaxedMarks{0},unrolledPipelines{0},unrolledLoops{0},halfPipelines{0},halfSites{0};
+ // Ops in group order. FUXI_MTL_SUBMIT_LEAN: permuted in place along the permutation's cycles, so ops that keep their position are not copied.
+ static void applyGroupOrder(std::vector<Operation> &ops,const std::vector<PassGroup> &groups,const std::vector<size_t> &order) {
+  std::vector<size_t> from;if(systemTranslationPolicy().submitLean){from.reserve(ops.size());for(auto gi:order)for(size_t i=groups[gi].first;i<=groups[gi].last;++i)from.push_back(i);}
+  if(from.size()!=ops.size() || ops.empty()){std::vector<Operation> sorted;sorted.reserve(ops.size());for(auto gi:order)for(size_t i=groups[gi].first;i<=groups[gi].last;++i)sorted.push_back(ops[i]);ops.swap(sorted);return;}
+  std::vector<uint8_t> done(ops.size(),0);
+  for(size_t i=0;i<from.size();++i){if(done[i])continue;done[i]=1;if(from[i]==i)continue;
+   Operation held=std::move(ops[i]);size_t j=i;while(from[j]!=i){ops[j]=std::move(ops[from[j]]);j=from[j];done[j]=1;}ops[j]=std::move(held);}
+ }
  void hoistOffscreen(std::vector<Operation> &ops) {
   std::vector<PassGroup> groups;if(!buildGroups(ops,groups,true))return;
   std::vector<size_t> order;order.reserve(groups.size());unsigned moved=0,offs=0;std::map<std::string,unsigned> reasons;std::map<std::string,std::string> examples;
@@ -1705,9 +1720,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
    if(insertAt!=order.size())++moved;
    order.insert(order.begin()+insertAt,gi);}
   if(!moved)return;
-  std::vector<Operation> sorted;sorted.reserve(ops.size());
-  for(auto gi:order)for(size_t i=groups[gi].first;i<=groups[gi].last;++i)sorted.push_back(ops[i]);
-  ops.swap(sorted);rtHoisted+=moved;
+  applyGroupOrder(ops,groups,order);rtHoisted+=moved;
  }
  void reorderPasses(std::vector<Operation> &ops) {
   std::vector<PassGroup> groups;if(!buildGroups(ops,groups,systemTranslationPolicy().rtRename))return;
@@ -1724,9 +1737,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
    order.insert(order.begin()+insertAt,gi);
   }
   if(!hops)return;
-  std::vector<Operation> sorted;sorted.reserve(ops.size());
-  for(auto gi:order)for(size_t i=groups[gi].first;i<=groups[gi].last;++i)sorted.push_back(ops[i]);
-  ops.swap(sorted);if(currentFrame)currentFrame->passReorders+=hops;
+  applyGroupOrder(ops,groups,order);if(currentFrame)currentFrame->passReorders+=hops;
  }
  void submit(std::vector<Operation> ops,const std::function<void()> &scheduled={},std::function<void()> *retirement=nullptr,const std::function<void()> &prepare={},const std::vector<PrepareWrite> *prepareWrites=nullptr,const std::function<void()> &fenced={}) {
   struct InSubmit {bool &f;explicit InSubmit(bool &x):f(x){f=true;}~InSubmit(){f=false;}} inSubmitScope(inSubmit);
@@ -1741,10 +1752,10 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
   struct HoldRelease {Backend &b;std::vector<Texture *> held;~HoldRelease(){for(auto *t:held)b.destroyTextureUnlocked(t);}} renameHold{*this,{}};
   const bool rtRenaming=systemTranslationPolicy().rtRename && ops.size()>2;size_t mainBefore=0;
   auto rewritePhase=std::make_unique<PhaseTimer>(SubPhase::rewrite);
-  if(rtRenaming){if(sequenceLog)logOpSequence(ops," pre");++rtRenameSubmits;mainBefore=countMainRuns(ops);renameOffscreen(ops,renameHold.held);hoistOffscreen(ops);}
-  if(systemTranslationPolicy().reorder && systemTranslationPolicy().merge && ops.size()>2)reorderPasses(ops);
+  if(rtRenaming){if(sequenceLog)logOpSequence(ops," pre");++rtRenameSubmits;mainBefore=countMainRuns(ops);renameOffscreen(ops,renameHold.held);PhaseTimer phase(SubPhase::rwHoist);hoistOffscreen(ops);}
+  if(systemTranslationPolicy().reorder && systemTranslationPolicy().merge && ops.size()>2){PhaseTimer phase(SubPhase::rwReorder);reorderPasses(ops);}
   if(rtRenaming){size_t after=countMainRuns(ops);rtMainBefore+=mainBefore;rtMainAfter+=after;if(mainBefore>after)rtMergedMain+=mainBefore-after;}
-  if(systemTranslationPolicy().rtShadow)rtShadowRewrite(ops);
+  if(systemTranslationPolicy().rtShadow){PhaseTimer phase(SubPhase::rwShadow);rtShadowRewrite(ops);}
   if(sequenceLog)logOpSequence(ops,"");
   rewritePhase.reset();
   std::vector<HostUse> hostUses,writes,uses;
@@ -1790,7 +1801,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
     if(conflict || index){unsigned m=conflictKinds()|(index?16u:0u);for(unsigned k=0;k<5;++k)if((m>>k&1) && !(kindSeen>>k&1)){kindSeen|=1u<<k;++currentFrame->conflictKinds[k];}}}
    bool ready=!full && (!drain || !busy) && !conflict;if(!ready){blockFull|=full;blockDrain|=drain && busy;blockConflict|=conflict;}return ready;
   });
-  waitPhase.reset();++submitEntered;if(blockFull || blockDrain || blockConflict){++submitBlocked;submitBlockedFull+=blockFull;submitBlockedDrain+=blockDrain;submitBlockedConflict+=blockConflict;submitSlotWaitNanos+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(FrameClock::now()-slotStart).count());}
+  waitPhase.reset();auto setupPhase=std::make_unique<PhaseTimer>(SubPhase::setup);++submitEntered;if(blockFull || blockDrain || blockConflict){++submitBlocked;submitBlockedFull+=blockFull;submitBlockedDrain+=blockDrain;submitBlockedConflict+=blockConflict;submitSlotWaitNanos+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(FrameClock::now()-slotStart).count());}
   if(currentFrame){currentFrame->indexGPUWritableSubmits+=sawIndex;currentFrame->indexReadOnlySubmits+=otherIndices && !sawIndex;}
   if(currentFrame)currentFrame->slotWait+=since(slotStart);
   requireLive();
@@ -2030,11 +2041,15 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
     for(auto *blob:op.pipeline->constantBlobs)addBuffer(blob);
     // CPU bounds check the fixed-function vertex fetches, including every index.
     uint32_t last=op.first+op.vertices-1;
-    if(op.indices){last=0;for(unsigned i=0;i<op.vertices;++i){uint32_t index=0;memcpy(&index,(uint8_t *)op.indices->contents+op.indexOffset+uint64_t(op.indexWidth)*i,op.indexWidth);if(primitiveRestart(op.topology) && index==(op.indexWidth==2?UINT16_MAX:UINT32_MAX))continue;last=std::max(last,uint32_t(index));}}
+    // FUXI_MTL_SUBMIT_LEAN=2: robustBufferAccess already confines every vertex fetch to its bound VkBuffer, so indexed draws skip the CPU scan (an out-of-range index reads zeros or other bytes of that buffer instead of refusing the submit).
+    const bool robustIndices=op.indices && systemTranslationPolicy().submitLeanLevel>=2 && (deviceFeatures&featRobustBuffer);
+    if(robustIndices){if(!leanIndexSkips++)fprintf(stderr,"FUXI MTL: submit lean=2 index scan skipped (robust_buffer=1)\n");}
+    else if(op.indices && lean)last=indexMax((const uint8_t *)op.indices->contents+op.indexOffset,op.vertices,op.indexWidth,primitiveRestart(op.topology));
+    else if(op.indices){last=0;for(unsigned i=0;i<op.vertices;++i){uint32_t index=0;memcpy(&index,(uint8_t *)op.indices->contents+op.indexOffset+uint64_t(op.indexWidth)*i,op.indexWidth);if(primitiveRestart(op.topology) && index==(op.indexWidth==2?UINT16_MAX:UINT32_MAX))continue;last=std::max(last,uint32_t(index));}}
     for(auto &a:op.pipeline->options.attributes)if(a.format){auto slot=a.buffer;
      if(slot>=4 || !op.buffers[0][slot].buffer)throw std::runtime_error("unbound vertex buffer");
      auto bound=op.buffers[0][slot];
-     if(!vertexFetchFits(bound.length(),bound.offset,last,op.pipeline->options.strides[slot],a.offset,a.format))throw std::runtime_error("vertex fetch bounds");
+     if(!robustIndices && !vertexFetchFits(bound.length(),bound.offset,last,op.pipeline->options.strides[slot],a.offset,a.format))throw std::runtime_error("vertex fetch bounds");
     }
     // CPU index bounds are valid only for quiescent host input. A preceding GPU
     // write in this command needs readback before its values can be checked.
@@ -2301,6 +2316,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
     daMarkWrites(ops,draws);}
    VkPipeline boundPipeline{};VkPipelineLayout boundLayout{};VkDescriptorSet boundSet{};bool passNoFetch=false;uint32_t passFetchDraws=0;
    VkViewport boundViewport{};VkRect2D boundScissor{};bool dynamicBound=false;
+   setupPhase.reset();auto loopPhase=std::make_unique<PhaseTimer>(SubPhase::recLoop);
    for(size_t opIndex=0;opIndex<ops.size();++opIndex) {diagnosticOp=opIndex;const auto &op=ops[opIndex];const auto &draw=draws[opIndex];
     size_t passEnd=mergeEnds.empty()?opIndex:mergeEnds[opIndex];const bool culledOp=occPlan && occPlan->culled[opIndex];
     bool continuation=opIndex && !mergeEnds.empty() && mergeEnds[opIndex-1]>=opIndex;
@@ -2526,6 +2542,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
      info.copies=stampCopies;info.barriers=stampBarriers;stampCopies=stampBarriers=0;passInfos.push_back(info);CmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,passQ,uint32_t(passInfos.size()));
     }
    }
+   loopPhase.reset();PhaseTimer tailPhase(SubPhase::tail);
    barrier.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_HOST_READ_BIT;
    pb(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&barrier,0,nullptr,0,nullptr);
    if(timestamps)CmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,timestamps,1);

@@ -129,9 +129,16 @@ void main() {color=textureLod(image,vec2(0.5),constants.lod);}
         for args in ('', 'fuxigpumerge=1 fuxigpuoverlap=1 fuxigpusubmit=1 fuxigpuperf=7', 'fuxigpumerge=1 fuxigpuperf=3'):
             for extra in ({}, rewrites):
                 plain = invoke(d/'lean', args, FUXI_MTL_SUBMIT_LEAN='0', **extra)
-                assert plain == invoke(d/'lean', args, FUXI_MTL_SUBMIT_LEAN='1', **extra), 'submit lean changed output: '+args+' '+str(extra)
+                for level in '12':
+                    assert plain == invoke(d/'lean', args, FUXI_MTL_SUBMIT_LEAN=level, **extra), 'submit lean '+level+' changed output: '+args+' '+str(extra)
                 assert int(re.search(r'RENAME submits=(\d+)', plain).group(1)) > (20 if extra else -1)
-        print('PASS: FUXI_MTL_SUBMIT_LEAN identical pixels, counts and refusal on the CA-shaped fixture (rewrites off/on)')
+                assert int(re.search(r'hoisted=(\d+)', plain).group(1)) > (20 if extra else -1)
+        # =2 with robustBufferAccess enabled skips the CPU index scan of the in-range indexed draws: same output, and the skip is logged.
+        robust = dict(rewrites, FUXI_MTL_ROBUST='1')
+        assert invoke(d/'lean', 'fuxigpumerge=1 fuxigpuperf=7', FUXI_MTL_SUBMIT_LEAN='0', **robust) == invoke(d/'lean', 'fuxigpumerge=1 fuxigpuperf=7', FUXI_MTL_SUBMIT_LEAN='2', **robust), 'submit lean 2 changed robust output'
+        p = subprocess.run([str(d/'lean')], env=dict(env, FUXI_MTL_TEST_BOOTARGS='fuxigpuframetrace=1 fuxigpumerge=1', FUXI_MTL_SUBMIT_LEAN='2', **robust), text=True, capture_output=True, timeout=90)
+        assert p.returncode == 0 and 'policy submit_lean=2' in p.stderr and 'index scan skipped (robust_buffer=1)' in p.stderr, p.stderr[-2000:]
+        print('PASS: FUXI_MTL_SUBMIT_LEAN=1/2 identical pixels, counts and refusal on the CA-shaped fixture (rewrites off/on)')
         subprocess.run(common+['-O2']+definitions+[str(ROOT/'tools/fuxi-metal/SubmitBench.cpp'), '-ldl', '-pthread', '-o', str(d/'bench')], check=True)
         for uncached in (True, False, False, True):
             overrides = {'PIPE_BENCH_UNCACHED': '1'} if uncached else {}
