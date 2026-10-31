@@ -16,6 +16,8 @@
 #include "core.h"
 #include "qmi.h"
 
+void	fa_hif_quiesce(void);		/* fa_hif.c */
+
 _Static_assert(FA_DEV_MEM_MOST >= ATH12K_QMI_WLFW_MAX_DEV_MEM_NUM_V01,
     "fuxi-ath12k: struct fa_caps cannot hold what ath12k's qmi.h keeps");
 
@@ -43,6 +45,8 @@ int
 ath12k_qmi_init_service(struct ath12k_base *ab)
 {
 	lx_tell("FUXI ATH12K: qmi shim: QMI stays in fuxi_wlan.c, no service started here\n");
+	ab->qmi.ab = ab;
+	ab->qmi.target_mem_mode = ab->target_mem_mode;
 	return (0);
 }
 
@@ -68,9 +72,11 @@ ath12k_qmi_firmware_start(struct ath12k_base *ab, u32 mode)
 	return (fuxi_ath12k_firmware_start(&cfg, mode));
 }
 
+/* core.c sends this before hif.stop; registers may not answer after it, so the rings are let go first. */
 void
 ath12k_qmi_firmware_stop(struct ath12k_base *ab)
 {
+	fa_hif_quiesce();
 	fuxi_ath12k_firmware_stop();
 }
 

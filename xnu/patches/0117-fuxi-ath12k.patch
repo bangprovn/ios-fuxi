@@ -1,0 +1,296 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -115,6 +115,7 @@
+ bsd/dev/fuxi_perf.c			standard
+ bsd/dev/fuxi_keys.c			standard
+ bsd/dev/fuxi_wlan.c			standard
++bsd/dev/fuxi_ath12k_os.c		standard
+ bsd/dev/fuxi_wifi_ios.c			standard
+ bsd/dev/fuxi_wifi_net.c			standard
+ bsd/dev/fuxi_wifi_sta.c			standard
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -880,6 +880,11 @@
+ #
+ LD_KERNEL_LIBS	   = -lcc_kext
+ LD_KERNEL_ARCHIVES = $(LDFLAGS_KERNEL_SDK) -lfirehose_kernel
++# Patch 0117, kernel-metal4wifi only: tools/ci/build-ath12k.py made this one object. Without it the link
++# fails at fuxi_wlan.c's fa_ calls, which is the right answer for a build that lost it.
++LD_KERNEL_ARCHIVES += $(FUXI_OBJECTS)
++MACHINE_FLAGS_ARM64_FUXI += -DFUXI_ATH12K=1
++
+ # Link opensource binary library
+ ifneq ($(filter T6000 T8101 VMAPPLE T6000 T8101 VMAPPLE,$(CURRENT_MACHINE_CONFIG)),)
+ 	LDFLAGS_KERNEL_ONLY += -rdynamic -Wl,-force_load,$(KDKROOT)/System/Library/KernelSupport/lib$(CURRENT_MACHINE_CONFIG).os.$(CURRENT_KERNEL_CONFIG).a
+--- /dev/null
++++ b/bsd/dev/fuxi_ath12k_os.c
+@@ -0,0 +1,165 @@
++/*
++ * FUXI ATH12K, the XNU side of the driver domain's calls (compat/include/lx_os.h): memory, time,
++ * threads, one lock to sleep under, boot arguments. The DMA pool is fuxi_wlan.c's, which owns the
++ * SMMU window. Only kernels built with patch 0117 have this file.
++ *
++ * Adapted from hackios drivers/wifi/hakios.lx.c (APSL 2.0, as the rest of this kernel's sources).
++ */
++#if defined(FUXI) && defined(FUXI_ATH12K)
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <kern/locks.h>
++#include <kern/sched_prim.h>
++#include <kern/thread.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include <pexpert/pexpert.h>
++#include <sys/errno.h>
++#include <sys/random.h>
++#include <sys/systm.h>
++
++#include "fa_xnu.h"
++#include "fa_lx_os.h"
++
++extern kern_return_t thread_terminate(thread_t thread);
++extern void thread_set_thread_name(thread_t thread, const char *name);
++
++static LCK_GRP_DECLARE(fa_lock_group, "fuxi-ath12k");
++static LCK_MTX_DECLARE(fa_lock, &fa_lock_group);
++static LCK_MTX_DECLARE(fa_mhi_lock, &fa_lock_group);
++
++void *
++lx_os_alloc(unsigned long size)
++{
++	return kalloc_data(size, Z_WAITOK | Z_ZERO);
++}
++
++void
++lx_os_free(void *memory, unsigned long size)
++{
++	kfree_data(memory, size);
++}
++
++void
++lx_os_print(const char *text)
++{
++	printf("%s", text);
++}
++
++void
++lx_os_tell(const char *text)
++{
++	printf("%s", text);
++}
++
++void
++lx_os_panic(const char *text)
++{
++	panic("%s", text);
++}
++
++unsigned long long
++lx_os_nanoseconds(void)
++{
++	uint64_t nanoseconds;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &nanoseconds);
++	return nanoseconds;
++}
++
++void *
++lx_os_thread_self(void)
++{
++	return current_thread();
++}
++
++struct fa_thread {
++	void (*function)(void *);
++	void *argument;
++};
++
++static void
++fa_thread_runs(void *parameter, __unused wait_result_t result)
++{
++	struct fa_thread start = *(struct fa_thread *)parameter;
++
++	kfree_type(struct fa_thread, parameter);
++	start.function(start.argument);
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++int
++lx_os_thread(const char *name, void (*function)(void *), void *argument)
++{
++	struct fa_thread *start = kalloc_type(struct fa_thread, Z_WAITOK | Z_ZERO);
++	thread_t thread;
++
++	if (start == NULL) {
++		return ENOMEM;
++	}
++	start->function = function;
++	start->argument = argument;
++	if (kernel_thread_start(fa_thread_runs, start, &thread) != KERN_SUCCESS) {
++		kfree_type(struct fa_thread, start);
++		return EAGAIN;
++	}
++	thread_set_thread_name(thread, name);
++	thread_deallocate(thread);
++	return 0;
++}
++
++void
++lx_os_lock(void)
++{
++	lck_mtx_lock(&fa_lock);
++}
++
++void
++lx_os_unlock(void)
++{
++	lck_mtx_unlock(&fa_lock);
++}
++
++void
++lx_os_sleep(const void *address, unsigned long long nanoseconds)
++{
++	uint64_t deadline;
++
++	nanoseconds_to_absolutetime(nanoseconds, &deadline);
++	deadline += mach_absolute_time();
++	(void)lck_mtx_sleep_deadline(&fa_lock, LCK_SLEEP_DEFAULT, (event_t)address, THREAD_UNINT, deadline);
++}
++
++void
++lx_os_wakeup(const void *address)
++{
++	thread_wakeup((event_t)address);
++}
++
++void
++lx_os_random(void *buffer, unsigned long size)
++{
++	read_random(buffer, (u_int)size);
++}
++
++unsigned
++lx_os_option(const char *name)
++{
++	unsigned value = 0;
++
++	return PE_parse_boot_argn(name, &value, sizeof(value)) ? value : 0;
++}
++
++void
++fuxi_ath12k_mhi_lock(void)
++{
++	lck_mtx_lock(&fa_mhi_lock);
++}
++
++void
++fuxi_ath12k_mhi_unlock(void)
++{
++	lck_mtx_unlock(&fa_mhi_lock);
++}
++#endif /* FUXI && FUXI_ATH12K */
+--- /dev/null
++++ b/bsd/dev/fa_xnu.h
+@@ -0,0 +1,61 @@
++/*
++ * The boundary between the driver domain (this object) and the XNU domain (fuxi_wlan.c and
++ * bsd/dev/fuxi_ath12k_os.c), plain C on both sides so that no Linux or FreeBSD type crosses it.
++ * Design section 2, hand-off sequence. Patch 0117 carries this file to bsd/dev/fa_xnu.h, and
++ * tools/ath12k-undefined-allow.json lists what the object may ask for.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef _FA_XNU_H_
++#define _FA_XNU_H_
++
++#define FA_DEV_MEM_MOST		4
++#define FA_BUILD_ID_MOST	128
++
++/* The driver domain is compiled with hidden visibility: only these leave the object. */
++#define FA_PUBLIC	__attribute__((__visibility__("default")))
++
++/* What our QMI learnt from the capability response before FW_READY. */
++struct fa_caps {
++	unsigned	chip_id;
++	unsigned	chip_family;
++	unsigned	board_id;		/* 0xff when the firmware does not say */
++	unsigned	soc_id;
++	unsigned	fw_version;
++	char		fw_build_id[FA_BUILD_ID_MOST];
++	struct {
++		unsigned long long start;
++		unsigned long long size;
++	} dev_mem[FA_DEV_MEM_MOST];		/* [0] is the CMEM ath12k's dp.c uses as a base */
++};
++
++/* What ath12k_qmi_firmware_start() hands to our INI, CFG and MODE: tables as ath12k keeps them. */
++struct fa_wlan_cfg {
++	const void	*target_ce;		/* struct ce_pipe_config[]: six little-endian u32 each */
++	unsigned	 target_ce_count;
++	const void	*service_map;		/* struct service_to_pipe[]: three little-endian u32 each */
++	unsigned	 service_map_count;
++	const unsigned	*shadow;		/* register addresses, shadow_reg_v3 */
++	unsigned	 shadow_count;
++};
++
++/* The driver domain offers these. */
++FA_PUBLIC int	fa_firmware_ready(const struct fa_caps *caps, unsigned stage);	/* fw_thread, once; 0 or -errno */
++FA_PUBLIC void	fa_stop(void);			/* rings and registers left alone from now on; repeatable */
++FA_PUBLIC void	fa_set_radio_mac(const unsigned char *mac);	/* before fa_firmware_ready(): station.address */
++
++/* fuxi_wlan.c (FUXI_ATH12K) owes these. */
++void	*fuxi_ath12k_bar(unsigned long *length);	/* BAR0 mapped contiguously for 0x100000 */
++unsigned fuxi_ath12k_read32(unsigned offset);		/* below 0x100000 of BAR0, fault contained */
++void	 fuxi_ath12k_write32(unsigned offset, unsigned value);
++void	 fuxi_ath12k_mhi_service(void);			/* MHI events and guard, at most every 10 ms */
++int	 fuxi_ath12k_firmware_start(const struct fa_wlan_cfg *cfg, unsigned mode);	/* INI, CFG, MODE */
++void	 fuxi_ath12k_firmware_stop(void);		/* MODE off */
++void	 fuxi_ath12k_contain(void);			/* containment is wanted when fw_thread gets back */
++void	 fuxi_ath12k_force_rddm(void);			/* wl18_force_rddm */
++
++/* bsd/dev/fuxi_ath12k_os.c owes these, for fuxi_wlan.c: the MHI lock of design section 2. */
++void	 fuxi_ath12k_mhi_lock(void);
++void	 fuxi_ath12k_mhi_unlock(void);
++
++#endif
+--- /dev/null
++++ b/bsd/dev/fa_lx_os.h
+@@ -0,0 +1,37 @@
++/*
++ * What the driver domain asks of the XNU side (bsd/dev/fuxi_ath12k_os.c, milestone M1). These
++ * calls are plain C on both sides: no FreeBSD or Linux type crosses here. Same shape of boundary
++ * as hackios bsd/sys/hakios.lx.h, written for this tree. Patch 0117 carries this file to bsd/dev/fa_lx_os.h,
++ * so both sides compile the same declarations.
++ *
++ * SPDX-License-Identifier: MIT (see compat/PROVENANCE.md)
++ */
++#ifndef _LX_OS_H_
++#define _LX_OS_H_
++
++/* Wired zeroed kernel memory; the size is given back when freed. */
++void		*lx_os_alloc(unsigned long size);
++void		 lx_os_free(void *memory, unsigned long size);
++
++/* One piece of Normal-NC memory that the chip reaches at *address (IOVA) through our SMMU window (fuxi_wlan.c). */
++void		*lx_os_radio_memory(unsigned long size, unsigned long long *address);
++
++void		 lx_os_print(const char *text);		/* a line for the log */
++void		 lx_os_tell(const char *text);		/* a line for the log that is always kept */
++void		 lx_os_panic(const char *text) __dead2;
++
++unsigned long long lx_os_nanoseconds(void);		/* monotonic */
++
++void		*lx_os_thread_self(void);
++int		 lx_os_thread(const char *name, void (*function)(void *), void *argument);
++
++/* The one lock of the layer, and sleeping under it: wakes on lx_os_wakeup(address) or after the time. */
++void		 lx_os_lock(void);
++void		 lx_os_unlock(void);
++void		 lx_os_sleep(const void *address, unsigned long long nanoseconds);
++void		 lx_os_wakeup(const void *address);
++
++void		 lx_os_random(void *buffer, unsigned long size);
++unsigned	 lx_os_option(const char *name);		/* a boot argument as a number; 0 when absent */
++
++#endif

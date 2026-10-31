@@ -15,6 +15,8 @@ notice are kept in `LICENSE.hackios` and apply to the adapted files and to the c
 | LinuxKPI edits `lx-device-of-node`, `lx-bss-conf-fields`, `lx-reg-rule-psd`, `lx-channel-psd`, `lx-regd-sync-copies` in `tools/ath12k-edits.json` | `patches/` | Same effect, restated as exact-match edits |
 | `src/fa_80211.c` (first part) | `src/lx_80211.c` | Radio allocation, regulatory domain, channel arithmetic; the station is not there yet |
 
+`os/fuxi_ath12k_os.c`, one directory up, is adapted from hackios `drivers/wifi/hakios.lx.c` (APSL 2.0, like the rest of the kernel tree it joins); its printing, options and thread start were rewritten for this kernel.
+
 Written for this tree: `include/lx_os.h` (the call list has the shape of hackios `bsd/sys/hakios.lx.h`, which is
 APSL and was not copied), `include/fa_radiotap_eht.h` (values from radiotap.org), and the stand-ins
 `include/linux/{acpi,bug,clk,ctype,of_graph,overflow,panic_notifier,rtnetlink}.h` and

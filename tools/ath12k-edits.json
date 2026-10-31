@@ -232,6 +232,14 @@
       "file": "sys/compat/linuxkpi/common/include/linux/skbuff.h",
       "find": "skb_realloc_headroom(struct sk_buff *skb, unsigned int headroom)\n{\n\n\tSKB_TODO();\n\treturn (NULL);\n}\n",
       "replace": "skb_realloc_headroom(struct sk_buff *skb, unsigned int headroom)\n{\n\textern long lx_stub(const char *);\n\n\tlx_stub(__func__);\n\treturn (NULL);\n}\n"
+    },
+    {
+      "id": "ath12k-stage-htc",
+      "why": "Design M1: stop after HTC ready through ath12k_core_start's normal error path.",
+      "tree": "ath12k",
+      "file": "core.c",
+      "find": "\t\tath12k_err(ab, \"failed to connect to HTC: %d\\n\", ret);\n\t\tgoto err_hif_stop;\n\t}\n",
+      "replace": "\t\tath12k_err(ab, \"failed to connect to HTC: %d\\n\", ret);\n\t\tgoto err_hif_stop;\n\t}\n\n\tif (fa_stage_htc_ready(ab)) {\n\t\tret = -ECANCELED;\n\t\tgoto err_hif_stop;\n\t}\n"
     }
   ]
 }

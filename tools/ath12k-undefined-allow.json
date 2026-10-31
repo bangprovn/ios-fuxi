@@ -29,7 +29,7 @@
       ]
     },
     "fuxi-ath12k-os": {
-      "implemented_by": "bsd/dev/fuxi_ath12k_os.c, new in M1 (compat/include/lx_os.h)",
+      "implemented_by": "bsd/dev/fuxi_ath12k_os.c (patch 0117)",
       "symbols": [
         "lx_os_alloc",
         "lx_os_free",
@@ -38,7 +38,6 @@
         "lx_os_option",
         "lx_os_panic",
         "lx_os_print",
-        "lx_os_radio_memory",
         "lx_os_random",
         "lx_os_sleep",
         "lx_os_tell",
@@ -49,7 +48,7 @@
       ]
     },
     "fuxi-wlan": {
-      "implemented_by": "xnu/fuxi-wlan/fuxi_wlan.c, added in M1 (src/fa_xnu.h)",
+      "implemented_by": "xnu/fuxi-wlan/fuxi_wlan.c under FUXI_ATH12K (patch 0099)",
       "symbols": [
         "fuxi_ath12k_bar",
         "fuxi_ath12k_contain",
@@ -58,7 +57,8 @@
         "fuxi_ath12k_force_rddm",
         "fuxi_ath12k_mhi_service",
         "fuxi_ath12k_read32",
-        "fuxi_ath12k_write32"
+        "fuxi_ath12k_write32",
+        "lx_os_radio_memory"
       ]
     }
   }

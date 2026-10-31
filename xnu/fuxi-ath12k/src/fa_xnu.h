@@ -1,8 +1,8 @@
 /*
- * The boundary between the driver domain (this object) and the XNU domain (fuxi_wlan.c), plain C on
- * both sides so that no Linux or FreeBSD type crosses it. Design section 2, hand-off sequence.
- * The fa_ functions are all this object shows; the fuxi_ath12k_ functions are what milestone M1 must
- * add to fuxi_wlan.c (tools/ath12k-undefined-allow.json lists them).
+ * The boundary between the driver domain (this object) and the XNU domain (fuxi_wlan.c and
+ * bsd/dev/fuxi_ath12k_os.c), plain C on both sides so that no Linux or FreeBSD type crosses it.
+ * Design section 2, hand-off sequence. Patch 0117 carries this file to bsd/dev/fa_xnu.h, and
+ * tools/ath12k-undefined-allow.json lists what the object may ask for.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -11,6 +11,9 @@
 
 #define FA_DEV_MEM_MOST		4
 #define FA_BUILD_ID_MOST	128
+
+/* The driver domain is compiled with hidden visibility: only these leave the object. */
+#define FA_PUBLIC	__attribute__((__visibility__("default")))
 
 /* What our QMI learnt from the capability response before FW_READY. */
 struct fa_caps {
@@ -26,29 +29,33 @@ struct fa_caps {
 	} dev_mem[FA_DEV_MEM_MOST];		/* [0] is the CMEM ath12k's dp.c uses as a base */
 };
 
-/* What ath12k_qmi_firmware_start() hands to our INI, CFG and MODE: tables as the firmware reads them. */
+/* What ath12k_qmi_firmware_start() hands to our INI, CFG and MODE: tables as ath12k keeps them. */
 struct fa_wlan_cfg {
-	const void	*target_ce;		/* struct ce_pipe_config[] */
+	const void	*target_ce;		/* struct ce_pipe_config[]: six little-endian u32 each */
 	unsigned	 target_ce_count;
-	const void	*service_map;		/* struct service_to_pipe[] */
+	const void	*service_map;		/* struct service_to_pipe[]: three little-endian u32 each */
 	unsigned	 service_map_count;
 	const unsigned	*shadow;		/* register addresses, shadow_reg_v3 */
 	unsigned	 shadow_count;
 };
 
 /* The driver domain offers these. */
-int	fa_firmware_ready(const struct fa_caps *caps);	/* on fw_thread, once, after FW_READY; 0 or -errno */
-void	fa_stop(void);					/* the rings are looked at no more; before containment */
-void	fa_set_radio_mac(const unsigned char *mac);	/* before fa_firmware_ready(): station.address */
+FA_PUBLIC int	fa_firmware_ready(const struct fa_caps *caps, unsigned stage);	/* fw_thread, once; 0 or -errno */
+FA_PUBLIC void	fa_stop(void);			/* rings and registers left alone from now on; repeatable */
+FA_PUBLIC void	fa_set_radio_mac(const unsigned char *mac);	/* before fa_firmware_ready(): station.address */
 
-/* The XNU domain owes these (fuxi_wlan.c, milestone M1). */
+/* fuxi_wlan.c (FUXI_ATH12K) owes these. */
 void	*fuxi_ath12k_bar(unsigned long *length);	/* BAR0 mapped contiguously for 0x100000 */
-unsigned fuxi_ath12k_read32(unsigned offset);		/* below 0x80000 of BAR0, fault contained */
+unsigned fuxi_ath12k_read32(unsigned offset);		/* below 0x100000 of BAR0, fault contained */
 void	 fuxi_ath12k_write32(unsigned offset, unsigned value);
-void	 fuxi_ath12k_mhi_service(void);			/* wl_w11_events under the MHI lock, guard at 1 Hz */
+void	 fuxi_ath12k_mhi_service(void);			/* MHI events and guard, at most every 10 ms */
 int	 fuxi_ath12k_firmware_start(const struct fa_wlan_cfg *cfg, unsigned mode);	/* INI, CFG, MODE */
 void	 fuxi_ath12k_firmware_stop(void);		/* MODE off */
-void	 fuxi_ath12k_contain(void);			/* wl5_abort containment */
+void	 fuxi_ath12k_contain(void);			/* containment is wanted when fw_thread gets back */
 void	 fuxi_ath12k_force_rddm(void);			/* wl18_force_rddm */
+
+/* bsd/dev/fuxi_ath12k_os.c owes these, for fuxi_wlan.c: the MHI lock of design section 2. */
+void	 fuxi_ath12k_mhi_lock(void);
+void	 fuxi_ath12k_mhi_unlock(void);
 
 #endif

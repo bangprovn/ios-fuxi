@@ -34,6 +34,11 @@
  *   fuxiwlanw15=1  W15 only: omit WLAN_CFG shadow-v3 TLV (default 0)
  *   fuxiwlanw16=N  qrtr=5 only: 1 larger IPCR, 2 doorbell redrive, 3 both,
  *                 4 diagnostics only; all include MODE context diagnostics
+#ifdef FUXI_ATH12K
+ *   fuxiath12k=N  kernel-metal4wifi only: hand the chip to Linux ath12k at FW_READY. N>0 alone
+ *                 implies the working recipe as defaults, each still overridable. Stage 1 stops
+ *                 after HTC ready, then contains; later stages are not built yet.
+#endif /* FUXI_ATH12K */
  * Steps 17..28 probe DMA safety and load rootfs firmware through BHI/BHIe.
  * Completion is polled; M6o can enable MSI to a RAM sink. W11 channels/QMI are opt-in;
  * see docs-lanes/wlan-bt.md M6.
@@ -96,6 +101,9 @@ extern kern_return_t pmap_enter_options_addr(pmap_t, vm_map_offset_t,
 /* Fault-contained aligned access, osfmk/arm64/machine_routines_asm.s. */
 extern unsigned fuxi_gpu_access(uintptr_t, uint64_t *, unsigned, unsigned);
 void fuxi_wlan_init(void);
+#ifdef FUXI_ATH12K
+#include "fa_xnu.h"
+#endif /* FUXI_ATH12K */
 
 #define rsr(r) ({ uint64_t rsr_v_; __asm__ volatile("mrs %0, " r : "=r"(rsr_v_)); rsr_v_; })
 #define delay fw_delay
@@ -121,8 +129,24 @@ static struct fw_window fw_windows[] = {
 	{0x81c60000, 0x20000, 0},   /* cmd-db (reserved DDR) */
 	{0x0c300000, 0x4000, 0},    /* opt-in M6n AOSS QMP; descriptor bounds 0x400 */
 	{0x00408000, 0x4000, 0},    /* opt-in M6n IPCC MPROC SEND_ID */
+#ifdef FUXI_ATH12K
+	{0x60400000, 0x100000, 0},  /* ath12k: BAR0 in one piece; only mapped when fuxiath12k>0 */
+#endif /* FUXI_ATH12K */
 };
 #define FW_NWIN (sizeof(fw_windows) / sizeof(fw_windows[0]))
+#ifdef FUXI_ATH12K
+/* The contiguous BAR0 mapping above. fw_va() still finds the older windows first. */
+static uintptr_t
+fw_bar_window(void)
+{
+	for (unsigned i = 0; i < FW_NWIN; i++) {
+		if (fw_windows[i].pa == 0x60400000 && fw_windows[i].size == 0x100000) {
+			return fw_windows[i].va;
+		}
+	}
+	return 0;
+}
+#endif /* FUXI_ATH12K */
 static uint64_t fw_mapped_bytes;
 
 static kern_return_t
@@ -920,6 +944,61 @@ static const char *const wl_pre_names[] = {"off", "qfprom", "warm", "reset", "wa
 static const char *const wl_fw_names[] = {"off", "stock"};
 static const char *const wl_vec_names[] = {"off", "early", "rddm"};
 
+#ifdef FUXI_ATH12K
+/* Design R7: the working recipe does not fit the 608-byte command line, so fuxiath12k>0 alone
+ * makes it the default for each argument that is absent. Absent fuxiath12k changes nothing. */
+static unsigned wl_fa_stage;
+static bool wl_fa_started;
+static struct fa_caps wl_fa_caps;
+static struct wl_dma wl_fa_pool; /* never freed: ath12k's workers may still name its rings */
+static const struct { const char *name; int number; const char *text; } wl_fa_recipe[] = {
+	{"fuxiwlan", 1, NULL}, {"fuxiwlanclk", 1, NULL}, {"fuxiwlanqrtr", 5, NULL},
+	{"fuxiwlanmlo", 0x1c1, NULL}, {"fuxiwlanp18", 6, NULL}, {"fuxiwlankeep", 1, NULL},
+	{"fuxiwlanprobe", 0, "civac"}, {"fuxiwlanbdf", 0, "bd_m3.elf"},
+	{"fuxiwlanseq", 0, "cycle,parf,dbi,eq,hostirq,msi,por,prefix"},
+};
+
+static void
+wl_fa_configure(void)
+{
+	int stage = 0;
+	if (PE_parse_boot_argn("fuxiath12k", &stage, sizeof(stage)) && stage > 0) {
+		wl_fa_stage = 1;
+		printf("FUXI ATH12K: fuxiath12k=%d, recipe defaults on, stage 1 is the last one built\n", stage);
+	}
+}
+
+static bool
+wl_fa_recipe_arg(const char *name, void *out, int size)
+{
+	for (unsigned i = 0; wl_fa_stage && i < sizeof(wl_fa_recipe)/sizeof(wl_fa_recipe[0]); i++) {
+		if (strcmp(name, wl_fa_recipe[i].name)) { continue; }
+		if (wl_fa_recipe[i].text) {
+			size_t n = strlen(wl_fa_recipe[i].text)+1;
+			if (n > (size_t)size) { return false; }
+			memcpy(out, wl_fa_recipe[i].text, n);
+		} else if (size == sizeof(int)) {
+			memcpy(out, &wl_fa_recipe[i].number, sizeof(int));
+		} else { return false; }
+		return true;
+	}
+	return false;
+}
+
+static bool
+wl_fa_argn(const char *name, void *out, int size)
+{
+	return PE_parse_boot_argn(name, out, size) || wl_fa_recipe_arg(name, out, size);
+}
+
+static bool
+wl_fa_arg_str(const char *name, char *out, int size)
+{
+	return PE_parse_boot_arg_str(name, out, size) || wl_fa_recipe_arg(name, out, size);
+}
+#define PE_parse_boot_argn wl_fa_argn
+#define PE_parse_boot_arg_str wl_fa_arg_str
+#endif /* FUXI_ATH12K */
 static unsigned
 wl_variant_arg(const char *name, const char *const *names, unsigned count)
 {
@@ -3478,6 +3557,15 @@ wl_qmi_cap(const uint8_t *p, unsigned len)
 			}
 		}
 	}
+#ifdef FUXI_ATH12K
+	/* Design section 2, step 4: dp.c:1304 uses dev_mem[0] as the CMEM base. */
+	wl_fa_caps.chip_id = chip; wl_fa_caps.chip_family = family; wl_fa_caps.soc_id = soc;
+	wl_fa_caps.board_id = (seen & (2u << 1)) ? board : 0xff; wl_fa_caps.fw_version = version;
+	memcpy(wl_fa_caps.fw_build_id, build, sizeof(wl_fa_caps.fw_build_id)-1);
+	for (unsigned i = 0; i < FA_DEV_MEM_MOST; i++) {
+		wl_fa_caps.dev_mem[i].start = dev_start[i]; wl_fa_caps.dev_mem[i].size = dev_size[i];
+	}
+#endif /* FUXI_ATH12K */
 	wl14_board = board; wl14_board_valid = !!(seen & (2u << 1));
 	wl_cap_done = true;
 	return 0;
@@ -4011,6 +4099,11 @@ static const uint32_t wl15_shadow_v3[36] = {
 	0x01b86400, 0x01b88400              /* CE3/4 SRC HP */
 };
 
+#ifdef FUXI_ATH12K
+/* ath12k's own values for this start (design section 2, step 5); filled just before use. */
+static struct fa_wlan_cfg wl_fa_cfg;
+static uint32_t wl_fa_target_ce[16][5];
+#endif /* FUXI_ATH12K */
 static int
 wl15_encode_cfg(struct wl12_encoder *e)
 {
@@ -4019,6 +4112,14 @@ wl15_encode_cfg(struct wl12_encoder *e)
 	 * QMI_STRING is raw "WIN" (ATH12K_HOST_VERSION_STRING), no count/NUL.
 	 * TLVs 0x11/0x12/0x17 use QMI_DATA_LEN u8 and nested structs above;
 	 * qmi_wlanfw_shadow_reg_v3_cfg_s_v01_ei is one u32 addr. No v1 0x13. */
+#ifdef FUXI_ATH12K
+	if (wl_fa_stage && e->len == 7) {
+		return wl12_tlv(e, 0x10, 0x4e4957, 3) ||
+		       wl15_array(e, 0x11, wl_fa_target_ce, wl_fa_cfg.target_ce_count, 5) ||
+		       wl15_array(e, 0x12, wl_fa_cfg.service_map, wl_fa_cfg.service_map_count, 3) ||
+		       (!wl15_variant && wl15_array(e, 0x17, wl_fa_cfg.shadow, wl_fa_cfg.shadow_count, 1));
+	}
+#endif /* FUXI_ATH12K */
 	if (e->len != 7) { return wl_w11_fail("W15 CFG encoder state"); }
 	return wl12_tlv(e, 0x10, 0x4e4957, 3) ||
 	       wl15_array(e, 0x11, wl15_target_ce, 9, 5) ||
@@ -4179,6 +4280,10 @@ wl_qmi_w12(const uint8_t *p, unsigned len)
 			uint64_t host_bdf = wl_get64(v);
 			printf("FUXI WLAN: P18 host_bdf_data %#llx HW_XPA %u CBC_FILE %u\n",
 			    (unsigned long long)host_bdf, (unsigned)(host_bdf & 1), (unsigned)((host_bdf >> 1) & 1));
+#ifdef FUXI_ATH12K
+		} else if (indication && msg == 0x3e && type == 0x10 && n == 8) {
+			printf("FUXI WLAN: P18 CAL_DONE cal file upload size %llu\n", (unsigned long long)wl_get64(v));
+#endif /* FUXI_ATH12K */
 		} else {
 			printf("FUXI WLAN: %s msg %#x unknown TLV %#x bytes %u\n", lane, msg, type, n);
 		}
@@ -4652,6 +4757,9 @@ wl_w15_run(void)
 	printf("FUXI WLAN: W15 wlan mode normal ok; stop before CE/HTC\n");
 	wl16_snapshot("MODE reply");
 	wl12_stage = WL15_OBSERVE;
+#ifdef FUXI_ATH12K
+	if (wl_fa_stage) { return wl_w11_guard(); } /* ath12k's CE init follows at once */
+#endif /* FUXI_ATH12K */
 	printf("FUXI WLAN: W15 observing indications 2000 ms (reported only)\n");
 	/* Transport consumes/reposts IPCR RX buffers as usual, but indication
 	 * contents cannot provision memory or trigger further QMI requests. */
@@ -4662,6 +4770,121 @@ wl_w15_run(void)
 	return wl_w11_events() || wl_w11_guard();
 }
 
+#ifdef FUXI_ATH12K
+/* ---- ath12k hand-off (design section 2, milestone M1). The object it enters is built by
+ * tools/ci/build-ath12k.py; src/fa_xnu.h there is the whole interface. */
+void *
+fuxi_ath12k_bar(unsigned long *length)
+{
+	*length = 0x100000;
+	return (void *)fw_bar_window();
+}
+
+unsigned fuxi_ath12k_read32(unsigned offset) { return wl_mrd(offset); }
+void fuxi_ath12k_write32(unsigned offset, unsigned value) { wl_mwr(offset, value); }
+
+void *
+lx_os_radio_memory(unsigned long size, unsigned long long *address)
+{
+	if (wl_fa_pool.va || wl_dma_alloc(&wl_fa_pool, size)) { return NULL; }
+	wl_dma_clean(&wl_fa_pool);
+	if (wl_dma_nc(&wl_fa_pool) || wl12_map_target(&wl_fa_pool)) { return NULL; }
+	printf("FUXI ATH12K: pool %lu bytes IOVA %#llx Normal-NC, SMMU mapped\n", size, (unsigned long long)wl_fa_pool.iova);
+	*address = wl_fa_pool.iova;
+	return (void *)wl_fa_pool.va;
+}
+
+/* Events were polled only inside waits on one thread until now. The poll thread calls this each
+ * round; every 10 ms is what those waits did, and each pass already includes the guard. */
+void
+fuxi_ath12k_mhi_service(void)
+{
+	static uint64_t last;
+	static bool said;
+	uint64_t now = mach_absolute_time(), ns = 0;
+	absolutetime_to_nanoseconds(now-last, &ns);
+	if (ns < 10000000ull) { return; }
+	last = now;
+	fuxi_ath12k_mhi_lock();
+	if (!wl_w11_error && wl_w11_events() && !said) {
+		said = true;
+		printf("FUXI ATH12K: MHI service stopped by a transport failure\n");
+	}
+	fuxi_ath12k_mhi_unlock();
+}
+
+/* INI, CFG, MODE as W15 sends them, with ath12k's tables. Design R5: log whether they differ. */
+int
+fuxi_ath12k_firmware_start(const struct fa_wlan_cfg *cfg, unsigned mode)
+{
+	const uint32_t (*ce)[6] = cfg->target_ce;
+	if (mode != 0 || cfg->target_ce_count > 16 || cfg->service_map_count > 32 || cfg->shadow_count > 60) {
+		printf("FUXI ATH12K: firmware start refused mode %u ce %u svc %u shadow %u\n", mode,
+		    cfg->target_ce_count, cfg->service_map_count, cfg->shadow_count);
+		return -22;
+	}
+	for (unsigned i = 0; i < cfg->target_ce_count; i++) { memcpy(wl_fa_target_ce[i], ce[i], 20); }
+	wl_fa_cfg = *cfg;
+	bool match = cfg->target_ce_count == 9 && cfg->service_map_count == 14 && cfg->shadow_count == 36 &&
+	    !memcmp(wl_fa_target_ce, wl15_target_ce, sizeof(wl15_target_ce)) &&
+	    !memcmp(cfg->service_map, wl15_service_ce, sizeof(wl15_service_ce)) &&
+	    !memcmp(cfg->shadow, wl15_shadow_v3, sizeof(wl15_shadow_v3));
+	printf("FUXI ATH12K: cfg ce %u svc %u shadow %u match-table %u\n",
+	    cfg->target_ce_count, cfg->service_map_count, cfg->shadow_count, match);
+	fuxi_ath12k_mhi_lock();
+	wl12_stage = WL15_INI;
+	int e = wl_w15_run();
+	fuxi_ath12k_mhi_unlock();
+	if (e) { wl_wlfw_diagnostics("ATH12K firmware start"); }
+	return e ? -5 : 0;
+}
+
+void
+fuxi_ath12k_firmware_stop(void)
+{
+	static struct wl12_encoder e;
+	fuxi_ath12k_mhi_lock();
+	bzero(&e, sizeof(e)); e.len = 7;
+	if (wl_w11_error || wl12_tlv(&e, 1, 4, 4) || wl12_tlv(&e, 0x10, 0, 1) || wl12_send(&e, 0x22, WL15_MODE) ||
+	    wl12_wait(0, "ATH12K MODE OFF reply") || wl_w11_wait(3, "ATH12K MODE OFF TX drain")) {
+		printf("FUXI ATH12K: mode off unconfirmed; containment follows\n");
+	} else {
+		printf("FUXI ATH12K: mode off ok\n");
+	}
+	wl12_stage = WL15_OBSERVE;
+	fuxi_ath12k_mhi_unlock();
+}
+
+/* Only asks: the one abort is fw_thread's, after fa_firmware_ready() has returned. */
+void fuxi_ath12k_contain(void) { wl_keep = false; }
+
+void
+fuxi_ath12k_force_rddm(void)
+{
+	fuxi_ath12k_mhi_lock();
+	wl18_force_rddm();
+	fuxi_ath12k_mhi_unlock();
+}
+
+static int
+wl_fa_handoff(void)
+{
+	printf("FUXI ATH12K: hand-off stage %u chip %#x family %#x board %#x soc %#x fw %#x cmem %#llx/%#llx\n",
+	    wl_fa_stage, wl_fa_caps.chip_id, wl_fa_caps.chip_family, wl_fa_caps.board_id, wl_fa_caps.soc_id,
+	    wl_fa_caps.fw_version, wl_fa_caps.dev_mem[0].start, wl_fa_caps.dev_mem[0].size);
+	wl_fa_started = true;
+	int e = fa_firmware_ready(&wl_fa_caps, wl_fa_stage);
+	/* Poll thread and ath12k's register access end here, before this thread's own MHI work. */
+	fa_stop();
+	wl_keep = false; /* every stage built so far ends in containment */
+	if (e) {
+		printf("FUXI ATH12K: hand-off failed %d; contain\n", e);
+		return wl_w11_fail("ath12k hand-off");
+	}
+	printf("FUXI ATH12K: stage %u done; containment follows\n", wl_fa_stage);
+	return 0;
+}
+#endif /* FUXI_ATH12K */
 static int
 wl_w14_run(void)
 {
@@ -4695,6 +4918,9 @@ wl_w14_run(void)
 		printf("FUXI WLAN: P18 fw ready; cold boot calibration\n");
 		return wl18_cal();
 	}
+#ifdef FUXI_ATH12K
+	if (wl_w15 && wl_fa_stage) { return wl_fa_handoff(); }
+#endif /* FUXI_ATH12K */
 	if (wl_w15) {
 		printf("FUXI WLAN: W15 fw ready; starting WLAN INI/CFG/MODE\n");
 		wl12_stage = WL15_INI;
@@ -5131,6 +5357,9 @@ wl_contain_wr(uint64_t pa, uint32_t value)
 static void
 wl5_abort(unsigned step)
 {
+#ifdef FUXI_ATH12K
+	if (wl_fa_started) { fa_stop(); } /* design section 2: before containment */
+#endif /* FUXI_ATH12K */
 	if (wl_w11_attempted) { wl_w11_stop(); }
 	wl5_status(step);
 	(void)wl_smmu_fault(step);
@@ -5409,6 +5638,9 @@ fw_thread(void *arg, wait_result_t result)
 	for (unsigned i = 0; i < FW_NWIN; i++) {
 		if ((!wl_cnss || wl_variant_invalid) &&
 		    (fw_windows[i].pa == WL_AOSS_QMP || fw_windows[i].pa == WL_AOSS_IPCC)) { continue; }
+#ifdef FUXI_ATH12K
+		if (fw_windows[i].pa == WL_BAR0 && fw_windows[i].size == 0x100000 && !wl_fa_stage) { continue; }
+#endif /* FUXI_ATH12K */
 		kern_return_t kr = fw_map_window(&fw_windows[i]);
 		if (kr != KERN_SUCCESS) {
 			printf("FUXI WLAN: map PA %#llx bytes %#llx failed %d\n",
@@ -5436,6 +5668,9 @@ fuxi_wlan_init(void)
 		return;
 	}
 	started = true;
+#ifdef FUXI_ATH12K
+	wl_fa_configure();
+#endif /* FUXI_ATH12K */
 	if (!PE_parse_boot_argn("fuxiwlan", &arg, sizeof(arg)) || arg <= 0) {
 		return;
 	}

@@ -4,7 +4,10 @@
  * calls: MHI wake stays held for the whole conversation and ASPM stays off. All rings are polled
  * and no MSI is offered, so ce.c and dp.c skip ring MSI setup because get_user_msi_vector is NULL.
  *
- * Compile and link proof only so far (M0): none of this has run.
+ * After a failure or a stage stop, fa_stop() ends the poll thread and latches every later register
+ * access to nothing, because ath12k's work queues and timers may still run. The rings stay: the
+ * pool is never freed, and containment on fw_thread is the only other step. `ab` stays too, which
+ * is the price of not unwinding what those workers may name; the radio needs a reboot anyway.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -51,6 +54,9 @@ static struct {
 	volatile bool looking;			/* the poll thread should run */
 	volatile bool looks;			/* it runs */
 	volatile bool data;			/* DP rings join the poll: irq_enable */
+	volatile bool dead;			/* fa_stop(): no more register access */
+	unsigned stage;
+	bool stage_hit;
 } hif;
 
 /* ---- registers: pci.c:1150-1242 without wake calls ------------------------------------------------- */
@@ -72,6 +78,9 @@ hif_read32(struct ath12k_base *ab, u32 offset)
 {
 	u32 value;
 
+	if (hif.dead) {
+		return (~0u);
+	}
 	if (offset < FA_WINDOW_START) {
 		return (fuxi_ath12k_read32(offset));
 	}
@@ -89,6 +98,9 @@ hif_read32(struct ath12k_base *ab, u32 offset)
 static void
 hif_write32(struct ath12k_base *ab, u32 offset, u32 value)
 {
+	if (hif.dead) {
+		return;
+	}
 	if (offset < FA_WINDOW_START) {
 		fuxi_ath12k_write32(offset, value);
 		return;
@@ -144,8 +156,8 @@ hif_poll(void *argument)
 	hif.looks = false;
 }
 
-static void
-hif_quiesce(void)
+void
+fa_hif_quiesce(void)
 {
 	hif.data = false;
 	hif.looking = false;
@@ -175,7 +187,7 @@ hif_start(struct ath12k_base *ab)
 static void
 hif_stop(struct ath12k_base *ab)
 {
-	hif_quiesce();
+	fa_hif_quiesce();
 	ath12k_ce_cleanup_pipes(ab);
 }
 
@@ -201,7 +213,7 @@ hif_power_up(struct ath12k_base *ab)
 static void
 hif_power_down(struct ath12k_base *ab, bool is_suspend)
 {
-	hif_quiesce();
+	fa_hif_quiesce();
 	fuxi_ath12k_contain();
 }
 
@@ -254,8 +266,22 @@ static const struct ath12k_hif_ops fa_hif_ops = {
 
 void	fa_qmi_take_caps(struct ath12k_base *ab, const struct fa_caps *caps);
 
+/* tools/ath12k-edits.json, ath12k-stage-htc: core.c asks right after HTC ready (design M1). */
+bool
+fa_stage_htc_ready(struct ath12k_base *ab)
+{
+	lx_tell("FUXI ATH12K: M1 HTC ready credits %d size %d\n", ab->htc.total_transmit_credits,
+	    ab->htc.target_credit_size);
+	lx_memory_say();
+	if (hif.stage != 1) {
+		return (false);
+	}
+	hif.stage_hit = true;
+	return (true);
+}
+
 int
-fa_firmware_ready(const struct fa_caps *caps)
+fa_firmware_ready(const struct fa_caps *caps, unsigned stage)
 {
 	static struct device device;
 	struct ath12k_base *ab;
@@ -280,7 +306,9 @@ fa_firmware_ready(const struct fa_caps *caps)
 		return (-ENODEV);
 	}
 	spin_lock_init(&hif.window_lock);
-	hif.window = 0;
+	hif.window = ~0u;			/* unknown: fuxi_wlan.c's diagnostics move and restore it too */
+	hif.stage = stage;
+	ath12k_debug_mask |= ATH12K_DBG_HTC;	/* design M1: "Target ready!" is part of the proof */
 
 	ab = ath12k_core_alloc(&device, 0, ATH12K_BUS_PCI);
 	if (ab == NULL) {
@@ -295,6 +323,9 @@ fa_firmware_ready(const struct fa_caps *caps)
 	ab->hw_rev = ATH12K_HW_WCN7850_HW20;
 	ab->static_window_map = false;
 	ab->target_mem_mode = ATH12K_QMI_MEMORY_MODE_DEFAULT;
+	ab->id.vendor = 0x17cb;
+	ab->id.device = 0x1107;			/* WCN7850, as the phone's endpoint reports */
+	ab->id.bdf_search = ATH12K_BDF_SEARCH_BUS_AND_BOARD;
 	for (int i = 0; i < ATH12K_EXT_IRQ_GRP_NUM_MAX; i++) {
 		ab->ext_irq_grp[i].ab = ab;
 		ab->ext_irq_grp[i].grp_id = i;
@@ -314,7 +345,6 @@ fa_firmware_ready(const struct fa_caps *caps)
 	}
 	if (error != 0) {
 		lx_tell("FUXI ATH12K: early init failed: %d\n", error);
-		ath12k_core_free(ab);
 		return (error);
 	}
 	ab->qmi.ce_cfg.tgt_ce = ab->hw_params->target_ce_config;
@@ -335,6 +365,10 @@ fa_firmware_ready(const struct fa_caps *caps)
 	fa_qmi_take_caps(ab, caps);
 
 	error = ath12k_core_qmi_firmware_ready(ab);
+	if (error == -ECANCELED && hif.stage_hit) {
+		/* core.c went down its normal error path: HIF stopped, DP down, mode off. */
+		return (0);
+	}
 	if (error != 0) {
 		lx_tell("FUXI ATH12K: firmware ready path failed: %d\n", error);
 		return (error);
@@ -346,5 +380,6 @@ fa_firmware_ready(const struct fa_caps *caps)
 void
 fa_stop(void)
 {
-	hif_quiesce();
+	fa_hif_quiesce();
+	hif.dead = true;
 }

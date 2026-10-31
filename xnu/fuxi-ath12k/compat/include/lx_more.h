@@ -118,6 +118,8 @@ void lx_vlog_ratelimited(const char *format, va_list list);
 void *lx_dma_zalloc(size_t size);
 void lx_dma_free(void *memory, size_t size);
 void fa_radio_mac(u8 *mac);		/* src/fa_80211.c: design section 4, station.address */
+struct ath12k_base;
+bool fa_stage_htc_ready(struct ath12k_base *ab);	/* src/fa_hif.c: stops ath12k_core_start at stage 1 */
 
 /* --- the six functions LinuxKPI 15.1 lacks (design section 4) */
 
