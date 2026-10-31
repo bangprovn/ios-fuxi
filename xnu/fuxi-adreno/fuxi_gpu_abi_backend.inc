@@ -55,8 +55,54 @@ static unsigned fg_abi_coh, fg_abi_coh_tries; /* coh: 0 untested, 1 proven coher
 static unsigned fg_abi_cbo, fg_abi_cbo_on; /* bit 29 asked; latched on once the wb-ish self-test passed (never cleared until init) */
 static const char *fg_abi_cbo_said;
 /* The submit record holds up to NativeAdrenoAbiMaxBuffers IBs; one frame is then one ring prologue and one CP context reset. */
-_Static_assert(FG_ABI_FRAME_WORDS+8 < 8192, "one frame must fit the idle ring");
-static uint32_t fg_abi_words[FG_ABI_FRAME_WORDS];
+/* Per-job GPU timestamps (always on, 12 ring words per job): CP_REG_TO_MEM of the always-on counter (19.2 MHz, reg 0x980) into the fence
+ * page at FG_JS_OFF + (seq & 7)*16: +0 right after the frame's opening BR sync (the CP reached the job; every frame ends with a WFI, so
+ * the earlier ring work is done), +8 after its closing WFI (the job's work is done), on BR alone (the frame ends with both threads
+ * selected; that selection is restored after the stamp). The CPU reads the counter's low word at submit (a
+ * parked job keeps its submit time: the park is part of its wait) and at the observation that retires the job. Per 600 retired jobs
+ * ('FUXI GPU ABI: job_stamps'): submit_to_start, exec and end_to_observed avg/max us, and jobs missing a stamp. The fence page slot is
+ * zeroed at submit, before the job can run. Not yet observed on device. */
+#define FG_JS_OFF 1024u
+#define FG_JS_WORDS 12u
+#define FG_ABI_JOB_WORDS (FG_ABI_FRAME_WORDS+FG_JS_WORDS)
+_Static_assert(FG_ABI_JOB_WORDS+8 < 8192, "one frame must fit the idle ring");
+static uint32_t fg_abi_words[FG_ABI_JOB_WORDS];
+static uint32_t fg_js_submit[8], fg_js_n, fg_js_bad;
+static uint64_t fg_js_sum[3], fg_js_max[3];
+/* words[4..4+n) holds a built frame: open it with its first packet (the BR sync), the start stamp, the rest, BR, the end stamp, BOTH. */
+static unsigned fg_js_wrap(uint32_t *words, unsigned n, uint32_t seq)
+{
+ const uint32_t slot=FG_JS_OFF+(seq&7u)*16u, op=fg_abi_pkt7(0x3e,3), reg=0x980|(2u<<18)|(1u<<30);
+ words[0]=words[4]; words[1]=words[5];
+ words[2]=op; words[3]=reg; words[4]=G3_FENCE_VA+slot; words[5]=0;
+ words[4+n]=fg_abi_pkt7(0x17,1); words[5+n]=1;
+ words[6+n]=op; words[7+n]=reg; words[8+n]=G3_FENCE_VA+slot+8; words[9+n]=0;
+ words[10+n]=fg_abi_pkt7(0x17,1); words[11+n]=3;
+ g_wr(G3_FENCE_PA,slot,0); g_wr(G3_FENCE_PA,slot+8,0);
+ fg_js_submit[seq&7u]=g3_gr(0x980);
+ return n+FG_JS_WORDS;
+}
+/* Jobs (from, to] retired by this observation. */
+static void fg_js_retire(uint32_t from, uint32_t to)
+{
+ for (uint32_t q=from+1; q-from<=to-from && q-from<=8; q++) {
+  /* Stamps before the counter: the inline root (bit 21) retires on the fence alone, which the CP writes before the end stamp. */
+  const uint32_t slot=FG_JS_OFF+(q&7u)*16u, s0=g3_read(G3_FENCE_PA+slot), s1=g3_read(G3_FENCE_PA+slot+8), now=g3_gr(0x980);
+  if (fg_access_failed || !s0 || !s1) fg_js_bad++;
+  else {
+   const uint32_t v[3]={s0-fg_js_submit[q&7u], s1-s0, now-s1};
+   for (unsigned i=0;i<3;i++) { fg_js_sum[i]+=v[i]; if (v[i]>fg_js_max[i]) fg_js_max[i]=v[i]; }
+  }
+  if (!(++fg_js_n % 600)) {
+   const uint64_t good=600-fg_js_bad ? 600-fg_js_bad : 1;
+   #define FG_JS_US(t) ((unsigned long long)((t)*10/192))
+   printf("FUXI GPU ABI: job_stamps per 600 jobs submit_to_start_us avg %llu max %llu exec_us avg %llu max %llu end_to_observed_us avg %llu max %llu no_stamp %u\n",
+       FG_JS_US(fg_js_sum[0]/good), FG_JS_US(fg_js_max[0]), FG_JS_US(fg_js_sum[1]/good), FG_JS_US(fg_js_max[1]), FG_JS_US(fg_js_sum[2]/good), FG_JS_US(fg_js_max[2]), fg_js_bad);
+   #undef FG_JS_US
+   memset(fg_js_sum,0,sizeof(fg_js_sum)); memset(fg_js_max,0,sizeof(fg_js_max)); fg_js_bad=0;
+  }
+ }
+}
 /* IBs per submission: submissions, IBs, the most in one, submissions with more than 16 (one frame was several before the 128-IB record). */
 static uint32_t fg_abi_ibs[4];
 /* Stall recovery: kicks, fence of the last stalled job, bus drains, GBIF client/arbiter halt acks of the last drain, jobs that completed
@@ -497,6 +543,7 @@ static int fg_abi_observe(void)
   if (!fg_root_client && !fg_abi_switch(G3_PT)) return fg_abi_fault("client restore TTBR");
   fg_abi_import_cache(1); /* before fence success, even without a user wait */
   if (fg_abi_stage) fg_abi_stall_done();
+  fg_js_retire(fg_abi_completed, fg_abi_seq);
   fg_abi_completed = fg_abi_seq;
   FG_ABI_WAKE(); fg_client_busy = 0; if (!fg_abi_hold) fg_abi_present_wait = 0; /* hold: the waiting present, not the next client job, takes the idle GPU */
   return 0;
@@ -507,6 +554,7 @@ static int fg_abi_observe(void)
    if (fg_abi_queue && (f=g3_read(G3_FENCE_PA+FG_ABI_FENCE_OFF+4))>fg_abi_completed && f<fg_abi_seq) {
     fg_abi_import_cache(1); fg_abi_host_handoff=1; /* the newer job's handoff is still open */
     if (fg_abi_stage) fg_abi_stall_done();
+    fg_js_retire(fg_abi_completed, f);
     fg_abi_completed=f; fg_client_deadline=rsr("cntpct_el0")+rsr("cntfrq_el0")/10;
     return 1;
    } }
@@ -884,7 +932,7 @@ static unsigned fg_abi_inflight(void) { return fg_abi_seq-fg_abi_completed; }
  * expiry. The GPU idles from job N's end to copy N's submit (device Q222: ~0.2 ms writer retire, then ~0.05 ms, or ~0.7 ms while the
  * previous copy still runs). Ring room for the parked frame plus one copy is reserved at park time (only the copy is written before the
  * parked job). Not yet observed on device. */
-static uint32_t fg_pk_words[FG_ABI_FRAME_WORDS];
+static uint32_t fg_pk_words[FG_ABI_JOB_WORDS];
 static uint32_t fg_pk_fence, fg_pk_wfence, fg_pk_gen, fg_pk_stats[FG_PK_REASONS+3], fg_pk_idle_n; /* stats: releases per reason, parked, no ring room, not after writer */
 static uint64_t fg_pk_since, fg_pk_retired, fg_pk_sum, fg_pk_max, fg_pk_idle_sum, fg_pk_idle_max;
 static void fg_pk_stats_reset(void) { fg_pk_idle_n=0; fg_pk_sum=fg_pk_max=fg_pk_idle_sum=fg_pk_idle_max=0; memset(fg_pk_stats,0,sizeof(fg_pk_stats)); }
@@ -991,15 +1039,16 @@ static int fg_abi_submit_locked(const uint64_t *iovas, const uint64_t *sizes,
   if (!inl && fg_abi_present_wait) { fg_abi_q_stats[2]++; FG_REFUSE(3); }
   uint32_t used=(g3_wptr-g3_gr(0x806))&8191;
   if (fg_access_failed) return fg_abi_fault("client queue ring read");
-  if (fg_abi_seq-fg_abi_completed>=FG_ABI_QUEUE_MAX || used+FG_ABI_FRAME_WORDS+64>8191) { fg_abi_q_stats[3]++; FG_REFUSE(4); }
+  if (fg_abi_seq-fg_abi_completed>=FG_ABI_QUEUE_MAX || used+FG_ABI_JOB_WORDS+64>8191) { fg_abi_q_stats[3]++; FG_REFUSE(4); }
   if (g3_faulted()) return fg_abi_fault("client pre-queue fault");
   queued=idle>0;
  } else if (g3_faulted() || g3_gr(0x806)!=g3_wptr || g3_gr(0x807)!=g3_wptr || (g3_gr(0x210)&~1u))
   return fg_abi_fault("client pre-submit idle/fault");
  FG_SS(FG_SS_IDLE);
  uint32_t *words=fg_abi_words; /* serialized by the GPU lock; too large for the kernel stack at 128 IBs */
- unsigned n=fg_abi_frame(words,iovas,sizes,count,G3_FENCE_VA+FG_ABI_FENCE_OFF,fg_abi_seq,fg_abi_seq+1,1);
+ unsigned n=fg_abi_frame(words+4,iovas,sizes,count,G3_FENCE_VA+FG_ABI_FENCE_OFF,fg_abi_seq,fg_abi_seq+1,1);
  if (!n) return -1;
+ n=fg_js_wrap(words,n,fg_abi_seq+1);
  FG_SS(FG_SS_FRAME);
  fg_abi_ibs[0]++; fg_abi_ibs[1]+=count; if (count>fg_abi_ibs[2]) fg_abi_ibs[2]=count; if (count>16) fg_abi_ibs[3]++;
  uint32_t pk_writer=0;

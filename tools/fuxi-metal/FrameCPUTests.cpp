@@ -48,7 +48,8 @@ int main(){
  auto trace=std::make_unique<FrameTraceWindow>();
  for(unsigned i=1;i<=10;++i){FrameSample s;s.retireQueue=i*1000000;trace->add(s);}
  assert(trace->percentile(&FrameSample::retireQueue,50)==5000000 && trace->percentile(&FrameSample::retireQueue,90)==9000000);
- FILE *report=tmpfile();assert(report);trace->report(report);rewind(report);char line[16384]{};assert(fgets(line,sizeof(line),report));fclose(report);
+ FILE *report=tmpfile();assert(report);trace->report(report);rewind(report);char line[16384]{};size_t used=0; // the main line, rejoined from its <=200-char pieces
+ for(char piece[512];fgets(piece,sizeof piece,report);){assert(strlen(piece)<=201);bool cont=!strncmp(piece,"FUXI MTL: frame trace+",22);if(used && !cont)break;if(used)--used;const char *at=cont?piece+22:piece;size_t m=strlen(at);assert(used+m<sizeof line);memcpy(line+used,at,m+1);used+=m;}fclose(report);
  assert(std::string(line).find("retire_queue=5.000/9.000")!=std::string::npos && !trace->size());
  puts("PASS: bounded CPU reads, level 0/1 disabled, 120 nested methods, gaps, migration, stop/exception/failure");
 }

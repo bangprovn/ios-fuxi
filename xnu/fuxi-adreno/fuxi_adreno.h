@@ -51,8 +51,11 @@ int fuxi_gpu_scanout_acquire(void);
 int fuxi_gpu_scanout_publish(void);
 int fuxi_gpu_scanout_retry(void);
 /* Not-shown accounting: offer_fate is what became of the frame waiting at the last publish (0 none, 1 STARTed by the spin thread
- * during the copy, 2 replaced unstarted); async_take returns 1 once when the spin thread STARTed the waiting frame unreported. */
+ * during the copy, 2 replaced unstarted, 3 kept waiting with this copy queued behind it, 4 STARTed by this offer with this copy queued
+ * behind it; 3 and 4 only with fuxi_gpu_scanout_fifo, fuxiearly bit 4); async_take returns 1 once when the spin thread STARTed the
+ * waiting frame unreported. */
 unsigned fuxi_gpu_scanout_offer_fate(void);
+int fuxi_gpu_scanout_fifo(void);
 int fuxi_gpu_scanout_async_take(void);
 int fuxi_gpu_scanout_pending(void);
 int fuxi_gpu_scanout_double(void);

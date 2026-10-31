@@ -107,11 +107,18 @@ bool sweet_surface_display_hold(SweetSurface *s)
  IOLockUnlock(sweet_surface_lock);
  return ok;
 }
+#if defined(FUXI)
+static void sweet_display_wake(void);
+#endif
 void sweet_surface_display_drop(SweetSurface *s)
 {
+ bool last = false;
  IOLockLock(sweet_surface_lock);
- if (s->displayUses) { s->displayUses--; sweet_surface_use_publish(s); }
+ if (s->displayUses) { s->displayUses--; sweet_surface_use_publish(s); last = !s->displayUses; }
  IOLockUnlock(sweet_surface_lock);
+#if defined(FUXI)
+ if (last) sweet_display_wake();
+#endif
 }
 
 OSDefineMetaClassAndStructors(SweetSurface, OSObject);
@@ -368,6 +375,48 @@ static void sweet_direct_nap(void)
  nanoseconds_to_absolutetime(250000ull, &deadline);
  (void)IOLockSleepDeadline(sweet_writer_lock, &sweet_gpu_inflight, mach_absolute_time() + deadline, THREAD_UNINT);
 }
+/* fuxiearly bit 2 (AppleCLCD SwapWait retire at swap admission): the first writer lease of a surface that a queued swap still holds for
+ * display (displayUses: from admission until its copy retires or the record is dropped) waits for that before bumping the writer epoch,
+ * which would make the record stale (dropped, never torn). AvoidSync leases wait too: their epoch bump stales the record just the same,
+ * and their writer count would keep the record from ever being copied. With a writer already outstanding the record cannot be copied
+ * anyway, so nothing waits. The display never waits for a writer that has not started (present_begin refuses instead), so the wait
+ * ends when the display copies or drops the record; SWEET_DISPLAY_WAIT_MS bounds it (display off, scanout held, a stalled START), after
+ * which today's stale-and-drop applies. Waiter count and the drop are ordered seq_cst (both sides store then load), and the wakeup is
+ * sent under the writer lock the waiter sleeps with, so none is lost. Counted for 'SWEET FB: early'. Not yet observed on device. */
+#define SWEET_DISPLAY_WAIT_MS 25
+static bool sweet_display_wait_on;
+static uint32_t sweet_display_waiters, sweet_display_waits, sweet_display_wait_timeouts;
+static uint64_t sweet_display_wait_sum, sweet_display_wait_max;
+void sweet_surface_display_wait(bool enabled) { if (sweet_gpu_init()) __atomic_store_n(&sweet_display_wait_on, enabled, __ATOMIC_RELEASE); }
+void sweet_surface_display_wait_stats(uint32_t *waits, uint32_t *timeouts, uint64_t *sum, uint64_t *max)
+{
+ if (!sweet_gpu_init()) return;
+ IOLockLock(sweet_writer_lock);
+ *waits = sweet_display_waits; *timeouts = sweet_display_wait_timeouts; *sum = sweet_display_wait_sum; *max = sweet_display_wait_max;
+ sweet_display_waits = sweet_display_wait_timeouts = 0; sweet_display_wait_sum = sweet_display_wait_max = 0;
+ IOLockUnlock(sweet_writer_lock);
+}
+static void sweet_display_wake(void)
+{
+ __atomic_thread_fence(__ATOMIC_SEQ_CST);
+ if (!__atomic_load_n(&sweet_display_waiters, __ATOMIC_SEQ_CST) || !sweet_writer_lock) return;
+ IOLockLock(sweet_writer_lock); IOLockWakeup(sweet_writer_lock, &sweet_gpu_inflight, false); IOLockUnlock(sweet_writer_lock);
+}
+/* Under sweet_writer_lock. */
+static void sweet_display_wait(SweetSurface *s)
+{
+ if (!__atomic_load_n(&sweet_display_wait_on, __ATOMIC_ACQUIRE) || s->gpuWriters || !__atomic_load_n(&s->displayUses, __ATOMIC_ACQUIRE)) return;
+ uint64_t start = mach_absolute_time(), bound = 0; bool timedOut = false;
+ nanoseconds_to_absolutetime(SWEET_DISPLAY_WAIT_MS * 1000000ull, &bound);
+ __atomic_fetch_add(&sweet_display_waiters, 1, __ATOMIC_SEQ_CST);
+ while (!s->gpuWriters && !s->gpuQuarantined && __atomic_load_n(&s->displayUses, __ATOMIC_SEQ_CST)) {
+  if (mach_absolute_time() - start >= bound) { timedOut = true; break; }
+  (void)IOLockSleepDeadline(sweet_writer_lock, &sweet_gpu_inflight, start + bound, THREAD_UNINT);
+ }
+ __atomic_fetch_sub(&sweet_display_waiters, 1, __ATOMIC_SEQ_CST);
+ uint64_t d = mach_absolute_time() - start;
+ sweet_display_waits++; sweet_display_wait_sum += d; if (d > sweet_display_wait_max) sweet_display_wait_max = d; if (timedOut) sweet_display_wait_timeouts++;
+}
 /* AvoidSync reserves a pending producer without waiting; it must take a
  * normal writer lease before touching pixels. Display reads never sleep. */
 static bool sweet_gpu_writer(SweetSurface *s, bool lock, bool pending = false)
@@ -375,6 +424,7 @@ static bool sweet_gpu_writer(SweetSurface *s, bool lock, bool pending = false)
  if (!sweet_gpu_init()) return false;
  IOLockLock(sweet_writer_lock);
  if (lock) {
+  sweet_display_wait(s);
   if (s->gpuWriters == ~0u || s->gpuWriterSerial == ~0ull || s->gpuWriterEpoch == ~0ull) { s->gpuQuarantined = true; sweet_surface_display_poison(s); }
   if (s->gpuQuarantined) { IOLockUnlock(sweet_writer_lock); return false; }
   s->gpuWriterSerial++;

@@ -335,33 +335,34 @@ static int fuxi_gpu_scanout_acquire(void) {return scanAcquire;}
 static unsigned scanFate;static int scanAsync,scanAsyncLate;
 static int fuxi_gpu_scanout_async_take(void) {int a=scanAsync;scanAsync=0;return a;}
 static unsigned fuxi_gpu_scanout_offer_fate(void) {return scanFate;}
-static int fuxi_gpu_scanout_publish(void) {scanFate=scanAsyncLate?1:scanBackReady?2:0;scanAsyncLate=0;scanPublications++;if(scanPublish==1){scanTimes.previous_start=scanTimes.start;scanTimes.start=mach_absolute_time();}if(scanPublish==2)scanBackReady=true;return scanPublish;}
+static unsigned scanFifoFate; /* fuxiearly bit 4: the offer queued behind the waiting frame (3) or also STARTed it (4) */
+static int fuxi_gpu_scanout_publish(void) {if(scanFifoFate){scanFate=scanFifoFate;scanAsyncLate=0;scanPublications++;if(scanFifoFate==4){scanTimes.previous_start=scanTimes.start;scanTimes.start=mach_absolute_time();}scanBackReady=true;return 2;}scanFate=scanAsyncLate?1:scanBackReady?2:0;scanAsyncLate=0;scanPublications++;if(scanPublish==1){scanTimes.previous_start=scanTimes.start;scanTimes.start=mach_absolute_time();}if(scanPublish==2)scanBackReady=true;return scanPublish;}
+static uint32_t dwWaits,dwTimeouts;static uint64_t dwSum,dwMax;
+static void sweet_surface_display_wait_stats(uint32_t *w,uint32_t *t,uint64_t *sum,uint64_t *max) {*w=dwWaits;*t=dwTimeouts;*sum=dwSum;*max=dwMax;dwWaits=dwTimeouts=0;dwSum=dwMax=0;}
 static char importStatsLog[2048],teStatsLog[2048],frameStatsLog[2048],stageStatsLog[2048],pacingStatsLog[2048];
-static char flogEndLog[1024],unshownLog[1024];static unsigned flogLines;
+static char flogEndLog[1024],unshownLog[1024],swapwaitLog[512],earlyLog[512],flogBeginLog[2048];static unsigned flogLines,wrappedPieces;
+/* A head line replaces buf; its '<head>+' continuations (AppleCLCD::logWrapped) append, which gives back the unwrapped line. */
+static void capture(char *buf,size_t size,const char *msg,const char *head) {
+ size_t h=strlen(head);if(strncmp(msg,head,h))return;
+ if(msg[h]=='+'){size_t n=strlen(buf);if(n && buf[n-1]=='\n')buf[--n]=0;snprintf(buf+n,size-n,"%s",msg+h+1);wrappedPieces++;}
+ else snprintf(buf,size,"%s",msg);
+}
 static int IOLog(const char *format,...) {
  logs++;
  if(!strncmp(format,"SWEET FB: flog %u",17))flogLines++;
- if(strstr(format,"SWEET FB: flog end")) {
-  va_list args;va_start(args,format);vsnprintf(flogEndLog,sizeof(flogEndLog),format,args);va_end(args);
- }
- if(strstr(format,"SWEET FB: unshown paths")) {
-  va_list args;va_start(args,format);vsnprintf(unshownLog,sizeof(unshownLog),format,args);va_end(args);
- }
- if(strstr(format,"SWEET FB: pacing")) {
-  va_list args;va_start(args,format);vsnprintf(pacingStatsLog,sizeof(pacingStatsLog),format,args);va_end(args);
- }
- if(strstr(format,"SWEET FB: stages")) {
-  va_list args;va_start(args,format);vsnprintf(stageStatsLog,sizeof(stageStatsLog),format,args);va_end(args);
- }
- if(strstr(format,"SWEET FB: stats")) {
-  va_list args;va_start(args,format);vsnprintf(frameStatsLog,sizeof(frameStatsLog),format,args);va_end(args);
- }
- if(strstr(format,"vsync te-locked=")) {
-  va_list args;va_start(args,format);vsnprintf(teStatsLog,sizeof(teStatsLog),format,args);va_end(args);
- }
- if(strstr(format,"bytes cumulative")) {
-  va_list args;va_start(args,format);vsnprintf(importStatsLog,sizeof(importStatsLog),format,args);va_end(args);
- }
+ char msg[2048];va_list args;va_start(args,format);vsnprintf(msg,sizeof(msg),format,args);va_end(args);
+ static const char *const wrapped[]={"SWEET FB: flog begin","SWEET FB: flog end","SWEET FB: unshown paths","SWEET FB: stages","SWEET FB: stats","FUXI GPU: presents","SWEET FB: swapwait","SWEET FB: early","SWEET FB: pacing"};
+ for(const char *head:wrapped)if(!strncmp(msg,head,strlen(head)))assert(strlen(msg)<=201); /* the device logger splits lines near 240 chars */
+ capture(flogBeginLog,sizeof(flogBeginLog),msg,"SWEET FB: flog begin");
+ capture(flogEndLog,sizeof(flogEndLog),msg,"SWEET FB: flog end");
+ capture(unshownLog,sizeof(unshownLog),msg,"SWEET FB: unshown paths");
+ capture(pacingStatsLog,sizeof(pacingStatsLog),msg,"SWEET FB: pacing");
+ capture(stageStatsLog,sizeof(stageStatsLog),msg,"SWEET FB: stages");
+ capture(frameStatsLog,sizeof(frameStatsLog),msg,"SWEET FB: stats");
+ capture(swapwaitLog,sizeof(swapwaitLog),msg,"SWEET FB: swapwait");
+ capture(earlyLog,sizeof(earlyLog),msg,"SWEET FB: early");
+ capture(importStatsLog,sizeof(importStatsLog),msg,"FUXI GPU: presents");
+ if(strstr(msg,"vsync te-locked="))snprintf(teStatsLog,sizeof(teStatsLog),"%s",msg);
  return 0;
 }
 struct IOTimerEventSource {uint64_t next=0;void wakeAtTime(int,uint64_t n,int){next=n;arms++;}void setTimeoutUS(unsigned n){next=ticks+n*1000;arms++;}};
@@ -921,6 +922,64 @@ int main(void) {
  puts("PASS: frame log (bit 8): warmup, per-frame fates S/P and drop paths, GPU detail, one-shot summary and TE gaps; spin-STARTed waiting frames shown, lost/replaced split; not-shown trigger (bit 28); due surfaces (bit 16) follow the queue and the copy; superseded ready swap dropped before its copy (bit 32), not while a writer holds it");
  }
  {
+ // SwapWait busy counters per mode and per swap, busy before 1- and 2+-vsync swap intervals; fuxiearly bit 2 admission retire.
+ OSArray adClients;AppleCLCD ad={};IOTimerEventSource adt;ad.fClients=&adClients;ad.fLock=&lock;ad.fVsync=&adt;ad.fConsolePaused=true;ad.fFlushTicks=1;
+ ad.fWidth=18;ad.fHeight=3;ad.fRowBytes=96;ad.fPixels=(uintptr_t)pixels;ad.fTickAbs=1000;ad.fSwapIdle=1000000;ad.fSwapID=4100;
+ gpuMode=0;pollMode=1;unsigned baseRefs=refs;const unsigned H=SWEET_FB_SWAP_HISTORY;
+ uint8_t frame[SWEET_FB_SWAP_REC_SIZE];memcpy(frame,rec,sizeof(frame));
+ put32(frame,0x50,4001);assert(!ad.swap(frame) && ad.fSwapStatus[4001%H].state==AppleCLCD::SwapQueued);
+ assert(ad.swapWait(4001,0x80000000u,0)==kIOReturnBusy && ad.swapWait(4001,0x80000001u,0)==kIOReturnBusy);
+ assert(ad.fWaitBusy[0]==1 && ad.fWaitBusy[1]==1 && ad.fBusySinceSwap==2 && ad.fBusySwaps==1);
+ ad.vsyncFired(&ad,&adt);assert(ad.swapWait(4001,0x80000001u,0)==kIOReturnSuccess);
+ advanceGate(1000);put32(frame,0x50,4002);assert(!ad.swap(frame));ad.vsyncFired(&ad,&adt);
+ assert(ad.fCadIntervals[0]==1 && ad.fCadBusy[0]==1 && ad.fBusySwapMax==2 && !ad.fBusySinceSwap);
+ advanceGate(2000);put32(frame,0x50,4003);assert(!ad.swap(frame));ad.vsyncFired(&ad,&adt);
+ assert(ad.fCadIntervals[1]==1 && !ad.fCadBusy[1] && ad.fBusySwaps==3);
+ ad.fAdmitRetire=true;advanceGate(1000);put32(frame,0x50,4004);assert(!ad.swap(frame));
+ assert(ad.fSwapStatus[4004%H].state==AppleCLCD::SwapConsumed && ad.fAdmitRetires==1 && ad.swapWait(4004,0,0)==kIOReturnSuccess);
+ assert(ad.swapWait(4004,0x80000001u,0)==kIOReturnBusy && ad.fWaitBusy[1]==2 && ad.fPendingCount==1);
+ ad.vsyncFired(&ad,&adt);assert(ad.swapWait(4004,0x80000001u,0)==kIOReturnSuccess && ad.fSwapStatus[4004%H].state==AppleCLCD::SwapShown);
+ dwWaits=3;dwTimeouts=1;dwSum=9000;dwMax=5000;ad.fStatFrames=599;unsigned pieces=wrappedPieces;
+ advanceGate(1000);put32(frame,0x50,4005);assert(!ad.swap(frame));ad.vsyncFired(&ad,&adt);
+ assert(!ad.fStatFrames && strstr(swapwaitLog,"busy_mode0=1 busy_mode1=2 timeouts=0 busy_per_swap_x1000=600 busy_swap_max=2 intervals_1=3 busy_before_1=2 intervals_2plus=1 busy_before_2plus=0\n"));
+ assert(strstr(earlyLog,"admit_retires=2 writer_display_waits=3 timeouts=1 wait_us avg=3 max=5 fifo_queued=0 fifo_started_at_offer=0 fifo_dropped=0\n") && !dwWaits);
+ assert(!ad.fWaitBusy[0] && !ad.fWaitBusy[1] && !ad.fCadIntervals[0] && !ad.fAdmitRetires && !ad.fBusySwaps);
+ assert(wrappedPieces>pieces && strstr(frameStatsLog,"outstanding_max=") && strstr(frameStatsLog,"early_retires=0\n") && !strstr(frameStatsLog,"+"));
+ ad.fAdmitRetire=false;earlyLog[0]=0;ad.fStatFrames=599;put32(frame,0x50,4006);assert(!ad.swap(frame));ad.vsyncFired(&ad,&adt);
+ assert(!earlyLog[0] && strstr(swapwaitLog,"busy_mode0=0 busy_mode1=0") && ad.fSwapStatus[4006%H].state==AppleCLCD::SwapShown);
+ put32(frame,0x50,4007);assert(!ad.swap(frame));assert(ad.swapWait(4007,0,0)==kIOReturnTimeout && ad.fWaitTimeouts==1 && ad.fBusySinceSwap==1);
+ IOLockLock(ad.fLock);ad.stopRecords();IOLockUnlock(ad.fLock);assert(refs==baseRefs);
+ puts("PASS: SwapWait busy per mode/per swap, timeouts, and busy before 1-/2+-vsync intervals; admission retire (fuxiearly bit 2) Consumed at swap, shown later; early log and resets");
+ }
+ {
+ // fuxiearly bit 4: a newer copy queues behind the frame waiting for START (fate 3), is promoted at its START, or the offer STARTs it (4); drops.
+ OSArray ffClients;AppleCLCD ff={};ff.fClients=&ffClients;ff.fLock=&lock;ff.fScanout=true;ff.fConsolePaused=true;ff.fFlushTicks=1;
+ ff.fWidth=18;ff.fHeight=3;ff.fRowBytes=96;ff.fPixels=(uintptr_t)pixels;ff.fTickAbs=8333;ff.fSwapID=5100;ff.fFifo=true;
+ scanOwned=scanDouble=scanTriple=true;scanAcquire=1;scanPublish=2;scanRetryResult=0;gpuMode=2;pollMode=1;
+ unsigned baseRefs=refs,dropsBefore=ff.fStatDropped;
+ uint8_t frame[SWEET_FB_SWAP_REC_SIZE];memcpy(frame,rec,sizeof(frame));
+ put32(frame,0x50,5001);assert(!ff.swap(frame));ff.presentStep(true);ff.presentStep(true);assert(ff.fPublicationPending && ff.fPublicationID==5001);
+ scanFifoFate=3;put32(frame,0x50,5002);assert(!ff.swap(frame));ff.presentStep(true);ff.presentStep(true);
+ assert(ff.fPublicationID==5001 && ff.fFifoPending && ff.fFifoID==5002 && ff.fFifoQueued==1 && ff.fStatDropped==dropsBefore);
+ assert(ff.swapWait(5001,0x80000001u,0)==kIOReturnBusy && ff.swapWait(5002,0x80000001u,0)==kIOReturnBusy && ff.swapWait(5002,0x80000000u,0)==0);
+ scanFifoFate=0;scanRetryResult=1;unsigned framesBefore=ff.fStatFrames;ff.presentStep(false);scanRetryResult=0;
+ assert(ff.swapWait(5001,0x80000001u,0)==0 && ff.fPublicationPending && ff.fPublicationID==5002 && !ff.fFifoPending && ff.fStatFrames==framesBefore+1);
+ scanBackReady=true;scanFifoFate=4;put32(frame,0x50,5003);assert(!ff.swap(frame));ff.presentStep(true);ff.presentStep(true);
+ assert(ff.swapWait(5002,0x80000001u,0)==0 && ff.fPublicationID==5003 && !ff.fFifoPending && ff.fFifoQueued==2 && ff.fFifoStarted==1);
+ scanFifoFate=3;put32(frame,0x50,5004);assert(!ff.swap(frame));ff.presentStep(true);ff.presentStep(true);assert(ff.fFifoPending && ff.fFifoID==5004);
+ scanFifoFate=0;scanBackReady=false;scanPublish=1;ff.fStatFrames=599;put32(frame,0x50,5005);assert(!ff.swap(frame));ff.presentStep(true);ff.presentStep(true);
+ assert(ff.swapWait(5003,0x80000001u,0)==kIOReturnAborted && ff.swapWait(5004,0x80000001u,0)==kIOReturnAborted && ff.swapWait(5005,0x80000001u,0)==0);
+ assert(!ff.fPublicationPending && !ff.fFifoPending && strstr(unshownLog," lost=2 "));
+ assert(strstr(earlyLog,"admit_retires=0 writer_display_waits=0 timeouts=0 wait_us avg=0 max=0 fifo_queued=3 fifo_started_at_offer=1 fifo_dropped=1\n"));
+ scanPublish=2;put32(frame,0x50,5006);assert(!ff.swap(frame));ff.presentStep(true);ff.presentStep(true);assert(ff.fPublicationID==5006);
+ scanFifoFate=3;put32(frame,0x50,5007);assert(!ff.swap(frame));ff.presentStep(true);ff.presentStep(true);assert(ff.fFifoPending && ff.fFifoID==5007);
+ unsigned stops=ff.fUnshown[AppleCLCD::UnStop];
+ IOLockLock(ff.fLock);ff.stopRecords();IOLockUnlock(ff.fLock);scanFifoFate=0;
+ assert(!ff.fFifoPending && ff.fFifoDropped==1 && ff.fUnshown[AppleCLCD::UnStop]>=stops+1 && ff.swapWait(5007,0x80000001u,0)==kIOReturnAborted && refs==baseRefs);
+ scanDouble=scanTriple=scanOwned=scanBackReady=false;scanPublish=0;gpuMode=0;
+ puts("PASS: present FIFO (fuxiearly bit 4): queued behind the waiting frame, promoted at its START, offer-STARTed, dropped with a lost waiting frame and at stop");
+ }
+ {
  // Exact production stage aggregation, mach-to-us conversion, 600-frame cadence and reset.
  AppleCLCD staged={};staged.fLock=&lock;staged.fScanout=true;staged.fStageGpu=true;
  bool previousOwned=scanOwned;scanOwned=true;
@@ -1062,7 +1121,7 @@ def main():
             'AppleCLCD::vsyncFired', 'AppleCLCD::scanoutLog', 'get32', 'AppleCLCD::observeRecord', 'AppleCLCD::recordDone', 'AppleCLCD::consumeRecord', 'AppleCLCD::retireEarly', 'AppleCLCD::releaseRecord',
             'AppleCLCD::swapWait', 'AppleCLCD::stopRecords',
             'AppleCLCD::writerRetired', 'AppleCLCD::writerWake', 'AppleCLCD::writerWakeAction',
-            'AppleCLCD::presentStep', 'AppleCLCD::stageStats', 'AppleCLCD::completePresent', 'AppleCLCD::presentStats', 'AppleCLCD::presentNext', 'AppleCLCD::swap', 'AppleCLCD::present'))
+            'AppleCLCD::presentStep', 'AppleCLCD::fifoDrop', 'AppleCLCD::stageStats', 'AppleCLCD::completePresent', 'AppleCLCD::presentStats', 'AppleCLCD::presentNext', 'AppleCLCD::swap', 'AppleCLCD::present'))
         methods = methods.replace('__asm__ volatile ("dsb sy" ::: "memory");', '(void)0;')
         cpp = tmp / 'display.cpp'
         cpp.write_text(DISPLAY_PREFIX + declaration + methods + DISPLAY_TEST)

@@ -15,7 +15,19 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 namespace fuxi {
+// The device logger splits lines near 240 chars and drops bytes at the split: print text (one line) in pieces of at most 200 chars cut
+// before a space, each continuation as '<tag><rest>' (rest starts with the space). Deleting every '\n<tag>' gives back the line.
+inline void wrapLine(FILE *out,const char *text,const char *tag) {
+ size_t len=strlen(text),at=0,tagLen=strlen(tag);if(len && text[len-1]=='\n')--len;
+ for(bool first=true;at<len;first=false){
+  size_t room=first?200:200-tagLen,take=len-at;
+  if(take>room){take=room;while(take>1 && text[at+take]!=' ')--take;if(take<=1)take=room;}
+  fprintf(out,"%s%.*s\n",first?"":tag,int(take),text+at);at+=take;
+ }
+}
 using FrameClock=std::chrono::steady_clock;
 inline uint64_t frameNanos(FrameClock::time_point start) {
  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(FrameClock::now()-start).count());
@@ -260,9 +272,17 @@ public:
   if(len>399)len=399;line[len]=0;fprintf(out,"%s\n",line);
  }
  void report(FILE *out=stderr) {
+  char *text=nullptr;size_t size=0;FILE *line=open_memstream(&text,&size); // the main line, wrapped at 200 chars
+  flockfile(out);
+  reportMain(line?line:out);
+  if(line){fclose(line);wrapLine(out,text?text:"","FUXI MTL: frame trace+");free(text);}
+  reportPhases(out);
+  funlockfile(out);
+  count=wallMax=draws=passes=encodeUnknown=gpuUnavailable=mergedDraws=0;mergeSplits.fill(0);counts={};totals={};cpus.fill(0);cadence.fill(0);
+ }
+ void reportMain(FILE *out) {
   auto p=[&](uint64_t FrameSample::*field,unsigned percent){return percentile(field,percent)/1e6;};
   double n=count?double(count):1;
-  flockfile(out); // Keep the histogram on the same line as its percentiles.
   fprintf(out,"FUXI MTL: frame trace n=%llu samples=%llu wall=%.3f/%.3f/%.3f ms cpu_before_commit=%.3f/%.3f shadow_copy=%.3f/%.3f lease_lock=%.3f/%.3f backend_submit=%.3f/%.3f gpu_wait=%.3f/%.3f gpu_exec=%.3f/%.3f draws/frame=%.2f render_passes/frame=%.2f pipelines/frame=%.2f descriptors/frame=%.2f allocations/frame=%.2f cpu_hist=",
    (unsigned long long)count,(unsigned long long)std::min<uint64_t>(count,capacity),
    p(&FrameSample::wall,50),p(&FrameSample::wall,90),wallMax/1e6,
@@ -304,9 +324,6 @@ public:
   stage("pipe_cpu",&FrameSample::pipeCPU);stage("desc_cpu",&FrameSample::descCPU);stage("record_cpu",&FrameSample::recordCPU);stage("flush_cpu",&FrameSample::flushCPU);stage("kernel_io_cpu",&FrameSample::kernelIOCPU);stage("queue_submit_cpu",&FrameSample::queueSubmitCPU);
   fprintf(out," cpu_sampled_submits/frame=%.2f cpu_omitted_submits/frame=%.2f",totals.cpuSampledSubmits/n,totals.cpuOmittedSubmits/n);
   fputc('\n',out);
-  reportPhases(out);
-  funlockfile(out);
-  count=wallMax=draws=passes=encodeUnknown=gpuUnavailable=mergedDraws=0;mergeSplits.fill(0);counts={};totals={};cpus.fill(0);cadence.fill(0);
  }
 };
 }

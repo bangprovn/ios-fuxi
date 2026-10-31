@@ -193,10 +193,11 @@ static unsigned state=1,drains,drainGood=1,fault,tlbs,failTlb,doorbells,enqueued
 static uint32_t regs[0x10000],sregs[0x1000],ring[8192];
 static unsigned highReads,rollover;
 static unsigned readFault,sreadFault,writeFail,writeCount,logLines,dumpLines,hangLines;
-static char lastLog[512],hangLog[16][256],stallLog[40][512];static unsigned stallLines;
+static char lastLog[512],hangLog[16][256],stallLog[40][512],jsLog[512];static unsigned stallLines,jsLines;
 static int trace(const char *fmt,...) {
  va_list ap;va_start(ap,fmt);vsnprintf(lastLog,sizeof(lastLog),fmt,ap);va_end(ap);
  logLines++;if(strstr(lastLog,"init regs"))dumpLines++;if(strstr(lastLog,"FUXI GPU HANG:")){assert(hangLines<16);strcpy(hangLog[hangLines++],lastLog);}
+ if(strstr(lastLog,"FUXI GPU ABI: job_stamps")){strcpy(jsLog,lastLog);jsLines++;}
  if(strstr(lastLog,"FUXI GPU STALL:")){assert(stallLines<40);strcpy(stallLog[stallLines++],lastLog);}return 0;
 }
 #define printf trace
@@ -809,7 +810,7 @@ int main(void) {
   fuxi_gpu_present_writer(7,1);fuxi_gpu_present_due(&s7,1);
   assert(!SUB() && f==2 && !fg_pk_n);
   unsigned w=g3_wptr,db=doorbells;assert(!SUB() && f==3 && fg_pk_n && g3_wptr==w && doorbells==db && fg_abi_seq==3 && !fg_cf_stats[0] && fg_abi_inflight()==2);
-  uint32_t frame[FG_ABI_FRAME_WORDS];unsigned fn=fg_pk_n;memcpy(frame,fg_pk_words,fn*4);
+  uint32_t frame[FG_ABI_JOB_WORDS];unsigned fn=fg_pk_n;memcpy(frame,fg_pk_words,fn*4);
   assert(POLL(2)==1 && POLL(3)==1 && fg_pk_n); /* not due to leave yet: the writer fence is unwritten */
   g3_emit(0x70000001u);g3_emit(0xC0FFEEu);w=g3_wptr; /* the copy */
   assert(!fg_pk_flush(FG_PK_COPY) && !fg_pk_n && g3_wptr==((w+fn)&8191) && doorbells==db+1);
@@ -961,20 +962,41 @@ int main(void) {
   unsigned start=8100;g3_wptr=regs[0x806]=regs[0x807]=start;
   assert(fuxi_gpu_abi_submit(many,lens,129,&fence)==-1 && !doorbells && fg_client_busy==0 && g3_wptr==start);
   assert(!fuxi_gpu_abi_submit(many,lens,128,&fence) && fence==1 && doorbells==1);
-  assert(regs[0x807]==((start+FG_ABI_FRAME_WORDS)&8191) && g3_wptr==regs[0x807]);
-  unsigned ibs=0,at=0;
-  while(at<FG_ABI_FRAME_WORDS) {
+  assert(regs[0x807]==((start+FG_ABI_JOB_WORDS)&8191) && g3_wptr==regs[0x807]);
+  unsigned ibs=0,at=0,stamps=0,stampAt[2]={0,0};
+  while(at<FG_ABI_JOB_WORDS) {
    uint32_t h=ring[(start+at)&8191];unsigned type=h>>28,len=type==7?h&0x3fff:h&0x7f;
    if(type==7 && ((h>>16)&0x7f)==0x3f) {assert(len==3 && ring[(start+at+1)&8191]==many[ibs]);ibs++;}
+   if(type==7 && ((h>>16)&0x7f)==0x3e) {assert(len==3 && stamps<2 && ring[(start+at+1)&8191]==(0x980u|(2u<<18)|(1u<<30)));
+    assert(ring[(start+at+2)&8191]==G3_FENCE_VA+FG_JS_OFF+(1u&7u)*16u+8u*stamps && !ring[(start+at+3)&8191]);stampAt[stamps++]=at;}
    at+=len+1;
   }
-  assert(at==FG_ABI_FRAME_WORDS && ibs==128);
+  /* Job stamps: start right after the opening BR sync (2 words), end after the closing WFI on BR, then both threads again. */
+  assert(at==FG_ABI_JOB_WORDS && ibs==128 && stamps==2 && stampAt[0]==2 && stampAt[1]==FG_ABI_JOB_WORDS-6);
+  assert(ring[start&8191]==fg_abi_pkt7(0x17,1) && ring[(start+1)&8191]==0x80000001u && ring[(start+FG_ABI_JOB_WORDS-9)&8191]==fg_abi_pkt7(0x26,0));
+  assert(ring[(start+FG_ABI_JOB_WORDS-8)&8191]==fg_abi_pkt7(0x17,1) && ring[(start+FG_ABI_JOB_WORDS-7)&8191]==1);
+  assert(ring[(start+FG_ABI_JOB_WORDS-2)&8191]==fg_abi_pkt7(0x17,1) && ring[(start+FG_ABI_JOB_WORDS-1)&8191]==3);
   assert(fg_abi_ibs[0]==1 && fg_abi_ibs[1]==128 && fg_abi_ibs[2]==128 && fg_abi_ibs[3]==1);
   complete();assert(!fuxi_gpu_abi_poll(fence));
   assert(!fuxi_gpu_abi_submit(many,lens,3,&fence) && fg_abi_ibs[0]==2 && fg_abi_ibs[1]==131 && fg_abi_ibs[2]==128 && fg_abi_ibs[3]==1);
   uint32_t a[4],b[4],c[8];fuxi_gpu_abi_sched_stats(a,b,c);assert(a[0]==2 && a[1]==131 && b[0]==2 && !gmuReads);
   {uint64_t sn[8],lm,kib[2];uint32_t why[5],cn[2];fuxi_gpu_abi_submit_split(sn,why,cn,&lm,kib);assert(cn[1]>=2 && cn[0]>=cn[1] && fg_abi_ss_ok==0 && !fg_abi_ss_att);fuxi_gpu_abi_submit_split(sn,why,cn,&lm,kib);assert(!cn[0] && !sn[0] && !lm);}
   puts("PASS: 128-IB frame is one submission across the ring wrap, 129 refused before any doorbell, IB counters");
+ }
+ /* Per-job GPU stamps: zeroed at submit, read at retirement against the submit and observation counter; one line per 600 jobs. */
+ {
+  reset();uint64_t one[1]={0x20000000},len[1]={4096},f=0;unsigned lines=jsLines;
+  fg_js_n=fg_js_bad=0;memset(fg_js_sum,0,sizeof fg_js_sum);memset(fg_js_max,0,sizeof fg_js_max);
+  for(unsigned i=0;i<600;i++) {
+   const unsigned slot=FG_JS_OFF+((fg_abi_seq+1)&7u)*16u;g_wr(G3_FENCE_PA,slot,7);g_wr(G3_FENCE_PA,slot+8,7);
+   regs[0x980]=100000u+i*10000u;assert(!fuxi_gpu_abi_submit(one,len,1,&f) && !g3_read(G3_FENCE_PA+slot) && !g3_read(G3_FENCE_PA+slot+8));
+   if(i!=599) {g_wr(G3_FENCE_PA,slot,regs[0x980]+384);g_wr(G3_FENCE_PA,slot+8,regs[0x980]+384+1920);} /* 20 us to start, 100 us of work */
+   regs[0x980]+=384+1920+960;complete();assert(!fuxi_gpu_abi_poll(f));       /* observed 50 us after the end stamp */
+   assert(jsLines==lines+(i==599));
+  }
+  assert(strstr(jsLog,"job_stamps per 600 jobs submit_to_start_us avg 20 max 20 exec_us avg 100 max 100 end_to_observed_us avg 50 max 50 no_stamp 1\n"));
+  assert(strlen(jsLog)<=200 && !fg_js_bad && !fg_js_sum[0] && !fg_js_max[2]);
+  puts("PASS: per-job GPU stamps: slot zeroed at submit, submit->start/exec/end->observed avg/max us per 600 retired jobs, missing stamps counted");
  }
  /* Fenced WPTR (fuxigpuncimport bit 1): off = one plain write and no GMU access; on = read the AHB fence status and write again while dropped. */
  for(unsigned mode=0;mode<5;mode++) {

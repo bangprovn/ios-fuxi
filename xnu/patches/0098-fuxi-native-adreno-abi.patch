@@ -900,7 +900,7 @@
  {
 - if (!fuxi_gpu_ready() || fg_busy || slot >= FG_CACHE_SLOTS || fg_generation[slot] != generation) return 0;
 + FG_GUARD;
-+ if (fg_scanout_owned && !fg_scanout_writable) return 0;
++ if (fg_scanout_owned && (!fg_scanout_writable || fg_scanout_fifo_q)) return 0; /* fuxiearly bit 4: no free buffer while a frame is queued */
 + unsigned inl = fg_abi_inline && fg_inl_usable(); /* the client root is installed and stays: queue the copy in it */
 + if (!inl && fg_client_busy) fg_abi_present_wait = 1;
 + if (!fuxi_gpu_ready() || fg_busy || (!inl && fg_client_busy) || slot >= FG_CACHE_SLOTS || fg_generation[slot] != generation) return 0;
@@ -1015,7 +1015,7 @@
  #endif
 --- a/bsd/dev/fuxi_adreno.h
 +++ b/bsd/dev/fuxi_adreno.h
-@@ -2,19 +2,92 @@
+@@ -2,19 +2,95 @@
  #define FUXI_ADRENO_H
  #define FG_CACHE_SLOTS 4u
  /* Timings in mach absolute ticks, CPU uses scheduler runtime (excludes sleep).
@@ -1069,8 +1069,11 @@
 +int fuxi_gpu_scanout_publish(void);
 +int fuxi_gpu_scanout_retry(void);
 +/* Not-shown accounting: offer_fate is what became of the frame waiting at the last publish (0 none, 1 STARTed by the spin thread
-+ * during the copy, 2 replaced unstarted); async_take returns 1 once when the spin thread STARTed the waiting frame unreported. */
++ * during the copy, 2 replaced unstarted, 3 kept waiting with this copy queued behind it, 4 STARTed by this offer with this copy queued
++ * behind it; 3 and 4 only with fuxi_gpu_scanout_fifo, fuxiearly bit 4); async_take returns 1 once when the spin thread STARTed the
++ * waiting frame unreported. */
 +unsigned fuxi_gpu_scanout_offer_fate(void);
++int fuxi_gpu_scanout_fifo(void);
 +int fuxi_gpu_scanout_async_take(void);
 +int fuxi_gpu_scanout_pending(void);
 +int fuxi_gpu_scanout_double(void);
@@ -1625,7 +1628,7 @@
 +#endif
 --- a/bsd/dev/fuxi_gpu_scanout.inc
 +++ b/bsd/dev/fuxi_gpu_scanout.inc
-@@ -0,0 +1,2307 @@
+@@ -0,0 +1,2351 @@
 +/* SPDX-License-Identifier: MIT
 + * Copyright (c) 2026 NativeMetal contributors
 + * Ported from UniXNU drivers/NativeMetal/GpuScanoutClient.h (MIT).
@@ -1721,12 +1724,22 @@
 +/* Buffers 3..3+FG_DD_SLOTS_N-1 are direct slots. fg_dd_geo: VIG0 holds the slot geometry; fg_dd_ga: A's SRC_IMG_SIZE, SRC_XY, YSTRIDE0. */
 +static unsigned fg_dd_on, fg_dd_dead, fg_dd_geo, fg_dd_ga[3];
 +static uintptr_t fg_dd_va[FG_DD_SLOTS_N];
++/* fuxiearly bit 4 (value 4, default off; needs fuxiscantriple=1): present FIFO. A copy that finishes while the previous frame is ready
++ * but not STARTed is queued behind it (fifo_q, buffer fifo_buf) instead of replacing it, when that frame has been ready for less than a
++ * panel period (it STARTs at the next TE, so the queued one shows one TE later than a replacement would) and the third buffer holds
++ * it. The START of the ready frame promotes the queued one (ready, back_ready, a fresh ready_at and the publish token), and the next
++ * START shows it. While one is queued no buffer is free: acquire refuses a new copy (full_waits), which bounds the queue to one frame.
++ * Off with autorefresh (bit 131072) or direct scanout (bit 24). Offer fate 3: queued behind the waiting frame; 4: queued, and this offer
++ * STARTed the waiting frame. The TE spin thread does not START the promoted frame while its predecessor's START is still unreported.
++ * Stats (queued, promoted, dropped, full_waits, spin_held, stale_replaced) per 600 STARTs. Not yet observed on device. */
++static unsigned fg_scanout_fifo, fg_scanout_fifo_q, fg_scanout_fifo_buf, fg_scanout_fifo_st[6];
 +static unsigned fg_scanout_target(void)
 +{
 + for (unsigned i = 0; i < (fg_scanout_triple_requested ? 3u : 2u); i++)
-+  if (i != fg_scanout_front && (!fg_scanout_back_ready || i != fg_scanout_ready)) return i;
++  if (i != fg_scanout_front && (!fg_scanout_back_ready || i != fg_scanout_ready) && (!fg_scanout_fifo_q || i != fg_scanout_fifo_buf)) return i;
 + return fg_scanout_front ^ 1u;
 +}
++int fuxi_gpu_scanout_fifo(void) { return fg_scanout_fifo; }
 +static unsigned fg_scanout_pa(unsigned buffer) { return buffer >= 3 ? FG_DPU_IOVA + (buffer - 3)*FG_DD_SLOT_BYTES : 0xb8000000u + buffer*0xa00000u; }
 +static uintptr_t fg_scanout_pixels_at(unsigned buffer) { return buffer == 2 ? fg_scanout_pixels_c : buffer ? fg_scanout_pixels_b : fg_scanout_pixels; }
 +static int fg_scanout_acquire(unsigned publication);
@@ -1755,6 +1768,9 @@
 +  fg_scanout_triple_requested = fg_scanout_double_requested && triple;
 +  fg_scanout_panel120_requested = PE_parse_boot_argn("fuxipanel120", &panel120, sizeof(panel120)) && panel120 == 1;
 +  fg_scanout_te_mode = PE_parse_boot_argn("fuxiscante", &te, sizeof(te)) && te == 1;
++  unsigned early = 0;
++  fg_scanout_fifo = PE_parse_boot_argn("fuxiearly", &early, sizeof(early)) && (early & 4u) && fg_scanout_triple_requested;
++  if (early & 4u) printf("FUXI SCANOUT: present fifo=%u (fuxiearly bit 4%s)\n", fg_scanout_fifo, fg_scanout_fifo ? "" : " needs fuxiscandouble=1 fuxiscantriple=1");
 +  /* The TE gate needs no floor unless one is given explicitly. */
 +  if (fg_scanout_te_mode) fg_scanout_drain_us = 0;
 +  if (PE_parse_boot_argn("fuxiscandrain", &drain, sizeof(drain)) && drain >= 4000 && drain <= FG_SCAN_DRAIN_US) {
@@ -2012,6 +2028,7 @@
 +    if (hard && fg_scanout_starts == serial && fg_scanout_back_ready) fg_scanout_spin_stat[FG_SPIN_WAIT_DONE]++;
 +    unsigned ov = hard && fg_scanout_overlap_ok();
 +    if (fg_scanout_starts != serial || fg_scanout_failed || !fg_scanout_back_ready || (fg_busy && !ov)) result = fg_scanout_back_ready ? FG_SPIN_RACED : FG_SPIN_NO_BACK;
++    else if (fg_scanout_fifo && fg_scanout_async_published) { result = FG_SPIN_RACED; fg_scanout_fifo_st[4]++; } /* bit 4: one START unreported at a time */
 +    else if (fg_scanout_copy_open && !ov) { result = FG_SPIN_COPY_OPEN; if (hard) fg_scanout_spin_stat[FG_SPIN_COPY_SAME]++; }
 +    else if (fg_scanout_publish() == 1) {
 +     fg_scanout_async_published = 1; fg_scanout_spin_stolen = !ov; published = 1; result = FG_SPIN_PUBLISHED;
@@ -3224,6 +3241,7 @@
 +     !fg_scanout_address(0xb8000000u))
 +  printf("FUXI SCANOUT: restore A failed; panel held, reboot required\n");
 + fg_scanout_back_ready = 0;
++ if (fg_scanout_fifo_q) { fg_scanout_fifo_st[2]++; fg_scanout_fifo_q = 0; }
 + fg_scanout_failed = 1;
 + fg_scanout_writable = 0;
 + return -1;
@@ -3475,6 +3493,7 @@
 +  return 1;
 + }
 + if (fg_scanout_double_active && !publication) {
++  if (fg_scanout_fifo_q) { fg_scanout_fifo_st[3]++; return 0; } /* bit 4: front, ready and queued fill all three buffers */
 +  if (fg_scanout_back_ready && !fg_scanout_triple_requested) return 0;
 +  fg_scanout_copy = fg_scanout_target();
 +  fg_scanout_writable = 1;
@@ -3591,7 +3610,7 @@
 + if ((fg_scanout_ar_on() || fg_scanout_ar_state == 4) && fg_scanout_ar_disable(0, FG_AR_OFF_CPU, "cpu fallback") < 0) return -1;
 + int writable = fg_scanout_acquire(1);
 + if (writable != 1 || !fg_scanout_double_active) return writable;
-+ unsigned newest = fg_scanout_back_ready ? (fg_scanout_triple_requested ? fg_scanout_ready : fg_scanout_front ^ 1u) : fg_scanout_front;
++ unsigned newest = fg_scanout_fifo_q ? fg_scanout_fifo_buf : fg_scanout_back_ready ? (fg_scanout_triple_requested ? fg_scanout_ready : fg_scanout_front ^ 1u) : fg_scanout_front;
 + if (newest >= 3 && newest < 3 + FG_DD_SLOTS_N && fg_dd_va[newest - 3]) {
 +  /* Bit 24: the newest frame is a slot's surface (retained by SweetSurface while slotted): its crop to A. */
 +  const uint8_t *sp = (const uint8_t *)fg_dd_va[newest - 3];
@@ -3604,6 +3623,7 @@
 + }
 + if (!fg_scanout_address(0xb8000000u)) return fg_scanout_stop("CPU restore A");
 + if (fg_scanout_back_ready) fg_scanout_ready_drops++;
++ if (fg_scanout_fifo_q) { fg_scanout_fifo_st[2]++; fg_scanout_fifo_q = 0; }
 + fg_scanout_back_ready = fg_scanout_double_active = fg_scanout_front = 0;
 + if (fg_dd_on || fg_dd_dead) (void)fg_dd_mask();
 + if (fg_scanout_reentries < 4) printf("FUXI SCANOUT: double CPU fallback, drained; single buffer A until the next GPU frame\n");
@@ -3689,6 +3709,13 @@
 + fg_scanout_last_start = now;
 + if (fg_scanout_ready_at) { fg_scanout_r2s += now - fg_scanout_ready_at; fg_scanout_r2s_n++; }
 + fg_scanout_ready_at = fg_scanout_charged_at = 0;
++ if (fg_scanout_fifo_q && fg_scanout_double_active) {
++  /* Bit 4: the queued frame is the ready one now; it may START from the next TE (the token goes with it, as after an unstarted offer).
++   * The copy index moves to the free buffer, so nothing can be written into the promoted frame before the next acquire. */
++  fg_scanout_ready = fg_scanout_fifo_buf; fg_scanout_back_ready = 1; fg_scanout_fifo_q = 0; fg_scanout_writable = 1;
++  fg_scanout_copy = fg_scanout_target();
++  fg_scanout_ready_at = now; fg_scanout_fifo_st[1]++;
++ }
 + fg_scanout_te_frames = fg_scanout_last_count = count >> 16;
 + fg_copy_log.te = count >> 16;
 + if (++fg_scanout_starts % 600 == 0) {
@@ -3787,6 +3814,11 @@
 +       fg_scanout_flips, fg_scanout_ready_drops, fg_scanout_retries, current, expected,
 +       fg_scanout_current_match, fg_scanout_current_mismatch, triple);
 +   fg_scanout_buffer_flips[0] = fg_scanout_buffer_flips[1] = fg_scanout_buffer_flips[2] = 0;
++   if (fg_scanout_fifo) {
++    unsigned *f = fg_scanout_fifo_st;
++    printf("FUXI SCANOUT: fifo queued=%u promoted=%u dropped=%u full_waits=%u spin_held=%u stale_replaced=%u\n", f[0], f[1], f[2], f[3], f[4], f[5]);
++    for (unsigned i = 0; i < 6; i++) f[i] = 0;
++   }
 +   fg_scanout_flips = fg_scanout_ready_drops = fg_scanout_retries = 0;
 +  }
 +  fg_scanout_wait_ring = fg_scanout_wait_floor = fg_scanout_wait_xfer = fg_scanout_wait_te = 0;
@@ -3831,6 +3863,14 @@
 + unsigned a = fg_scanout_async_published; fg_scanout_async_published = 0;
 + return a != 0;
 +}
++/* Bit 4: queue this copy behind the ready frame instead of replacing it (see fg_scanout_fifo). */
++static unsigned fg_scanout_fifo_ok(void)
++{
++ if (!fg_scanout_fifo || !fg_scanout_triple_requested || !fg_scanout_double_active || !fg_scanout_back_ready || fg_scanout_fifo_q) return 0;
++ if (fg_abi_ar || fg_dd_on || fg_dd_dead || fg_scanout_ready >= 3 || fg_scanout_copy >= 3 || fg_scanout_copy == fg_scanout_ready || fg_scanout_copy == fg_scanout_front) return 0;
++ if (!fg_scanout_ready_at || rsr("cntpct_el0") - fg_scanout_ready_at >= rsr("cntfrq_el0")*fg_scanout_period_us/1000000) { fg_scanout_fifo_st[5]++; return 0; }
++ return 1;
++}
 +int fuxi_gpu_scanout_publish(void)
 +{
 + if (!fuxi_gpu_scanout_owned()) { fg_scanout_offer_fate = 0; return 0; }
@@ -3842,7 +3882,9 @@
 + if (fg_scanout_failed || fg_busy || !fg_scanout_writable) { (void)fg_dd_mask(); fg_scanout_refused("publish"); return -1; }
 + if (fg_dd_lost) { fg_dd_lost = 0; (void)fg_dd_mask(); return 2; } /* a bank fault dropped this present's queued slot: nothing new to offer */
 + if (fg_scanout_async_published) fg_scanout_async_published = 0; /* the waiting frame was STARTed during this copy (fate 1): this offer replaces its record */
-+ if (fg_scanout_double_active) {
++ unsigned queue = fg_scanout_fifo_ok();
++ if (queue) { fg_scanout_fifo_buf = fg_scanout_copy; fg_scanout_fifo_q = 1; fg_scanout_fifo_st[0]++; fg_scanout_offer_fate = 3; }
++ else if (fg_scanout_double_active) {
 +  if (fg_scanout_back_ready && fg_scanout_triple_requested) fg_scanout_ready_drops++;
 +  fg_scanout_ready = fg_scanout_triple_requested ? fg_scanout_copy : fg_scanout_front ^ 1u;
 +  fg_scanout_back_ready = 1;
@@ -3860,6 +3902,11 @@
 +  fg_scanout_kick_why = 0;
 +  if (fg_abi_hard) { unsigned line, start; fg_scanout_offer_xfer = fg_scanout_read(FG_SCAN_CTL+0x1c, &start) && fg_scanout_read(FG_SCAN_INTF+0x2b0, &line) && ((start & 1) || ((line & 65535) != 0 && (line & 65535) < 2400)); }
 +  fg_scanout_spin_kick(0);
++ }
++ if (queue) {
++  if (r == 1) fg_scanout_offer_fate = 4; /* the waiting frame STARTed now; the queued one was promoted and waits */
++  else if (r < 0) { if (fg_scanout_fifo_q) fg_scanout_fifo_st[2]++; fg_scanout_fifo_q = 0; fg_scanout_offer_fate = 2; }
++  return r < 0 ? r : 2;
 + }
 + return r;
 +}
@@ -3959,7 +4006,7 @@
 +SOFTWARE.
 --- a/bsd/dev/fuxi_gpu_abi_backend.inc
 +++ b/bsd/dev/fuxi_gpu_abi_backend.inc
-@@ -0,0 +1,1236 @@
+@@ -0,0 +1,1285 @@
 +/* Built into fuxi_adreno.c, with access to its proven SMMU/ring helpers.
 + * Single privileged diagnostic client, not a security boundary for PM4.
 + * Its root has no scanout or surface-cache mappings. The kernel-only runtime
@@ -4017,8 +4064,54 @@
 +static unsigned fg_abi_cbo, fg_abi_cbo_on; /* bit 29 asked; latched on once the wb-ish self-test passed (never cleared until init) */
 +static const char *fg_abi_cbo_said;
 +/* The submit record holds up to NativeAdrenoAbiMaxBuffers IBs; one frame is then one ring prologue and one CP context reset. */
-+_Static_assert(FG_ABI_FRAME_WORDS+8 < 8192, "one frame must fit the idle ring");
-+static uint32_t fg_abi_words[FG_ABI_FRAME_WORDS];
++/* Per-job GPU timestamps (always on, 12 ring words per job): CP_REG_TO_MEM of the always-on counter (19.2 MHz, reg 0x980) into the fence
++ * page at FG_JS_OFF + (seq & 7)*16: +0 right after the frame's opening BR sync (the CP reached the job; every frame ends with a WFI, so
++ * the earlier ring work is done), +8 after its closing WFI (the job's work is done), on BR alone (the frame ends with both threads
++ * selected; that selection is restored after the stamp). The CPU reads the counter's low word at submit (a
++ * parked job keeps its submit time: the park is part of its wait) and at the observation that retires the job. Per 600 retired jobs
++ * ('FUXI GPU ABI: job_stamps'): submit_to_start, exec and end_to_observed avg/max us, and jobs missing a stamp. The fence page slot is
++ * zeroed at submit, before the job can run. Not yet observed on device. */
++#define FG_JS_OFF 1024u
++#define FG_JS_WORDS 12u
++#define FG_ABI_JOB_WORDS (FG_ABI_FRAME_WORDS+FG_JS_WORDS)
++_Static_assert(FG_ABI_JOB_WORDS+8 < 8192, "one frame must fit the idle ring");
++static uint32_t fg_abi_words[FG_ABI_JOB_WORDS];
++static uint32_t fg_js_submit[8], fg_js_n, fg_js_bad;
++static uint64_t fg_js_sum[3], fg_js_max[3];
++/* words[4..4+n) holds a built frame: open it with its first packet (the BR sync), the start stamp, the rest, BR, the end stamp, BOTH. */
++static unsigned fg_js_wrap(uint32_t *words, unsigned n, uint32_t seq)
++{
++ const uint32_t slot=FG_JS_OFF+(seq&7u)*16u, op=fg_abi_pkt7(0x3e,3), reg=0x980|(2u<<18)|(1u<<30);
++ words[0]=words[4]; words[1]=words[5];
++ words[2]=op; words[3]=reg; words[4]=G3_FENCE_VA+slot; words[5]=0;
++ words[4+n]=fg_abi_pkt7(0x17,1); words[5+n]=1;
++ words[6+n]=op; words[7+n]=reg; words[8+n]=G3_FENCE_VA+slot+8; words[9+n]=0;
++ words[10+n]=fg_abi_pkt7(0x17,1); words[11+n]=3;
++ g_wr(G3_FENCE_PA,slot,0); g_wr(G3_FENCE_PA,slot+8,0);
++ fg_js_submit[seq&7u]=g3_gr(0x980);
++ return n+FG_JS_WORDS;
++}
++/* Jobs (from, to] retired by this observation. */
++static void fg_js_retire(uint32_t from, uint32_t to)
++{
++ for (uint32_t q=from+1; q-from<=to-from && q-from<=8; q++) {
++  /* Stamps before the counter: the inline root (bit 21) retires on the fence alone, which the CP writes before the end stamp. */
++  const uint32_t slot=FG_JS_OFF+(q&7u)*16u, s0=g3_read(G3_FENCE_PA+slot), s1=g3_read(G3_FENCE_PA+slot+8), now=g3_gr(0x980);
++  if (fg_access_failed || !s0 || !s1) fg_js_bad++;
++  else {
++   const uint32_t v[3]={s0-fg_js_submit[q&7u], s1-s0, now-s1};
++   for (unsigned i=0;i<3;i++) { fg_js_sum[i]+=v[i]; if (v[i]>fg_js_max[i]) fg_js_max[i]=v[i]; }
++  }
++  if (!(++fg_js_n % 600)) {
++   const uint64_t good=600-fg_js_bad ? 600-fg_js_bad : 1;
++   #define FG_JS_US(t) ((unsigned long long)((t)*10/192))
++   printf("FUXI GPU ABI: job_stamps per 600 jobs submit_to_start_us avg %llu max %llu exec_us avg %llu max %llu end_to_observed_us avg %llu max %llu no_stamp %u\n",
++       FG_JS_US(fg_js_sum[0]/good), FG_JS_US(fg_js_max[0]), FG_JS_US(fg_js_sum[1]/good), FG_JS_US(fg_js_max[1]), FG_JS_US(fg_js_sum[2]/good), FG_JS_US(fg_js_max[2]), fg_js_bad);
++   #undef FG_JS_US
++   memset(fg_js_sum,0,sizeof(fg_js_sum)); memset(fg_js_max,0,sizeof(fg_js_max)); fg_js_bad=0;
++  }
++ }
++}
 +/* IBs per submission: submissions, IBs, the most in one, submissions with more than 16 (one frame was several before the 128-IB record). */
 +static uint32_t fg_abi_ibs[4];
 +/* Stall recovery: kicks, fence of the last stalled job, bus drains, GBIF client/arbiter halt acks of the last drain, jobs that completed
@@ -4459,6 +4552,7 @@
 +  if (!fg_root_client && !fg_abi_switch(G3_PT)) return fg_abi_fault("client restore TTBR");
 +  fg_abi_import_cache(1); /* before fence success, even without a user wait */
 +  if (fg_abi_stage) fg_abi_stall_done();
++  fg_js_retire(fg_abi_completed, fg_abi_seq);
 +  fg_abi_completed = fg_abi_seq;
 +  FG_ABI_WAKE(); fg_client_busy = 0; if (!fg_abi_hold) fg_abi_present_wait = 0; /* hold: the waiting present, not the next client job, takes the idle GPU */
 +  return 0;
@@ -4469,6 +4563,7 @@
 +   if (fg_abi_queue && (f=g3_read(G3_FENCE_PA+FG_ABI_FENCE_OFF+4))>fg_abi_completed && f<fg_abi_seq) {
 +    fg_abi_import_cache(1); fg_abi_host_handoff=1; /* the newer job's handoff is still open */
 +    if (fg_abi_stage) fg_abi_stall_done();
++    fg_js_retire(fg_abi_completed, f);
 +    fg_abi_completed=f; fg_client_deadline=rsr("cntpct_el0")+rsr("cntfrq_el0")/10;
 +    return 1;
 +   } }
@@ -4846,7 +4941,7 @@
 + * expiry. The GPU idles from job N's end to copy N's submit (device Q222: ~0.2 ms writer retire, then ~0.05 ms, or ~0.7 ms while the
 + * previous copy still runs). Ring room for the parked frame plus one copy is reserved at park time (only the copy is written before the
 + * parked job). Not yet observed on device. */
-+static uint32_t fg_pk_words[FG_ABI_FRAME_WORDS];
++static uint32_t fg_pk_words[FG_ABI_JOB_WORDS];
 +static uint32_t fg_pk_fence, fg_pk_wfence, fg_pk_gen, fg_pk_stats[FG_PK_REASONS+3], fg_pk_idle_n; /* stats: releases per reason, parked, no ring room, not after writer */
 +static uint64_t fg_pk_since, fg_pk_retired, fg_pk_sum, fg_pk_max, fg_pk_idle_sum, fg_pk_idle_max;
 +static void fg_pk_stats_reset(void) { fg_pk_idle_n=0; fg_pk_sum=fg_pk_max=fg_pk_idle_sum=fg_pk_idle_max=0; memset(fg_pk_stats,0,sizeof(fg_pk_stats)); }
@@ -4953,15 +5048,16 @@
 +  if (!inl && fg_abi_present_wait) { fg_abi_q_stats[2]++; FG_REFUSE(3); }
 +  uint32_t used=(g3_wptr-g3_gr(0x806))&8191;
 +  if (fg_access_failed) return fg_abi_fault("client queue ring read");
-+  if (fg_abi_seq-fg_abi_completed>=FG_ABI_QUEUE_MAX || used+FG_ABI_FRAME_WORDS+64>8191) { fg_abi_q_stats[3]++; FG_REFUSE(4); }
++  if (fg_abi_seq-fg_abi_completed>=FG_ABI_QUEUE_MAX || used+FG_ABI_JOB_WORDS+64>8191) { fg_abi_q_stats[3]++; FG_REFUSE(4); }
 +  if (g3_faulted()) return fg_abi_fault("client pre-queue fault");
 +  queued=idle>0;
 + } else if (g3_faulted() || g3_gr(0x806)!=g3_wptr || g3_gr(0x807)!=g3_wptr || (g3_gr(0x210)&~1u))
 +  return fg_abi_fault("client pre-submit idle/fault");
 + FG_SS(FG_SS_IDLE);
 + uint32_t *words=fg_abi_words; /* serialized by the GPU lock; too large for the kernel stack at 128 IBs */
-+ unsigned n=fg_abi_frame(words,iovas,sizes,count,G3_FENCE_VA+FG_ABI_FENCE_OFF,fg_abi_seq,fg_abi_seq+1,1);
++ unsigned n=fg_abi_frame(words+4,iovas,sizes,count,G3_FENCE_VA+FG_ABI_FENCE_OFF,fg_abi_seq,fg_abi_seq+1,1);
 + if (!n) return -1;
++ n=fg_js_wrap(words,n,fg_abi_seq+1);
 + FG_SS(FG_SS_FRAME);
 + fg_abi_ibs[0]++; fg_abi_ibs[1]+=count; if (count>fg_abi_ibs[2]) fg_abi_ibs[2]=count; if (count>16) fg_abi_ibs[3]++;
 + uint32_t pk_writer=0;

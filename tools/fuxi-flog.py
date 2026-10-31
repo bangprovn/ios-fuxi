@@ -5,7 +5,8 @@ Reads a boot log (bytes, any noise), extracts the `SWEET FB: flog N ...` lines a
 START goes: swap->ready (writer retire), ready->copy submit, submit->copy start on the GPU (the wait behind ring work), the blit,
 fence->START, plus a TE-window replay that tells "no new copy ready at the window" (GPU side) from "a copy was ready but no START"
 (display side). Optional fields added by later kernels (eager copy, dp= drop path letter, trigger=) are parsed when present, and the
-periodic `SWEET FB: unshown paths` lines are summed over the whole log. Usage: fuxi-flog.py boot.log [...]"""
+periodic `SWEET FB: unshown paths` lines are summed over the whole log. Long lines that the kernel wraps at 200 characters (continuations
+start with '<tag>+', any logger prefix before it) are joined first. Usage: fuxi-flog.py boot.log [...]"""
 import re
 import statistics
 import sys
@@ -18,6 +19,14 @@ UNSHOWN_KV = re.compile(rb'([a-z_]+)=(\d+)')
 PATHS = {'s': 'stale', 'r': 'not_ready', 'u': 'superseded', 'f': 'failed_copy', 'o': 'fifo', 'c': 'refused_full', 'p': 'replaced',
          'l': 'lost', 'h': 'stop', 'a': 'spin_started', 'A': 'spin_race'}
 END = re.compile(rb'SWEET FB: flog end [^\n]*')
+# AppleCLCD::logWrapped: deleting the line break, any logger prefix and '<tag>+' gives back the original line.
+WRAP = re.compile(rb'\r?\n[^\n]*?(?:SWEET FB: (?:flog begin|flog end|unshown paths|stages|stats)|FUXI GPU: presents)\+')
+
+
+def unwrap(data):
+    return WRAP.sub(b'', data)
+
+
 NAMES = ('n', 'id', 'surface', 'swap', 'ready', 'submit', 'fence', 'start', 's2s', 'blit', 'ahead', 'buf', 'te', 'xfer')
 
 
@@ -178,7 +187,7 @@ def main(argv):
         return 2
     for path in argv[1:]:
         with open(path, 'rb') as f:
-            report(path, f.read())
+            report(path, unwrap(f.read()))
     return 0
 
 
