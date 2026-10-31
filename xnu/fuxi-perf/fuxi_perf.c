@@ -30,7 +30,7 @@ static const uint64_t fp_tsens_pa[2] = {0xc271000,0xc272000};
 static const char * const fp_domain[3] = {"silver","gold","prime"};
 static const unsigned fp_cores[3] = {3,4,1};
 static const unsigned fp_cool_cap[3] = {1228800,1401600,1363200};
-static const unsigned fp_high_cap[3] = {1228800,2400000,2400000};
+static unsigned fp_high_cap[3] = {1228800,2400000,2400000};
 static unsigned fp_cool[3], fp_high[3], fp_cool_khz[3], fp_high_khz[3];
 static unsigned fp_idle[3], fp_idle_khz[3], fp_idle_ms, fp_idle_floor;
 static uint64_t fp_idle_after, fp_idle_start, fp_idle_entry;
@@ -538,6 +538,12 @@ static void fp_configure(void)
  fp_arg("fuxiperffast",&fp_fast_ms,5,25);
  fp_arg("fuxiperfrate",&fp_rate_ms,fp_fast_ms,1000);
  fp_arg("fuxiperfbudget",&fp_budget_ms,20,500);
+ /* Short names for a full boot line: fpb=MS boost budget per second, fpc=MHz gold/prime boost cap.
+  * The thermal hot, limit and slope guards are unchanged. */
+ fp_arg("fpb",&fp_budget_ms,20,1000);
+ unsigned cap_mhz = 2400;
+ fp_arg("fpc",&cap_mhz,1402,3200);
+ fp_high_cap[1] = fp_high_cap[2] = cap_mhz*1000;
  nanoseconds_to_absolutetime((uint64_t)fp_budget_ms*NSEC_PER_MSEC,&fp_budget);
  nanoseconds_to_absolutetime(NSEC_PER_SEC,&fp_duty_window);
  nanoseconds_to_absolutetime(500ULL*NSEC_PER_MSEC,&fp_recovery);
