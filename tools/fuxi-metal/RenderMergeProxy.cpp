@@ -44,6 +44,10 @@ static PFN_vkQueueSubmit queueSubmit;
 extern "C" uint64_t render_merge_image_barriers(){return imageBarriers;}
 extern "C" uint64_t render_merge_submits(){return submits;}
 static VkResult submit(VkQueue q,uint32_t n,const VkSubmitInfo *s,VkFence f){++submits;return queueSubmit(q,n,s,f);}
+// Fence fault injection for the split-submit tests: 1 = device lost, 2 = timeout (the GPU work itself still runs).
+static PFN_vkWaitForFences waitFences;static int fenceFault;
+extern "C" void render_merge_fence_fault(int mode){fenceFault=mode;}
+static VkResult waited(VkDevice d,uint32_t n,const VkFence *f,VkBool32 all,uint64_t timeout){auto r=waitFences(d,n,f,all,timeout);return fenceFault==1?VK_ERROR_DEVICE_LOST:fenceFault==2?VK_TIMEOUT:r;}
 static VkRenderPass activePass;
 static VkFramebuffer activeFrame;
 static VkDescriptorSet activeSet;
@@ -82,7 +86,7 @@ static VkResult finish(VkCommandBuffer c){assert(!inside);return endCommand(c);}
 static PFN_vkVoidFunction getDevice(VkDevice d,const char *name){auto f=deviceProc(d,name);
 #define WRAP(n,var,fn) if(!strcmp(name,"vk" #n)){var=reinterpret_cast<PFN_vk##n>(f);return reinterpret_cast<PFN_vkVoidFunction>(fn);}
  WRAP(CmdSetViewport,setViewport,viewport);WRAP(CmdSetScissor,setScissor,scissor);
- WRAP(QueueSubmit,queueSubmit,submit);WRAP(CmdBeginRenderPass,beginPass,begin);WRAP(CmdEndRenderPass,endPass,end);WRAP(CmdPipelineBarrier,pipelineBarrier,barrier);WRAP(CmdDraw,draw,drawn);WRAP(BeginCommandBuffer,beginCommand,start);WRAP(EndCommandBuffer,endCommand,finish);WRAP(CreateRenderPass,createPass,create);
+ WRAP(QueueSubmit,queueSubmit,submit);WRAP(WaitForFences,waitFences,waited);WRAP(CmdBeginRenderPass,beginPass,begin);WRAP(CmdEndRenderPass,endPass,end);WRAP(CmdPipelineBarrier,pipelineBarrier,barrier);WRAP(CmdDraw,draw,drawn);WRAP(BeginCommandBuffer,beginCommand,start);WRAP(EndCommandBuffer,endCommand,finish);WRAP(CreateRenderPass,createPass,create);
  WRAP(CreateGraphicsPipelines,createPipelines,pipelines);WRAP(CreateFramebuffer,createFramebuffer,framebuffer);WRAP(CmdBindPipeline,bindPipeline,boundPipeline);WRAP(UpdateDescriptorSets,updateSets,updated);WRAP(CmdBindDescriptorSets,bindSets,boundSets);WRAP(CmdCopyBufferToImage,copyImage,copied);
  return f;
 }

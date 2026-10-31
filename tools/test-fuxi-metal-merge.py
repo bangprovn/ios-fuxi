@@ -139,6 +139,34 @@ void main() {color=textureLod(image,vec2(0.5),constants.lod);}
         p = subprocess.run([str(d/'lean')], env=dict(env, FUXI_MTL_TEST_BOOTARGS='fuxigpuframetrace=1 fuxigpumerge=1', FUXI_MTL_SUBMIT_LEAN='2', **robust), text=True, capture_output=True, timeout=90)
         assert p.returncode == 0 and 'policy submit_lean=2' in p.stderr and 'index scan skipped (robust_buffer=1)' in p.stderr, p.stderr[-2000:]
         print('PASS: FUXI_MTL_SUBMIT_LEAN=1/2 identical pixels, counts and refusal on the CA-shaped fixture (rewrites off/on)')
+        # FUXI_MTL_SPLIT_SUBMIT: chunked recording/queueing (every pass end, up to 8 chunks) leaves pixels, pass/draw/barrier counts, overlap retirement,
+        # early release and the drained-failure path identical; only CHUNKS lines (QueueSubmit counts) differ. Fault modes run in their own processes.
+        recorded = ['-DFUXI_MTL_HOST_TEST', '-DFUXI_MTL_ICD="'+str(d/'proxy.so')+'"', '-DFUXI_MTL_TRANSLATOR="'+str(d/'bridge.so')+'"'] # submit counter, fence faults, blending control
+        subprocess.run(common+sanitized+recorded+[str(ROOT/'tools/fuxi-metal/SplitSubmitTests.cpp'), '-ldl', '-pthread', '-o', str(d/'split')], check=True)
+        chunked = dict(FUXI_MTL_SPLIT_SUBMIT='1', FUXI_MTL_SPLIT_SUBMIT_US='0', FUXI_MTL_SPLIT_SUBMIT_MAX='8')
+        timed = dict(FUXI_MTL_GPU_PASS_TIMES='1', FUXI_MTL_GPU_DRAW_TIMES='1')
+        strip = lambda output: [line for line in output.splitlines() if not line.startswith('CHUNKS ')]
+        for args in ('', 'fuxigpumerge=1 fuxigpuoverlap=1 fuxigpusubmit=1 fuxigpuperf=7', 'fuxigpumerge=1 fuxigpuperf=3'):
+            for extra in ({}, dict(rewrites, **timed)):
+                plain = invoke(d/'split', args, FUXI_MTL_SPLIT_SUBMIT='0', **extra)
+                for limit in ('2', '3', '8'):
+                    split = invoke(d/'split', args, **dict(chunked, FUXI_MTL_SPLIT_SUBMIT_MAX=limit), **extra)
+                    assert strip(plain) == strip(split), 'split submit changed output: '+args+' '+str(extra)+' max='+limit
+                    counts = [int(x) for x in re.findall(r'CHUNKS sync frame=\d+ queue_submits=(\d+)', split)]
+                    assert len(counts) == 6 and all(1 < c <= int(limit) for c in counts) and 'CHUNKS drained failed=1' in split, split
+                assert re.findall(r'CHUNKS sync frame=\d+ queue_submits=(\d+)', plain) == ['1']*6 and 'CHUNKS drained failed=0' in plain
+        for mode in ('lost', 'timeout', 'chunk', 'drain'):
+            for knob in ({'FUXI_MTL_SPLIT_SUBMIT': '0'}, chunked):
+                print(invoke(d/'split', 'fuxigpunoslab=1', cli=(mode,), **knob), end='')
+        controls = 'fuxigpumerge=1 fuxigpusubmit=1 fuxigpuoverlap=1 '
+        for args in (controls+'fuxigpuperf=7', controls+'fuxigpuperf=3', ''):
+            plain, split = invoke(d/'barriers', args), invoke(d/'barriers', args, **chunked)
+            assert pixels(plain)+re.findall(r'COUNTS .*', plain) == pixels(split)+re.findall(r'COUNTS .*', split), 'split submit changed barrier pixels/counts: '+args
+        for extra in ('', 'fuxigpumerge=1 fuxigpuoverlap=1 fuxigpusubmit=1 fuxigpufeedback=1 fuxigpuperf=7'):
+            # RenderMergeTests asserts one QueueSubmit per submit, which a split frame breaks by design; its lean twin has no such assert
+            for level in '012':
+                assert invoke(d/'lean', extra, FUXI_MTL_SUBMIT_LEAN=level, **chunked) == invoke(d/'lean', extra), 'split submit changed lean fixture output: lean='+level+' '+extra
+        print('PASS: FUXI_MTL_SPLIT_SUBMIT identical pixels/counts (sync, two flights, early release, drained failure; barrier/lean 0/1/2 fixtures), faults poison')
         subprocess.run(common+['-O2']+definitions+[str(ROOT/'tools/fuxi-metal/SubmitBench.cpp'), '-ldl', '-pthread', '-o', str(d/'bench')], check=True)
         for uncached in (True, False, False, True):
             overrides = {'PIPE_BENCH_UNCACHED': '1'} if uncached else {}

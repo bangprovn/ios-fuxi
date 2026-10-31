@@ -39,6 +39,13 @@ def main():
                     e=dict(os.environ);e.pop('FUXI_MTL_SUBMIT_LEAN',None)
                     if env is not None:e['FUXI_MTL_SUBMIT_LEAN']=env
                     subprocess.run([str(d/name),'lean',want],env=e,check=True,timeout=15)
+                # FUXI_MTL_SPLIT_SUBMIT: exactly "1"; _US 0..100000 (default 400), _MAX 2..8 (default 3); malformed values keep the default
+                for on,us,mx,want in ((None,None,None,('0','400','3')),('1',None,None,('1','400','3')),('2','0','2',('0','0','2')),('1','100000','8',('1','100000','8')),('1 ','100001','9',('0','400','3')),('1','-1','1',('1','400','3')),('1','5x','04',('1','400','4'))):
+                    e=dict(os.environ)
+                    for k,v in (('FUXI_MTL_SPLIT_SUBMIT',on),('FUXI_MTL_SPLIT_SUBMIT_US',us),('FUXI_MTL_SPLIT_SUBMIT_MAX',mx)):
+                        e.pop(k,None)
+                        if v is not None:e[k]=v
+                    subprocess.run([str(d/name),'split',*want],env=e,check=True,timeout=15)
             if not a.compile_only and name == 'FrameTraceTests':
                 subprocess.run([str(d/name)],env=dict(os.environ,FUXI_MTL_TEST_BOOTARGS='fuxigpumerge=1 fuxigpuoverlap=1'),check=True,timeout=15)
             if not a.compile_only and name == 'FrameCPUTests':

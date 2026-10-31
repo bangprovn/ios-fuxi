@@ -254,6 +254,7 @@ private:
   VkCommandPool commandPool{};VkCommandBuffer command{};VkFence submitFence{};VkQueryPool queryPool{},passPool{},drawPool{};
   Buffer *aliasScratch=nullptr;VkDescriptorPool descriptorPool{};uint32_t descriptorSets{};
   std::vector<VkDescriptorPoolSize> descriptorCapacity;std::vector<HostUse> hostUses,writes,uses;bool busy=false;
+  std::vector<VkCommandBuffer> chunkCommands;VkQueryPool chunkPool{}; // FUXI_MTL_SPLIT_SUBMIT: chunks 2.. (from commandPool) and TOP/BOTTOM stamps per chunk
  } slots[2];
  std::condition_variable submitWake;
  static constexpr size_t aliasScratchLimit=1024*1024;
@@ -271,12 +272,31 @@ private:
   for(size_t i=0;i<infos.size();++i)delta[i]=uint64_t(double((ticks[i+1]-ticks[i])&mask)*timestampPeriod);
   reportDraws(stderr,infos,delta);if(drawPipes.add(infos,delta))drawPipes.report(stderr);if(systemTranslationPolicy().occlude)occNoteDrawTimes(infos,delta);
  }
- void readPassTimes(VkQueryPool pool,const std::vector<PassInfo> &infos,uint64_t whole){
+ void readPassTimes(VkQueryPool pool,const std::vector<PassInfo> &infos,uint64_t whole,const std::vector<std::pair<size_t,uint64_t>> &gaps={}){
   if(!pool || infos.empty())return;std::vector<uint64_t> ticks(infos.size()+1),delta(infos.size());
   if(GetQueryPoolResults(device,pool,0,uint32_t(ticks.size()),ticks.size()*sizeof(uint64_t),ticks.data(),sizeof(uint64_t),VK_QUERY_RESULT_64_BIT)!=VK_SUCCESS)return;
   uint64_t mask=timestampBits>=64?UINT64_MAX:(uint64_t(1)<<timestampBits)-1;
   for(size_t i=0;i<infos.size();++i)delta[i]=uint64_t(double((ticks[i+1]-ticks[i])&mask)*timestampPeriod);
+  for(auto g:gaps)if(g.first<delta.size())delta[g.first]-=std::min(delta[g.first],g.second);
   passTimes.add(infos,delta,whole);if(passTimes.submitCount()>=300){reportRtCounters();passTimes.report(stderr);}
+ }
+ // FUXI_MTL_SPLIT_SUBMIT: GPU idle between chunks, from each chunk's closing BOTTOM stamp (2k+1) to the next chunk's opening TOP stamp (2k+2).
+ // passStarts[k] is the pass-stamp index whose delta spans the gap before chunk k+1; that delta loses the gap, so pass times stay GPU busy time.
+ uint64_t chunkGaps(VkQueryPool pool,const std::vector<size_t> &passStarts,std::vector<std::pair<size_t,uint64_t>> &gaps){
+  size_t chunks=passStarts.size()+1;if(!pool || chunks<2)return 0;std::vector<uint64_t> ticks(2*chunks);
+  if(GetQueryPoolResults(device,pool,0,uint32_t(ticks.size()),ticks.size()*sizeof(uint64_t),ticks.data(),sizeof(uint64_t),VK_QUERY_RESULT_64_BIT)!=VK_SUCCESS)return 0;
+  uint64_t mask=timestampBits>=64?UINT64_MAX:(uint64_t(1)<<timestampBits)-1,sum=0;
+  for(size_t k=0;k+1<chunks;++k){uint64_t end=ticks[2*k+1],start=ticks[2*k+2],d=(start-end)&mask;if(d>(mask>>1))continue; // the next chunk began before this one drained: no idle
+   uint64_t ns=uint64_t(double(d)*timestampPeriod);sum+=ns;gaps.push_back({passStarts[k],ns});}
+  splitGapNs+=sum;++splitGapSamples;return sum;
+ }
+ // One line per 600 submits with FUXI_MTL_SPLIT_SUBMIT=1 (empty submits excluded); means are over split submits. Caller holds mutex.
+ static void noteSplitSubmit(unsigned chunks,bool fewPasses,uint64_t firstNs,uint64_t lastNs){
+  if(chunks>1){++splitSubmits;splitChunks+=chunks;splitFirstNs+=firstNs;splitLastNs+=lastNs;}else if(fewPasses)++splitFewPasses;else ++splitUnsplit;
+  if(++splitWindow<600)return;uint64_t n=splitSubmits,g=splitGapSamples;auto per=[&](uint64_t v,uint64_t d){return d?double(v)/d:0.0;};
+  fprintf(stderr,"FUXI MTL: split submit submits=%llu split=%llu chunks/submit=%.2f first_chunk_ms=%.3f last_chunk_ms=%.3f overlap_ms=%.3f gpu_gap_ms=%.3f gap_samples=%llu few_passes=%llu unsplit=%llu drained=%llu us=%u max=%u\n",
+   (unsigned long long)splitWindow.load(),(unsigned long long)n,per(splitChunks,n),per(splitFirstNs,n)/1e6,per(splitLastNs,n)/1e6,per(splitLastNs-splitFirstNs,n)/1e6,per(splitGapNs,g)/1e6,(unsigned long long)g,(unsigned long long)splitFewPasses.load(),(unsigned long long)splitUnsplit.load(),(unsigned long long)splitDrained.load(),systemTranslationPolicy().splitSubmitUs,systemTranslationPolicy().splitSubmitMax);
+  splitWindow=0;splitSubmits=0;splitChunks=0;splitFirstNs=0;splitLastNs=0;splitGapNs=0;splitGapSamples=0;splitFewPasses=0;splitUnsplit=0;splitDrained=0;
  }
  // Fast 4-lane multiply-xor hash over a pitched rectangle of bytes (change detection only, not security).
  static uint64_t hashRows(const uint8_t *base,size_t rows,size_t pitch,size_t rowBytes){
@@ -292,7 +312,7 @@ private:
   auto &descriptorPool=slot.descriptorPool;auto &queryPool=slot.queryPool;auto &submitFence=slot.submitFence;auto &commandPool=slot.commandPool;auto &command=slot.command;auto &descriptorSets=slot.descriptorSets;auto &descriptorCapacity=slot.descriptorCapacity;
   if(descriptorPool)DestroyDescriptorPool(device,descriptorPool,nullptr);
   if(queryPool)DestroyQueryPool(device,queryPool,nullptr);if(slot.passPool)DestroyQueryPool(device,slot.passPool,nullptr);slot.passPool={};if(slot.drawPool)DestroyQueryPool(device,slot.drawPool,nullptr);slot.drawPool={};
-  if(submitFence)DestroyFence(device,submitFence,nullptr);
+  if(submitFence)DestroyFence(device,submitFence,nullptr);if(slot.chunkPool)DestroyQueryPool(device,slot.chunkPool,nullptr);slot.chunkPool={};slot.chunkCommands.clear();
   if(commandPool)DestroyCommandPool(device,commandPool,nullptr);
   descriptorPool={};queryPool={};submitFence={};commandPool={};command={};descriptorSets=0;descriptorCapacity.clear();
  }
@@ -338,12 +358,14 @@ public:
  static inline std::atomic<uint64_t> submitObjectsNanos{0},submitDescriptorsNanos{0},submitRecordNanos{0},shadowCopyNanos{0},submitFlushNanos{0},submitInvalidateNanos{0};
  // Async retirement: backend mutex wait after the fence (the next encode holds it), and FUXI_MTL_EARLY_RELEASE's fenced hook.
  static inline std::atomic<uint64_t> retireLockCount{0},retireLockNanos{0},retireLockMax{0},retireLockOver1ms{0},earlyReleases{0},earlyReleaseNanos{0},earlyRefused{0},retireWindow{0};
+ // FUXI_MTL_SPLIT_SUBMIT window counters (noteSplitSubmit); splitDrained counts failed frames whose queued chunks were drained.
+ static inline std::atomic<uint64_t> splitWindow{0},splitSubmits{0},splitChunks{0},splitFirstNs{0},splitLastNs{0},splitGapNs{0},splitGapSamples{0},splitFewPasses{0},splitUnsplit{0},splitDrained{0};
  static inline std::atomic<uint64_t> flushCalls{0},invalidateCalls{0},emptySubmits{0},submitObjectCreates{0},submitPoolCreates{0},submitFrameCreates{0},submitViewCreates{0};
  std::map<std::array<uint64_t,7>,Texture *> imports;
  struct ReuseCounts {uint64_t commandPools{},commandBuffers{},fences{},queries{},descriptors{},frames{},views{};} reuseCounts;
 #ifdef FUXI_MTL_HOST_TEST
  // Test-only reference mode and deterministic recording failure; no production environment switches.
- bool reuseSubmitObjects=true,reuseDrawPlans=true,captureDrawPlans=false,failBeforeQueue=false,failQueueAttempt=false;
+ bool reuseSubmitObjects=true,reuseDrawPlans=true,captureDrawPlans=false,failBeforeQueue=false,failQueueAttempt=false,failAfterChunk=false,failChunkAttempt=false;
  std::vector<std::pair<Pipeline *,DrawOutput>> drawPlansForTest;
  void loseWhileInFlightForTest(){std::lock_guard<std::mutex> lock(mutex);check(VK_ERROR_DEVICE_LOST);}
  struct ImageTransition {Texture *texture;uint32_t level;VkImageLayout before,after;};
@@ -1837,7 +1859,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
   }),ops.end());
   // Empty completion participates in the same lock/order, but creates no BO or GPU fence.
   if(ops.empty()){if(cpuTiming)cpuTiming->backendCPU+=frameCPUDelta(backendCPU,frameThreadCPU());if(currentFrame)currentFrame->backendSubmit+=frameNanos(locked);++emptySubmits;if(scheduled)scheduled();return;}
-  bool submitted=false,completed=false;std::vector<VkImageView> sampleViews;std::vector<VkFramebuffer> frames;std::vector<VkRenderPass> emptyRenders;std::vector<Texture *> textures;
+  bool submitted=false,completed=false;unsigned chunksSubmitted=0;std::vector<VkImageView> sampleViews;std::vector<VkFramebuffer> frames;std::vector<VkRenderPass> emptyRenders;std::vector<Texture *> textures;
   struct TextureState {Texture *texture;VkImageLayout layout;std::array<VkImageLayout,32> levelLayouts;bool defined;uint32_t definedLevels;uint64_t shadowHash;bool shadowHashed;};std::vector<TextureState> oldTextures;
   size_t diagnosticOp=0;Buffer *neutralBuffer=nullptr,*aliasBuffer=nullptr;size_t aliasBytes=0;
   std::vector<bool> aliasCopies(ops.size(),false);
@@ -2140,6 +2162,10 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
    }
    if(neutralSize){Measure measure{objectNanos,SubPhase::objects};neutralBuffer=allocateUnlocked(neutralSize);addBuffer(neutralBuffer);}
    for(auto *t:textures)oldTextures.push_back({t,t->layout,t->levelLayouts,t->defined,t->definedLevels,t->shadowHash,t->shadowHashed});
+   // FUXI_MTL_SPLIT_SUBMIT: only a submit with 2+ render passes is chunked, and only at a pass end that leaves a render pass to record.
+   const unsigned splitMax=systemTranslationPolicy().splitSubmit?systemTranslationPolicy().splitSubmitMax:1;std::vector<uint32_t> laterPasses;unsigned passStarts=0;
+   if(splitMax>1){laterPasses.assign(ops.size(),0);for(size_t n=ops.size();n-->0;){laterPasses[n]=passStarts;passStarts+=(ops[n].pipeline || ops[n].clearOnly) && ops[n].texture && (!n || mergeEnds.empty() || mergeEnds[n-1]<n);}}
+   const bool splitting=splitMax>1 && passStarts>=2;static constexpr uint32_t chunkStamps=16;
    analyzePhase.reset();
    auto flushStart=std::chrono::steady_clock::now();auto flushPhase=std::make_unique<PhaseTimer>(SubPhase::flush);
    // Direct shared host writes are not tracked. Only Vulkan HOST_COHERENT permits omission.
@@ -2156,6 +2182,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
     else check(ResetFences(device,1,&submitFence));
     if(systemTranslationPolicy().passTimes && supportsTimestamps() && !slot.passPool){VkQueryPoolCreateInfo pi{};pi.sType=VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;pi.queryType=VK_QUERY_TYPE_TIMESTAMP;pi.queryCount=passStampLimit+1;check(CreateQueryPool(device,&pi,nullptr,&slot.passPool));}
     if(systemTranslationPolicy().drawTimes && supportsTimestamps() && !slot.drawPool){VkQueryPoolCreateInfo pi{};pi.sType=VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;pi.queryType=VK_QUERY_TYPE_TIMESTAMP;pi.queryCount=passStampLimit+1;check(CreateQueryPool(device,&pi,nullptr,&slot.drawPool));}
+    if(splitting && supportsTimestamps() && !slot.chunkPool){VkQueryPoolCreateInfo ci{};ci.sType=VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;ci.queryType=VK_QUERY_TYPE_TIMESTAMP;ci.queryCount=chunkStamps;check(CreateQueryPool(device,&ci,nullptr,&slot.chunkPool));}
     if(supportsTimestamps() && !queryPool){VkQueryPoolCreateInfo qi{};qi.sType=VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;qi.queryType=VK_QUERY_TYPE_TIMESTAMP;qi.queryCount=2;check(CreateQueryPool(device,&qi,nullptr,&queryPool));++reuseCounts.queries;++submitObjectCreates;++submitPoolCreates;}
    }
    VkCommandBuffer cmd=command;VkQueryPool timestamps=queryPool;VkFence fence=submitFence;VkQueryPool passQ=timestamps && systemTranslationPolicy().passTimes?slot.passPool:VkQueryPool{};
@@ -2165,6 +2192,8 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
    if(timestamps){CmdResetQueryPool(cmd,timestamps,0,2);CmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,timestamps,0);}
    if(passQ){CmdResetQueryPool(cmd,passQ,0,passStampLimit+1);CmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,passQ,0);}
    if(drawQ){CmdResetQueryPool(cmd,drawQ,0,passStampLimit+1);CmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,drawQ,0);}
+   VkQueryPool chunkQ=splitting && timestamps?slot.chunkPool:VkQueryPool{};unsigned chunk=0;std::vector<size_t> chunkPassStarts;auto chunkStart=FrameClock::now();uint64_t chunkSubmitNanos=0,firstChunkNs=0;
+   if(chunkQ){CmdResetQueryPool(cmd,chunkQ,0,chunkStamps);CmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,chunkQ,0);}
    uint32_t stampCopies=0,stampBarriers=0;std::vector<PassInfo> passInfos;PassInfo cur{};
    auto pb=[&](auto &&...a){++stampBarriers;if(currentFrame)++currentFrame->pipelineBarriers;{PhaseTimer phase(SubPhase::barriers);CmdPipelineBarrier(cmd,a...);}};
    VkMemoryBarrier barrier{};barrier.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;barrier.srcAccessMask=VK_ACCESS_HOST_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
@@ -2541,13 +2570,37 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
      else {info.kind=op.clearOnly?1:2;if(op.texture){info.width=op.texture->levelWidth(op.dstLevel);info.height=op.texture->levelHeight(op.dstLevel);}if(op.clearOnly)info.colors=op.colorCount;}
      info.copies=stampCopies;info.barriers=stampBarriers;stampCopies=stampBarriers=0;passInfos.push_back(info);CmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,passQ,uint32_t(passInfos.size()));
     }
+    // FUXI_MTL_SPLIT_SUBMIT: queue the recorded chunk so the GPU starts while the rest is recorded. Same queue, so submission order keeps every
+    // barrier and render-pass dependency of later chunks against it; layouts carry over; only the last chunk signals the frame fence.
+    if(splitting && opIndex==passEnd && chunk+1<splitMax && laterPasses[opIndex] && frameNanos(chunkStart)>=uint64_t(systemTranslationPolicy().splitSubmitUs)*1000){
+     flushImages();if(chunkQ)CmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,chunkQ,2*chunk+1);
+     {PhaseTimer phase(SubPhase::cmdEnd);check(EndCommandBuffer(cmd));}
+     requireLive();auto queued=FrameClock::now();VkSubmitInfo ci{};ci.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO;ci.commandBufferCount=1;ci.pCommandBuffers=&cmd;
+     submitted=true; // an uncertain QueueSubmit poisons, as for the last chunk
+#ifdef FUXI_MTL_HOST_TEST
+     if(failChunkAttempt){failChunkAttempt=false;check(VK_ERROR_DEVICE_LOST);}
+#endif
+     {PhaseTimer phase(SubPhase::queueSubmit);check(frameKernelCall([&]{return QueueSubmit(queue,1,&ci,VK_NULL_HANDLE);}));}
+     submitted=false;++chunksSubmitted;{auto ns=frameNanos(queued);chunkSubmitNanos+=ns;if(currentFrame){++currentFrame->queueSubmits;currentFrame->queueSubmit+=ns;}}if(!chunk)firstChunkNs=since(submitStart);
+     // A later failure drains the queue and restores the state the queued chunks leave behind.
+     for(auto &old:oldTextures){auto *t=old.texture;old.layout=t->layout;old.levelLayouts=t->levelLayouts;old.defined=t->defined;old.definedLevels=t->definedLevels;old.shadowHash=t->shadowHash;old.shadowHashed=t->shadowHashed;}
+     ++chunk;chunkPassStarts.push_back(passInfos.size());
+     if(slot.chunkCommands.size()<chunk){Measure measure{objectNanos,SubPhase::objects};VkCommandBufferAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;ai.commandPool=commandPool;ai.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY;ai.commandBufferCount=1;
+      VkCommandBuffer extra{};check(AllocateCommandBuffers(device,&ai,&extra));slot.chunkCommands.push_back(extra);++reuseCounts.commandBuffers;++submitObjectCreates;}
+     cmd=slot.chunkCommands[chunk-1];{PhaseTimer phase(SubPhase::cmdBegin);check(BeginCommandBuffer(cmd,&bi));}if(chunkQ)CmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,chunkQ,2*chunk);
+     chunkStart=FrameClock::now();
+#ifdef FUXI_MTL_HOST_TEST
+     if(failAfterChunk){failAfterChunk=false;throw std::runtime_error("injected failure after a queued chunk");}
+#endif
+    }
    }
    loopPhase.reset();PhaseTimer tailPhase(SubPhase::tail);
    barrier.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_HOST_READ_BIT;
    pb(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&barrier,0,nullptr,0,nullptr);
    if(timestamps)CmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,timestamps,1);
+   if(chunkQ)CmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,chunkQ,2*chunk+1);
    {PhaseTimer phase(SubPhase::cmdEnd);check(EndCommandBuffer(cmd));}
-   auto recordNS=since(recordStart)-(objectNanos-recordObjects)-descriptorNanos;
+   auto recordNS=since(recordStart)-(objectNanos-recordObjects)-descriptorNanos-chunkSubmitNanos;
    submitRecordNanos+=recordNS;
    if(timing){timing->record+=recordNS;timing->desc+=descriptorNanos;}
    submitObjectsNanos+=objectNanos;submitDescriptorsNanos+=descriptorNanos;
@@ -2564,6 +2617,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
    auto submitToQueue=[&]{
     auto start=FrameClock::now();
     {PhaseTimer phase(SubPhase::queueSubmit);check(frameKernelCall([&]{return QueueSubmit(queue,1,&si,fence);}));}
+    if(splitMax>1)noteSplitSubmit(chunk+1,!splitting,firstChunkNs,since(submitStart));
     if(currentFrame){++currentFrame->queueSubmits;currentFrame->queueSubmit+=frameNanos(start);}
     if(cpuTiming)cpuTiming->backendCPU+=frameCPUDelta(backendCPU,frameThreadCPU());
     if(currentFrame)currentFrame->backendSubmit+=frameNanos(locked);
@@ -2582,7 +2636,8 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
    if(timestamps){uint64_t ticks[2]{};check(GetQueryPoolResults(device,timestamps,0,2,sizeof(ticks),ticks,sizeof(uint64_t),VK_QUERY_RESULT_64_BIT));
     uint64_t mask=timestampBits>=64?UINT64_MAX:(uint64_t(1)<<timestampBits)-1;
     uint64_t elapsed=(uint64_t)(double((ticks[1]-ticks[0])&mask)*timestampPeriod);
-    gpuNanos.fetch_add(elapsed);if(currentFrame){currentFrame->gpuExec+=elapsed;++currentFrame->gpuSamples;}++gpuSamples;readPassTimes(passQ,passInfos,elapsed);readDrawTimes(drawQ,drawInfos);
+    std::vector<std::pair<size_t,uint64_t>> gaps;elapsed-=std::min(elapsed,chunkGaps(chunkQ,chunkPassStarts,gaps)); // GPU busy time: idle waits for later chunks excluded
+    gpuNanos.fetch_add(elapsed);if(currentFrame){currentFrame->gpuExec+=elapsed;++currentFrame->gpuSamples;}++gpuSamples;readPassTimes(passQ,passInfos,elapsed,gaps);readDrawTimes(drawQ,drawInfos);
    }
    auto invalidateStart=std::chrono::steady_clock::now();
    for(auto *t:textures)if(t->mapped && !coherent(t->memoryType)) {VkMappedMemoryRange r{};r.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;r.memory=t->memory;r.size=VK_WHOLE_SIZE;++invalidateCalls;check(InvalidateMappedMemoryRanges(device,1,&r));}
@@ -2613,7 +2668,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
    pinPhase.reset();auto retired=std::make_shared<bool>(false);
    // A mapped non-coherent texture is invalidated under the mutex; its surface stays leased until then.
    bool earlyOk=bool(fenced);for(auto *t:pinnedTextures)if(t->mapped && !coherent(t->memoryType))earlyOk=false;
-   std::function<void()> finish=[this,&slot,fence,timestamps,passQ,passInfos,drawQ,drawInfos,pinnedBuffers,pinnedTextures,pinnedPipelines,pinnedSamplers,sampleViews,frames,emptyRenders,aliasBuffer,neutralBuffer,submitQueued,retired,fenced,earlyOk] {
+   std::function<void()> finish=[this,&slot,fence,timestamps,passQ,passInfos,drawQ,drawInfos,chunkQ,chunkPassStarts,pinnedBuffers,pinnedTextures,pinnedPipelines,pinnedSamplers,sampleViews,frames,emptyRenders,aliasBuffer,neutralBuffer,submitQueued,retired,fenced,earlyOk] {
     // Fence waits never hold the device/recording mutex. One owner retires each ticket.
     if(*retired)return;*retired=true;
     auto waitStart=FrameClock::now();VkResult result;
@@ -2636,7 +2691,8 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
      if(timestamps){uint64_t ticks[2]{};check(GetQueryPoolResults(device,timestamps,0,2,sizeof(ticks),ticks,sizeof(uint64_t),VK_QUERY_RESULT_64_BIT));
       uint64_t mask=timestampBits>=64?UINT64_MAX:(uint64_t(1)<<timestampBits)-1;
       uint64_t elapsed=uint64_t(double((ticks[1]-ticks[0])&mask)*timestampPeriod);
-      gpuNanos+=elapsed;if(currentFrame){currentFrame->gpuExec+=elapsed;++currentFrame->gpuSamples;}++gpuSamples;readPassTimes(passQ,passInfos,elapsed);readDrawTimes(drawQ,drawInfos);
+      std::vector<std::pair<size_t,uint64_t>> gaps;elapsed-=std::min(elapsed,chunkGaps(chunkQ,chunkPassStarts,gaps));
+      gpuNanos+=elapsed;if(currentFrame){currentFrame->gpuExec+=elapsed;++currentFrame->gpuSamples;}++gpuSamples;readPassTimes(passQ,passInfos,elapsed,gaps);readDrawTimes(drawQ,drawInfos);
      }
      auto invalidateStart=FrameClock::now();
      for(auto *t:pinnedTextures)if(t->mapped && !coherent(t->memoryType)){VkMappedMemoryRange r{};r.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;r.memory=t->memory;r.size=VK_WHOLE_SIZE;++invalidateCalls;check(InvalidateMappedMemoryRanges(device,1,&r));}
@@ -2656,7 +2712,13 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
    retireBuildPhase.reset();submitToQueue();if(scheduled)scheduled();
    submitted=false;completed=true;
    *retirement=std::move(finish);
-  } catch(...) {if(submitted){poisoned=true;slot.busy=false;submitWake.notify_all();}else if(!completed){for(auto old:oldTextures){old.texture->layout=old.layout;old.texture->levelLayouts=old.levelLayouts;old.texture->defined=old.defined;old.texture->definedLevels=old.definedLevels;old.texture->shadowHash=old.shadowHash;old.texture->shadowHashed=old.shadowHashed;}clearSubmitObjects(slot);cleanup();}
+  } catch(...) {
+   // FUXI_MTL_SPLIT_SUBMIT: chunks are queued but the frame failed before its last chunk. A fence-only submission signals once they finish; then
+   // their objects may go and the state they leave behind stays. A failed or uncertain drain poisons, as an uncertain QueueSubmit does.
+   if(!submitted && !completed && chunksSubmitted){bool drained=false;
+    if(!poisoned){VkResult r=frameKernelCall([&]{return QueueSubmit(queue,0,nullptr,slot.submitFence);});if(r==VK_SUCCESS)r=WaitForFences(device,1,&slot.submitFence,VK_TRUE,2000000000ULL);drained=r==VK_SUCCESS;}
+    if(drained)++splitDrained;else submitted=true;}
+   if(submitted){poisoned=true;slot.busy=false;submitWake.notify_all();}else if(!completed){for(auto old:oldTextures){old.texture->layout=old.layout;old.texture->levelLayouts=old.levelLayouts;old.texture->defined=old.defined;old.texture->definedLevels=old.definedLevels;old.texture->shadowHash=old.shadowHash;old.texture->shadowHashed=old.shadowHashed;}clearSubmitObjects(slot);cleanup();}
    try{throw;}catch(const std::exception &e){if(diagnosticOp<ops.size() && !ops[diagnosticOp].diagnostic.empty())throw std::runtime_error(std::string(e.what())+" desc="+ops[diagnosticOp].diagnostic);throw;}
   }
  }
