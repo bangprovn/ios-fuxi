@@ -322,8 +322,16 @@
       "replace": "\tif (!ahvif->links_map && fa_scan_on_link_zero(ar->ab))\n\t\treturn 0;\n\n\tscan_links_map = ~ahvif->links_map & ATH12K_SCAN_LINKS_MASK;\n"
     },
     {
+      "id": "ath12k-regd-5ghz-with-6ghz",
+      "why": "w-m4: every channel list had 2.4 GHz only. For a radio with both 5 and 6 GHz (one WCN7850 radio) this function sets the 5 GHz range only if the radio has no 6 GHz, and relies on the 6 GHz branch to cover 5 GHz by widening the range to 7125 MHz. A domain without a 6 GHz rule (CN here) leaves reg_freq_6ghz.end_freq 0, so that branch does nothing and the range stays at 2.4 GHz. ath12k_mac_setup_channels_rates() does not have this condition, which is why the first range was right. The 5 GHz branch now runs for any radio that registered a 5 GHz band.",
+      "tree": "ath12k",
+      "file": "reg.c",
+      "find": "\tif (supported_bands & WMI_HOST_WLAN_5GHZ_CAP && !ar->supports_6ghz) {\n",
+      "replace": "\tif (supported_bands & WMI_HOST_WLAN_5GHZ_CAP &&\n\t    (!ar->supports_6ghz || ar->mac.sbands[NL80211_BAND_5GHZ].channels)) {\n"
+    },
+    {
       "id": "ath12k-no-11d",
-      "why": "Design M4 sends nothing beyond what the one scan needs. With PREPARING left unset, hw_scan does not start the firmware's periodic 11d country scan, whose answer could also change the regulatory domain under this stage. This code is only reached on stage 4.",
+      "why": "Design M4 sends nothing beyond what the one scan needs. With PREPARING left unset, hw_scan does not start the firmware's periodic 11d country scan, whose answer could also change the regulatory domain under this stage. This code is only reached on stages 4 and 5.",
       "tree": "ath12k",
       "file": "mac.c",
       "find": "\t\tif (test_bit(WMI_TLV_SERVICE_11D_OFFLOAD, ab->wmi_ab.svc_map) &&\n\t\t    ahvif->vdev_type == WMI_VDEV_TYPE_STA &&\n\t\t    ahvif->vdev_subtype == WMI_VDEV_SUBTYPE_NONE) {\n\t\t\treinit_completion(&ar->completed_11d_scan);\n\t\t\tar->state_11d = ATH12K_11D_PREPARING;\n\t\t}\n\t\tbreak;\n\tcase WMI_VDEV_TYPE_MONITOR:\n",
