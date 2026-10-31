@@ -27,8 +27,12 @@ components/ArmCpu, components/ArmDTPlatform
   components/README.md).
 tools/mkadt-fuxi27.py (outside this directory) follows the tree shape of
   UniXNU-sheng scripts/make-sheng-adt.py.
+tools/xnuprelink/ (outside this directory)
+  XnuPrelink, https://github.com/UniXNU/XnuPrelink, commit 76452c6 (the
+  revision UniXNU 88604d0 pins): the Python modules, tests, fixtures and
+  LICENSE, copied verbatim (changes, if any, carry a "Fuxi:" comment).
 
-The UniXNU, UniXNU-sheng and UniXNU-sm8550-common licence text:
+The UniXNU, UniXNU-sheng, UniXNU-sm8550-common and XnuPrelink licence text:
 
 Copyright (c) 2026, UniXNU contributors. All rights reserved.
 
