@@ -1,0 +1,42 @@
+UniXNU-sheng (https://github.com/UniXNU/UniXNU-sheng, branch feat/ipados27-gpu-parity
+at 5b7d83c), BSD-2-Clause-Patent, Copyright (c) 2026 UniXNU contributors; see
+xnu27/NOTICE. osfmk/kern/stack.c hunk of patches/xnu-12377/zzzz-sheng-ipados27-bringup.patch,
+unchanged: exports unixnu_kernel_stack_shift, which the XnuPrelink 24A446 fixture
+binds AppleMobileFileIntegrity's PAGE_SHIFT_CONST GOT slot to (reviewed site), and
+aligns kernel stacks so sp & stack_addr_mask stays at least 8 KiB inside a stack.
+The fileset emitter refuses a kernel without the symbol.
+
+diff --git a/osfmk/kern/stack.c b/osfmk/kern/stack.c
+index 1111ccf..069db94 100644
+--- a/osfmk/kern/stack.c
++++ b/osfmk/kern/stack.c
+@@ -154,6 +154,13 @@ roundup_pow2(vm_offset_t size)
+ static vm_offset_t stack_alloc_internal(void);
+ static void stack_free_stack(vm_offset_t);
+ 
++/*
++ * log2 of the stack allocation alignment (stack_addr_mask + 1). Original components measure the stack room left as
++ * sp & ((1 << shift) - 1) and read PAGE_SHIFT_CONST for the shift, which is right only where the lower guard pages
++ * keep the stack base aligned (16 KiB pages). XnuPrelink binds those reads here (reviewed sites in its fixtures).
++ */
++__attribute__((used)) SECURITY_READ_ONLY_LATE(uint32_t) unixnu_kernel_stack_shift;
++
+ static void
+ stack_init(void)
+ {
+@@ -173,8 +180,14 @@ stack_init(void)
+ 		    (void *) kernel_stack_size, PAGE_SIZE);
+ 	}
+ 
+-	stack_addr_mask = roundup_pow2(kernel_stack_size) - 1;
++	/*
++	 * Align the whole allocation (two guard pages below the stack, one above) rather than the stack size alone:
++	 * with 4 KiB pages the stack then starts at least 8 KiB above an aligned address, so sp & stack_addr_mask
++	 * never comes near zero inside a stack (see unixnu_kernel_stack_shift).
++	 */
++	stack_addr_mask = roundup_pow2(kernel_stack_size + ptoa(3)) - 1;
+ 	kernel_stack_mask = ~stack_addr_mask;
++	unixnu_kernel_stack_shift = (uint32_t)__builtin_ctzl(stack_addr_mask + 1);
+ }
+ STARTUP(TUNABLES, STARTUP_RANK_MIDDLE, stack_init);
+ 

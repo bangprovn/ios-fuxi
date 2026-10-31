@@ -60,6 +60,8 @@ unixnu/darwin26-kpi.patch
 unixnu/darwin26-shared-region.patch
 # UniXNU-sheng CPU/MMU layer (same SM8550 SoC): 47-bit user VA, 16-bit ASID, WFE idle, ...
 sheng/sheng-cpu-mmu.patch
+# UniXNU-sheng stack.c: unixnu_kernel_stack_shift (XnuPrelink reviewed AMFI site, K2)
+sheng/sheng-kernel-stack-shift.patch
 # UniXNU-sm8550-common: secondary-CPU MPIDR mask for BCM2837-based configs
 sm8550/native-smp-secondary-start.patch
 # Fuxi device layer

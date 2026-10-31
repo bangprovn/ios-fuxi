@@ -17,6 +17,9 @@ patches/sheng/sheng-cpu-mmu.patch
   feat/ipados27-gpu-parity at 5b7d83c: per-file extract of
   patches/xnu-12377/zzzz-sheng-ipados27-bringup.patch and
   zzye-sheng-cpu-idle.patch (hunks unchanged; the patch header lists the files).
+patches/sheng/sheng-kernel-stack-shift.patch
+  UniXNU-sheng at 5b7d83c: osfmk/kern/stack.c hunk of the same bring-up patch,
+  unchanged (unixnu_kernel_stack_shift for XnuPrelink's reviewed AMFI site).
 patches/sm8550/native-smp-secondary-start.patch
   UniXNU-sm8550-common, https://github.com/UniXNU/UniXNU-sm8550-common,
   commit 23b2049fcd9e30356161def84231334fb55ecca9: start.s hunk of

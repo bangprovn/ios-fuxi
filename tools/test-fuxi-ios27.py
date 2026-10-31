@@ -62,7 +62,7 @@ def layout():
                  'UniXNU-sheng', '5b7d83c', 'UniXNU-sm8550-common', '23b2049', 'components/README.md',
                  'make-sheng-adt.py'):
         assert need in notice, need
-    for name in ('sheng/sheng-cpu-mmu.patch', 'sm8550/native-smp-secondary-start.patch'):
+    for name in ('sheng/sheng-cpu-mmu.patch', 'sheng/sheng-kernel-stack-shift.patch', 'sm8550/native-smp-secondary-start.patch'):
         head = (X27 / 'patches' / name).read_text().split('\ndiff --git', 1)[0]
         assert 'BSD-2-Clause-Patent' in head and 'xnu27/NOTICE' in head, name
     table = (X27 / 'components/README.md').read_text()
@@ -89,7 +89,12 @@ def layout():
         assert 'register_crypto_functions' not in t and 'XNU_SOURCE_CORECRYPTO14' not in t
     assert handoff.count('+\tif (FUXI_KMEM_BUILTIN()) {') == 4 and '+static bool fuxi_kmem_builtin;' in handoff
     assert 'FUXI crypto: kmem RNG from corecrypto' in handoff and 'built-in DRBG unused' in handoff
-    print(f'PASS: series = {len(listed)} committed patches (51 UniXNU verbatim, sheng, sm8550, 5 Fuxi), notices and '
+    # K2: symbols tools/xnuprelink needs from the native kernel (fileset_emit stub, reviewed AMFI site, OSKext hook)
+    allp = ''.join((X27 / 'patches' / p).read_text() for p in listed)
+    for sym in ('+unixnu_fileset_unmapped(uint64_t arg0, uint64_t arg1)', 'SECURITY_READ_ONLY_LATE(uint32_t) unixnu_kernel_stack_shift;',
+                '"_NativePrelinkEarlySecurityInit"', 'trust_cache_mut_rt_reserved', '-Wl,-threaded_starts_section'):
+        assert sym in allp, sym
+    print(f'PASS: series = {len(listed)} committed patches (51 UniXNU verbatim, 2 sheng, sm8550, 5 Fuxi), notices and '
           'component hashes present, no corecrypto source, monitor symbol contract kept, kext crypto handoff latched')
 
 
@@ -260,11 +265,17 @@ def ci():
     for need in ('MACHINE_CONFIGS=FUXI', 'ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG=arm64e', 'XNU_KERNEL_CHAINED_FIXUPS=0',
                  '-find ld-classic', 'xnu27/apply.sh', '--variant ios27', 'DEVELOPMENT_ARM64_FUXI'):
         assert need in b27, need
+    rel = b27[b27.index('# K2 matching reference'):]
+    for need in ('KERNEL_CONFIGS=RELEASE', 'BUILD_LTO=1', 'OBJROOT="$robj"', '"${kflags[@]}"', 'MACHINE_CONFIGS=FUXI',
+                 'FUXI_XNU27_RELEASE_REF', 'mach.release.fuxi.unstripped', 'release-reference.txt'):
+        assert need in rel or need in b27, need
+    assert b27.count('"${kflags[@]}"') == 2 and 'BUILD_LTO=0' in b27 and 'BUILD_LTO=0' not in rel
+    assert not re.search(r'kernelcache|\.ipsw|KDK|curl|wget', b27.split('\nset -euo pipefail', 1)[1], re.I)
     wf = (ROOT / '.github/workflows/fuxi-build.yml').read_text()
     assert 'options: [none, metal4, wlan6g, metal4e, ios27, all]' in wf and "'xnu27/sources.env'" in wf
     assert wf.count("matrix.target != 'kernel-ios27'") == 3
     print('PASS: kernel-inputs ios27 (fuxi27 ADTs, cpus=1 and cpus7+sheng-smp lines < 1024), CI plan ios27 only '
-          '(not in all), dry-run pins, workflow option and iig steps skipped for ios27')
+          '(not in all), dry-run pins, workflow option and iig steps skipped for ios27, RELEASE reference build (LTO, own OBJROOT)')
 
 
 def main():
