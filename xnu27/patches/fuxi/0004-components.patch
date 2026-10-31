@@ -1,0 +1,13 @@
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index f2aa835..f462f98 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -5,4 +5,8 @@ iokit/Kernel/IOPMrootDomain.cpp    					optional iokitcpp
+ 
+ # SMP
+ iokit/Kernel/arm/AppleARMSMP.cpp    					optional iokitcpp
++# UniXNU ArmCpu (GICv3 + PSCI CPU driver) and ArmDTPlatform (Apple-format DT
++# platform expert), BSD-2-Clause-Patent; xnu27/stage-components.sh copies them in.
++iokit/Kernel/arm/ArmCpu.cpp					optional iokitcpp
++iokit/Kernel/arm/ArmDTPlatform.cpp				optional iokitcpp
+ 

@@ -1,0 +1,580 @@
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index ffe7ce0..190aa96 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -79,6 +79,9 @@
+  * Version 2.0.
+  */
+ 
++#if defined(FUXI)
++extern void fuxi_early_mark(unsigned int stage, const char *label); /* osfmk/arm64/fuxi_console.c */
++#endif
+ #include <sys/param.h>
+ #include <sys/filedesc.h>
+ #include <sys/kernel.h>
+@@ -805,6 +808,9 @@ bsd_init(void)
+ 	sysctl_mib_init();
+ 
+ 	bsd_init_kprintf("calling bsd_autoconf\n");
++#if defined(FUXI)
++	fuxi_early_mark(0x120, "bsd_autoconf");
++#endif
+ 	bsd_autoconf();
+ 
+ #if CONFIG_DTRACE
+@@ -888,6 +894,9 @@ bsd_init(void)
+ 
+ 		bsd_init_kprintf("calling setconf\n");
+ 		setconf();
++#if defined(FUXI)
++		fuxi_early_mark(0x121, "mounting root");
++#endif
+ #if CONFIG_NETBOOT
+ 		netboot = (mountroot == netboot_mountroot);
+ #endif
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index 2629e2d..4e5a59c 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -29,6 +29,9 @@
+  * @OSF_COPYRIGHT@
+  */
+ 
++#if defined(FUXI)
++#include <arm64/fuxi_console.h>
++#endif
+ #include <debug.h>
+ #include <mach_ldebug.h>
+ #include <mach_kdp.h>
+@@ -362,6 +365,9 @@ arm_init(
+ 	flush_core_tlb();
+ #endif /* T0SZ_USER != T0SZ_BOOT */
+ 
++#if defined(FUXI)
++	fuxi_early_mark(0x101, "arm_init entered; rebasing");
++#endif
+ 	arm_slide_rebase_and_sign_image();
+ 
+ 	arm_static_if_init(args);
+@@ -382,6 +388,9 @@ arm_init(
+ #endif /* defined(HAS_APPLE_PAC) */
+ 
+ 	PE_init_platform(FALSE, args); /* Get platform expert set up */
++#if defined(FUXI)
++	fuxi_early_mark(0x102, "PE_init_platform done");
++#endif
+ 
+ #if __arm64__
+ 	configure_timer_apple_regs();
+@@ -475,6 +484,9 @@ arm_init(
+ #endif
+ 
+ 	ml_parse_cpu_topology();
++#if defined(FUXI)
++	fuxi_early_mark(0x103, "ml_parse_cpu_topology done");
++#endif
+ 
+ 
+ 	boot_cpu_id = ml_get_boot_cpu_number();
+@@ -511,6 +523,9 @@ arm_init(
+ 
+ 	kernel_debug_string_early("kernel_startup_bootstrap");
+ 	kernel_startup_bootstrap();
++#if defined(FUXI)
++	fuxi_early_mark(0x105, "kernel_startup_bootstrap done");
++#endif
+ 
+ 	/*
+ 	 * Initialize the timer callout world
+@@ -586,6 +601,9 @@ arm_init(
+ 	pmap_first_pnum = (ppnum_t)atop(gDramBase);
+ 
+ 	arm_vm_init(xmaxmem, args);
++#if defined(FUXI)
++	fuxi_early_mark(0x107, "arm_vm_init returned");
++#endif
+ 
+ 	if (debug_boot_arg) {
+ 		patch_low_glo();
+@@ -599,6 +617,9 @@ arm_init(
+ 
+ 	/* Setup debugging output. */
+ 	const unsigned int serial_exists = serial_init();
++#if defined(FUXI)
++	fuxi_early_mark(0x108, "serial_init returned");
++#endif
+ 	kernel_startup_initialize_upto(STARTUP_SUB_KPRINTF);
+ 	kprintf("kprintf initialized\n");
+ 
+@@ -703,6 +724,9 @@ arm_init(
+ 	 * against string vulnerabilities
+ 	 */
+ 	__stack_chk_guard &= ~(0xFFULL << 8);
++#if defined(FUXI)
++	fuxi_early_mark(0x10f, "machine_startup");
++#endif
+ 	machine_startup(args);
+ }
+ 
+diff --git a/osfmk/arm64/fuxi_console.c b/osfmk/arm64/fuxi_console.c
+new file mode 100644
+index 0000000..a9bca31
+--- /dev/null
++++ b/osfmk/arm64/fuxi_console.c
+@@ -0,0 +1,93 @@
++/*
++ * Fuxi bring-up console (see fuxi_console.h). No allocation, locks or ADT
++ * parsing: it runs from arm_init before the VM is up and from panic().
++ *
++ * tools/fuxi-xnu-monitor.py finds these by name in the unstripped kernel's
++ * symbol table: _fuxi_early_status, _sweet_log_ring and _sweet_log_total
++ * (the names are shared with the xnu-8796 kernel so one host tool reads both).
++ */
++#include <arm64/fuxi_console.h>
++
++#if defined(FUXI)
++#include <kern/assert.h>
++#include <machine/atomic.h>
++
++/* Initialized data, so the record exists (and says "not entered") before XNU runs. */
++struct fuxi_early_record {
++	uint64_t stage;
++	char text[120];
++};
++volatile struct fuxi_early_record fuxi_early_status __attribute__((aligned(64), used)) = {
++	0x4655584900000000ULL, "not entered"
++};
++
++#define SWEET_LOG_SIZE (4u << 20)
++static char sweet_log_ring[SWEET_LOG_SIZE] __attribute__((aligned(64), used));
++static uint64_t _Atomic sweet_log_total __attribute__((aligned(64), used));
++
++static inline void
++fuxi_clean_line(const volatile void *p)
++{
++	__asm__ volatile ("dc cvac, %0" :: "r"(p) : "memory");
++}
++
++void
++fuxi_early_mark(unsigned int stage, const char *label)
++{
++	fuxi_early_status.stage = 0x10000u + stage;
++	unsigned int i = 0;
++	while (label && label[i] && i < sizeof(fuxi_early_status.text) - 1) {
++		fuxi_early_status.text[i] = label[i];
++		i++;
++	}
++	fuxi_early_status.text[i] = 0;
++	for (uintptr_t p = (uintptr_t)&fuxi_early_status;
++	    p < (uintptr_t)&fuxi_early_status + sizeof(fuxi_early_status); p += 64) {
++		fuxi_clean_line((const volatile void *)p);
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++void
++fuxi_log_append(const char *c, int size)
++{
++	if (size <= 0) {
++		return;
++	}
++	uint64_t at = os_atomic_add_orig(&sweet_log_total, (uint64_t)size, relaxed);
++	for (int i = 0; i < size; i++) {
++		uint64_t slot = (at + (uint64_t)i) % SWEET_LOG_SIZE;
++		sweet_log_ring[slot] = c[i];
++		/* Publish each finished 64-byte line, the ring's end and the last byte. */
++		if (((uintptr_t)&sweet_log_ring[slot] & 63) == 63 || slot == SWEET_LOG_SIZE - 1 || i == size - 1) {
++			fuxi_clean_line(&sweet_log_ring[slot]);
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	fuxi_clean_line(&sweet_log_total);
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++uint64_t
++fuxi_log_position(void)
++{
++	return os_atomic_load(&sweet_log_total, relaxed);
++}
++
++/* Copy bytes from *pos on; skips ahead if the ring has already overwritten them. */
++size_t
++fuxi_log_copy(uint64_t *pos, char *out, size_t len)
++{
++	uint64_t total = os_atomic_load(&sweet_log_total, relaxed);
++	if (total - *pos > SWEET_LOG_SIZE) {
++		*pos = total - SWEET_LOG_SIZE;
++	}
++	size_t n = 0;
++	while (n < len && *pos + n < total) {
++		out[n] = sweet_log_ring[(*pos + n) % SWEET_LOG_SIZE];
++		n++;
++	}
++	*pos += n;
++	return n;
++}
++#endif /* FUXI */
+diff --git a/osfmk/arm64/fuxi_console.h b/osfmk/arm64/fuxi_console.h
+new file mode 100644
+index 0000000..5df82b0
+--- /dev/null
++++ b/osfmk/arm64/fuxi_console.h
+@@ -0,0 +1,30 @@
++/*
++ * Fuxi bring-up console: a RAM log ring and an early-stage record that the
++ * loader's native USB monitor (cpu@100, outside XNU) reads by physical
++ * address with its own MMU and caches off. Every write is cleaned to the
++ * point of coherency so the monitor never needs to snoop XNU's caches.
++ */
++#ifndef _ARM64_FUXI_CONSOLE_H_
++#define _ARM64_FUXI_CONSOLE_H_
++
++#include <sys/cdefs.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#if defined(FUXI)
++__BEGIN_DECLS
++void fuxi_early_mark(unsigned int stage, const char *label);
++void fuxi_log_append(const char *c, int size);
++uint64_t fuxi_log_position(void);
++size_t fuxi_log_copy(uint64_t *pos, char *out, size_t len);
++__END_DECLS
++#else
++static inline void
++fuxi_early_mark(unsigned int stage, const char *label)
++{
++	(void)stage;
++	(void)label;
++}
++#endif
++
++#endif /* _ARM64_FUXI_CONSOLE_H_ */
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 05d38d6..3240d9c 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -75,6 +75,22 @@
+ #endif
+ .endmacro
+ 
++#if defined(FUXI)
++/*
++ * Record a boot stage in fuxi_early_status for the loader's USB monitor
++ * (osfmk/arm64/fuxi_console.c). Clobbers x16 and x17. With the MMU off the
++ * store reaches memory directly; with it on, the line is cleaned.
++ */
++.macro FUXI_EARLY_STAGE stage
++	adrp	x16, EXT(fuxi_early_status)@page
++	add		x16, x16, EXT(fuxi_early_status)@pageoff
++	mov		x17, #\stage
++	str		x17, [x16]
++	dc		cvac, x16
++	dsb		sy
++.endmacro
++#endif /* FUXI */
++
+ .macro MSR_SCTLR_EL1_X0
+ #if defined(KERNEL_INTEGRITY_KTRR)
+ 	mov		x1, lr
+@@ -472,6 +488,9 @@ start_cpu:
+ 	.align 2
+ 	.globl EXT(start_first_cpu)
+ LEXT(start_first_cpu)
++#if defined(FUXI)
++	FUXI_EARLY_STAGE 1
++#endif
+ 
+ 	// Unlock the core for debugging
+ 	msr		OSLAR_EL1, xzr
+@@ -655,6 +674,9 @@ Lbootstrap_tables_ready:
+  *	TPIDRRO_EL0 - CPU number
+  */
+ common_start:
++#if defined(FUXI)
++	FUXI_EARLY_STAGE 2
++#endif
+ 
+ #if HAS_NEX_PG
+ 	mov x19, lr
+@@ -760,9 +782,15 @@ common_start:
+ #endif /* HAS_APPLE_PAC */
+ 
+ 	// Enable caches, MMU, ROP and JOP
++#if defined(FUXI)
++	FUXI_EARLY_STAGE 3
++#endif
+ 	MOV64   x0, SCTLR_EL1_DEFAULT
+ 	MSR_SCTLR_EL1_X0
+ 	isb		sy
++#if defined(FUXI)
++	FUXI_EARLY_STAGE 4
++#endif
+ 
+ #if !VMAPPLE
+ 	MOV64	x1, SCTLR_EL1_DEFAULT
+diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
+index 0db4600..b3ef43e 100644
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -69,6 +69,7 @@ osfmk/arm/machine_cpuid.c	standard
+ osfmk/arm/machine_routines_common.c		standard
+ osfmk/arm64/lock_ticket_pv.c		optional config_pv_ticket
+ osfmk/arm64/machine_routines.c		standard
++osfmk/arm64/fuxi_console.c		standard
+ osfmk/arm64/machine_routines_asm.s	optional nos_arm_asm
+ osfmk/arm64/machine_task.c		standard
+ osfmk/arm/machine_routines_apple.c	optional nos_arm_asm
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+index 7784e72..a79a914 100644
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -46,6 +46,9 @@
+ #include <kern/cpu_data.h>
+ #include <kern/sched_prim.h>
+ #include <libkern/section_keywords.h>
++#if defined(FUXI)
++#include <arm64/fuxi_console.h>
++#endif
+ 
+ #if __arm64__
+ #include <machine/machine_routines.h>
+@@ -278,6 +281,9 @@ _cnputc(char c, bool poll)
+ static inline void
+ _cnputs(char *c, int size, bool poll)
+ {
++#if defined(FUXI)
++	fuxi_log_append(c, size);
++#endif
+ 	if (disableConsoleOutput) {
+ 		return;
+ 	}
+@@ -608,6 +614,10 @@ console_write(char *str, int size)
+ void
+ console_write_unbuffered(char c)
+ {
++#if defined(FUXI)
++	/* kprintf without a serial device (PE_kputc) bypasses _cnputs. */
++	fuxi_log_append(&c, 1);
++#endif
+ 	if (disableConsoleOutput) {
+ 		return;
+ 	}
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index 032d9e0..9747cdd 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -122,6 +122,179 @@ register_serial_functions(struct pe_serial_functions *fns)
+ 	gPESF = fns;
+ }
+ 
++#if defined(FUXI)
++extern void fuxi_early_mark(unsigned int stage, const char *label); /* osfmk/arm64/fuxi_console.c */
++/*****************************************************************************/
++
++/*
++ * FUXI: framebuffer "serial" for a board with no usable UART (ported from the
++ * xnu-8796 sweet/fuxi kernel). kprintf output is drawn onto
++ * the boot framebuffer described by the ADT node "sweet-fbcon":
++ *   reg    = <phys size>       absolute physical address, not arm-io relative
++ *   width, height              pixels
++ *   stride                     bytes per line, 32bpp
++ * Lines wrap back to the top instead of scrolling; the line after the cursor
++ * is kept blank so the newest output is easy to find.
++ */
++
++extern unsigned char iso_font[256 * 16];
++
++#define FBCON_SCALE     2
++#define FBCON_FG        0xffffffffu
++#define FBCON_BG        0xff000000u
++
++static volatile uint32_t *fbcon_base;
++static uint32_t fbcon_width, fbcon_height, fbcon_stride;
++static uint32_t fbcon_cols, fbcon_rows, fbcon_col, fbcon_row;
++static volatile uint32_t *fuxi_ctl0, *fuxi_intf1;
++/*
++ * The inherited M3 panel is command mode. ABL leaves INTF1 tear autorefresh on,
++ * which already sends a frame every TE; a manual CTL0 START on top of it corrupts
++ * the DSC stream (panel static, ar-01). Kick only when autorefresh is off.
++ */
++static void
++fuxi_display_kick(void)
++{
++	if (fuxi_intf1 == NULL || (fuxi_intf1[0x2b4 / 4] & 0x80000000u)) {
++		__asm__ volatile("dsb sy" ::: "memory");
++		return;
++	}
++	if (fuxi_ctl0 != NULL && !(fuxi_ctl0[0x1c / 4] & 1)) {
++		__asm__ volatile("dsb sy" ::: "memory");
++		fuxi_ctl0[0x1c / 4] = 1;
++		__asm__ volatile("dsb sy" ::: "memory");
++	}
++}
++
++static void
++fbcon_clear_row(uint32_t row)
++{
++	for (uint32_t y = row * 16 * FBCON_SCALE; y < (row + 1) * 16 * FBCON_SCALE; y++) {
++		volatile uint32_t *line = fbcon_base + y * (fbcon_stride / 4);
++		for (uint32_t x = 0; x < fbcon_width; x++) {
++			line[x] = FBCON_BG;
++		}
++	}
++}
++
++static void
++fbcon_newline(void)
++{
++	fbcon_col = 0;
++	fbcon_row = (fbcon_row + 1) % fbcon_rows;
++	fbcon_clear_row(fbcon_row);
++	fbcon_clear_row((fbcon_row + 1) % fbcon_rows);
++	fuxi_display_kick();
++}
++
++static void
++fbcon_init(void)
++{
++	fbcon_cols = fbcon_width / (8 * FBCON_SCALE);
++	fbcon_rows = fbcon_height / (16 * FBCON_SCALE);
++	fbcon_col = fbcon_row = 0;
++	for (uint32_t r = 0; r < fbcon_rows; r++) {
++		fbcon_clear_row(r);
++	}
++}
++
++static unsigned int
++fbcon_transmit_ready(void)
++{
++	return 1;
++}
++
++static void
++fbcon_transmit_data(uint8_t c)
++{
++	if (c == '\r') {
++		fbcon_col = 0;
++		return;
++	}
++	if (c == '\n') {
++		fbcon_newline();
++		return;
++	}
++	if (fbcon_col >= fbcon_cols) {
++		fbcon_newline();
++	}
++	const unsigned char *glyph = iso_font + c * 16;
++	uint32_t x0 = fbcon_col * 8 * FBCON_SCALE, y0 = fbcon_row * 16 * FBCON_SCALE;
++	for (uint32_t gy = 0; gy < 16; gy++) {
++		for (uint32_t sy = 0; sy < FBCON_SCALE; sy++) {
++			volatile uint32_t *line = fbcon_base + (y0 + gy * FBCON_SCALE + sy) * (fbcon_stride / 4) + x0;
++			for (uint32_t gx = 0; gx < 8; gx++) {
++				uint32_t px = (glyph[gy] & (1u << gx)) ? FBCON_FG : FBCON_BG;
++				for (uint32_t sx = 0; sx < FBCON_SCALE; sx++) {
++					line[gx * FBCON_SCALE + sx] = px;
++				}
++			}
++		}
++	}
++	fbcon_col++;
++}
++
++static unsigned int
++fbcon_receive_ready(void)
++{
++	return 0;
++}
++
++static uint8_t
++fbcon_receive_data(void)
++{
++	return 0;
++}
++
++SECURITY_READ_ONLY_LATE(static struct pe_serial_functions) fuxi_fbcon_serial_functions =
++{
++	.init = fbcon_init,
++	.transmit_ready = fbcon_transmit_ready,
++	.transmit_data = fbcon_transmit_data,
++	.receive_ready = fbcon_receive_ready,
++	.receive_data = fbcon_receive_data,
++	.device = SERIAL_FUXI_FBCON
++};
++
++static bool
++fbcon_probe(void)
++{
++	DTEntry entry;
++	uint64_t const *reg;
++	uint32_t const *val;
++	unsigned int size;
++
++	if (SecureDTFindEntry("name", "sweet-fbcon", &entry) != kSuccess ||
++	    SecureDTGetProperty(entry, "reg", (void const **)&reg, &size) != kSuccess || size < 16) {
++		return false;
++	}
++	if (SecureDTGetProperty(entry, "width", (void const **)&val, &size) == kSuccess) {
++		fbcon_width = *val;
++	}
++	if (SecureDTGetProperty(entry, "height", (void const **)&val, &size) == kSuccess) {
++		fbcon_height = *val;
++	}
++	if (SecureDTGetProperty(entry, "stride", (void const **)&val, &size) == kSuccess) {
++		fbcon_stride = *val;
++	}
++	if (!fbcon_width || !fbcon_height || fbcon_stride < fbcon_width * 4) {
++		return false;
++	}
++	fuxi_early_mark(0x10a, "fbcon config read; mapping");
++	fbcon_base = (volatile uint32_t *)ml_io_map_wcomb(reg[0], reg[1]);
++	fuxi_early_mark(0x10b, "fbcon mapping returned");
++	/* SM8550 MDSS: CTL0 (START) and INTF1 (tear autorefresh) of the panel ABL lit. */
++	fuxi_ctl0 = (volatile uint32_t *)ml_io_map(0x0ae16000, 0x1000);
++	fuxi_intf1 = (volatile uint32_t *)ml_io_map(0x0ae36000, 0x1000);
++	if (fbcon_base == NULL) {
++		return false;
++	}
++	register_serial_functions(&fuxi_fbcon_serial_functions);
++	return true;
++}
++
++#endif /* FUXI */
++
+ /**
+  * Indicates whether or not a given device's irqs have been set up by calling
+  * serial_enable_irq for that particular device.
+@@ -899,6 +1072,18 @@ serial_init(void)
+ 		return gPESF != NULL;
+ 	}
+ 
++#if defined(FUXI)
++	/* The framebuffer console needs no SoC base or "serial-device" phandle. */
++	if (fbcon_probe()) {
++		for (fns = gPESF; fns != NULL; fns = fns->next) {
++			serial_do_transmit = 1;
++			fns->init();
++		}
++		uart_initted = true;
++		return 1;
++	}
++#endif /* FUXI */
++
+ 	soc_base = pe_arm_get_soc_base_phys();
+ 
+ 	if (soc_base == 0) {
+diff --git a/pexpert/pexpert/arm/protos.h b/pexpert/pexpert/arm/protos.h
+index f8fcbc2..d007c34 100644
+--- a/pexpert/pexpert/arm/protos.h
++++ b/pexpert/pexpert/arm/protos.h
+@@ -47,7 +47,8 @@ typedef enum serial_device {
+ 	SERIAL_APPLE_UART=0x1,
+ 	SERIAL_DOCKCHANNEL=0x2,
+ 	SERIAL_PL011_UART=0x4,
+-	SERIAL_DCC_UART=0x8
++	SERIAL_DCC_UART=0x8,
++	SERIAL_FUXI_FBCON=0x10
+ } serial_device_t;
+ 
+ kern_return_t serial_irq_enable(serial_device_t device);

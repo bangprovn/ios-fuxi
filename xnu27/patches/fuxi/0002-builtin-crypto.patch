@@ -1,0 +1,391 @@
+diff --git a/libkern/crypto/corecrypto_rand.c b/libkern/crypto/corecrypto_rand.c
+index d46815b..3ff4197 100644
+--- a/libkern/crypto/corecrypto_rand.c
++++ b/libkern/crypto/corecrypto_rand.c
+@@ -52,12 +52,50 @@ random_buf(void *buf, size_t buflen)
+ 	return cc_rand_generate(buf, buflen);
+ }
+ 
++#if defined(FUXI)
++/*
++ * FUXI boots without the corecrypto kext. The kmem RNG contract permits a
++ * non-cryptographic, lock-free generator: per-CPU SplitMix64 state seeded
++ * from early_random() (the kernel's built-in HMAC-SHA256 DRBG). SplitMix64:
++ * Sebastiano Vigna, 2015, public-domain reference at
++ * https://prng.di.unimi.it/splitmix64.c. A corecrypto kext that registers
++ * before EARLY_BOOT replaces all of this.
++ */
++extern uint64_t early_random(void);
++
++struct fuxi_kmem_rng {
++	uint64_t state;
++};
++
++static uint64_t
++fuxi_kmem_random64(struct fuxi_kmem_rng *rng)
++{
++	uint64_t value = (rng->state += 0x9e3779b97f4a7c15ULL);
++	value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
++	value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
++	return value ^ (value >> 31);
++}
++#endif /* FUXI */
++
+ void
+ crypto_random_generate(
+ 	crypto_random_ctx_t ctx,
+ 	void *random,
+ 	size_t random_size)
+ {
++#if defined(FUXI)
++	if (!g_crypto_funcs) {
++		uint8_t *out = random;
++		while (random_size > 0) {
++			uint64_t value = fuxi_kmem_random64((struct fuxi_kmem_rng *)ctx);
++			size_t n = random_size < sizeof(value) ? random_size : sizeof(value);
++			memcpy(out, &value, n);
++			out += n;
++			random_size -= n;
++		}
++		return;
++	}
++#endif
+ 	g_crypto_funcs->random_generate_fn(ctx, random, random_size);
+ }
+ 
+@@ -67,12 +105,29 @@ crypto_random_uniform(
+ 	uint64_t bound,
+ 	uint64_t *random)
+ {
++#if defined(FUXI)
++	if (!g_crypto_funcs) {
++		/* Reject the incomplete residue interval to avoid modulo bias. */
++		const uint64_t threshold = -bound % bound;
++		uint64_t value;
++		do {
++			value = fuxi_kmem_random64((struct fuxi_kmem_rng *)ctx);
++		} while (value < threshold);
++		*random = value % bound;
++		return;
++	}
++#endif
+ 	g_crypto_funcs->random_uniform_fn(ctx, bound, random);
+ }
+ 
+ size_t
+ crypto_random_kmem_ctx_size(void)
+ {
++#if defined(FUXI)
++	if (!g_crypto_funcs) {
++		return sizeof(struct fuxi_kmem_rng);
++	}
++#endif
+ 	return g_crypto_funcs->random_kmem_ctx_size_fn();
+ }
+ 
+@@ -80,5 +135,11 @@ void
+ crypto_random_kmem_init(
+ 	crypto_random_ctx_t ctx)
+ {
++#if defined(FUXI)
++	if (!g_crypto_funcs) {
++		((struct fuxi_kmem_rng *)ctx)->state = early_random();
++		return;
++	}
++#endif
+ 	g_crypto_funcs->random_kmem_init_fn(ctx);
+ }
+diff --git a/libkern/crypto/corecrypto_sha2.c b/libkern/crypto/corecrypto_sha2.c
+index 7392f0c..eb5168a 100644
+--- a/libkern/crypto/corecrypto_sha2.c
++++ b/libkern/crypto/corecrypto_sha2.c
+@@ -31,37 +31,66 @@
+ #include <libkern/libkern.h>
+ #include <kern/debug.h>
+ #include <corecrypto/ccdigest.h>
++#if defined(FUXI)
++#include <corecrypto/ccsha2.h>
++#endif
+ 
+ #if defined(CRYPTO_SHA2)
+ 
++#if defined(FUXI)
++/*
++ * FUXI boots without the corecrypto kext. Until one registers, SHA-256 and
++ * SHA-512 use the digests the kernel already links for early_random
++ * (osfmk/corecrypto). SHA-384 has no built-in digest and still needs a kext.
++ */
++static const struct ccdigest_info *
++fuxi_sha2_di(const struct ccdigest_info *registered, const struct ccdigest_info *builtin, const char *name)
++{
++	if (g_crypto_funcs) {
++		return registered;
++	}
++	if (builtin == NULL) {
++		panic("%s: no corecrypto registered and no built-in digest", name);
++	}
++	return builtin;
++}
++#define SHA2_DI(field, builtin) fuxi_sha2_di(g_crypto_funcs ? g_crypto_funcs->field : NULL, builtin, __FUNCTION__)
++#define SHA2_INIT(di, ctx) (g_crypto_funcs ? g_crypto_funcs->ccdigest_init_fn(di, ctx) : ccdigest_init(di, ctx))
++#define SHA2_UPDATE(di, ctx, len, data) (g_crypto_funcs ? g_crypto_funcs->ccdigest_update_fn(di, ctx, len, data) : ccdigest_update(di, ctx, len, data))
++#else
++#define SHA2_DI(field, builtin) (g_crypto_funcs->field)
++#define SHA2_INIT(di, ctx) g_crypto_funcs->ccdigest_init_fn(di, ctx)
++#define SHA2_UPDATE(di, ctx, len, data) g_crypto_funcs->ccdigest_update_fn(di, ctx, len, data)
++#endif
++
+ void
+ SHA256_Init(SHA256_CTX *ctx)
+ {
+ 	const struct ccdigest_info *di;
+-	di = g_crypto_funcs->ccsha256_di;
++	di = SHA2_DI(ccsha256_di, &ccsha256_ltc_di);
+ 
+ 	/* Make sure the context size for the digest info fits in the one we have */
+ 	if (ccdigest_di_size(di) > sizeof(SHA256_CTX)) {
+ 		panic("%s: inconsistent size for SHA256 context", __FUNCTION__);
+ 	}
+ 
+-	g_crypto_funcs->ccdigest_init_fn(di, ctx->ctx);
++	SHA2_INIT(di, ctx->ctx);
+ }
+ 
+ void
+ SHA256_Update(SHA256_CTX *ctx, const void *data, size_t len)
+ {
+ 	const struct ccdigest_info *di;
+-	di = g_crypto_funcs->ccsha256_di;
++	di = SHA2_DI(ccsha256_di, &ccsha256_ltc_di);
+ 
+-	g_crypto_funcs->ccdigest_update_fn(di, ctx->ctx, len, data);
++	SHA2_UPDATE(di, ctx->ctx, len, data);
+ }
+ 
+ void
+ SHA256_Final(void *digest, SHA256_CTX *ctx)
+ {
+ 	const struct ccdigest_info *di;
+-	di = g_crypto_funcs->ccsha256_di;
++	di = SHA2_DI(ccsha256_di, &ccsha256_ltc_di);
+ 
+ 	ccdigest_final(di, ctx->ctx, digest);
+ }
+@@ -70,23 +99,23 @@ void
+ SHA384_Init(SHA384_CTX *ctx)
+ {
+ 	const struct ccdigest_info *di;
+-	di = g_crypto_funcs->ccsha384_di;
++	di = SHA2_DI(ccsha384_di, NULL);
+ 
+ 	/* Make sure the context size for the digest info fits in the one we have */
+ 	if (ccdigest_di_size(di) > sizeof(SHA384_CTX)) {
+ 		panic("%s: inconsistent size for SHA384 context", __FUNCTION__);
+ 	}
+ 
+-	g_crypto_funcs->ccdigest_init_fn(di, ctx->ctx);
++	SHA2_INIT(di, ctx->ctx);
+ }
+ 
+ void
+ SHA384_Update(SHA384_CTX *ctx, const void *data, size_t len)
+ {
+ 	const struct ccdigest_info *di;
+-	di = g_crypto_funcs->ccsha384_di;
++	di = SHA2_DI(ccsha384_di, NULL);
+ 
+-	g_crypto_funcs->ccdigest_update_fn(di, ctx->ctx, len, data);
++	SHA2_UPDATE(di, ctx->ctx, len, data);
+ }
+ 
+ 
+@@ -94,7 +123,7 @@ void
+ SHA384_Final(void *digest, SHA384_CTX *ctx)
+ {
+ 	const struct ccdigest_info *di;
+-	di = g_crypto_funcs->ccsha384_di;
++	di = SHA2_DI(ccsha384_di, NULL);
+ 
+ 	ccdigest_final(di, ctx->ctx, digest);
+ }
+@@ -103,30 +132,30 @@ void
+ SHA512_Init(SHA512_CTX *ctx)
+ {
+ 	const struct ccdigest_info *di;
+-	di = g_crypto_funcs->ccsha512_di;
++	di = SHA2_DI(ccsha512_di, &ccsha512_ltc_di);
+ 
+ 	/* Make sure the context size for the digest info fits in the one we have */
+ 	if (ccdigest_di_size(di) > sizeof(SHA512_CTX)) {
+ 		panic("%s: inconsistent size for SHA512 context", __FUNCTION__);
+ 	}
+ 
+-	g_crypto_funcs->ccdigest_init_fn(di, ctx->ctx);
++	SHA2_INIT(di, ctx->ctx);
+ }
+ 
+ void
+ SHA512_Update(SHA512_CTX *ctx, const void *data, size_t len)
+ {
+ 	const struct ccdigest_info *di;
+-	di = g_crypto_funcs->ccsha512_di;
++	di = SHA2_DI(ccsha512_di, &ccsha512_ltc_di);
+ 
+-	g_crypto_funcs->ccdigest_update_fn(di, ctx->ctx, len, data);
++	SHA2_UPDATE(di, ctx->ctx, len, data);
+ }
+ 
+ void
+ SHA512_Final(void *digest, SHA512_CTX *ctx)
+ {
+ 	const struct ccdigest_info *di;
+-	di = g_crypto_funcs->ccsha512_di;
++	di = SHA2_DI(ccsha512_di, &ccsha512_ltc_di);
+ 
+ 	ccdigest_final(di, ctx->ctx, digest);
+ }
+diff --git a/osfmk/prng/prng_random.c b/osfmk/prng/prng_random.c
+index 504b3fa..0aa41d3 100644
+--- a/osfmk/prng/prng_random.c
++++ b/osfmk/prng/prng_random.c
+@@ -502,3 +502,140 @@ random_bool_gen_bits(struct bool_gen * bg, unsigned int * buffer, unsigned int c
+ 	}
+ 	return rbits;
+ }
++
++#if defined(FUXI)
++/*
++ * FUXI boots without the corecrypto kext that normally installs the kernel
++ * PRNG. Install the built-in NIST HMAC-SHA256 DRBG that early_random already
++ * uses (osfmk/corecrypto). One mutex serializes generation and reseeding on
++ * all CPUs: a small, auditable bring-up generator, not a per-CPU one. Only
++ * the PRNG is registered, not the g_crypto_funcs table.
++ */
++#include <kern/startup.h>
++
++static LCK_GRP_DECLARE(fuxi_prng_group, "fuxi-prng");
++static LCK_MTX_DECLARE(fuxi_prng_lock, &fuxi_prng_group);
++static struct cckprng_ctx fuxi_prng_ctx;
++static const struct ccdrbg_nisthmac_custom fuxi_prng_custom = {
++	.di = &ccsha256_ltc_di,
++	.strictFIPS = 0,
++};
++static cckprng_getentropy fuxi_getentropy;
++static void *fuxi_getentropy_arg;
++static unsigned fuxi_max_ngens;
++static bool fuxi_generators[MAX_CPUS];
++
++static struct ccdrbg_state *
++fuxi_prng_state(struct cckprng_ctx *ctx)
++{
++	return (struct ccdrbg_state *)ctx->drbg_state;
++}
++
++static void
++fuxi_prng_check(int status)
++{
++	if (status != CCDRBG_STATUS_OK) {
++		panic("FUXI HMAC DRBG error %d", status);
++	}
++}
++
++static void
++fuxi_prng_init_with_getentropy(struct cckprng_ctx *ctx, unsigned max_ngens,
++    size_t seed_nbytes, const void *seed, size_t nonce_nbytes, const void *nonce,
++    cckprng_getentropy getentropy, void *getentropy_arg)
++{
++	assert(max_ngens > 0 && max_ngens <= MAX_CPUS);
++	ccdrbg_factory_nisthmac(&ctx->drbg_info, &fuxi_prng_custom);
++	assert(ctx->drbg_info.size <= sizeof(ctx->drbg_state));
++	const char ps[] = "xnu fuxi kernel random";
++	fuxi_prng_check(ccdrbg_init(&ctx->drbg_info, fuxi_prng_state(ctx),
++	    seed_nbytes, seed, nonce_nbytes, nonce, sizeof(ps) - 1, ps));
++	fuxi_getentropy = getentropy;
++	fuxi_getentropy_arg = getentropy_arg;
++	fuxi_max_ngens = max_ngens;
++}
++
++static void
++fuxi_prng_init(struct cckprng_ctx *ctx, size_t seed_nbytes, const void *seed,
++    size_t nonce_nbytes, const void *nonce, cckprng_getentropy getentropy,
++    void *getentropy_arg)
++{
++	fuxi_prng_init_with_getentropy(ctx, MAX_CPUS, seed_nbytes, seed,
++	    nonce_nbytes, nonce, getentropy, getentropy_arg);
++}
++
++static void
++fuxi_prng_initgen(__unused struct cckprng_ctx *ctx, unsigned gen_idx)
++{
++	lck_mtx_lock(&fuxi_prng_lock);
++	assert(gen_idx < fuxi_max_ngens);
++	assert(!fuxi_generators[gen_idx]);
++	fuxi_generators[gen_idx] = true;
++	lck_mtx_unlock(&fuxi_prng_lock);
++}
++
++static void
++fuxi_prng_reseed(struct cckprng_ctx *ctx, size_t nbytes, const void *seed)
++{
++	lck_mtx_lock(&fuxi_prng_lock);
++	fuxi_prng_check(ccdrbg_reseed(&ctx->drbg_info, fuxi_prng_state(ctx),
++	    nbytes, seed, 0, NULL));
++	lck_mtx_unlock(&fuxi_prng_lock);
++}
++
++static void
++fuxi_prng_refresh(struct cckprng_ctx *ctx)
++{
++	/* The entropy callback also uses try-lock; refresh must not wait. */
++	if (!lck_mtx_try_lock(&fuxi_prng_lock)) {
++		return;
++	}
++	uint8_t entropy[CCKPRNG_ENTROPY_SIZE];
++	size_t nbytes = sizeof(entropy);
++	int32_t nsamples = fuxi_getentropy(&nbytes, entropy, fuxi_getentropy_arg);
++	if (nsamples < 0) {
++		panic("FUXI PRNG entropy health test failed");
++	}
++	if (nsamples >= 256) {
++		assert(nbytes >= 32 && nbytes <= sizeof(entropy));
++		fuxi_prng_check(ccdrbg_reseed(&ctx->drbg_info, fuxi_prng_state(ctx),
++		    nbytes, entropy, 0, NULL));
++	}
++	cc_clear(sizeof(entropy), entropy);
++	lck_mtx_unlock(&fuxi_prng_lock);
++}
++
++static void
++fuxi_prng_generate(struct cckprng_ctx *ctx, unsigned gen_idx,
++    size_t nbytes, void *out)
++{
++	assert(nbytes <= CCKPRNG_GENERATE_MAX_NBYTES);
++	lck_mtx_lock(&fuxi_prng_lock);
++	assert(gen_idx < fuxi_max_ngens && fuxi_generators[gen_idx]);
++	fuxi_prng_check(ccdrbg_generate(&ctx->drbg_info, fuxi_prng_state(ctx),
++	    nbytes, out, 0, NULL));
++	lck_mtx_unlock(&fuxi_prng_lock);
++}
++
++__startup_func
++static void
++fuxi_prng_startup(void)
++{
++	if (prng_ready) {
++		return; /* a corecrypto kext started before EARLY_BOOT registered its own */
++	}
++	/* The boot seed must exist before registration erases the early DRBG. */
++	(void)early_random();
++	const struct cckprng_funcs funcs = {
++		.init = fuxi_prng_init,
++		.initgen = fuxi_prng_initgen,
++		.reseed = fuxi_prng_reseed,
++		.refresh = fuxi_prng_refresh,
++		.generate = fuxi_prng_generate,
++		.init_with_getentropy = fuxi_prng_init_with_getentropy,
++	};
++	register_and_init_prng(&fuxi_prng_ctx, &funcs);
++	kprintf("FUXI PRNG: HMAC-SHA256 DRBG registered\n");
++}
++STARTUP(EARLY_BOOT, STARTUP_RANK_FIRST, fuxi_prng_startup);
++#endif /* FUXI */
