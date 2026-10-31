@@ -79,7 +79,7 @@
   *
 --- a/bsd/dev/fuxi_perf.c
 +++ b/bsd/dev/fuxi_perf.c
-@@ -0,0 +1,712 @@
+@@ -0,0 +1,710 @@
 +/* Opt-in touch/compile boost for SM8550. One serialized worker owns MMIO.
 + * Input/swap hooks only publish timestamps and queue work; no MMIO or sleeps.
 + * No voltage, PLL, thermal-trip or power-collapse registers are programmed.
@@ -112,7 +112,7 @@
 +static const char * const fp_domain[3] = {"silver","gold","prime"};
 +static const unsigned fp_cores[3] = {3,4,1};
 +static const unsigned fp_cool_cap[3] = {1228800,1401600,1363200};
-+static unsigned fp_high_cap[3] = {1228800,2400000,2400000};
++static const unsigned fp_high_cap[3] = {1228800,2400000,2400000};
 +static unsigned fp_cool[3], fp_high[3], fp_cool_khz[3], fp_high_khz[3];
 +static unsigned fp_idle[3], fp_idle_khz[3], fp_idle_ms, fp_idle_floor;
 +static uint64_t fp_idle_after, fp_idle_start, fp_idle_entry;
@@ -135,7 +135,7 @@
 +/* Temperatures are deci-Celsius, rise is dC/second. Only this worker owns
 + * history and votes. The 68 C ceiling can be lowered, never raised. */
 +static unsigned fp_hot = 620, fp_limit = 680, fp_resume = 580;
-+static unsigned fp_rise = 100, fp_fast_ms = 20, fp_budget_ms = 200;
++static unsigned fp_rise = 100, fp_fast_ms = 20, fp_budget_ms = 200, fp_cap_mhz;
 +/* Slope window. TSENS reports 0.4 C steps: one step in 20 ms is 200 dC/s and
 + * latched the rise guard above 55 C on every tick (observed 54.5 C refusals). */
 +static unsigned fp_rate_ms = 200;
@@ -443,7 +443,7 @@
 +  /* Cap boost at 2.4 GHz using eligible multi-core LUT rows.
 +   * Hardware owns CPR/LMh.
 +   * Silver stays cool: raising its shared rail also raises the monitor core. */
-+  int high = fp_level(rows,count,fp_high_cap[d],&high_khz);
++  int high = fp_level(rows,count,d && fp_cap_mhz ? fp_cap_mhz*1000 : fp_high_cap[d],&high_khz);
 +  if (cool < 0 || high < 0)
 +   return fp_init_fail("level selection",d,fp_epss_pa[d],0x100+4*(count-1),rows[count-1],1,(int)count-1);
 +  if (fp_idle_after) {
@@ -623,9 +623,7 @@
 + /* Short names for a full boot line: fpb=MS boost budget per second, fpc=MHz gold/prime boost cap.
 +  * The thermal hot, limit and slope guards are unchanged. */
 + fp_arg("fpb",&fp_budget_ms,20,1000);
-+ unsigned cap_mhz = 2400;
-+ fp_arg("fpc",&cap_mhz,1402,3200);
-+ fp_high_cap[1] = fp_high_cap[2] = cap_mhz*1000;
++ fp_arg("fpc",&fp_cap_mhz,1402,3200);
 + nanoseconds_to_absolutetime((uint64_t)fp_budget_ms*NSEC_PER_MSEC,&fp_budget);
 + nanoseconds_to_absolutetime(NSEC_PER_SEC,&fp_duty_window);
 + nanoseconds_to_absolutetime(500ULL*NSEC_PER_MSEC,&fp_recovery);
