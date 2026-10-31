@@ -131,6 +131,14 @@ def adt_check():
         assert ch['crypto-hash-method'] == b'sha2-384\0' and ch['kernel-ctrr-to-be-enabled'] == struct.pack('<I', 0)
         assert struct.unpack('<Q', ch['dram-base'])[0] == 0x8c0000000
         assert 'chip-id' not in ch and 'unique-chip-id' not in ch
+        # K2: what the original AppleImage4 and AMFI read (UniXNU profile [adt.chosen], make-sheng-adt.py)
+        for k, v in (('certificate-production-status', 0), ('effective-production-status-ap', 0),
+                     ('certificate-security-mode', 1), ('effective-security-mode-sep', 1), ('amfi-only-platform-code', 1)):
+            assert ch[k] == struct.pack('<I', v), k
+        mp = child(child(root, 'chosen'), 'manifest-properties')
+        assert set(props(mp)) == {'name'} and not mp.children
+        prod = props(child(root, 'product'))
+        assert prod['product-name'] == b'iPhone 11 Pro\0' and prod['model'] == b'iPhone12,3\0'
         img = ch['nvram-proxy-data']
         assert struct.unpack('<I', ch['nvram-bank-size'])[0] == len(img) == 8192
         assert struct.unpack_from('<I', img, 16)[0] == zlib.adler32(img[20:])
@@ -166,7 +174,10 @@ def adt_check():
         assert struct.unpack('<Q', gic['redistributor-stride'])[0] in (0x20000, 0x30000, 0x40000)
         assert struct.unpack('<I', props(child(root, 'defaults'))['vmm-present'])[0] == 1
         assert any(c.name == 'options' for c in root.children)
-    print('PASS: mkadt-fuxi27 (1 and 7 CPUs): seed, sha2-384, CTRR off, CHRP NVRAM, cpu/GIC/arm-io shape, '
+    board = props(child(adt.parse(adt.serialize(fuxi27.build(product='board')))[0], 'product'))
+    assert board == {'name': b'product\0', 'product-name': b'Xiaomi 13\0', 'model': b'xiaomi,fuxi\0'}
+    print('PASS: mkadt-fuxi27 (1 and 7 CPUs): seed, sha2-384, security tuple, amfi-only-platform-code, manifest-properties, '
+          '/product iPhone12,3 (board with --product board), CTRR off, CHRP NVRAM, cpu/GIC/arm-io shape, '
           'psci only with secondaries, no chip ids, <= 16 KiB')
 
 

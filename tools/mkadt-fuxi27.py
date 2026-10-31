@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build the Fuxi ADT for the iOS 27 kernel (xnu-12377, UniXNU machine layer).
 
-  mkadt-fuxi27.py OUT.adt [--cpus 1|7] [--psci-method smc|hvc] [--dump]
+  mkadt-fuxi27.py OUT.adt [--cpus 1|7] [--psci-method smc|hvc] [--product iphone12,3|board] [--dump]
 
 The xnu-8796 kernel matched its own SweetDTPlatform/SweetCPU; the 12377 kernel
 uses UniXNU's ArmDTPlatform and ArmCpu (docs-lanes/ios27.md), which read a
@@ -13,7 +13,13 @@ values from mkadt-fuxi.py:
              bytes: 12377 bootseed_init reads 4 x SHA-512 sizes), an empty CHRP
              NVRAM bank (ArmDTPlatform refuses to configure without one),
              osenvironment, crypto-hash-method, the dev-fused security tuple,
-             kernel-ctrr-to-be-enabled = 0, memory-map (mkpayload adds RAMDisk)
+             kernel-ctrr-to-be-enabled = 0, amfi-only-platform-code = 1 (the
+             original AppleImage4/AMFI read these at K2), memory-map (mkpayload
+             adds RAMDisk), manifest-properties (empty; AppleImage4 reads it)
+  /product   product-name/model: the original AppleImage4 panics without the
+             node. Default --product iphone12,3 names the 24A446 userland's
+             device (iPhone 11 Pro, iPhone12,3 / D421AP); --product board keeps
+             the K1 Xiaomi strings
   /cpus      boot core 0 first, MPIDR Aff1 numbering; with --cpus 7 also cores
              2-7 (cpu@100 keeps running the loader's USB monitor), plus /psci
   /arm-io    ranges <0 0x17000000 0x08000000>, intc = GICv3 0x17100000/0x10000,
@@ -46,6 +52,7 @@ GICR_STRIDE = 0x40000
 TIMEBASE = 19200000
 FB_W, FB_H = 1080, 2400
 CPU_REGS = (0x000, 0x200, 0x300, 0x400, 0x500, 0x600, 0x700)
+PRODUCTS = {'iphone12,3': ('iPhone 11 Pro', 'iPhone12,3'), 'board': ('Xiaomi 13', 'xiaomi,fuxi')}
 
 
 def nvram_proxy():
@@ -67,7 +74,7 @@ def nvram_proxy():
             ('nvram-current-bank', u32(0)), ('nvram-proxy-data', bytes(image))]
 
 
-def build(cpus=1, psci_method='smc', seed=None, mem_size=fuxi.MEM_SIZE):
+def build(cpus=1, psci_method='smc', seed=None, mem_size=fuxi.MEM_SIZE, product='iphone12,3'):
     if cpus not in (1, len(CPU_REGS)):
         raise ValueError('cpus must be 1 or 7')
     seed = os.urandom(256) if seed is None else seed
@@ -103,7 +110,7 @@ def build(cpus=1, psci_method='smc', seed=None, mem_size=fuxi.MEM_SIZE):
         node('defaults', [('sleep-disabled', u32(1)), ('vmm-present', u32(1)),
                           ('kern.maxvnodes', u32(78848))]),
         node('options'),
-        node('product', [('product-name', cstr('Xiaomi 13')), ('model', cstr('xiaomi,fuxi'))]),
+        node('product', [('product-name', cstr(PRODUCTS[product][0])), ('model', cstr(PRODUCTS[product][1]))]),
         node('arm-io', [
             ('device_type', cstr('arm-io')),
             ('#address-cells', u32(2)),
@@ -134,9 +141,11 @@ def main():
     ap.add_argument('out', type=Path)
     ap.add_argument('--cpus', type=int, choices=(1, len(CPU_REGS)), default=1)
     ap.add_argument('--psci-method', choices=('smc', 'hvc'), default='smc')
+    ap.add_argument('--product', choices=sorted(PRODUCTS), default='iphone12,3',
+                    help='/product identity: the userland device (default) or the K1 board strings')
     ap.add_argument('--dump', action='store_true')
     args = ap.parse_args()
-    blob = adt.serialize(build(args.cpus, args.psci_method))
+    blob = adt.serialize(build(args.cpus, args.psci_method, product=args.product))
     if len(blob) > 0x4000:
         ap.error(f'ADT is {len(blob)} bytes; the loader accepts at most 16 KiB')
     args.out.write_bytes(blob)
