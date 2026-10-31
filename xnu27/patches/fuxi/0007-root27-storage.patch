@@ -1098,7 +1098,7 @@ diff --git a/bsd/vfs/vfs_subr.c b/bsd/vfs/vfs_subr.c
  #include <sys/proc_internal.h>
  #include <sys/kauth.h>
  #include <sys/mount_internal.h>
-@@ -1211,6 +1214,11 @@
+@@ -1211,6 +1214,14 @@ vfs_mountroot(void)
  	int     error;
  	mount_t mp;
  	vnode_t bdevvp_rootvp;
@@ -1106,11 +1106,14 @@ diff --git a/bsd/vfs/vfs_subr.c b/bsd/vfs/vfs_subr.c
 +	/* fuxi_root27_nomockfs=1: APFS gets the UFS root device first (mockfs probes it and fails with ENOMEM). */
 +	uint32_t fuxi_nomockfs = 0;
 +	PE_parse_boot_argn("fuxi_root27_nomockfs", &fuxi_nomockfs, sizeof(fuxi_nomockfs));
++	/* fuxi_root27_hiderootfs=1: mountroot runs without MNT_ROOTFS (K4 APFS root gate experiment). */
++	uint32_t fuxi_hiderootfs = 0;
++	PE_parse_boot_argn("fuxi_root27_hiderootfs", &fuxi_hiderootfs, sizeof(fuxi_hiderootfs));
 +#endif
  
  	/*
  	 * Reset any prior "unmounting everything" state.  This handles the
-@@ -1247,6 +1255,11 @@
+@@ -1247,15 +1258,31 @@ vfs_mountroot(void)
  		    && !ISSET(vfsp->vfc_vfsflags, VFC_VFSCANMOUNTROOT)) {
  			continue;
  		}
@@ -1122,3 +1125,23 @@ diff --git a/bsd/vfs/vfs_subr.c b/bsd/vfs/vfs_subr.c
  
  		mp = vfs_rootmountalloc_internal(vfsp, "root_device");
  		mp->mnt_devvp = rootvp;
++#if defined(FUXI)
++		if (fuxi_hiderootfs == 1) {
++			mp->mnt_flag &= ~MNT_ROOTFS;
++		}
++#endif
+ 
+ 		if (vfsp->vfc_mountroot) {
+ 			error = (*vfsp->vfc_mountroot)(mp, rootvp, ctx);
+ 		} else {
+ 			error = VFS_MOUNT(mp, rootvp, 0, ctx);
+ 		}
++#if defined(FUXI)
++		if (fuxi_hiderootfs == 1) {
++			mp->mnt_flag |= MNT_ROOTFS;
++			printf("fuxi: %s mountroot without MNT_ROOTFS: %d\n", vfsp->vfc_name, error);
++		}
++#endif
+ 
+ 		if (!error) {
+ 			if (bdevvp_rootvp != rootvp) {
