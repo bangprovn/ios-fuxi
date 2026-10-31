@@ -9,7 +9,10 @@
 # AvailabilityVersions, libplatform, libdispatch and trustcache (xnu-8796.101.5,
 # EXTERNAL_HEADERS/TrustCache only). tools/ci/build.sh kernel-ios27 fetches them.
 # OUT receives mach.development.fuxi(.unstripped), fuxi27.adt, cmdline*.txt,
-# kernel-arch.txt and, unless FUXI_XNU27_RELEASE_REF=0, the symbol-bearing RELEASE
+# kernel-arch.txt, unless FUXI_XNU27_CHAINED=0 the K2 prelink input
+# mach.development.fuxi.chained.unstripped (same objects relinked with
+# XNU_KERNEL_CHAINED_FIXUPS=1: split-seg info + chained fixups, not standalone
+# bootable), and, unless FUXI_XNU27_RELEASE_REF=0, the symbol-bearing RELEASE
 # comparison kernel mach.release.fuxi.unstripped(.noctf) plus release-reference.txt
 # (K2 prelink matching, tools/ios27-prelink.py --reference; never booted).
 # Nothing Apple-binary is fetched: no KDK, IPSW or kernelcache.
@@ -121,6 +124,38 @@ if m['cpusub'] != mkpayload.CPU_SUBTYPE_ARM64E or not m['thread_starts']:
     raise SystemExit('ios27 kernel is not arm64e with __TEXT,__thread_starts')
 PY
 python3 "$root/tools/ci/kernel-inputs.py" --variant ios27 --out "$out"
+
+# K2 prelink input (docs-lanes/ios27.md#k2): XnuPrelink moves native segments
+# around the retained kexts using LC_SEGMENT_SPLIT_INFO, which ld only writes
+# with -add_split_seg_info -kernel (MakeInc.def, XNU_KERNEL_CHAINED_FIXUPS=1),
+# as UniXNU's sheng kernel is linked. Only the link differs, so the same objects
+# are relinked (.LDFLAGS changes); the later assignment on the make command line
+# wins over the =0 in kflags. The K1 standalone kernel above is already copied.
+if [[ ${FUXI_XNU27_CHAINED:-1} == 0 ]]; then
+    echo 'chained kernel: skipped (FUXI_XNU27_CHAINED=0)'
+elif make -C "$xnu" build "${common[@]}" DSTROOT="$dst" "${kflags[@]}" BUILD_LTO=0 XNU_KERNEL_CHAINED_FIXUPS=1; then
+    chained=
+    for raw in "$kdir/mach.development.fuxi.unstripped" "$kdir/mach.development.fuxi.unstripped.noctf"; do
+        [[ -f $raw ]] && { chained=$raw; break; }
+    done
+    [[ -n $chained ]] || die 'no unstripped chained kernel'
+    cp "$chained" "$out/mach.development.fuxi.chained.unstripped"
+    python3 - "$out/mach.development.fuxi.chained.unstripped" <<'PY' | tee -a "$out/kernel-arch.txt"
+import struct, sys
+b = open(sys.argv[1], 'rb').read()
+magic, cpu, sub, ftype, count = struct.unpack_from('<5I', b)
+off, cmds = 32, set()
+for _ in range(count):
+    cmd, size = struct.unpack_from('<II', b, off)
+    cmds.add(cmd)
+    off += size
+print(f'chained: filetype={ftype} cpusub={sub:#x} split_seg_info={0x1e in cmds} chained_fixups={0x80000034 in cmds}')
+if ftype != 2 or sub & 0xff != 2 or 0x1e not in cmds or 0x80000034 not in cmds:
+    raise SystemExit('chained kernel lacks MH_EXECUTE arm64e, LC_SEGMENT_SPLIT_INFO or LC_DYLD_CHAINED_FIXUPS')
+PY
+else
+    echo '::warning::chained-fixups relink failed; DEVELOPMENT outputs kept' >&2
+fi
 
 # K2 matching reference (docs-lanes/ios27.md#k2), after UniXNU's
 # build-fileset-release-reference.py --lto: the same patched tree, machine,

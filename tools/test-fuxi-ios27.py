@@ -334,13 +334,19 @@ def ci():
     for need in ('KERNEL_CONFIGS=RELEASE', 'BUILD_LTO=1', 'OBJROOT="$robj"', '"${kflags[@]}"', 'MACHINE_CONFIGS=FUXI',
                  'FUXI_XNU27_RELEASE_REF', 'mach.release.fuxi.unstripped', 'release-reference.txt'):
         assert need in rel or need in b27, need
-    assert b27.count('"${kflags[@]}"') == 2 and 'BUILD_LTO=0' in b27 and 'BUILD_LTO=0' not in rel
+    assert b27.count('"${kflags[@]}"') == 3 and 'BUILD_LTO=0' in b27 and 'BUILD_LTO=0' not in rel
+    # K2 prelink input: the same DEVELOPMENT objects relinked with split-seg info (a later make assignment wins).
+    chained = b27[b27.index('# K2 prelink input'):b27.index('# K2 matching reference')]
+    assert 'XNU_KERNEL_CHAINED_FIXUPS=1' in chained and chained.index('"${kflags[@]}"') < chained.rindex('XNU_KERNEL_CHAINED_FIXUPS=1')
+    assert 'OBJROOT' not in chained and '"${common[@]}"' in chained and 'FUXI_XNU27_CHAINED' in chained
+    assert 'mach.development.fuxi.chained.unstripped' in chained and '0x1e in cmds' in chained and '0x80000034 in cmds' in chained
+    assert b27.index('cp "$kdir/mach.development.fuxi" "$out/"') < b27.index('# K2 prelink input')
     assert not re.search(r'kernelcache|\.ipsw|KDK|curl|wget', b27.split('\nset -euo pipefail', 1)[1], re.I)
     wf = (ROOT / '.github/workflows/fuxi-build.yml').read_text()
     assert 'options: [none, metal4, wlan6g, metal4e, ios27, all]' in wf and "'xnu27/sources.env'" in wf
     assert wf.count("matrix.target != 'kernel-ios27'") == 3
     print('PASS: kernel-inputs ios27 (fuxi27 ADTs, cpus=1 and cpus7+sheng-smp lines < 1024), CI plan ios27 only '
-          '(not in all), dry-run pins, workflow option and iig steps skipped for ios27, RELEASE reference build (LTO, own OBJROOT)')
+          '(not in all), dry-run pins, workflow option and iig steps skipped for ios27, chained relink (split-seg info), RELEASE reference build (LTO, own OBJROOT)')
 
 
 def main():
