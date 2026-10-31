@@ -1,0 +1,237 @@
+{
+  "comment": "Edits on fetched sources, each must match exactly once. tree: ath12k (drivers/net/wireless/ath/ath12k) or freebsd (repository root). Edited FreeBSD headers go to an overlay searched first. LinuxKPI edits lx-device-of-node, lx-bss-conf-fields, lx-reg-rule-psd, lx-channel-psd and lx-regd-sync-copies are adapted from hackios wifi/lx/patches (MIT), see xnu/fuxi-ath12k/compat/PROVENANCE.md.",
+  "edits": [
+    {
+      "id": "lx-device-of-node",
+      "why": "ath12k reads dev->of_node; here it stays NULL.",
+      "tree": "freebsd",
+      "file": "sys/compat/linuxkpi/common/include/linux/device.h",
+      "find": "\tstruct fwnode_handle *fwnode;\n\tstruct cdev\t*backlight_dev;\n",
+      "replace": "\tstruct fwnode_handle *fwnode;\n\tstruct device_node *of_node;\t/* always NULL in this domain */\n\tstruct cdev\t*backlight_dev;\n"
+    },
+    {
+      "id": "lx-kmalloc-objs",
+      "why": "LinuxKPI bug: size_mul() is given one argument, so kmalloc_objs() cannot compile; kzalloc_objs() has it right.",
+      "tree": "freebsd",
+      "file": "sys/compat/linuxkpi/common/include/linux/slab.h",
+      "find": "kmalloc(size_mul((_n) * sizeof(typeof(_p))), default_gfp(__VA_ARGS__))",
+      "replace": "kmalloc(size_mul((_n), sizeof(typeof(_p))), default_gfp(__VA_ARGS__))"
+    },
+    {
+      "id": "lx-bss-conf-fields",
+      "why": "mac.c reads the MBSSID transmitter, the AP power constraint and two EHT flags of a link.",
+      "tree": "freebsd",
+      "file": "sys/compat/linuxkpi/common/include/net/mac80211.h",
+      "find": "struct ieee80211_bss_conf {\n\t/* TODO FIXME */\n\tstruct ieee80211_vif\t\t\t*vif;\n",
+      "replace": "struct ieee80211_bss_conf {\n\t/* TODO FIXME */\n\tstruct ieee80211_vif\t\t\t*vif;\n\tstruct ieee80211_bss_conf\t\t*tx_bss_conf;\t/* of a multiple-BSSID set: the one that transmits */\n\tuint8_t\t\t\t\t\tpwr_reduction;\t/* the access point's power constraint, dB */\n\tbool\t\t\t\t\teht_disable_mcs15;\n\tbool\t\t\t\t\teht_80mhz_full_bw_ul_mumimo;\n"
+    },
+    {
+      "id": "lx-sta-eml-cap",
+      "why": "mac.c copies the station's EML capabilities; stays 0 without MLO.",
+      "tree": "freebsd",
+      "file": "sys/compat/linuxkpi/common/include/net/mac80211.h",
+      "find": "\tstruct ieee80211_link_sta\t\tdeflink;\n",
+      "replace": "\tuint16_t\t\t\t\teml_cap;\n\tstruct ieee80211_link_sta\t\tdeflink;\n"
+    },
+    {
+      "id": "lx-hw-flag-mlo-mcast",
+      "why": "mac.c sets this flag when the chip can do MLO, which it does not here.",
+      "tree": "freebsd",
+      "file": "sys/compat/linuxkpi/common/include/net/mac80211.h",
+      "find": "\tIEEE80211_HW_NO_VIRTUAL_MONITOR,\n",
+      "replace": "\tIEEE80211_HW_NO_VIRTUAL_MONITOR,\n\tIEEE80211_HW_MLO_MCAST_MULTI_LINK_TX,\n"
+    },
+    {
+      "id": "lx-op-link-sta-statistics",
+      "why": "Linux 7.0 reports statistics per link; ath12k's op table fills this member, which LinuxKPI does not have.",
+      "tree": "freebsd",
+      "file": "sys/compat/linuxkpi/common/include/net/mac80211.h",
+      "find": "\tvoid (*sta_statistics)(struct ieee80211_hw *, struct ieee80211_vif *, struct ieee80211_sta *, struct station_info *);\n",
+      "replace": "\tvoid (*sta_statistics)(struct ieee80211_hw *, struct ieee80211_vif *, struct ieee80211_sta *, struct station_info *);\n\tvoid (*link_sta_statistics)(struct ieee80211_hw *, struct ieee80211_vif *, struct ieee80211_link_sta *, struct link_station_info *);\n"
+    },
+    {
+      "id": "lx-link-station-info",
+      "why": "The members of Linux 7.0's per-link statistics that mac.c fills.",
+      "tree": "freebsd",
+      "file": "sys/compat/linuxkpi/common/include/net/cfg80211.h",
+      "find": "struct station_parameters {\n",
+      "replace": "struct link_station_info {\n\tuint64_t\t\t\t\tfilled;\t\t/* enum nl80211_sta_info */\n\tuint64_t\t\t\t\trx_duration;\n\tuint64_t\t\t\t\ttx_duration;\n\tuint32_t\t\t\t\ttx_failed;\n\tuint32_t\t\t\t\ttx_retries;\n\tint8_t\t\t\t\t\tsignal;\n\tint8_t\t\t\t\t\tsignal_avg;\n\tstruct rate_info\t\t\ttxrate;\n};\n\nstruct station_parameters {\n"
+    },
+    {
+      "id": "lx-reg-rule-psd",
+      "why": "reg.c fills the power spectral density of a rule.",
+      "tree": "freebsd",
+      "file": "sys/compat/linuxkpi/common/include/net/cfg80211.h",
+      "find": "struct ieee80211_reg_rule {\n\t/* TODO FIXME */\n\tuint32_t\tflags;\n",
+      "replace": "struct ieee80211_reg_rule {\n\t/* TODO FIXME */\n\tuint32_t\tflags;\n\tint8_t\t\tpsd;\t\t/* power spectral density, dBm/MHz */\n"
+    },
+    {
+      "id": "lx-channel-psd",
+      "why": "mac.c reads the power spectral density of a channel.",
+      "tree": "freebsd",
+      "file": "sys/compat/linuxkpi/common/include/net/cfg80211.h",
+      "find": "struct linuxkpi_ieee80211_channel {\n",
+      "replace": "struct linuxkpi_ieee80211_channel {\n\tint8_t\t\t\t\t\tpsd;\t/* power spectral density, dBm/MHz */\n"
+    },
+    {
+      "id": "lx-regd-sync-copies",
+      "why": "LinuxKPI's inline keeps the caller's pointer and refuses unless self-managed; ath12k frees its copy, so the domain must be copied as Linux does.",
+      "tree": "freebsd",
+      "file": "sys/compat/linuxkpi/common/include/net/cfg80211.h",
+      "find": "\tIMPROVE();\n\tif (regd == NULL)\n\t\treturn (EINVAL);\n\n\t/* XXX-BZ wild guessing here based on brcmfmac. */\n\tif (wiphy->regulatory_flags & REGULATORY_WIPHY_SELF_MANAGED)\n\t\twiphy->regd = regd;\n\telse\n\t\treturn (EPERM);\n\n\t/* XXX FIXME, do we have to do anything with reg_notifier? */\n\treturn (0);\n",
+      "replace": "\t/* (the caller keeps and may free regd: a copy is made, as Linux makes one) */\n\treturn (linuxkpi_regulatory_set_wiphy_regd_sync(wiphy, regd));\n"
+    },
+    {
+      "id": "lx-rate-info-eht-ru",
+      "why": "wifi7/dp_tx.c fills the EHT resource unit of a rate.",
+      "tree": "freebsd",
+      "file": "sys/compat/linuxkpi/common/include/net/cfg80211.h",
+      "find": "\tuint8_t\t\t\t\t\teht_gi;\n};\n\nstruct ieee80211_rate {\n",
+      "replace": "\tuint8_t\t\t\t\t\teht_gi;\n\tuint8_t\t\t\t\t\teht_ru_alloc;\n};\n\nstruct ieee80211_rate {\n"
+    },
+    {
+      "id": "lx-action-addba-resp",
+      "why": "wifi7/hw.c recognizes ADDBA responses. Layout per 802.11-2024 9.6.4.3.",
+      "tree": "freebsd",
+      "file": "sys/compat/linuxkpi/common/include/linux/ieee80211.h",
+      "find": "\t\t\t\t} __packed addba_req;\n",
+      "replace": "\t\t\t\t} __packed addba_req;\n\t\t\t\tstruct {\n\t\t\t\t\tuint8_t action_code;\n\t\t\t\t\tuint8_t dialog_token;\n\t\t\t\t\tuint16_t status;\n\t\t\t\t\tuint16_t capab;\n\t\t\t\t\tuint16_t timeout;\n\t\t\t\t\tuint8_t variable[0];\n\t\t\t\t} __packed addba_resp;\n"
+    },
+    {
+      "id": "lx-action-addba-resp-code",
+      "why": "802.11-2020 Table 9-359: ADDBA Response is 1.",
+      "tree": "freebsd",
+      "file": "sys/compat/linuxkpi/common/include/linux/ieee80211.h",
+      "find": "\tWLAN_ACTION_ADDBA_REQ\t\t= 0,\n",
+      "replace": "\tWLAN_ACTION_ADDBA_REQ\t\t= 0,\n\tWLAN_ACTION_ADDBA_RESP\t\t= 1,\n"
+    },
+    {
+      "id": "lx-eid-non-tx-bssid-cap",
+      "why": "802.11-2020 Table 9-92: Nontransmitted BSSID Capability is element 83.",
+      "tree": "freebsd",
+      "file": "sys/compat/linuxkpi/common/include/linux/ieee80211.h",
+      "find": "enum ieee80211_eid {\n",
+      "replace": "enum ieee80211_eid {\n\tWLAN_EID_NON_TX_BSSID_CAP\t\t= 83,\n"
+    },
+    {
+      "id": "ath12k-debug-info-no-pv",
+      "why": "%pV is a Linux printk extension that XNU's printf does not have; each message would print a pointer.",
+      "tree": "ath12k",
+      "file": "debug.c",
+      "find": "\tdev_info(ab->dev, \"%pV\", &vaf);\n",
+      "replace": "\tlx_vlog(fmt, args);\n"
+    },
+    {
+      "id": "ath12k-debug-err-no-pv",
+      "why": "As above.",
+      "tree": "ath12k",
+      "file": "debug.c",
+      "find": "\tdev_err(ab->dev, \"%pV\", &vaf);\n",
+      "replace": "\tlx_vlog(fmt, args);\n"
+    },
+    {
+      "id": "ath12k-debug-warn-no-pv",
+      "why": "As above; keeps the rate limit.",
+      "tree": "ath12k",
+      "file": "debug.c",
+      "find": "\tdev_warn_ratelimited(dev, \"%pV\", &vaf);\n",
+      "replace": "\tlx_vlog_ratelimited(fmt, args);\n"
+    },
+    {
+      "id": "ath12k-debug-dbg-no-pv",
+      "why": "As above.",
+      "tree": "ath12k",
+      "file": "debug.c",
+      "find": "\tif (likely(ab))\n\t\tdev_printk(KERN_DEBUG, ab->dev, \"%pV\", &vaf);\n\telse\n\t\tprintk(KERN_DEBUG \"ath12k: %pV\", &vaf);\n",
+      "replace": "\tlx_vlog(fmt, args);\n"
+    },
+    {
+      "id": "ath12k-rfkill-pin",
+      "why": "Design R3: fuxi's wiring is unknown and a wrongly reported switch disables the radio with no error. 48 is WCN7850's; with 0 ath12k_mac_rfkill_config() declines. fa_hif.c logs that this edit is in force.",
+      "tree": "ath12k",
+      "file": "wifi7/hw.c",
+      "find": "\t\t.rfkill_pin = 48,\n\t\t.rfkill_cfg = 0,\n\t\t.rfkill_on_level = 1,\n",
+      "replace": "\t\t.rfkill_pin = 0,\t/* fuxi: design R3 */\n\t\t.rfkill_cfg = 0,\n\t\t.rfkill_on_level = 1,\n"
+    },
+    {
+      "id": "ath12k-reo-qdesc-alloc",
+      "why": "Design section 3: REO queue descriptors must be memory the radio can reach, so they come from pool rings instead of kzalloc().",
+      "tree": "ath12k",
+      "file": "wifi7/dp_rx.c",
+      "find": "vaddr = kzalloc(hw_desc_sz + HAL_LINK_DESC_ALIGN - 1, GFP_ATOMIC);\n",
+      "replace": "vaddr = lx_dma_zalloc(hw_desc_sz + HAL_LINK_DESC_ALIGN - 1);\n"
+    },
+    {
+      "id": "ath12k-reo-qdesc-unwind",
+      "why": "The failure path of that allocation.",
+      "tree": "ath12k",
+      "file": "wifi7/dp_rx.c",
+      "find": "\t\t\tkfree(vaddr);\n\t\t\treturn ret;\n",
+      "replace": "\t\t\tlx_dma_free(vaddr, hw_desc_sz + HAL_LINK_DESC_ALIGN - 1);\n\t\t\treturn ret;\n"
+    },
+    {
+      "id": "ath12k-reo-qdesc-free",
+      "why": "Its normal free; the same size as the allocation.",
+      "tree": "ath12k",
+      "file": "dp_rx.c",
+      "find": "\t\tkfree(tid_qbuf->vaddr);\n",
+      "replace": "\t\tlx_dma_free(tid_qbuf->vaddr, tid_qbuf->size + HAL_LINK_DESC_ALIGN - 1);\n"
+    },
+    {
+      "id": "ath12k-rx-refill-guard-a",
+      "why": "Design R6: returning before the replenish loses buffers whose MSDUs were all dropped. The early return moves after the loop (with -b).",
+      "tree": "ath12k",
+      "file": "wifi7/dp_rx.c",
+      "find": "\tif (!total_msdu_reaped)\n\t\tgoto exit;\n\n\tfor (device_id = 0; device_id < ATH12K_MAX_DEVICES; device_id++) {\n\t\tif (!num_buffs_reaped[device_id])\n",
+      "replace": "\tfor (device_id = 0; device_id < ATH12K_MAX_DEVICES; device_id++) {\n\t\tif (!num_buffs_reaped[device_id])\n"
+    },
+    {
+      "id": "ath12k-rx-refill-guard-b",
+      "why": "See ath12k-rx-refill-guard-a.",
+      "tree": "ath12k",
+      "file": "wifi7/dp_rx.c",
+      "find": "\tath12k_wifi7_dp_rx_process_received_packets(dp, napi, &msdu_list,\n\t\t\t\t\t\t    ring_id);\n",
+      "replace": "\tif (!total_msdu_reaped)\n\t\tgoto exit;\n\n\tath12k_wifi7_dp_rx_process_received_packets(dp, napi, &msdu_list,\n\t\t\t\t\t\t    ring_id);\n"
+    },
+    {
+      "id": "ath12k-mac-override",
+      "why": "Design section 4: the address given to iOS at attach, before the radio exists, must be the radio's; mac.c has no device-address fallback.",
+      "tree": "ath12k",
+      "file": "mac.c",
+      "find": "\t\t\tar->mac_addr[4] += ar->pdev_idx;\n\t\t}\n\n\t\tret = ath12k_mac_setup_register(ar, &ht_cap_info, hw->wiphy->bands);\n",
+      "replace": "\t\t\tar->mac_addr[4] += ar->pdev_idx;\n\t\t}\n\t\tfa_radio_mac(ar->mac_addr);\n\n\t\tret = ath12k_mac_setup_register(ar, &ht_cap_info, hw->wiphy->bands);\n"
+    },
+    {
+      "id": "lx-find-ie-real",
+      "why": "LinuxKPI's cfg80211_find_ie() answers NULL always with a TODO; mac.c's beacon parsing needs the element. Same walk as cfg80211_find_elem() beside it.",
+      "tree": "freebsd",
+      "file": "sys/compat/linuxkpi/common/include/net/cfg80211.h",
+      "find": "cfg80211_find_ie(uint8_t eid, const uint8_t *ie, uint32_t ielen)\n{\n\tTODO();\n\treturn (NULL);\n}\n",
+      "replace": "cfg80211_find_ie(uint8_t eid, const uint8_t *ie, uint32_t ielen)\n{\n\tconst uint8_t *at = ie, *end = ie + ielen;\n\n\twhile (end - at >= 2 && end - at - 2 >= at[1]) {\n\t\tif (at[0] == eid)\n\t\t\treturn (at);\n\t\tat += 2 + at[1];\n\t}\n\treturn (NULL);\n}\n"
+    },
+    {
+      "id": "lx-vif-is-mesh-quiet",
+      "why": "There is no mesh here, so false is the true answer. dp_tx.c asks for each frame: with TODO() logging on (fa_80211.c) this would flood the log.",
+      "tree": "freebsd",
+      "file": "sys/compat/linuxkpi/common/include/net/mac80211.h",
+      "find": "ieee80211_vif_is_mesh(struct ieee80211_vif *vif)\n{\n\tTODO();\n\treturn (false);\n}\n",
+      "replace": "ieee80211_vif_is_mesh(struct ieee80211_vif *vif)\n{\n\treturn (false);\n}\n"
+    },
+    {
+      "id": "lx-pskb-expand-says",
+      "why": "LinuxKPI refuses silently (SKB_TODO is compiled out). Buffers cannot grow here; the failure is ath12k's to handle but must show in the log.",
+      "tree": "freebsd",
+      "file": "sys/compat/linuxkpi/common/include/linux/skbuff.h",
+      "find": "pskb_expand_head(struct sk_buff *skb, int x, int len, gfp_t gfp)\n{\n\tSKB_TRACE(skb);\n\tSKB_TODO();\n\treturn (-ENXIO);\n}\n",
+      "replace": "pskb_expand_head(struct sk_buff *skb, int x, int len, gfp_t gfp)\n{\n\textern long lx_stub(const char *);\n\n\tSKB_TRACE(skb);\n\tlx_stub(__func__);\n\treturn (-ENXIO);\n}\n"
+    },
+    {
+      "id": "lx-skb-realloc-says",
+      "why": "As lx-pskb-expand-says. Design section 4 keeps hw->extra_tx_headroom free so TX should not get here.",
+      "tree": "freebsd",
+      "file": "sys/compat/linuxkpi/common/include/linux/skbuff.h",
+      "find": "skb_realloc_headroom(struct sk_buff *skb, unsigned int headroom)\n{\n\n\tSKB_TODO();\n\treturn (NULL);\n}\n",
+      "replace": "skb_realloc_headroom(struct sk_buff *skb, unsigned int headroom)\n{\n\textern long lx_stub(const char *);\n\n\tlx_stub(__func__);\n\treturn (NULL);\n}\n"
+    }
+  ]
+}

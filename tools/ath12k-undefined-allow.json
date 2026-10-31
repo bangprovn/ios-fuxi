@@ -1,0 +1,65 @@
+{
+  "comment": "Everything the object may still ask for, by who must implement it. A name not listed fails the build; a name listed in a group that is not optional and not needed fails it too.",
+  "exported": [
+    "fa_firmware_ready",
+    "fa_set_radio_mac",
+    "fa_stop"
+  ],
+  "groups": {
+    "xnu-libkern": {
+      "implemented_by": "XNU's libkern and osfmk, same names and meaning. Optional: which ones appear depends on the compiler's lowering.",
+      "optional": true,
+      "symbols": [
+        "__stack_chk_fail",
+        "__stack_chk_guard",
+        "bzero",
+        "memcmp",
+        "memcpy",
+        "memmove",
+        "memset",
+        "snprintf",
+        "strchr",
+        "strcmp",
+        "strlcat",
+        "strlcpy",
+        "strlen",
+        "strncmp",
+        "strrchr",
+        "vsnprintf"
+      ]
+    },
+    "fuxi-ath12k-os": {
+      "implemented_by": "bsd/dev/fuxi_ath12k_os.c, new in M1 (compat/include/lx_os.h)",
+      "symbols": [
+        "lx_os_alloc",
+        "lx_os_free",
+        "lx_os_lock",
+        "lx_os_nanoseconds",
+        "lx_os_option",
+        "lx_os_panic",
+        "lx_os_print",
+        "lx_os_radio_memory",
+        "lx_os_random",
+        "lx_os_sleep",
+        "lx_os_tell",
+        "lx_os_thread",
+        "lx_os_thread_self",
+        "lx_os_unlock",
+        "lx_os_wakeup"
+      ]
+    },
+    "fuxi-wlan": {
+      "implemented_by": "xnu/fuxi-wlan/fuxi_wlan.c, added in M1 (src/fa_xnu.h)",
+      "symbols": [
+        "fuxi_ath12k_bar",
+        "fuxi_ath12k_contain",
+        "fuxi_ath12k_firmware_start",
+        "fuxi_ath12k_firmware_stop",
+        "fuxi_ath12k_force_rddm",
+        "fuxi_ath12k_mhi_service",
+        "fuxi_ath12k_read32",
+        "fuxi_ath12k_write32"
+      ]
+    }
+  }
+}
