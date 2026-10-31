@@ -1243,6 +1243,12 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
 		proc_selfname(name, sizeof(name));
 		snprintf(tag, sizeof(tag), "SWEET SURF: bt %s id %u fmt 0x%x", name, s->id, s->pixelFormat);
 		sweet_prof_user_bt(tag);
+		for (uint32_t i = 0; i < s->planeCount; i++) {
+			const struct sweet_surface_plane *pl = &s->planes[i];
+			IOLog("SWEET SURF: id %u plane %u %ux%u bpe %u el %ux%u bpr %u off %u size %u\n", s->id, i,
+			    pl->width, pl->height, pl->bytesPerElement, pl->elementWidth, pl->elementHeight,
+			    pl->bytesPerRow, pl->offset, pl->size);
+		}
 	}
 	props->release();
 	if (ret != kIOReturnSuccess) {

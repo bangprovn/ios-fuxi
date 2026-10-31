@@ -524,7 +524,7 @@
  	IOReturn trapLock(void *id, void *options, void *seedOut, void *, void *, void *);
  	IOReturn trapUnlock(void *id, void *options, void *seedOut, void *, void *, void *);
  	IOReturn trapRelease(void *id, void *, void *, void *, void *, void *);
-@@ -882,6 +1236,14 @@
+@@ -882,6 +1236,20 @@
  		    name, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
  		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), ret);
  	}
@@ -535,11 +535,17 @@
 +		proc_selfname(name, sizeof(name));
 +		snprintf(tag, sizeof(tag), "SWEET SURF: bt %s id %u fmt 0x%x", name, s->id, s->pixelFormat);
 +		sweet_prof_user_bt(tag);
++		for (uint32_t i = 0; i < s->planeCount; i++) {
++			const struct sweet_surface_plane *pl = &s->planes[i];
++			IOLog("SWEET SURF: id %u plane %u %ux%u bpe %u el %ux%u bpr %u off %u size %u\n", s->id, i,
++			    pl->width, pl->height, pl->bytesPerElement, pl->elementWidth, pl->elementHeight,
++			    pl->bytesPerRow, pl->offset, pl->size);
++		}
 +	}
  	props->release();
  	if (ret != kIOReturnSuccess) {
  		s->release();
-@@ -956,11 +1318,34 @@
+@@ -956,11 +1324,34 @@
  	}
  }
  
@@ -579,7 +585,7 @@
  }
  
  static IOReturn
-@@ -1001,7 +1386,7 @@
+@@ -1001,7 +1392,7 @@
  		return kIOReturnNotFound;
  	}
  #if defined(FUXI)
@@ -588,7 +594,7 @@
    s->release(); return kIOReturnNotReady;
   }
  #endif
-@@ -1041,8 +1426,8 @@
+@@ -1041,8 +1432,8 @@
  }
  
  static IOExternalTrap sweet_surface_traps[] = {
