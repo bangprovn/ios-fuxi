@@ -27,6 +27,10 @@ Payload layout (little endian, all offsets from payload start):
   0x048  char  cmdline[608]
   0x2a8  seg[nsegs] { u64 vmaddr, vmsize, file_off(in payload), file_size }
 
+Version 2 (--boot-line-length 1024, the xnu-12377 kernel of docs-lanes/ios27.md,
+whose boot_args.CommandLine grew from 608 to 1024 bytes) is the same header
+with cmdline[1024] at 0x048 and the segment table at 0x448.
+
 --ramdisk appends IMAGE as one more segment right after the kernel and moves
 kernel_end past it, so the shim needs no changes: the image lands below the
 ADT and boot_args, inside topOfKernelData (never handed to the VM), and the
@@ -43,6 +47,8 @@ PAGE = 0x4000
 BOOT_LINE_LENGTH = 608
 CMDLINE = 0x48
 SEG_TABLE = CMDLINE + BOOT_LINE_LENGTH	# 0x2a8
+# payload version -> boot_args.CommandLine size of the kernel it carries
+BOOT_LINES = {1: 608, 2: 1024}
 
 
 def parse_macho(buf):
@@ -157,7 +163,11 @@ def adt_dram(adt_blob):
 CPU_SUBTYPE_ARM64E = 2
 
 
-def build(kernel_path, adt_path, cmdline, ramdisk_path=None, allow_unsigned_auth=False):
+def build(kernel_path, adt_path, cmdline, ramdisk_path=None, allow_unsigned_auth=False, boot_line_length=BOOT_LINE_LENGTH):
+    version = next((v for v, n in BOOT_LINES.items() if n == boot_line_length), None)
+    if version is None:
+        raise SystemExit(f'boot line length must be one of {sorted(BOOT_LINES.values())}')
+    seg_table_off = CMDLINE + boot_line_length
     buf = bytearray(open(kernel_path, 'rb').read())
     m = parse_macho(buf)
     nfix = apply_chained_fixups(buf, m)
@@ -190,7 +200,7 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None, allow_unsigned_auth
         adt_blob = add_ramdisk_to_adt(adt_blob, rd_pa, rd_size)
         ramdisk = (hex(rd_pa), hex(rd_size))
 
-    hdr_size = SEG_TABLE + 32 * len(pieces)
+    hdr_size = seg_table_off + 32 * len(pieces)
     out = bytearray(hdr_size)
     seg_table = []
     for vmaddr, vmsize, data in pieces:
@@ -202,14 +212,18 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None, allow_unsigned_auth
     out += adt_blob
     out += b'\0' * (-len(out) & 0xf)
 
-    struct.pack_into('<8sII', out, 0, b'SWEETXNU', 1, len(pieces))
+    struct.pack_into('<8sII', out, 0, b'SWEETXNU', version, len(pieces))
     struct.pack_into('<7Q', out, 0x10, virt_base, m['entry'], adt_off, len(adt_blob), kernel_end,
                      PHYS_BASE, MEM_SIZE)
-    cl = cmdline.encode()[:BOOT_LINE_LENGTH - 1]
+    cl = cmdline.encode()
+    if version == 1:
+        cl = cl[:boot_line_length - 1]	# v1 has always truncated
+    elif len(cl) >= boot_line_length:
+        raise SystemExit(f'command line is {len(cl)} bytes; this kernel takes at most {boot_line_length - 1}')
     out[CMDLINE:CMDLINE + len(cl)] = cl
     for i, t in enumerate(seg_table):
-        struct.pack_into('<4Q', out, SEG_TABLE + 32 * i, *t)
-    info = dict(cputype=hex(m['cputype']), cpusub=m['cpusub'], fixups=nfix, auth_fixups=m['auth_fixups'],
+        struct.pack_into('<4Q', out, seg_table_off + 32 * i, *t)
+    info = dict(version=version, cputype=hex(m['cputype']), cpusub=m['cpusub'], fixups=nfix, auth_fixups=m['auth_fixups'],
                 thread_starts=m['thread_starts'] and (hex(m['thread_starts'][0]), hex(m['thread_starts'][1])),
                 virt_base=hex(virt_base),
                 entry=hex(m['entry']), kernel_end=hex(kernel_end), ramdisk=ramdisk, size=len(out),
@@ -224,8 +238,10 @@ if __name__ == '__main__':
     ap.add_argument('--ramdisk', help='root image for md0 (boot with rd=md0)')
     ap.add_argument('--allow-unsigned-auth', action='store_true',
                     help='pack arm64e authenticated fixups unsigned (stock VMAPPLE kernel experiments only)')
+    ap.add_argument('--boot-line-length', type=int, choices=sorted(BOOT_LINES.values()), default=BOOT_LINE_LENGTH,
+                    help='boot_args.CommandLine size of the kernel: 608 (xnu-8796, payload v1) or 1024 (xnu-12377, v2)')
     a = ap.parse_args()
-    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, a.allow_unsigned_auth)
+    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, a.allow_unsigned_auth, a.boot_line_length)
     open(a.out, 'wb').write(blob)
     for k, v in info.items():
         if k != 'segs':

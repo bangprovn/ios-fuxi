@@ -9,7 +9,9 @@ void probe_main(uintptr_t fdt);
 uint64_t probe_fdt_address(void);
 uint32_t probe_fdt_bytes(void);
 
-#define BOOT_LINE_LENGTH	608
+/* boot_args.CommandLine: 608 bytes up to xnu-8796 (payload v1), 1024 in xnu-12377 (v2) */
+#define BOOT_LINE_V1		608
+#define BOOT_LINE_V2		1024
 #define PAGE_16K		0x4000UL
 
 struct payload_seg {
@@ -21,8 +23,7 @@ struct payload {
 	uint32_t version, nsegs;
 	uint64_t virt_base, entry_va, adt_off, adt_size, kernel_end;
 	uint64_t phys_base, mem_size;
-	char cmdline[BOOT_LINE_LENGTH];
-	struct payload_seg segs[];
+	char cmdline[];		/* BOOT_LINE_V1 or _V2 bytes, then struct payload_seg[nsegs] */
 };
 
 /* pexpert/pexpert/arm64/boot.h, Revision/Version 2 */
@@ -37,14 +38,16 @@ struct boot_args {
 	uint32_t machineType;
 	uint64_t deviceTreeP;
 	uint32_t deviceTreeLength;
-	char CommandLine[BOOT_LINE_LENGTH];
-	uint64_t bootFlags, memSizeActual;
+	char CommandLine[];	/* line bytes, then u64 bootFlags, memSizeActual (8-aligned) */
 };
 
-_Static_assert(__builtin_offsetof(struct payload, segs) == 0x2a8, "payload header layout");
+_Static_assert(__builtin_offsetof(struct payload, cmdline) == 0x48, "payload header layout");
 _Static_assert(__builtin_offsetof(struct boot_args, Video) == 40, "boot_args layout");
 _Static_assert(__builtin_offsetof(struct boot_args, CommandLine) == 108, "boot_args layout");
-_Static_assert(sizeof(struct boot_args) == 736, "boot_args layout");
+/* v1: bootFlags at 720, sizeof 736 (xnu-8796); v2: 1136, 1152 (xnu-12377) */
+#define BOOT_ARGS_FLAGS(line)	((108 + (line) + 7) & ~7UL)
+_Static_assert(BOOT_ARGS_FLAGS(BOOT_LINE_V1) + 16 == 736, "boot_args v1 layout");
+_Static_assert(BOOT_ARGS_FLAGS(BOOT_LINE_V2) + 16 == 1152, "boot_args v2 layout");
 
 /* MMU off: everything is Device memory, so copy in aligned 8-byte words. */
 static void copy64(uintptr_t dst, uintptr_t src, uint64_t n)
@@ -106,9 +109,12 @@ static const char *loader_boot(void)
  uint64_t rd_start = (uintptr_t)_payload_start, rd_end = (uintptr_t)_payload_end;
  uint64_t length = rd_end - rd_start;
  const struct payload *p = (const struct payload *)rd_start;
- if (length < sizeof(*p) || !magic_ok(p->magic) || p->version != 1 ||
-     p->nsegs == 0 || p->nsegs > 32 ||
-     length < sizeof(*p) + p->nsegs * sizeof(struct payload_seg))
+ if (length < sizeof(*p) || !magic_ok(p->magic) || (p->version != 1 && p->version != 2))
+  return "bad embedded payload header";
+ const uint64_t line = p->version == 1 ? BOOT_LINE_V1 : BOOT_LINE_V2;
+ const struct payload_seg *segs = (const struct payload_seg *)(rd_start + sizeof(*p) + line);
+ if (p->nsegs == 0 || p->nsegs > 32 ||
+     length < sizeof(*p) + line + p->nsegs * sizeof(struct payload_seg))
   return "bad embedded payload header";
  if (p->phys_base != 0x8c0000000ULL || (p->mem_size != 0x40000000ULL && p->mem_size != FG_RAM_SIZE) ||
      (p->virt_base & (0x2000000-1)) || (p->kernel_end & (PAGE_16K-1)) ||
@@ -116,11 +122,11 @@ static const char *loader_boot(void)
      p->kernel_end - p->virt_base > p->mem_size - 2*PAGE_16K ||
      !p->adt_size || p->adt_size > PAGE_16K || (p->adt_off & 7) ||
      p->adt_off > length || p->adt_size > length-p->adt_off ||
-     p->cmdline[BOOT_LINE_LENGTH-1])
+     p->cmdline[line-1])
   return "unsafe Fuxi memory layout";
  int entry_found = 0;
  for (uint32_t i=0; i<p->nsegs; i++) {
-  const struct payload_seg *s = &p->segs[i];
+  const struct payload_seg *s = &segs[i];
   if (s->vmaddr < p->virt_base || s->vmaddr > p->kernel_end ||
       s->vmsize > p->kernel_end-s->vmaddr || s->file_size > s->vmsize ||
       (s->vmaddr & 7) || (s->vmsize & 7) || (s->file_off & 7) ||
@@ -128,7 +134,7 @@ static const char *loader_boot(void)
       ((s->file_size+7)&~7ULL) > length-s->file_off)
    return "unsafe payload segment";
   for (uint32_t j=0;j<i;j++) {
-   const struct payload_seg *t=&p->segs[j];
+   const struct payload_seg *t=&segs[j];
    if (s->vmaddr < t->vmaddr+t->vmsize && t->vmaddr < s->vmaddr+s->vmsize)
     return "overlapping segments";
   }
@@ -156,7 +162,7 @@ static const char *loader_boot(void)
 		return "ramdisk overlaps kernel memory";
 
 	for (uint32_t i = 0; i < p->nsegs; i++) {
-		const struct payload_seg *s = &p->segs[i];
+		const struct payload_seg *s = &segs[i];
 		uintptr_t dst = s->vmaddr + pa_of_va_base;
 		zero64(dst, s->vmsize);
 		copy64(dst, rd_start + s->file_off, s->file_size);
@@ -188,9 +194,10 @@ static const char *loader_boot(void)
 	ba->Video.v_depth = 32;
 	ba->deviceTreeP = adt_pa - pa_of_va_base;	/* xnu reads it with the MMU on: a VA */
 	ba->deviceTreeLength = (uint32_t)p->adt_size;
-	for (int i = 0; i < BOOT_LINE_LENGTH; i++)
+	for (uint64_t i = 0; i < line; i++)
 		ba->CommandLine[i] = p->cmdline[i];
-	ba->memSizeActual = p->mem_size;
+	/* bootFlags stays 0 (zeroed page) */
+	*(volatile uint64_t *)(ba_pa + BOOT_ARGS_FLAGS(line) + 8) = p->mem_size;	/* memSizeActual */
 	con_hex2("BOOTARG", "pa=", ba_pa, "top=", top);
 
  monitor_report[MON_BOOT_ARGS]=ba_pa;

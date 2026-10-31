@@ -25,11 +25,12 @@ assert len(b)>=680 and b[:8]==b'SWEETXNU'
 # (darwin-xnu-build) builds do not, so accept an xnu-8796 kernel with Fuxi drivers.
 assert b'DEVELOPMENT_ARM64_FUXI' in b or (b'xnu-8796' in b and b'FUXI KEYS:' in b), 'Payload is not a FUXI kernel'
 version,n=struct.unpack_from('<II',b,8)
-assert version==1 and 0<n<=32 and len(b)>=680+32*n
+seg=72+{1:608,2:1024}.get(version,0)  # v1 xnu-8796 boot line, v2 xnu-12377
+assert seg>72 and 0<n<=32 and len(b)>=seg+32*n
 assert struct.unpack_from('<Q',b,56)[0]==0x8c0000000
 assert struct.unpack_from('<Q',b,64)[0] in (0x40000000,0x13e000000)
 for i in range(n):
- va,vs,off,sz=struct.unpack_from('<4Q',b,680+32*i)
+ va,vs,off,sz=struct.unpack_from('<4Q',b,seg+32*i)
  assert off<=len(b) and sz<=len(b)-off and sz<=vs
 PY
 # Required pinned firmware input; only the ignored build directory receives bytes.
