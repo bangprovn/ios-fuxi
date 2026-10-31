@@ -708,11 +708,13 @@ def k4_patch_check():
     # fuxi_root27_nomockfs=1 drops mockfs from vfs_mountroot's candidates; every added line is FUXI-gated.
     vfs = patch.split('+++ b/bsd/vfs/vfs_subr.c\n', 1)[1]
     added = [l[1:] for l in vfs.splitlines() if l.startswith('+')]
-    assert added.count('#if defined(FUXI)') == 5 == added.count('#endif'), added
+    assert added.count('#if defined(FUXI)') == 6 == added.count('#endif'), added
     assert 'PE_parse_boot_argn("fuxi_root27_nomockfs", &fuxi_nomockfs, sizeof(fuxi_nomockfs));' in vfs
     assert 'if (fuxi_nomockfs == 1 && strcmp(vfsp->vfc_name, "mockfs") == 0) {' in vfs
     # fuxi_root27_hiderootfs=1 clears MNT_ROOTFS only around the mountroot call and restores it.
     assert "mp->mnt_flag &= ~MNT_ROOTFS;" in vfs and "mp->mnt_flag |= MNT_ROOTFS;" in vfs
+    # fuxi_root27_kmount=1 mounts the APFS root with VFS_MOUNT as a kernel mount (imageboot pivot style).
+    assert "error = VFS_MOUNT(mp, rootvp, USER_ADDR_NULL, ctx);" in vfs and "mp->mnt_kern_flag |= MNTK_KERNEL_MOUNT;" in vfs
     # Read-only transport: READ(10), TEST UNIT READY and the device-WLUN ACTIVE power command only; once the
     # extents are loaded every READ(10) is checked against them; no write opcode is ever built.
     scsi = drv[drv.index('ufs_scsi(const uint8_t'):drv.index('struct utrd *utrd')]
