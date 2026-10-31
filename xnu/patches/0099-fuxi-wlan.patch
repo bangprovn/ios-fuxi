@@ -29,7 +29,7 @@
  	sweet_sample_start();
 --- a/bsd/dev/fuxi_wlan.c
 +++ b/bsd/dev/fuxi_wlan.c
-@@ -0,0 +1,5687 @@
+@@ -0,0 +1,5688 @@
 +/*
 + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
 + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -135,6 +135,7 @@
 +void fuxi_wlan_init(void);
 +#ifdef FUXI_ATH12K
 +#include "fa_xnu.h"
++#include "fa_lx_os.h" /* lx_os_radio_memory is defined below */
 +#endif /* FUXI_ATH12K */
 +
 +#define rsr(r) ({ uint64_t rsr_v_; __asm__ volatile("mrs %0, " r : "=r"(rsr_v_)); rsr_v_; })
@@ -1009,7 +1010,7 @@
 +			size_t n = strlen(wl_fa_recipe[i].text)+1;
 +			if (n > (size_t)size) { return false; }
 +			memcpy(out, wl_fa_recipe[i].text, n);
-+		} else if (size == sizeof(int)) {
++		} else if (size == (int)sizeof(int)) {
 +			memcpy(out, &wl_fa_recipe[i].number, sizeof(int));
 +		} else { return false; }
 +		return true;

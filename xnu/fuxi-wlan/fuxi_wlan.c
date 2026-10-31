@@ -103,6 +103,7 @@ extern unsigned fuxi_gpu_access(uintptr_t, uint64_t *, unsigned, unsigned);
 void fuxi_wlan_init(void);
 #ifdef FUXI_ATH12K
 #include "fa_xnu.h"
+#include "fa_lx_os.h" /* lx_os_radio_memory is defined below */
 #endif /* FUXI_ATH12K */
 
 #define rsr(r) ({ uint64_t rsr_v_; __asm__ volatile("mrs %0, " r : "=r"(rsr_v_)); rsr_v_; })
@@ -977,7 +978,7 @@ wl_fa_recipe_arg(const char *name, void *out, int size)
 			size_t n = strlen(wl_fa_recipe[i].text)+1;
 			if (n > (size_t)size) { return false; }
 			memcpy(out, wl_fa_recipe[i].text, n);
-		} else if (size == sizeof(int)) {
+		} else if (size == (int)sizeof(int)) {
 			memcpy(out, &wl_fa_recipe[i].number, sizeof(int));
 		} else { return false; }
 		return true;
