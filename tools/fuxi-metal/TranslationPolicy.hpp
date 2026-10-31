@@ -35,14 +35,11 @@ inline void applyBootOptions(const char *args) {
   {"FUXI_MTL_EARLY_RELEASE","1"},{"FUXI_MTL_SAMPLE_SHADOW","1"},{"FUXI_MTL_SPIRV_UNROLL","1"},{"FUXI_MTL_SPIRV_UNROLL","2"},{"FUXI_MTL_HALF_ROUND","1"},{"FUXI_MTL_HALF_ROUND","2"},
   {"FUXI_MTL_HALF_ROUND","3"},{"FUXI_MTL_SUBMIT_LEAN","1"},{"FUXI_MTL_SUBMIT_LEAN","2"},{"FUXI_MTL_SPLIT_SUBMIT","1"},{"FUXI_MTL_FETCH_SPLIT","1"},{"FUXI_MTL_BUFFER_CACHED","1"}};
  for(const char *p=args;*p;){
-  p+=strspn(p," 	
-");size_t n=strcspn(p," 	
-");
+  p+=strspn(p," \t\r\n");size_t n=strcspn(p," \t\r\n");
   if(n>5 && !strncmp(p,"fmtl=",5)){
    unsigned long mask=strtoul(p+5,nullptr,16);
    for(size_t i=0;i<sizeof(bits)/sizeof(bits[0]);++i)if(mask>>i&1)setenv(bits[i].name,bits[i].value,0);
-   fprintf(stderr,"FUXI MTL: boot options fmtl=%lx
-",mask);return;
+   fprintf(stderr,"FUXI MTL: boot options fmtl=%lx\n",mask);return;
   }
   p+=n;
  }

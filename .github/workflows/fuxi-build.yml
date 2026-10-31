@@ -41,7 +41,7 @@ on:
       iig_run:
         description: replay - ID of a capture run with fuxi-iig-pregen-* artifacts (empty uses committed xnu/iig-pregen/)
         type: string
-        default: '41098982212'
+        default: ''
 
 permissions:
   contents: read
