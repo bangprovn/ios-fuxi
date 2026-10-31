@@ -111,6 +111,37 @@ void main() {color=textureLod(image,vec2(0.5),constants.lod);}
         merged = invoke(d/'test', 'fuxigpumerge=1 fuxigpuoverlap=1 fuxigpusubmit=1 fuxigpuperf=3', MERGE_TEST_NO_ORDER='1')
         assert baseline == merged, 'no-extension fallback pixels differ'
         print('PASS: extension-hidden fallback keeps ordinary merge/shadow pixels; fetch skipped')
+        # FUXI_MTL_FETCH_SPLIT: CA-shaped passes mixing fetch (programmable blend with the destination) and SRC_ALPHA-blended draws. Pixels equal knob off,
+        # alone and with FUXI_MTL_NOFETCH_RP; with merging, every fetch draw after a non-fetch draw of its pass gets exactly one by-region in-pass barrier.
+        subprocess.run(common+sanitized+definitions+[str(ROOT/'tools/fuxi-metal/FetchSplitTests.cpp'), '-ldl', '-pthread', '-o', str(d/'fetchsplit')], check=True)
+        def fetch_split(args, split, nofetch='0', **extra):
+            p = subprocess.run([str(d/'fetchsplit')], env=dict(env, FUXI_MTL_TEST_BOOTARGS='fuxigpuframetrace=1 '+args, FUXI_MTL_FETCH_SPLIT=split, FUXI_MTL_NOFETCH_RP=nofetch, **extra), text=True, capture_output=True, timeout=120)
+            assert p.returncode == 0, (args, split, nofetch, p.stdout[-2000:], p.stderr[-4000:])
+            assert 'AddressSanitizer' not in p.stderr and 'runtime error:' not in p.stderr, p.stderr
+            assert 'FUXI MTL: policy fetch_split=%s' % ('1' if split == '1' else '0') in p.stderr, p.stderr[-2000:]
+            return p
+        fetch_pixels = lambda out: [line for line in out.splitlines() if line.startswith('PIXELS ')]
+        for args in ('', 'fuxigpumerge=1', 'fuxigpumerge=1 fuxigpuoverlap=1 fuxigpusubmit=1 fuxigpuperf=7', 'fuxigpumerge=1 fuxigpuperf=3'):
+            ref = fetch_split(args, '0')
+            if 'SKIP:' in ref.stdout:
+                print(ref.stdout.strip())
+                break
+            assert len(fetch_pixels(ref.stdout)) == 7 and all(' issued=0 in_pass=0' in l for l in ref.stdout.splitlines() if l.startswith('FETCHSPLIT '))
+            assert 'blend_order_flag=0' not in ref.stderr
+            for nofetch in ('0', '1'):
+                for extra in ({}, dict(FUXI_MTL_GPU_PASS_TIMES='1', FUXI_MTL_GPU_DRAW_TIMES='1')):
+                    p = fetch_split(args, '1', nofetch, **extra)
+                    assert fetch_pixels(p.stdout) == fetch_pixels(ref.stdout), 'fetch split changed pixels: %r nofetch=%s %r' % (args, nofetch, extra)
+                    assert 'framebuffer fetch plan mask=0 ordered=1 blend_order_flag=0' in p.stderr and 'framebuffer fetch plan mask=1 ordered=1 blend_order_flag=1' in p.stderr
+                    issued = sum(int(x) for x in re.findall(r'FETCHSPLIT \S+ .* issued=(\d+)', p.stdout))
+                    assert (issued == 0) == ('fuxigpumerge=1' not in args), (args, issued)
+                    if nofetch == '0':
+                        assert fetch_pixels(fetch_split(args, '0', '1').stdout) == fetch_pixels(ref.stdout)
+            print('PASS: FUXI_MTL_FETCH_SPLIT pixels identical %r (alone, with NOFETCH_RP, with pass/draw times); in-pass barriers=%d' % (args, issued))
+        for extra in ('', 'fuxigpumerge=1 fuxigpuoverlap=1 fuxigpusubmit=1 fuxigpufeedback=1 fuxigpuperf=7'):
+            assert invoke(d/'test', extra, FUXI_MTL_FETCH_SPLIT='1') == invoke(d/'test', extra), 'fetch split changed render merge output: '+extra
+            assert pixels(invoke(d/'barriers', extra, FUXI_MTL_FETCH_SPLIT='1')) == pixels(invoke(d/'barriers', extra)), 'fetch split changed barrier fixture pixels: '+extra
+        print('PASS: FUXI_MTL_FETCH_SPLIT keeps render merge (fetch-normal interleaved, mip view, two flights) and CA boundary outputs')
         for bad in ('0', 'bad', '1 fuxigpumerge=1'):
             invoke(d/'test', 'fuxigpumerge='+bad)
         print('PASS: disabled/malformed/duplicate boot tokens preserve default pass counts')

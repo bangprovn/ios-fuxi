@@ -50,6 +50,10 @@ def main():
                     e=dict(os.environ);e.pop('FUXI_MTL_BUFFER_CACHED',None)
                     if env is not None:e['FUXI_MTL_BUFFER_CACHED']=env
                     subprocess.run([str(d/name),'cached',want],env=e,check=True,timeout=15)
+                for env,want in ((None,'0'),('1','1'),('0','0'),('2','0'),('1 ','0'),('','0')):
+                    e=dict(os.environ);e.pop('FUXI_MTL_FETCH_SPLIT',None)
+                    if env is not None:e['FUXI_MTL_FETCH_SPLIT']=env
+                    subprocess.run([str(d/name),'fetchsplit',want],env=e,check=True,timeout=15)
             if not a.compile_only and name == 'FrameTraceTests':
                 subprocess.run([str(d/name)],env=dict(os.environ,FUXI_MTL_TEST_BOOTARGS='fuxigpumerge=1 fuxigpuoverlap=1'),check=True,timeout=15)
             if not a.compile_only and name == 'FrameCPUTests':

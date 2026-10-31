@@ -1065,7 +1065,10 @@ public:
    deps[1].dstStageMask=VK_PIPELINE_STAGE_VERTEX_INPUT_BIT|producers;deps[1].dstAccessMask=VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT|VK_ACCESS_COLOR_ATTACHMENT_READ_BIT|VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT|VK_ACCESS_TRANSFER_READ_BIT|VK_ACCESS_TRANSFER_WRITE_BIT|VK_ACCESS_INPUT_ATTACHMENT_READ_BIT|VK_ACCESS_UNIFORM_READ_BIT|VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT|VK_ACCESS_INDEX_READ_BIT;
   }
   if(orderedColorAccess && !nofetch){deps[0].dstStageMask|=VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;deps[0].dstAccessMask|=VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;deps[1].srcStageMask|=VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;deps[1].srcAccessMask|=VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;}
-  VkRenderPassCreateInfo ri{};ri.sType=VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;ri.attachmentCount=used;ri.pAttachments=attachments;ri.subpassCount=1;ri.pSubpasses=&sub;ri.dependencyCount=2;ri.pDependencies=deps;
+  // FUXI_MTL_FETCH_SPLIT: the by-region self-dependency that the in-pass barrier before a fetch draw must be a subset of (every ordered pass gets it, so pipelines stay compatible)
+  VkSubpassDependency all[3]{deps[0],deps[1],{}};const bool selfDep=systemTranslationPolicy().fetchSplit && orderedColorAccess && !nofetch;
+  if(selfDep){auto &d=all[2];d.srcSubpass=d.dstSubpass=0;d.srcStageMask=VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;d.dstStageMask=VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;d.srcAccessMask=VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;d.dstAccessMask=VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;d.dependencyFlags=VK_DEPENDENCY_BY_REGION_BIT;}
+  VkRenderPassCreateInfo ri{};ri.sType=VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;ri.attachmentCount=used;ri.pAttachments=attachments;ri.subpassCount=1;ri.pSubpasses=&sub;ri.dependencyCount=selfDep?3:2;ri.pDependencies=selfDep?all:deps;
   VkRenderPass render{};check(CreateRenderPass(device,&ri,nullptr,&render));
   try{p->renders.push_back({key,render});}catch(...){DestroyRenderPass(device,render,nullptr);throw;}return render;
  }
@@ -1142,7 +1145,7 @@ public:
    }catch(...){pipelineCache.finishedPair(std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-began).count());throw;}
    auto buildMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-began).count();pipelineCache.finishedPair(buildMs);
    fprintf(stderr,"FUXI MTL: Vulkan pipelines PASS %.3f ms cache=%u\n",buildMs,pipelineCache.get()!=VK_NULL_HANDLE);
-   fprintf(stderr,"FUXI MTL: framebuffer fetch plan mask=%u ordered=%u blend_order_flag=%d\n",p->fetchMask,p->orderedColorAccess,int(orderedColorAccess && (p->fetchMask || !systemTranslationPolicy().orderFetchOnly)));
+   fprintf(stderr,"FUXI MTL: framebuffer fetch plan mask=%u ordered=%u blend_order_flag=%d\n",p->fetchMask,p->orderedColorAccess,int(orderedColorAccess && (p->fetchMask || !(systemTranslationPolicy().orderFetchOnly || systemTranslationPolicy().fetchSplit))));
    p->translation=translated.handle;translated.handle=nullptr;cleanup();return p;
   }catch(...) {cleanup();destroyPipelineUnlocked(p);throw;}
  }
@@ -1193,7 +1196,7 @@ public:
    VkPipelineColorBlendAttachmentState blends[8]{};
    for(unsigned i=0;i<p->options.colorCount;++i){auto &blend=blends[i];auto c=translated.colors[i];blend.colorWriteMask=c.mask;blend.blendEnable=c.blend;
     blend.srcColorBlendFactor=(VkBlendFactor)c.factors[0];blend.dstColorBlendFactor=(VkBlendFactor)c.factors[1];blend.colorBlendOp=(VkBlendOp)c.factors[2];blend.srcAlphaBlendFactor=(VkBlendFactor)c.factors[3];blend.dstAlphaBlendFactor=(VkBlendFactor)c.factors[4];blend.alphaBlendOp=(VkBlendOp)c.factors[5];}
-   VkPipelineColorBlendStateCreateInfo bs{};bs.sType=VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;bs.attachmentCount=p->options.colorCount;bs.pAttachments=blends;if(orderedColorAccess && !nofetch && (translated.fetchMask || !systemTranslationPolicy().orderFetchOnly))bs.flags=VK_PIPELINE_COLOR_BLEND_STATE_CREATE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_BIT_EXT;
+   VkPipelineColorBlendStateCreateInfo bs{};bs.sType=VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;bs.attachmentCount=p->options.colorCount;bs.pAttachments=blends;if(orderedColorAccess && !nofetch && (translated.fetchMask || !(systemTranslationPolicy().orderFetchOnly || systemTranslationPolicy().fetchSplit)))bs.flags=VK_PIPELINE_COLOR_BLEND_STATE_CREATE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_BIT_EXT;
 
    VkGraphicsPipelineCreateInfo gi{};gi.sType=VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;gi.stageCount=2;gi.pStages=stages;gi.pVertexInputState=&vertex;gi.pInputAssemblyState=&assembly;
    gi.pViewportState=&vp;gi.pRasterizationState=&raster;gi.pMultisampleState=&ms;gi.pColorBlendState=&bs;gi.layout=p->layout;gi.renderPass=nofetch?renderPass(p,nullptr,true):p->render;
@@ -1309,7 +1312,8 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
  // Culled draws stay in `ops` (pass load/store semantics untouched) and are only not recorded. Load elision turns LOAD into DONT_CARE when a kept dst-independent coverer paints the whole render area and nothing before it reads the target.
  struct OccPlan {std::vector<uint8_t> culled,hasCover,reads,mask;std::vector<Cover> cover;};
  // no-proof backoff: after 600 submits in which no cover was ever proven, analyze only every 64th submit; any proof resets it
- uint64_t nfBuilt=0;double nfBuildMs=0; // FUXI_MTL_NOFETCH_RP: lazily built no-input-attachment pipeline variants
+ uint64_t nfBuilt=0;double nfBuildMs=0;uint64_t fetchSplitBarriers=0; // FUXI_MTL_FETCH_SPLIT: in-pass barriers issued before fetch draws
+ // FUXI_MTL_NOFETCH_RP: lazily built no-input-attachment pipeline variants
  std::atomic<uint64_t> occIdle{0},occSkipped{0};uint64_t occOkSeen{0};
  bool occProbe(){uint64_t ok=occCoverOk;if(ok!=occOkSeen){occOkSeen=ok;occIdle=0;}uint64_t n=++occIdle;if(n<=600||n%64==0)return true;++occSkipped;return false;}
  std::atomic<uint64_t> occSubmits{0},occVictims{0},occCoverTries{0},occCoverOk{0},occCulled{0},occElided{0},occEvalNs{0},occEstNs{0},occUnpriced{0},occCulledKpx{0};
@@ -2346,6 +2350,8 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
    if(daOn){++daSubmits;for(size_t n=0;n<ops.size();++n){auto &o=ops[n];for(unsigned i=0;i<o.colorCount;++i)if(auto *t=o.color(i).texture)daTargets.push_back(t);if(o.pipeline && daStorageWriter(o,draws[n]))daBlocked=true;}
     daMarkWrites(ops,draws);}
    VkPipeline boundPipeline{};VkPipelineLayout boundLayout{};VkDescriptorSet boundSet{};bool passNoFetch=false;uint32_t passFetchDraws=0;
+   // per pass: recorded fetch / non-fetch draws, fetch/non-fetch runs, FUXI_MTL_FETCH_SPLIT barriers; fsUnordered: a non-fetch draw wrote since the pass began or the last such barrier
+   uint32_t fsFetch=0,fsNofetch=0,fsRuns=0,fsBarriers=0;int fsLast=-1;bool fsUnordered=false;const bool fsOn=systemTranslationPolicy().fetchSplit && orderedColorAccess;
    VkViewport boundViewport{};VkRect2D boundScissor{};bool dynamicBound=false;
    setupPhase.reset();auto loopPhase=std::make_unique<PhaseTimer>(SubPhase::recLoop);
    for(size_t opIndex=0;opIndex<ops.size();++opIndex) {diagnosticOp=opIndex;const auto &op=ops[opIndex];const auto &draw=draws[opIndex];
@@ -2384,6 +2390,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
      if(passQ){cur={};cur.width=op.texture->levelWidth(op.dstLevel);cur.tiling=op.texture->rtTarget?2:op.texture->tiling==VK_IMAGE_TILING_LINEAR?1:0;cur.height=op.texture->levelHeight(op.dstLevel);cur.colors=used;
       for(unsigned i=0,u=0;i<op.colorCount && u<8;++i){auto c=op.color(i);if(!c.texture)continue;unsigned st=passEnd>opIndex?ops[passEnd].color(i).store:c.store;cur.load|=uint32_t(c.load&3u)<<(u*2);cur.store|=(st?1u:0u)<<u;++u;}}
      passFetchDraws=0;for(size_t i=opIndex;i<=passEnd;++i)if(ops[i].pipeline && ops[i].pipeline->fetchMask)++passFetchDraws;
+     fsFetch=fsNofetch=fsRuns=fsBarriers=0;fsLast=-1;fsUnordered=false;
      // every draw of the pass lacks a fetch plan: use the render pass without input attachments (a pass is a feedback loop to Turnip only when it declares one)
      passNoFetch=systemTranslationPolicy().nofetchRp && !passFetchDraws && orderedColorAccess;
      auto render=renderPass(op.pipeline,passOp?&*passOp:&op,passNoFetch);
@@ -2432,7 +2439,12 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
      if(currentFrame)++currentFrame->passes;{PhaseTimer phase(SubPhase::passes);CmdBeginRenderPass(cmd,&ri,VK_SUBPASS_CONTENTS_INLINE);}
      if(drawQ && drawInfos.size()<passStampLimit){DrawInfo m{};m.begin=true;m.passW=ri.renderArea.extent.width;m.passH=ri.renderArea.extent.height;drawInfos.push_back(m);CmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,drawQ,uint32_t(drawInfos.size()));}
      }else if(currentFrame)++currentFrame->mergedDraws;
-     if(!culledOp){auto bindPhase=std::make_unique<PhaseTimer>(SubPhase::bind);
+     if(!culledOp){const bool fetching=op.pipeline->fetchMask!=0;if(fetching)++fsFetch;else ++fsNofetch;if(fsLast!=int(fetching)){++fsRuns;fsLast=int(fetching);}
+      // FUXI_MTL_FETCH_SPLIT: non-fetch pipelines lack the rasterization-order flag, so make their writes visible to this fetch draw's input attachment read
+      if(fsOn && !passNoFetch && fetching && fsUnordered){VkMemoryBarrier mb{};mb.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;mb.srcAccessMask=VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;mb.dstAccessMask=VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
+       pb(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,VK_DEPENDENCY_BY_REGION_BIT,1,&mb,0,nullptr,0,nullptr);++fsBarriers;++fetchSplitBarriers;fsUnordered=false;}
+      if(!fetching)fsUnordered=true;
+      auto bindPhase=std::make_unique<PhaseTimer>(SubPhase::bind);
      auto pipeline=topologyPipeline(op.pipeline,op.topology,passNoFetch);
      if(pipeline!=boundPipeline){CmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline);boundPipeline=pipeline;}
      if(currentFrame)++currentFrame->draws;++cur.draws;
@@ -2568,7 +2580,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
      else {barrier.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
      pb(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&barrier,0,nullptr,0,nullptr);}}
     if(passQ && opIndex==passEnd && passInfos.size()<passStampLimit){ // stamp after the pass and its closing barrier
-     PassInfo info{};if(op.texture && op.pipeline){info=cur;info.nofetch=passNoFetch;info.fetchDraws=passFetchDraws;}
+     PassInfo info{};if(op.texture && op.pipeline){info=cur;info.nofetch=passNoFetch;info.fetchDraws=passFetchDraws;info.fetchRec=fsFetch;info.nofetchRec=fsNofetch;info.runs=fsRuns;info.fetchBarriers=fsBarriers;}
      else {info.kind=op.clearOnly?1:2;if(op.texture){info.width=op.texture->levelWidth(op.dstLevel);info.height=op.texture->levelHeight(op.dstLevel);}if(op.clearOnly)info.colors=op.colorCount;}
      info.copies=stampCopies;info.barriers=stampBarriers;stampCopies=stampBarriers=0;passInfos.push_back(info);CmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,passQ,uint32_t(passInfos.size()));
     }

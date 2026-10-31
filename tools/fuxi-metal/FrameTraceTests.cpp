@@ -90,6 +90,13 @@ int main(){
   const char *da=strstr(b2,"FUXI MTL: gpu pass draw area per submit: shrunk passes=1.00 ms=0.500 avg_ms=0.500 area_pct=25.0 | eligible not shrunk passes=1.00 ms=2.000 avg_ms=2.000 area_pct=100.0 | not eligible passes=1.00 ms=0.100");
   assert(da);
   times.add({big},{1000},1000);char b3[4096]{};o=fmemopen(b3,sizeof b3,"w");times.report(o);fclose(o);assert(!strstr(b3,"draw area per submit")); // window reset
+  // fetch draw mix: only passes that recorded a fetch draw count; one fetch-split line per top row that has such passes, all lines < 200 chars
+  PassInfo fp=big;fp.fetchDraws=3;fp.fetchRec=3;fp.nofetchRec=5;fp.runs=4;fp.fetchBarriers=2;PassInfo pure=big;pure.fetchDraws=1;pure.fetchRec=1;pure.runs=1;PassInfo none=big;none.nofetchRec=40;none.runs=1;
+  for(int i=0;i<2;++i)times.add({fp,pure,none,small},{1000000,500000,2000000,100000},4000000);
+  char b4[4096]{};o=fmemopen(b4,sizeof b4,"w");times.report(o);fclose(o);
+  assert(strstr(b4,"FUXI MTL: gpu pass fetch draws per submit: passes=2.00 mixed=1.00 fetch=4.00 nofetch=5.00 runs=5.00 fetch_barriers=2.00 ms=1.500"));
+  assert(strstr(b4,"FUXI MTL: gpu pass top1 fetch passes_pct=66.7 fetch=2.0 nofetch=2.5 runs=2.5 fetch_barriers=1.00 avg_ms=0.750") && !strstr(b4,"top2 fetch"));
+  for(char *l=strtok(b4,"\n");l;l=strtok(nullptr,"\n"))assert(!strstr(l,"fetch") || strlen(l)<200);
  }
  { // per-draw GPU times: the pass with the largest draw sum wins, draws ranked, begin markers skipped; SPIR-V statistics
   std::vector<DrawInfo> infos;std::vector<uint64_t> ns;
