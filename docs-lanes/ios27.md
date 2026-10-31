@@ -220,8 +220,12 @@ ld-classic chains (0x101), ADT parsing in ArmDTPlatform/ArmCpu (after 0x10f), an
   kernel functions, 4 missing data references), AppleImage4, AMFI, Sandbox and vnguard initialize, the trust-cache
   bundle loads (2 modules), APFS and AppleFSCompressionTypeZlib start, `BSD root: md0`, and our arm64e init runs as
   PID 1 (`/sbin/launchd`, served by mockfs, cdhash in the owner module) and keeps printing its heartbeat.
-- **K3** IPSW `/sbin/launchd` + `/usr/lib/dyld` from mockfs (`k3.img`, static trust cache from the IPSW), then
-  the remaining stubs (Darwin 26 helpers the 12377 source lacks).
+- **K3** IPSW `/sbin/launchd` + `/usr/lib/dyld` from mockfs (`k3.img`, static trust cache from the IPSW).
+  **Booted (OBSERVED):** both exec from the static trust cache. Without boot-args launchd enters libignition
+  ("Darwin Ignition Sequence", ignition level 0x5) and stays silent. With `dyld_flags=8` (dyld bit 3 = no ignition,
+  as UniXNU sets it; the DEVELOPMENT kernel passes the tunable to every exec) dyld runs and stops as expected:
+  `Library not loaded: /usr/lib/libSystem.B.dylib ... no dyld cache`, then "initproc failed to start". The panic
+  path itself nests (open). Next: a real root with the shared cache (K4).
 - **K4** UFS root (port our FuxiUFS or UniXNU's UFS layer) and launchd.
 - **K5** Display/backlight/touch/buttons on 12377 (port the xnu-8796 Fuxi drivers).
 - **K6** GPU (Adreno 740 path) and SMP on all 7 usable cores.
