@@ -66,7 +66,7 @@ for forbidden in ('ml_io_map', 'IOMemoryDescriptor', 'IOMemoryMap', 'writeRegist
                   'volatile uint', '__asm__', '0x51'):
     assert forbidden not in code, forbidden
 ci = (ROOT / 'tools/ci/build.sh').read_text()
-assert ci.index('python3 tools/test-fuxi-backlight.py') < ci.index('if [[ $target == kernel-wlan6g ]]')
+assert ci.index('python3 tools/test-fuxi-backlight.py') < ci.index('if [[ $target == kernel-wlan6g')
 
 # Compile the real setProperties body with a small dictionary/number adapter.
 # Covers the public flat input, nested diagnostic inputs, malformed data,
