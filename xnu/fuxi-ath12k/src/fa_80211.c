@@ -3,9 +3,11 @@
  * read), and here it will be the station layer of design section 4. As of M4 what is real: the radio
  * as ath12k allocates, registers and frees it, the regulatory domain, channel arithmetic, the
  * deferred work queues, and on stage 4 alone one interface in station mode and one scan, as mac80211
- * brings them up: ops.start, add_interface, hw_scan, then remove_interface, ops.stop. There is no
- * station yet, so everything that a station would do logs its name at runtime through STUB(). Nothing
- * here authenticates or associates, and the probe request offers legacy rates only.
+ * brings them up: ops.start, add_interface, hw_scan, then remove_interface, ops.stop. Stage 5 goes on to join
+ * one open network named by fuxiwifissid, as mac80211 joins it: channel context, link configuration, the access
+ * point as a station from none to authorized, its authentication and association frames, some seconds of
+ * listening, and away again. Nothing here knows of a key or a passphrase. What stands in for mac80211 without
+ * doing its work logs its name at runtime through STUB(). The probe request offers legacy rates only.
  *
  * What the scan hears comes here by both of ath12k's routes: linuxkpi_ieee80211_rx() below. wmi.c says
  * "Firmware is guaranteed to report all essential management frames via WMI while it can deliver some
@@ -31,6 +33,7 @@
 #include "lx.h"
 #include "fa_xnu.h"
 #include "fa_bss.h"
+#include "fa_join.h"
 
 /* Says the name a few times and keeps going; each caller then gives its own documented answer. */
 #define STUB()	lx_stub(__func__)
@@ -63,6 +66,26 @@ struct fa_radio {
 	struct cfg80211_ssid asked;		/* of no length: any network */
 	uint8_t probe_rates[32];
 	struct fa_bss_table heard;
+	bool say_names;				/* stage 4 alone logs the networks it hears */
+	/* the join of stage 5 */
+	struct fa_target target;
+	volatile bool joining;			/* received frames go to join_rx() */
+	struct ieee80211_chanctx_conf *chanctx;	/* set for as long as the join has one */
+	bool chanctx_added;			/* the driver took it */
+	void *sta_memory;			/* kept until the wiphy goes: the data path's peer may still name it */
+	struct ieee80211_sta *sta;		/* the access point */
+	enum ieee80211_sta_state reached;
+	volatile enum fa_answer answer;		/* its last word, and what it said */
+	unsigned answer_code, aid, answer_length;
+	unsigned reason;			/* when it showed us the door */
+	uint8_t answer_kind;			/* the answer that is being waited for */
+	uint8_t answer_elements[FA_TARGET_ELEMENTS_MOST];
+	volatile bool lost, went_protected;
+	unsigned beacon_losses;
+	unsigned tx_sent, tx_done, tx_acked, tx_dropped;
+	unsigned tx_sent_before, tx_done_before;	/* when the exchange that is going on began */
+	unsigned link_data, link_beacons, link_others;	/* frames from the access point while joined */
+	int rssi;				/* of the access point's last frame that had a value */
 };
 
 enum { SCAN_NONE, SCAN_RUNNING, SCAN_OVER, SCAN_ABORTED };
@@ -78,10 +101,30 @@ enum { SCAN_NONE, SCAN_RUNNING, SCAN_OVER, SCAN_ABORTED };
 #define FA_REGD_QUIET_NS	(500 * 1000000ull)
 #define FA_REGD_LOOK_NS		(50 * 1000000ull)
 
+/*
+ * Bounds of stage 5. Each frame is tried three times, half a second each. ath12k's own waits are bounded too: peer
+ * create and delete, vdev start and stop, WMI commands and its flush each have a timeout of seconds (core.h, wmi.h, peer.c).
+ */
+#define FA_JOIN_SCANS		2
+#define FA_JOIN_TRIES		3
+#define FA_JOIN_ANSWER_NS	(500 * 1000000ull)
+#define FA_JOIN_LOOK_NS		(20 * 1000000ull)
+#define FA_JOIN_STAY_NS		(20 * 1000000000ull)
+#define FA_JOIN_LOOK_STAY_NS	(100 * 1000000ull)
+#define FA_JOIN_SAY_EVERY_NS	(5 * 1000000000ull)
+#define FA_FRAME_MOST		768		/* what the association request can come to */
+
 /* The address of the network an interface has joined while it has joined none: mac.c compares beacons with it. */
 static const uint8_t no_network[ETH_ALEN];
 
 static unsigned char radio_mac[ETH_ALEN];
+
+/* The name of the network stage 5 joins, from fuxi_wlan.c. It is said by its length alone. */
+static uint8_t target_name[FA_SSID_MOST];
+static unsigned target_name_length;
+
+/* find_sta has only the interface to go by, and there is one radio. */
+static struct fa_radio *the_radio;
 
 static const char *const band_names[NUM_NL80211_BANDS] = {
 	[NL80211_BAND_2GHZ] = "2 GHz", [NL80211_BAND_5GHZ] = "5 GHz", [NL80211_BAND_6GHZ] = "6 GHz",
@@ -99,6 +142,16 @@ void
 fa_set_radio_mac(const unsigned char *mac)
 {
 	memcpy(radio_mac, mac, ETH_ALEN);
+}
+
+/* Before fa_firmware_ready(). Anything but 1 to 32 bytes is no name at all. */
+void
+fa_set_target_ssid(const unsigned char *name, unsigned length)
+{
+	target_name_length = length >= 1 && length <= FA_SSID_MOST ? length : 0;
+	if (target_name_length != 0) {
+		memcpy(target_name, name, target_name_length);
+	}
 }
 
 /* tools/ath12k-edits.json, ath12k-mac-override. mac.c has no device-address fallback. */
@@ -269,6 +322,10 @@ linuxkpi_wiphy_free(struct wiphy *wiphy)
 
 	kfree(radio->regd);
 	kfree(radio->vif_memory);
+	kfree(radio->sta_memory);
+	if (the_radio == radio) {
+		the_radio = NULL;
+	}
 	kfree(radio->memory);
 }
 
@@ -511,9 +568,17 @@ ieee80211_queue_stopped(struct ieee80211_hw *hw, int queue)
 
 /* ---- buffers the driver is done with --------------------------------------------------------------- */
 
+/* A management frame's end comes here (wmi.c, wmi_process_mgmt_tx_comp()): counted, because a join reads them. */
 void
 linuxkpi_ieee80211_tx_status(struct ieee80211_hw *hw, struct sk_buff *skb)
 {
+	struct fa_radio *radio = radio_of(hw);
+	bool acked = (IEEE80211_SKB_CB(skb)->flags & IEEE80211_TX_STAT_ACK) != 0;
+
+	lx_os_lock();
+	radio->tx_done++;
+	radio->tx_acked += acked;
+	lx_os_unlock();
 	dev_kfree_skb_any(skb);
 }
 
@@ -528,10 +593,15 @@ linuxkpi_ieee80211_tx_status_ext(struct ieee80211_hw *hw, struct ieee80211_tx_st
 void
 linuxkpi_ieee80211_free_txskb(struct ieee80211_hw *hw, struct sk_buff *skb, int status)
 {
+	struct fa_radio *radio = radio_of(hw);
+
+	lx_os_lock();
+	radio->tx_dropped++;
+	lx_os_unlock();
 	dev_kfree_skb_any(skb);
 }
 
-/* ---- the station that is not here yet: each says its name ------------------------------------------- */
+/* ---- what mac80211 keeps for the driver ---------------------------------------------------------------- */
 
 /* The one interface there can be, for as long as it is there. The poll thread comes here for each beacon. */
 void
@@ -545,30 +615,46 @@ linuxkpi_ieee80211_iterate_interfaces(struct ieee80211_hw *hw, enum ieee80211_if
 	}
 }
 
-/* BEHAVIOUR STUB, M5: there are no stations, so nothing is visited. */
+/* The access point, the one station there can be, for as long as the driver knows of it. */
 void
 linuxkpi_ieee80211_iterate_stations_atomic(struct ieee80211_hw *hw, void (*function)(void *, struct ieee80211_sta *), void *argument)
 {
-	STUB();
+	struct ieee80211_sta *sta = radio_of(hw)->sta;
+
+	if (sta != NULL) {
+		function(argument, sta);
+	}
 }
 
-/* BEHAVIOUR STUB, M5: there are no channel contexts, so nothing is visited. */
+/* The channel context of the join, the one there can be. */
 void
 linuxkpi_ieee80211_iterate_chan_contexts(struct ieee80211_hw *hw,
     void (*function)(struct ieee80211_hw *, struct ieee80211_chanctx_conf *, void *), void *argument)
 {
-	STUB();
+	struct ieee80211_chanctx_conf *chanctx = radio_of(hw)->chanctx;
+
+	if (chanctx != NULL) {
+		function(hw, chanctx, argument);
+	}
 }
 
-/* BEHAVIOUR STUB, M5: no station is known, which ath12k treats as a peer that has gone. */
+/* The access point if that is its address. NULL is the true answer for any other. */
 struct ieee80211_sta *
 linuxkpi_ieee80211_find_sta(struct ieee80211_vif *vif, const u8 *address)
 {
-	STUB();
-	return (NULL);
+	struct fa_radio *radio = the_radio;
+
+	if (radio == NULL || radio->vif != vif || radio->sta == NULL || memcmp(radio->sta->addr, address, ETH_ALEN) != 0) {
+		return (NULL);
+	}
+	return (radio->sta);
 }
 
-/* BEHAVIOUR STUB, M5: no scan results are kept, so ath12k sees an AP without RSN (mac.c peer_assoc). */
+/*
+ * BEHAVIOUR STUB: no scan results are kept here, so ath12k sees an access point without RSN or WPA (mac.c, peer assoc).
+ * As of M5 that is the truth of what it gets to ask about: a network with either is refused before any of this.
+ * M6 must keep the elements and answer properly, or the firmware will not expect the handshake.
+ */
 struct cfg80211_bss *
 linuxkpi_cfg80211_get_bss(struct wiphy *wiphy, struct linuxkpi_ieee80211_channel *channel, const uint8_t *bssid,
     const uint8_t *ssid, size_t ssid_length, enum ieee80211_bss_type type, enum ieee80211_privacy privacy)
@@ -583,7 +669,7 @@ linuxkpi_cfg80211_put_bss(struct wiphy *wiphy, struct cfg80211_bss *bss)
 	STUB();
 }
 
-/* BEHAVIOUR STUB, M5: nothing is queued above the driver, so nothing is pulled. */
+/* BEHAVIOUR STUB: nothing is queued above the driver, so nothing is pulled. Stage 5 sends management frames only. */
 void
 linuxkpi_ieee80211_handle_wake_tx_queue(struct ieee80211_hw *hw, struct ieee80211_txq *queue)
 {
@@ -604,10 +690,64 @@ linuxkpi_ieee80211_scan_completed(struct ieee80211_hw *hw, struct cfg80211_scan_
 	lx_os_unlock();
 }
 
+/* What the join reads of a frame from the air: under the layer's lock, on the poll thread. */
+static void
+join_rx(struct fa_radio *radio, const struct sk_buff *skb, const struct ieee80211_rx_status *status)
+{
+	struct fa_reply reply;
+
+	lx_os_lock();
+	if ((status->flag & RX_FLAG_8023) != 0) {
+		radio->link_data++;
+		lx_os_unlock();
+		return;
+	}
+	switch (fa_rx_kind(skb->data, skb->len, radio->target.address)) {
+	case FA_RX_DATA:
+		radio->link_data++;
+		break;
+	case FA_RX_BEACON:
+		radio->link_beacons++;
+		if ((status->flag & RX_FLAG_NO_SIGNAL_VAL) == 0) {
+			radio->rssi = status->signal;
+		}
+		if (fa_target_take(&radio->target, skb->data, skb->len, status->freq, status->signal, target_name, target_name_length) ==
+		    FA_TARGET_PROTECTED) {
+			radio->went_protected = true;
+			lx_os_wakeup(&radio->answer);
+		}
+		break;
+	case FA_RX_MANAGEMENT:
+		fa_reply_read(&reply, skb->data, skb->len, radio->vif->addr, radio->target.address);
+		if (reply.answer == FA_ANSWER_NONE) {
+			radio->link_others++;
+		} else if (reply.answer == FA_ANSWER_GONE) {
+			radio->answer = FA_ANSWER_GONE;
+			radio->reason = reply.code;
+			lx_os_wakeup(&radio->answer);
+		} else if (reply.kind == radio->answer_kind && radio->answer != FA_ANSWER_GONE) {
+			/* What is not being waited for moves nothing: an answer to an earlier step is not the one asked for. */
+			radio->answer = reply.answer;
+			radio->answer_code = reply.code;
+			if (reply.answer == FA_ANSWER_ASSOC) {
+				radio->aid = reply.aid;
+				radio->answer_length = fa_elements_cut(reply.elements, reply.elements_length, sizeof(radio->answer_elements));
+				memcpy(radio->answer_elements, reply.elements, radio->answer_length);
+			}
+			lx_os_wakeup(&radio->answer);
+		}
+		break;
+	default:
+		radio->link_others++;
+		break;
+	}
+	lx_os_unlock();
+}
+
 /*
- * A frame the radio received, with the driver's description behind it. BEHAVIOUR STUB, M5: only beacons and
- * probe responses during the scan are looked at. Every other frame is dropped: counted, and said by name
- * when no scan has run.
+ * A frame the radio received, with the driver's description behind it. During a join its frames go to join_rx().
+ * BEHAVIOUR STUB otherwise: only beacons and probe responses during the scan are looked at, and every other frame
+ * is dropped: counted, and said by name when no scan has run. No frame goes further up than this layer.
  */
 void
 linuxkpi_ieee80211_rx(struct ieee80211_hw *hw, struct sk_buff *skb, struct ieee80211_sta *sta, struct napi_struct *napi,
@@ -616,6 +756,11 @@ linuxkpi_ieee80211_rx(struct ieee80211_hw *hw, struct sk_buff *skb, struct ieee8
 	struct fa_radio *radio = radio_of(hw);
 	const struct ieee80211_rx_status *status = IEEE80211_SKB_RXCB(skb);
 
+	if (radio->joining) {
+		join_rx(radio, skb, status);
+		dev_kfree_skb_any(skb);
+		return;
+	}
 	if (!radio->collecting) {
 		if (radio->vif == NULL) {
 			STUB();
@@ -633,23 +778,47 @@ linuxkpi_ieee80211_rx(struct ieee80211_hw *hw, struct sk_buff *skb, struct ieee8
 	if ((status->flag & RX_FLAG_8023) != 0) {
 		radio->heard.others++;
 	} else {
-		(void)fa_bss_take(&radio->heard, skb->data, skb->len, status->freq,
-		    (status->flag & RX_FLAG_NO_SIGNAL_VAL) != 0 ? FA_RSSI_NONE : status->signal);
+		int signal = (status->flag & RX_FLAG_NO_SIGNAL_VAL) != 0 ? FA_RSSI_NONE : status->signal;
+
+		(void)fa_bss_take(&radio->heard, skb->data, skb->len, status->freq, signal);
+		if (!radio->say_names && target_name_length != 0) {
+			(void)fa_target_take(&radio->target, skb->data, skb->len, status->freq, signal, target_name, target_name_length);
+		}
 	}
 	lx_os_unlock();
 	dev_kfree_skb_any(skb);
 }
 
+/*
+ * BEHAVIOUR STUB: mac80211 would probe the access point; here the firmware's word is counted, and ath12k's own timer
+ * turns it into connection loss if no beacon follows (mac.c, ath12k_mac_handle_beacon_miss()).
+ */
 void
 linuxkpi_ieee80211_beacon_loss(struct ieee80211_vif *vif)
 {
-	STUB();
+	struct fa_radio *radio = the_radio;
+
+	if (radio != NULL && radio->vif == vif) {
+		lx_os_lock();
+		radio->beacon_losses++;
+		lx_os_unlock();
+	}
+	lx_tell("FUXI ATH12K: M5 beacon loss from the firmware\n");
 }
 
+/* The link is gone by the driver's account: the stay ends, and the way down goes on without a deauthentication. */
 void
 linuxkpi_ieee80211_connection_loss(struct ieee80211_vif *vif)
 {
-	STUB();
+	struct fa_radio *radio = the_radio;
+
+	if (radio != NULL && radio->vif == vif) {
+		lx_os_lock();
+		radio->lost = true;
+		lx_os_wakeup(&radio->answer);
+		lx_os_unlock();
+	}
+	lx_tell("FUXI ATH12K: M5 connection loss from the driver\n");
 }
 
 /* ---- stage 4: one interface, one scan, and down again ------------------------------------------------ */
@@ -662,6 +831,7 @@ station_up(struct fa_radio *radio)
 	struct ieee80211_vif *vif;
 	int error;
 
+	the_radio = radio;
 	radio->vif_memory = kzalloc(64 + sizeof(*vif) + hw->vif_data_size, GFP_KERNEL);
 	if (radio->vif_memory == NULL) {
 		return (-ENOMEM);
@@ -728,7 +898,7 @@ say_heard(struct fa_radio *radio)
 {
 	const struct fa_bss_table *heard = &radio->heard;
 	uint8_t order[FA_BSS_SAID_MOST];
-	unsigned said = fa_bss_strongest(heard, order, FA_BSS_SAID_MOST);
+	unsigned said = radio->say_names ? fa_bss_strongest(heard, order, FA_BSS_SAID_MOST) : 0;
 
 	for (unsigned i = 0; i < said; i++) {
 		const struct fa_bss *network = &heard->entry[order[i]];
@@ -737,7 +907,7 @@ say_heard(struct fa_radio *radio)
 		(void)fa_ssid_escape(name, sizeof(name), network->ssid, network->ssid_length);
 		lx_tell("FUXI ATH12K: M4 bss %u %d \"%s\"\n", network->frequency, network->rssi, name);
 	}
-	if (heard->count > said) {
+	if (radio->say_names && heard->count > said) {
 		lx_tell("FUXI ATH12K: M4 bss %u weaker ones not said\n", heard->count - said);
 	}
 	lx_tell("FUXI ATH12K: M4 rx wmi %u data %u beacons %u responses %u malformed %u others %u lost %u\n", radio->rx_wmi,
@@ -767,8 +937,9 @@ probe_rates(struct fa_radio *radio)
 /*
  * One scan of every channel the regulatory domain allows. Channels it marks no-IR or radar are in the list too:
  * the firmware has them as passive from ath12k's channel list (reg.c), so it sends nothing there. Active asks for
- * any network with an SSID of no length; passive gives ath12k no SSID, which it passes on as WMI_SCAN_FLAG_PASSIVE,
- * and nothing is sent at all. 0 when the driver has said the scan is over.
+ * any network with an SSID of no length (stage 5: the one network, so that a hidden one answers too); passive gives
+ * ath12k no SSID, which it passes on as WMI_SCAN_FLAG_PASSIVE, and nothing is sent at all. 0 when the driver has said
+ * the scan is over. By then ath12k has deleted the vdev it scanned on.
  */
 static int
 station_scan(struct fa_radio *radio, bool passive)
@@ -898,6 +1069,7 @@ fa_m4_station(struct ieee80211_hw *hw, bool passive)
 	unsigned regd_before = radio->regd_applied;
 	int error;
 
+	radio->say_names = true;
 	error = station_up(radio);
 	if (error != 0) {
 		lx_tell("FUXI ATH12K: M4 not proven: bring-up %d\n", error);
@@ -910,6 +1082,672 @@ fa_m4_station(struct ieee80211_hw *hw, bool passive)
 	}
 	if (fa_m4_trouble()) {
 		fa_m4_firmware_dead();
+	}
+	station_down(radio);
+	if (fa_m4_trouble()) {
+		fa_m4_firmware_dead();
+		return (error != 0 ? error : -EIO);
+	}
+	return (error);
+}
+
+/* ---- stage 5: one open network, and away again ------------------------------------------------------------- */
+
+/* A frame for the driver to send: `length` bytes at the returned place, in a buffer the radio can read. */
+static struct sk_buff *
+frame_new(struct fa_radio *radio, unsigned length, uint8_t **bytes)
+{
+	struct sk_buff *skb = dev_alloc_skb(length + 256);
+	struct ieee80211_tx_info *info;
+
+	if (skb == NULL) {
+		return (NULL);
+	}
+	skb_reserve(skb, 128);			/* room in front for what the driver puts there */
+	*bytes = skb_put(skb, length);
+	info = IEEE80211_SKB_CB(skb);
+	memset(info, 0, sizeof(*info));
+	info->control.vif = radio->vif;
+	info->band = radio->chanctx != NULL ? radio->chanctx->def.chan->band : NL80211_BAND_2GHZ;
+	return (skb);
+}
+
+static void
+frame_send(struct fa_radio *radio, struct sk_buff *skb)
+{
+	struct ieee80211_tx_control control = { .sta = radio->sta };
+
+	lx_os_lock();
+	radio->tx_sent++;
+	lx_os_unlock();
+	radio->ops->tx(&radio->hw, &control, skb);
+}
+
+/* One step of the station's state as the driver is told of it (mac80211: drv_sta_state()). */
+static int
+station_state(struct fa_radio *radio, enum ieee80211_sta_state from, enum ieee80211_sta_state to)
+{
+	int error;
+
+	wiphy_lock(radio->wiphy);
+	error = radio->ops->sta_state(&radio->hw, radio->vif, radio->sta, from, to);
+	wiphy_unlock(radio->wiphy);
+	if (error == 0) {
+		radio->reached = to;
+	}
+	return (error);
+}
+
+static void
+link_changed(struct fa_radio *radio, u64 what)
+{
+	wiphy_lock(radio->wiphy);
+	radio->ops->link_info_changed(&radio->hw, radio->vif, &radio->vif->bss_conf, what);
+	wiphy_unlock(radio->wiphy);
+}
+
+static void
+vif_changed(struct fa_radio *radio, u64 what)
+{
+	wiphy_lock(radio->wiphy);
+	radio->ops->vif_cfg_changed(&radio->hw, radio->vif, what);
+	wiphy_unlock(radio->wiphy);
+}
+
+/* The band's HE abilities for a station, or NULL. */
+static const struct ieee80211_sta_he_cap *
+station_he(const struct ieee80211_supported_band *band)
+{
+	const struct ieee80211_sta_he_cap *he = ieee80211_get_he_iftype_cap(band, NL80211_IFTYPE_STATION);
+
+	return (he != NULL && he->has_he ? he : NULL);
+}
+
+/*
+ * What the access point says it can do, into the form the driver reads when it tells the firmware of the peer: rates,
+ * HT, VHT, HE as far as both sides have them, and WMM. The channel is 20 MHz wide, so its width says so. `elements`
+ * are the association response's, or the beacon's before that. EHT stays out (design section 9).
+ */
+static void
+station_abilities(struct fa_radio *radio, const uint8_t *elements, unsigned length)
+{
+	struct ieee80211_supported_band *band = radio->wiphy->bands[radio->chanctx->def.chan->band];
+	struct ieee80211_link_sta *link = &radio->sta->deflink;
+	struct ieee80211_bss_conf *conf = &radio->vif->bss_conf;
+	const uint8_t *ht = fa_element(elements, length, FA_EID_HT);
+	const uint8_t *vht = fa_element(elements, length, FA_EID_VHT);
+	const uint8_t *he_element = fa_ext_element(elements, length, FA_EXT_HE);
+	const uint8_t *e;
+	const struct ieee80211_sta_he_cap *own_he = station_he(band);
+	struct fa_he he;
+	bool has_he = false;
+	uint16_t bitrates[32];
+	uint32_t basic = 0, rates;
+	unsigned count = 0;
+
+	for (int i = 0; i < band->n_bitrates && count < nitems(bitrates); i++) {
+		bitrates[count++] = (uint16_t)band->bitrates[i].bitrate;
+	}
+	rates = fa_rates_mask(bitrates, count, elements, length, &basic);
+	/* A response that says nothing of rates leaves the beacon's standing. */
+	if (rates != 0) {
+		link->supp_rates[band->band] = rates;
+		conf->basic_rates = basic;
+	}
+	link->bandwidth = IEEE80211_STA_RX_BW_20;
+	link->smps_mode = IEEE80211_SMPS_OFF;
+	radio->sta->wme = fa_wmm_element(elements, length) != NULL;
+	conf->qos = radio->sta->wme;
+	memset(&link->ht_cap, 0, sizeof(link->ht_cap));
+	memset(&link->vht_cap, 0, sizeof(link->vht_cap));
+	memset(&link->he_cap, 0, sizeof(link->he_cap));
+	if (ht != NULL && ht[1] >= FA_HT_BODY && band->ht_cap.ht_supported) {
+		link->ht_cap.ht_supported = true;
+		link->ht_cap.cap = (uint16_t)((ht[2] | ht[3] << 8) & ~(FA_HT_CAP_40 | FA_HT_CAP_SGI_40));
+		link->ht_cap.ampdu_factor = ht[4] & 3;
+		link->ht_cap.ampdu_density = (ht[4] >> 2) & 7;
+		memcpy(&link->ht_cap.mcs, ht + 5, sizeof(link->ht_cap.mcs));
+	} else {
+		ht = NULL;
+	}
+	if (vht != NULL && vht[1] >= FA_VHT_BODY && band->vht_cap.vht_supported) {
+		link->vht_cap.vht_supported = true;
+		link->vht_cap.cap = (uint32_t)vht[2] | (uint32_t)vht[3] << 8 | (uint32_t)vht[4] << 16 | (uint32_t)vht[5] << 24;
+		memcpy(&link->vht_cap.vht_mcs, vht + 6, sizeof(link->vht_cap.vht_mcs));
+	} else {
+		vht = NULL;
+	}
+	if (he_element != NULL && own_he != NULL && fa_he_read(he_element, &he)) {
+		has_he = true;
+		link->he_cap.has_he = true;
+		memcpy(link->he_cap.he_cap_elem.mac_cap_info, he.mac, FA_HE_MAC);
+		memcpy(link->he_cap.he_cap_elem.phy_cap_info, he.phy, FA_HE_PHY);
+		link->he_cap.he_mcs_nss_supp.rx_mcs_80 = he.rx_mcs_80;
+		link->he_cap.he_mcs_nss_supp.tx_mcs_80 = he.tx_mcs_80;
+		link->he_cap.he_mcs_nss_supp.rx_mcs_160 = he.rx_mcs_160;
+		link->he_cap.he_mcs_nss_supp.tx_mcs_160 = he.tx_mcs_160;
+		link->he_cap.he_mcs_nss_supp.rx_mcs_80p80 = he.rx_mcs_80_80;
+		link->he_cap.he_mcs_nss_supp.tx_mcs_80p80 = he.tx_mcs_80_80;
+		memcpy(link->he_cap.ppe_thres, he.ppe, sizeof(he.ppe));
+	}
+	conf->he_support = has_he;
+	if ((e = fa_ext_element(elements, length, FA_EXT_HE_OPERATION)) != NULL && has_he && e[1] >= 5) {
+		/* Three bytes of parameters and the BSS colour's byte, the word ath12k hands the firmware. */
+		conf->he_oper.params = (uint32_t)e[3] | (uint32_t)e[4] << 8 | (uint32_t)e[5] << 16 | (uint32_t)e[6] << 24;
+	}
+	link->rx_nss = (uint8_t)fa_peer_streams(ht, vht, has_he ? &he : NULL);
+	if ((e = fa_element(elements, length, FA_EID_HT_OPERATION)) != NULL && e[1] >= 22) {
+		conf->ht_operation_mode = (uint16_t)(e[4] | e[5] << 8);
+	}
+	if ((e = fa_element(elements, length, FA_EID_TIM)) != NULL && e[1] >= 2 && e[3] != 0) {
+		conf->dtim_period = e[3];
+	}
+}
+
+/* Our association request, as far as both sides have what it offers, at 20 MHz. Its length, 0 when it does not fit. */
+static unsigned
+request_build(struct fa_radio *radio, uint8_t *frame, unsigned size)
+{
+	const struct fa_target *target = &radio->target;
+	struct linuxkpi_ieee80211_channel *channel = radio->chanctx->def.chan;
+	struct ieee80211_supported_band *band = radio->wiphy->bands[channel->band];
+	const struct ieee80211_sta_he_cap *own_he = station_he(band);
+	struct fa_offer offer;
+
+	memset(&offer, 0, sizeof(offer));
+	offer.capability = (uint16_t)(FA_CAP_ESS | (target->capability & (FA_CAP_SHORT_PREAMBLE | FA_CAP_SHORT_SLOT | FA_CAP_SPECTRUM)));
+	offer.ssid = target_name;
+	offer.ssid_length = target_name_length;
+	for (int i = 0; i < band->n_bitrates && offer.rate_count < FA_RATES_MOST; i++) {
+		offer.rates[offer.rate_count++] = (uint8_t)(band->bitrates[i].bitrate / 5 |
+		    ((radio->vif->bss_conf.basic_rates & (1u << i)) != 0 ? 0x80 : 0));
+	}
+	if ((target->capability & FA_CAP_SPECTRUM) != 0) {
+		offer.spectrum = true;
+		offer.power_most = (uint8_t)channel->max_power;
+		offer.channel = (uint8_t)linuxkpi_ieee80211_frequency_to_channel(channel->center_freq, 0);
+	}
+	if (fa_element(target->elements, target->elements_length, FA_EID_HT) != NULL && band->ht_cap.ht_supported) {
+		unsigned cap = band->ht_cap.cap & ~(unsigned)(FA_HT_CAP_40 | FA_HT_CAP_SGI_40);
+
+		offer.has_ht = true;
+		offer.ht[0] = (uint8_t)cap;
+		offer.ht[1] = (uint8_t)(cap >> 8);
+		offer.ht[2] = (uint8_t)(band->ht_cap.ampdu_factor | band->ht_cap.ampdu_density << 2);
+		memcpy(offer.ht + 3, &band->ht_cap.mcs, sizeof(band->ht_cap.mcs));
+	}
+	if (fa_element(target->elements, target->elements_length, FA_EID_VHT) != NULL && band->vht_cap.vht_supported) {
+		uint32_t cap = band->vht_cap.cap & ~(FA_VHT_CAP_WIDTH | FA_VHT_CAP_SGI_160);
+
+		offer.has_vht = true;
+		offer.vht[0] = (uint8_t)cap;
+		offer.vht[1] = (uint8_t)(cap >> 8);
+		offer.vht[2] = (uint8_t)(cap >> 16);
+		offer.vht[3] = (uint8_t)(cap >> 24);
+		memcpy(offer.vht + 4, &band->vht_cap.vht_mcs, sizeof(band->vht_cap.vht_mcs));
+	}
+	if (fa_ext_element(target->elements, target->elements_length, FA_EXT_HE) != NULL && own_he != NULL) {
+		offer.he_length = fa_he_offer(offer.he, sizeof(offer.he), own_he->he_cap_elem.mac_cap_info, own_he->he_cap_elem.phy_cap_info,
+		    own_he->he_mcs_nss_supp.rx_mcs_80, own_he->he_mcs_nss_supp.tx_mcs_80);
+	}
+	offer.wmm = fa_wmm_element(target->elements, target->elements_length) != NULL;
+	return (fa_assoc_request(frame, size, radio->vif->addr, target->address, &offer));
+}
+
+/*
+ * One exchange with the access point: `kind` is the answer that is being waited for, and the frame goes out up to three
+ * times, half a second each. Its answer, or FA_ANSWER_NONE when the time is up or the firmware is taken as dead.
+ */
+static enum fa_answer
+exchange(struct fa_radio *radio, uint8_t kind, unsigned (*build)(struct fa_radio *, uint8_t *, unsigned), const char *what)
+{
+	enum fa_answer answer = FA_ANSWER_NONE;
+	unsigned tries = 0;
+
+	lx_os_lock();
+	radio->tx_sent_before = radio->tx_sent;
+	radio->tx_done_before = radio->tx_done;
+	lx_os_unlock();
+	while (tries < FA_JOIN_TRIES && answer == FA_ANSWER_NONE && !fa_m4_trouble()) {
+		unsigned long long began = lx_os_nanoseconds();
+		struct sk_buff *skb;
+		uint8_t *bytes;
+		unsigned length;
+
+		lx_os_lock();
+		radio->answer_kind = kind;
+		if (radio->answer != FA_ANSWER_GONE) {
+			radio->answer = FA_ANSWER_NONE;
+		}
+		lx_os_unlock();
+		if ((skb = frame_new(radio, FA_FRAME_MOST, &bytes)) == NULL) {
+			lx_tell("FUXI ATH12K: M5 no buffer for the %s frame\n", what);
+			break;
+		}
+		length = build(radio, bytes, FA_FRAME_MOST);
+		if (length == 0) {
+			lx_tell("FUXI ATH12K: M5 the %s frame does not fit\n", what);
+			dev_kfree_skb_any(skb);
+			break;
+		}
+		skb_trim(skb, length);
+		tries++;
+		frame_send(radio, skb);
+		for (;;) {
+			bool over;
+
+			lx_os_lock();
+			answer = radio->answer;
+			over = answer != FA_ANSWER_NONE || lx_os_nanoseconds() - began >= FA_JOIN_ANSWER_NS;
+			if (!over) {
+				lx_os_sleep(&radio->answer, FA_JOIN_LOOK_NS);
+			}
+			lx_os_unlock();
+			if (over || fa_m4_trouble()) {
+				break;
+			}
+		}
+	}
+	lx_tell("FUXI ATH12K: M5 %s: answer %d code %u after %u tries; frames sent %u done %u acked %u dropped %u\n", what, answer, radio->answer_code,
+	    tries, radio->tx_sent, radio->tx_done, radio->tx_acked, radio->tx_dropped);
+	return (answer);
+}
+
+static unsigned
+build_auth(struct fa_radio *radio, uint8_t *frame, unsigned size)
+{
+	return (fa_auth_request(frame, size, radio->vif->addr, radio->target.address));
+}
+
+/*
+ * No answer is either the air's doing or the firmware's. When frames went to the firmware and none of them came back, it is
+ * the firmware's: that goes the way of any other death. Otherwise it is only a join that did not happen.
+ */
+static int
+no_answer(struct fa_radio *radio, const char *what)
+{
+	lx_tell("FUXI ATH12K: M5 not proven: no answer to %s\n", what);
+	if (radio->tx_sent != radio->tx_sent_before && radio->tx_done == radio->tx_done_before && !fa_m4_trouble()) {
+		fa_m4_evidence("management frames never came back from the firmware");
+		return (-EIO);
+	}
+	return (0);
+}
+
+/*
+ * Everything a join has made, undone in mac80211's order, as far as it got. The deauthentication goes first and is waited
+ * for, unless the access point has shown us the door or the firmware is taken as dead. Once it is, each command here
+ * fails at once (ATH12K_FLAG_CRASH_FLUSH), so this touches only the host.
+ */
+static void
+station_leave(struct fa_radio *radio)
+{
+	struct ieee80211_hw *hw = &radio->hw;
+	struct ieee80211_vif *vif = radio->vif;
+	enum ieee80211_sta_state state = radio->reached;
+
+	if (radio->sta != NULL && state >= IEEE80211_STA_AUTH && radio->answer != FA_ANSWER_GONE && !radio->lost && !fa_m4_trouble()) {
+		struct sk_buff *skb;
+		uint8_t *bytes;
+
+		if ((skb = frame_new(radio, FA_DEAUTH_LENGTH, &bytes)) != NULL) {
+			(void)fa_deauth(bytes, FA_DEAUTH_LENGTH, vif->addr, radio->target.address, FA_REASON_LEAVING);
+			frame_send(radio, skb);
+			wiphy_lock(hw->wiphy);
+			radio->ops->flush(hw, vif, ~0u, false);
+			wiphy_unlock(hw->wiphy);
+			lx_tell("FUXI ATH12K: M5 deauthentication sent; frames sent %u done %u acked %u dropped %u\n", radio->tx_sent, radio->tx_done,
+			    radio->tx_acked, radio->tx_dropped);
+		}
+	}
+	for (; radio->sta != NULL && state > IEEE80211_STA_NOTEXIST; state--) {
+		int error = station_state(radio, state, state - 1);
+
+		if (error != 0) {
+			lx_tell("FUXI ATH12K: M5 station state %d to %d: %d\n", state, state - 1, error);
+		}
+	}
+	radio->reached = IEEE80211_STA_NOTEXIST;
+	radio->sta = NULL;
+	if (vif->cfg.assoc) {
+		vif->cfg.assoc = false;
+		vif->cfg.aid = 0;
+		vif_changed(radio, BSS_CHANGED_ASSOC);
+	}
+	wiphy_lock(hw->wiphy);
+	if (vif->bss_conf.chanctx_conf != NULL) {
+		radio->ops->unassign_vif_chanctx(hw, vif, &vif->bss_conf, radio->chanctx);
+		vif->bss_conf.chanctx_conf = NULL;
+	}
+	if (radio->chanctx_added) {
+		radio->ops->remove_chanctx(hw, radio->chanctx);
+		radio->chanctx_added = false;
+	}
+	wiphy_unlock(hw->wiphy);
+	vif->bss_conf.bssid = no_network;
+	lx_os_lock();
+	radio->joining = false;
+	lx_os_unlock();
+	kfree(radio->chanctx);
+	radio->chanctx = NULL;
+	lx_tell("FUXI ATH12K: M5 left\n");
+}
+
+/*
+ * The channel the access point says it is on: a beacon can be heard on the one next to its own. NULL when it may not be
+ * used: out of the domain, or at 6 GHz, which this stage does not build.
+ */
+static struct linuxkpi_ieee80211_channel *
+target_channel(struct fa_radio *radio)
+{
+	const struct fa_target *target = &radio->target;
+	struct linuxkpi_ieee80211_channel *channel = linuxkpi_ieee80211_get_channel(radio->wiphy, target->frequency);
+	const uint8_t *ds = fa_element(target->elements, target->elements_length, FA_EID_DS);
+
+	if (channel != NULL && ds != NULL && ds[1] == 1) {
+		struct linuxkpi_ieee80211_channel *said = linuxkpi_ieee80211_get_channel(radio->wiphy,
+		    linuxkpi_ieee80211_channel_to_frequency(ds[2], channel->band));
+
+		channel = said != NULL ? said : channel;
+	}
+	return (channel != NULL && (channel->flags & IEEE80211_CHAN_DISABLED) == 0 && channel->band != NL80211_BAND_6GHZ ? channel : NULL);
+}
+
+/* WMM's parameters, for each of the four classes how long to wait and how long to hold the air. */
+static void
+wmm_parameters(struct fa_radio *radio)
+{
+	static const uint8_t classes[4] = { IEEE80211_AC_BE, IEEE80211_AC_BK, IEEE80211_AC_VI, IEEE80211_AC_VO };
+	const uint8_t *e = fa_wmm_element(radio->answer_elements, radio->answer_length);
+
+	if (e == NULL || e[1] < 24 || e[6] != 1) {
+		return;
+	}
+	wiphy_lock(radio->wiphy);
+	for (unsigned i = 0; i < 4; i++) {
+		const uint8_t *record = e + 10 + 4 * i;
+		struct ieee80211_tx_queue_params params;
+
+		memset(&params, 0, sizeof(params));
+		params.aifs = record[0] & 0x0f;
+		params.acm = (record[0] >> 4) & 1;
+		params.cw_min = (uint16_t)((1u << (record[1] & 0x0f)) - 1);
+		params.cw_max = (uint16_t)((1u << (record[1] >> 4)) - 1);
+		params.txop = (uint16_t)(record[2] | record[3] << 8);
+		radio->ops->conf_tx(&radio->hw, radio->vif, 0, classes[(record[0] >> 5) & 3], &params);
+	}
+	wiphy_unlock(radio->wiphy);
+}
+
+/* Said for an answer that ends the join. It is the access point's doing, not the firmware's: nothing was proven. */
+static void
+join_refused(struct fa_radio *radio, enum fa_answer answer, const char *what)
+{
+	lx_tell("FUXI ATH12K: M5 not proven: %s %s, code %u\n", what, answer == FA_ANSWER_GONE ? "ended by the access point" : "refused",
+	    answer == FA_ANSWER_GONE ? radio->reason : radio->answer_code);
+}
+
+/*
+ * Join the one open network that a scan has heard, in the order mac80211 goes through (ieee80211_prep_connection(), then
+ * authentication and association): the channel taken, the link told of the access point, the access point made a station
+ * of the driver's, which creates the peer and starts the vdev (vdev_start_delay), then the frames. A network without
+ * control-port protection is authorized before the association is told, which is when ath12k brings the vdev up and sets
+ * the peer authorized on the firmware (mac.c, ath12k_bss_assoc()). 0 with *joined when it stands; 0 without when the air
+ * or the access point stopped it; -errno when the driver or the firmware did.
+ */
+static int
+station_join(struct fa_radio *radio, bool *joined)
+{
+	struct ieee80211_hw *hw = &radio->hw;
+	struct ieee80211_vif *vif = radio->vif;
+	struct fa_target *target = &radio->target;
+	struct linuxkpi_ieee80211_channel *channel = target_channel(radio);
+	enum fa_answer answer;
+	int error;
+
+	*joined = false;
+	if (channel == NULL) {
+		lx_tell("FUXI ATH12K: M5 not proven: the access point's channel may not be used here (heard on %u MHz)\n", target->frequency);
+		return (0);
+	}
+	radio->chanctx = kzalloc(64 + sizeof(*radio->chanctx) + hw->chanctx_data_size, GFP_KERNEL);
+	radio->sta_memory = kzalloc(64 + sizeof(*radio->sta) + hw->sta_data_size, GFP_KERNEL);
+	if (radio->chanctx == NULL || radio->sta_memory == NULL) {
+		lx_tell("FUXI ATH12K: M5 no memory for the join\n");
+		kfree(radio->chanctx);
+		kfree(radio->sta_memory);
+		radio->chanctx = NULL;
+		radio->sta_memory = NULL;
+		return (-ENOMEM);
+	}
+	lx_os_lock();
+	target->fixed = true;
+	radio->joining = true;
+	radio->answer = FA_ANSWER_NONE;
+	lx_os_unlock();
+
+	/* the channel, 20 MHz wide */
+	radio->chanctx->def.chan = channel;
+	radio->chanctx->def.width = NL80211_CHAN_WIDTH_20;
+	radio->chanctx->def.center_freq1 = channel->center_freq;
+	radio->chanctx->min_def = radio->chanctx->def;
+	radio->chanctx->rx_chains_static = 2;
+	radio->chanctx->rx_chains_dynamic = 2;
+	vif->bss_conf.chanreq.oper = radio->chanctx->def;
+	wiphy_lock(hw->wiphy);
+	error = radio->ops->add_chanctx(hw, radio->chanctx);
+	if (error == 0) {
+		radio->chanctx_added = true;
+		vif->bss_conf.chanctx_conf = radio->chanctx;
+		error = radio->ops->assign_vif_chanctx(hw, vif, &vif->bss_conf, radio->chanctx);
+		if (error != 0) {
+			vif->bss_conf.chanctx_conf = NULL;
+		}
+	}
+	wiphy_unlock(hw->wiphy);
+	lx_tell("FUXI ATH12K: M5 channel %u MHz, 20 MHz wide, chanctx %d\n", channel->center_freq, error);
+	if (error != 0) {
+		fa_m4_evidence("channel context refused");
+		return (error);
+	}
+
+	/* the access point, to the link */
+	vif->bss_conf.bssid = target->address;
+	vif->bss_conf.beacon_int = target->interval;
+	vif->bss_conf.assoc_capability = target->capability;
+	vif->bss_conf.dtim_period = 1;
+	vif->bss_conf.use_short_slot = (target->capability & FA_CAP_SHORT_SLOT) != 0 || channel->band != NL80211_BAND_2GHZ;
+	vif->bss_conf.use_short_preamble = (target->capability & FA_CAP_SHORT_PREAMBLE) != 0;
+	memcpy(vif->cfg.ap_addr, target->address, ETH_ALEN);
+	memcpy(vif->cfg.ssid, target_name, target_name_length);
+	vif->cfg.ssid_len = target_name_length;
+	hw->conf.listen_interval = FA_LISTEN_INTERVAL;
+	radio->sta = (struct ieee80211_sta *)roundup2((uintptr_t)radio->sta_memory, 64);
+	memcpy(radio->sta->addr, target->address, ETH_ALEN);
+	memcpy(radio->sta->deflink.addr, target->address, ETH_ALEN);
+	radio->sta->deflink.sta = radio->sta;
+	radio->sta->link[0] = &radio->sta->deflink;
+	station_abilities(radio, target->elements, target->elements_length);
+	link_changed(radio, BSS_CHANGED_BSSID | BSS_CHANGED_BASIC_RATES | BSS_CHANGED_BEACON_INT);
+
+	/* the access point, to the driver: the firmware learns of the peer, and the radio goes to its channel */
+	error = station_state(radio, IEEE80211_STA_NOTEXIST, IEEE80211_STA_NONE);
+	lx_tell("FUXI ATH12K: M5 peer and vdev start %d\n", error);
+	fa_m4_credits("after the peer and vdev start");
+	if (error != 0) {
+		radio->sta = NULL;		/* the driver has taken its station away again */
+		fa_m4_evidence("peer create or vdev start failed");
+		return (error);
+	}
+
+	answer = exchange(radio, FA_KIND_AUTH, build_auth, "authentication");
+	if (answer == FA_ANSWER_NONE) {
+		return (no_answer(radio, "authentication"));
+	}
+	if (answer != FA_ANSWER_AUTH) {
+		join_refused(radio, answer, "authentication");
+		return (0);
+	}
+	error = station_state(radio, IEEE80211_STA_NONE, IEEE80211_STA_AUTH);
+	if (error != 0) {
+		fa_m4_evidence("station state: authenticated");
+		return (error);
+	}
+	if (radio->went_protected) {
+		lx_tell("FUXI ATH12K: M5 refused: the access point now asks for protection\n");
+		return (0);
+	}
+
+	answer = exchange(radio, FA_KIND_ASSOC_RESPONSE, request_build, "association");
+	if (answer == FA_ANSWER_NONE) {
+		return (no_answer(radio, "association"));
+	}
+	if (answer != FA_ANSWER_ASSOC) {
+		join_refused(radio, answer, "association");
+		return (0);
+	}
+	lx_tell("FUXI ATH12K: M5 association response: aid %u, %u bytes of elements\n", radio->aid, radio->answer_length);
+	fa_m4_credits("after the association response");
+
+	station_abilities(radio, radio->answer_elements, radio->answer_length);
+	radio->sta->aid = (uint16_t)radio->aid;
+	error = station_state(radio, IEEE80211_STA_AUTH, IEEE80211_STA_ASSOC);
+	if (error == 0) {
+		error = station_state(radio, IEEE80211_STA_ASSOC, IEEE80211_STA_AUTHORIZED);
+	}
+	if (error != 0) {
+		fa_m4_evidence("station state: associated or authorized");
+		return (error);
+	}
+	vif->cfg.assoc = true;
+	vif->cfg.aid = (uint16_t)radio->aid;
+	vif_changed(radio, BSS_CHANGED_ASSOC);
+	wmm_parameters(radio);
+	link_changed(radio, BSS_CHANGED_BEACON_INT | BSS_CHANGED_BEACON_INFO | BSS_CHANGED_ERP_SLOT | BSS_CHANGED_ERP_PREAMBLE | BSS_CHANGED_QOS);
+	fa_m4_credits("after the association was told");
+	if (fa_m4_trouble()) {
+		return (-EIO);
+	}
+	lx_tell("FUXI ATH12K: M5 peer rates %#x, HT %d VHT %d HE %d, %u streams, QoS %d\n", radio->sta->deflink.supp_rates[channel->band],
+	    radio->sta->deflink.ht_cap.ht_supported, radio->sta->deflink.vht_cap.vht_supported, radio->sta->deflink.he_cap.has_he,
+	    radio->sta->deflink.rx_nss, radio->sta->wme);
+	lx_tell("FUXI ATH12K: M5 auth ok assoc ok aid %u freq %u\n", radio->aid, channel->center_freq);
+	*joined = true;
+	return (0);
+}
+
+/* Stay for a while, counting what comes. Ends early when the link goes, and never hangs: the clock alone ends it. */
+static void
+station_stay(struct fa_radio *radio)
+{
+	unsigned long long began = lx_os_nanoseconds(), said = began;
+
+	lx_os_lock();
+	radio->link_data = radio->link_beacons = radio->link_others = 0;
+	radio->rssi = radio->target.rssi;
+	lx_os_unlock();
+	fa_m5_rx_ring("after the association");
+	while (lx_os_nanoseconds() - began < FA_JOIN_STAY_NS) {
+		bool over;
+
+		lx_os_lock();
+		over = radio->answer == FA_ANSWER_GONE || radio->lost || radio->went_protected;
+		if (!over) {
+			lx_os_sleep(&radio->answer, FA_JOIN_LOOK_STAY_NS);
+		}
+		lx_os_unlock();
+		if (over || fa_m4_trouble()) {
+			break;
+		}
+		if (lx_os_nanoseconds() - said >= FA_JOIN_SAY_EVERY_NS) {
+			said = lx_os_nanoseconds();
+			lx_tell("FUXI ATH12K: M5 after %llu s: rx data %u beacons %u others %u rssi %d\n", (said - began) / 1000000000ull, radio->link_data,
+			    radio->link_beacons, radio->link_others, radio->rssi);
+			fa_m4_credits("during the stay");
+			fa_m5_rx_ring("during the stay");
+		}
+	}
+	if (radio->answer == FA_ANSWER_GONE) {
+		lx_tell("FUXI ATH12K: M5 the access point has shown us the door, reason %u\n", radio->reason);
+	}
+	if (radio->went_protected) {
+		lx_tell("FUXI ATH12K: M5 the access point now asks for protection: leaving\n");
+	}
+	lx_tell("FUXI ATH12K: M5 stayed %llu ms\n", (lx_os_nanoseconds() - began) / 1000000ull);
+	lx_tell("FUXI ATH12K: M5 rx data %u beacons %u rssi %d\n", radio->link_data, radio->link_beacons, radio->rssi);
+	lx_tell("FUXI ATH12K: M5 beacon losses %u others %u\n", radio->beacon_losses, radio->link_others);
+	fa_m4_credits("after the stay");
+	fa_m5_rx_ring("after the stay");
+}
+
+/* Scans until the network is heard or refused, at most FA_JOIN_SCANS. 0, or what a scan came to. */
+static int
+join_find(struct fa_radio *radio, bool passive)
+{
+	int error = 0;
+
+	for (unsigned scan = 0; scan < FA_JOIN_SCANS && !radio->target.found && radio->target.protected_frames == 0 && error == 0; scan++) {
+		error = station_scan(radio, passive);
+	}
+	return (error);
+}
+
+/*
+ * Stage 5, from fa_hif.c on fw_thread. With no name given nothing happens, the radio least of all. A network that asks for
+ * protection is refused before a frame is sent to it: only its name went out, in the scan's probe requests. Trouble takes
+ * the same way as on stage 4: the firmware's own account first, then the way down. Not being heard, refused, or an access
+ * point that does not answer are not the firmware's fault: they return 0 and say that nothing was proven.
+ */
+int
+fa_m5_station(struct ieee80211_hw *hw, bool passive)
+{
+	struct fa_radio *radio = radio_of(hw);
+	unsigned regd_before = radio->regd_applied;
+	struct fa_target *target = &radio->target;
+	bool joined = false;
+	int error;
+
+	if (target_name_length == 0) {
+		lx_tell("FUXI ATH12K: M5 not run: no usable fuxiwifissid, so no radio work\n");
+		return (0);
+	}
+	lx_tell("FUXI ATH12K: M5 target ssid length %u\n", target_name_length);
+	radio->asked.ssid_len = (uint8_t)target_name_length;
+	memcpy(radio->asked.ssid, target_name, target_name_length);
+	error = station_up(radio);
+	if (error != 0) {
+		lx_tell("FUXI ATH12K: M4 not proven: bring-up %d\n", error);
+		fa_m4_evidence("bring-up failed");
+	} else if (!fa_m4_trouble()) {
+		regd_wait(radio, regd_before);
+		if (!fa_m4_trouble()) {
+			error = join_find(radio, passive);
+		}
+	}
+	if (error == 0 && !fa_m4_trouble()) {
+		if (target->protected_frames != 0) {
+			lx_tell("FUXI ATH12K: M5 refused: the target has %s (%u frames), only open networks are allowed at this stage\n",
+			    fa_protection_name(target->why), target->protected_frames);
+		} else if (!target->found) {
+			lx_tell("FUXI ATH12K: M5 not proven: the target was not heard in %u scans\n", FA_JOIN_SCANS);
+		} else {
+			lx_tell("FUXI ATH12K: M5 target heard %u times, %u MHz at %d dBm, capability %#x, beacon every %u, HT %d VHT %d HE %d WMM %d\n",
+			    target->heard, target->frequency, target->rssi, target->capability, target->interval,
+			    fa_element(target->elements, target->elements_length, FA_EID_HT) != NULL,
+			    fa_element(target->elements, target->elements_length, FA_EID_VHT) != NULL,
+			    fa_ext_element(target->elements, target->elements_length, FA_EXT_HE) != NULL,
+			    fa_wmm_element(target->elements, target->elements_length) != NULL);
+			error = station_join(radio, &joined);
+			if (joined) {
+				station_stay(radio);
+			}
+		}
+	}
+	if (fa_m4_trouble()) {
+		fa_m4_firmware_dead();
+	}
+	if (radio->chanctx != NULL) {
+		station_leave(radio);
 	}
 	station_down(radio);
 	if (fa_m4_trouble()) {

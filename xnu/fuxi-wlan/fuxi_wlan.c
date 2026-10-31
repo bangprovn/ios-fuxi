@@ -101,10 +101,12 @@ void fuxi_wlan_init(void);
  *   fuxiath12k=N  kernel-metal4wifi only: hand the chip to Linux ath12k at FW_READY. N>0 alone
  *                 implies the working recipe as defaults, each still overridable. Stage 1 stops
  *                 after HTC ready, stage 2 after WMI ready, hw_mode and mac registration, stage 4
- *                 after one scan, each then contains. Stage 4 is the only one that uses the radio's
- *                 RF and logs SSIDs, and only N exactly 4 runs it: any other N runs stage 2 at most,
- *                 and says so.
- *   fuxiath12kq=MASK  with fuxiath12k=4: 0x1 no idle power save, 0x2 no hw mode command, 0x8 settle
+ *                 after one scan, stage 5 after joining one open network for 20 s, each then contains.
+ *                 Stages 4 and 5 are the only ones that use the radio's RF, and only N exactly 4 or 5
+ *                 runs them: any other N runs stage 2 at most, and says so. Stage 4 alone logs SSIDs.
+ *   fuxiwifissid=NAME  with fuxiath12k=5: the open network to join, 1 to 32 bytes, and it cannot hold a
+ *                 space. Logged by length only. Without it stage 5 does no radio work.
+ *   fuxiath12kq=MASK  with fuxiath12k=4 or 5: 0x1 no idle power save, 0x2 no hw mode command, 0x8 settle
  *                 after vdev create, 0x10 passive scan. Read and logged by the driver domain.
  *   fuxiwifimac=aa:bb:cc:dd:ee:ff  with fuxiath12k: the radio's address, instead of the locally
  *                 administered default. Malformed, all-zero or group addresses are refused, and say so.
@@ -971,8 +973,8 @@ wl_fa_configure(void)
 {
 	int stage = 0;
 	if (PE_parse_boot_argn("fuxiath12k", &stage, sizeof(stage)) && stage > 0) {
-		wl_fa_stage = stage == 1 || stage == 4 ? (unsigned)stage : 2;
-		printf("FUXI ATH12K: fuxiath12k=%d, recipe defaults on, running stage %u; stages built are 1, 2 and 4\n",
+		wl_fa_stage = stage == 1 || stage == 4 || stage == 5 ? (unsigned)stage : 2;
+		printf("FUXI ATH12K: fuxiath12k=%d, recipe defaults on, running stage %u; stages built are 1, 2, 4 and 5\n",
 		    stage, wl_fa_stage);
 	}
 }
@@ -1040,6 +1042,22 @@ wl_fa_mac_configure(void)
 	if (!given) { memcpy(mac, wl_fa_default_mac, sizeof(mac)); }
 	printf("FUXI ATH12K: station address from %s\n", given ? "fuxiwifimac" : "the default");
 	fa_set_radio_mac(mac);
+}
+
+/* Stage 5 only: the open network to join. The name is not secret, but a test's business: its length is all that is said. */
+static void
+wl_fa_ssid_configure(void)
+{
+	char text[34] = ""; /* one byte more than a name may have, so that a longer one is seen and not cut */
+	size_t length;
+	if (wl_fa_stage != 5 || !PE_parse_boot_arg_str("fuxiwifissid", text, sizeof(text))) { return; }
+	length = strlen(text);
+	if (length < 1 || length > 32) {
+		printf("FUXI ATH12K: fuxiwifissid refused: 1 to 32 bytes\n");
+		return;
+	}
+	printf("FUXI ATH12K: fuxiwifissid length %u\n", (unsigned)length);
+	fa_set_target_ssid((const unsigned char *)text, (unsigned)length);
 }
 #endif /* FUXI_ATH12K */
 static unsigned
@@ -4926,6 +4944,7 @@ wl_fa_handoff(void)
 	    wl_fa_caps.fw_version, wl_fa_caps.dev_mem[0].start, wl_fa_caps.dev_mem[0].size);
 	wl_fa_started = true;
 	wl_fa_mac_configure();
+	wl_fa_ssid_configure();
 	int e = fa_firmware_ready(&wl_fa_caps, wl_fa_stage);
 	/* Poll thread and ath12k's register access end here, before this thread's own MHI work. */
 	fa_stop();

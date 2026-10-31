@@ -57,6 +57,8 @@ static unsigned fa_case, fa_stage_wanted=1;
 static int fa_result;
 static unsigned char seen_mac[6];
 static unsigned macs_set;
+static unsigned ssids_set, seen_ssid_length;
+static unsigned char seen_ssid[64];
 static struct fa_caps seen_caps;
 static void *pool;
 static unsigned long long pool_iova;
@@ -114,6 +116,7 @@ int fa_firmware_ready(const struct fa_caps *caps, unsigned stage) {
 }
 void fa_stop(void) { fa_stops++; assert(!mhi_depth); }
 void fa_set_radio_mac(const unsigned char *mac) { memcpy(seen_mac,mac,6); macs_set++; }
+void fa_set_target_ssid(const unsigned char *name, unsigned length) { assert(length<=sizeof(seen_ssid));memcpy(seen_ssid,name,length);seen_ssid_length=length;ssids_set++; }
 
 static void boot_fa(unsigned c,bool keep) {
     fa_case=c;fa_entries=fa_stops=mode_offs=macs_set=0;fa_result=0;pool=NULL;wl_fa_rddm_asked=false;
@@ -144,17 +147,19 @@ int main(void) {
 
     /* fuxiath12k>0 alone is the recipe of design section 5, argument by argument. */
     ath12k_arg=1;wl_fa_configure();assert(wl_fa_stage==1);
-    assert(strstr(logbuf,"fuxiath12k=1, recipe defaults on, running stage 1; stages built are 1, 2 and 4"));
+    assert(strstr(logbuf,"fuxiath12k=1, recipe defaults on, running stage 1; stages built are 1, 2, 4 and 5"));
     ath12k_arg=2;wl_fa_configure();assert(wl_fa_stage==2);
-    assert(strstr(logbuf,"fuxiath12k=2, recipe defaults on, running stage 2; stages built are 1, 2 and 4"));
+    assert(strstr(logbuf,"fuxiath12k=2, recipe defaults on, running stage 2; stages built are 1, 2, 4 and 5"));
     ath12k_arg=4;wl_fa_configure();assert(wl_fa_stage==4);
-    assert(strstr(logbuf,"fuxiath12k=4, recipe defaults on, running stage 4; stages built are 1, 2 and 4"));
-    /* The scan, its SSID lines and all RF need exactly 4. Anything else not built runs stage 2, and says so. */
+    assert(strstr(logbuf,"fuxiath12k=4, recipe defaults on, running stage 4; stages built are 1, 2, 4 and 5"));
+    ath12k_arg=5;wl_fa_configure();assert(wl_fa_stage==5);
+    assert(strstr(logbuf,"fuxiath12k=5, recipe defaults on, running stage 5; stages built are 1, 2, 4 and 5"));
+    /* All RF needs exactly 4 or 5. Anything else not built runs stage 2, and says so. */
     ath12k_arg=3;wl_fa_configure();assert(wl_fa_stage==2);
-    assert(strstr(logbuf,"fuxiath12k=3, recipe defaults on, running stage 2; stages built are 1, 2 and 4"));
-    ath12k_arg=5;wl_fa_configure();assert(wl_fa_stage==2);
+    assert(strstr(logbuf,"fuxiath12k=3, recipe defaults on, running stage 2; stages built are 1, 2, 4 and 5"));
+    ath12k_arg=6;wl_fa_configure();assert(wl_fa_stage==2);
     ath12k_arg=7;wl_fa_configure();assert(wl_fa_stage==2);
-    assert(strstr(logbuf,"fuxiath12k=7, recipe defaults on, running stage 2; stages built are 1, 2 and 4"));
+    assert(strstr(logbuf,"fuxiath12k=7, recipe defaults on, running stage 2; stages built are 1, 2, 4 and 5"));
     const struct {const char *name;int v;} numbers[]={{"fuxiwlan",1},{"fuxiwlanclk",1},{"fuxiwlanqrtr",5},
         {"fuxiwlanmlo",0x1c1},{"fuxiwlanp18",6},{"fuxiwlankeep",1}};
     for(unsigned i=0;i<6;i++){assert(wl_fa_recipe_arg(numbers[i].name,&number,sizeof(number)) && number==numbers[i].v);}
@@ -208,6 +213,35 @@ int main(void) {
         assert(strstr(logbuf,"FUXI ATH12K: stage 4 done; containment follows"));
     }
     contain_fa();
+    /* And stage 5: the join is in the object too. It is told the name first, and this file says only how long it is. */
+    fa_stage_wanted=5;
+    ssid_arg="open-test-ap";ssids_set=0;
+    boot_fa(0,true);
+    {
+        int e=finish_step();assert(!e && fa_entries==1 && !wl_keep && wl_w11_ok && fa_stops==1);
+        assert(strstr(logbuf,"FUXI ATH12K: hand-off stage 5 chip 0x2"));
+        assert(strstr(logbuf,"FUXI ATH12K: stage 5 done; containment follows"));
+        assert(ssids_set==1 && seen_ssid_length==12 && !memcmp(seen_ssid,"open-test-ap",12));
+        assert(strstr(logbuf,"FUXI ATH12K: fuxiwifissid length 12") && !strstr(logbuf,"open-test-ap"));
+    }
+    contain_fa();
+    ssid_arg=NULL;
+    /* The name: absent, of each edge length, and too long, which is not cut to fit. */
+    {
+        char longest[33],toolong[40];
+        memset(longest,'n',32);longest[32]=0;memset(toolong,'n',39);toolong[39]=0;
+        wl_fa_stage=5;ssids_set=0;loglen=0;logbuf[0]=0;
+        ssid_arg=NULL;wl_fa_ssid_configure();assert(ssids_set==0 && !strstr(logbuf,"fuxiwifissid"));
+        ssid_arg="";wl_fa_ssid_configure();assert(ssids_set==0 && strstr(logbuf,"fuxiwifissid refused"));
+        ssid_arg=toolong;loglen=0;logbuf[0]=0;wl_fa_ssid_configure();assert(ssids_set==0 && strstr(logbuf,"fuxiwifissid refused"));
+        toolong[33]=0;loglen=0;logbuf[0]=0;wl_fa_ssid_configure();assert(ssids_set==0 && strstr(logbuf,"fuxiwifissid refused"));
+        ssid_arg=longest;wl_fa_ssid_configure();assert(ssids_set==1 && seen_ssid_length==32);
+        ssid_arg="x";wl_fa_ssid_configure();assert(ssids_set==2 && seen_ssid_length==1 && seen_ssid[0]=='x');
+        /* Only stage 5 reads it. */
+        wl_fa_stage=4;ssids_set=0;wl_fa_ssid_configure();assert(ssids_set==0);
+        wl_fa_stage=2;wl_fa_ssid_configure();assert(ssids_set==0);
+        wl_fa_stage=0;ssid_arg=NULL;
+    }
     /* The firmware died under stage 4: read once, not asked again by the hand-off's failure, then contained. */
     boot_fa(4,true);loglen=0;logbuf[0]=0;
     assert(finish_step() && fa_entries==1 && fa_stops==1 && !wl_keep && !mode_offs);
@@ -282,7 +316,7 @@ int main(void) {
         uint8_t q[]={4,0,0,0x3e,0,7,0,0x10,4,0,1,2,3,4};
         assert(!wl_qmi_w12(q,sizeof(q)) && strstr(logbuf,"msg 0x3e unknown TLV 0x10 bytes 4"));
     }
-    puts("ATH12K hand-off: recipe defaults, stages 1, 2 and 4 and what else runs 2, station address, CAP data, pool map, exact INI/CFG/MODE, ath12k tables, mode off, fa_stop before containment, RDDM once on failure, pool kept, off by default, CAL_DONE size");
+    puts("ATH12K hand-off: recipe defaults, stages 1, 2, 4 and 5 and what else runs 2, the network's name by length, station address, CAP data, pool map, exact INI/CFG/MODE, ath12k tables, mode off, fa_stop before containment, RDDM once on failure, pool kept, off by default, CAL_DONE size");
     return 0;
 }
 '''
@@ -294,8 +328,9 @@ def main():
     preamble = preamble.replace('return 0x12345; }', 'return (uint64_t)sleeps*1000000ull; }')
     assert 'static bool PE_parse_boot_argn(const char *name, void *out, int size) {' in preamble
     preamble = preamble.replace('static bool PE_parse_boot_argn(const char *name, void *out, int size) {',
-                                'static int ath12k_arg;\nstatic const char *mac_arg;\nstatic bool PE_parse_boot_argn(const char *name, void *out, int size) {\n'
+                                'static int ath12k_arg;\nstatic const char *mac_arg;\nstatic const char *ssid_arg;\nstatic bool PE_parse_boot_argn(const char *name, void *out, int size) {\n'
                                 '    if(!strcmp(name,"fuxiwifimac")){if(!mac_arg)return false;strlcpy(out,mac_arg,size);return true;}\n'
+                                '    if(!strcmp(name,"fuxiwifissid")){if(!ssid_arg)return false;strlcpy(out,ssid_arg,size);return true;}\n'
                                 '    if(!strcmp(name,"fuxiath12k")){if(!ath12k_arg)return false;memcpy(out,&ath12k_arg,size);return true;}')
     m6.PREAMBLE = PREAMBLE_HEAD + preamble + PREAMBLE_TAIL
     w15.w14.TESTS = TESTS

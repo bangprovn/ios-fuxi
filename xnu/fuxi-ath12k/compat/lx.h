@@ -23,5 +23,8 @@ void	fa_m4_scan_started(void);		/* fa_hif.c: per-frame HTC lines off from here o
 void	fa_m4_evidence(const char *why);	/* fa_hif.c: the firmware is taken as dead; credits and last commands, events */
 bool	fa_m4_trouble(void);			/* fa_hif.c: has that happened; also looks for a stall or a transport failure */
 void	fa_m4_firmware_dead(void);		/* fa_hif.c: fw_thread only: rings stopped, RDDM forced, once */
+/* Stage 5: the same evidence, and these. */
+int	fa_m5_station(struct ieee80211_hw *hw, bool passive);	/* fa_80211.c: up, scan, join, stay, leave, down; 0 or -errno */
+void	fa_m5_rx_ring(const char *when);	/* fa_hif.c: design R6, buffers reaped against buffers put back, said */
 
 #endif

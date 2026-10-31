@@ -13,8 +13,9 @@ notice are kept in `LICENSE.hackios` and apply to the adapted files and to the c
 | `include/linux/{irq,of,of_reserved_mem,remoteproc,rhashtable}.h` | `include/linux/` | Comments; `of_reserved_mem` answers "none" |
 | `include/machine/pcpu.h`, `include/sys/{cdefs,linker_set}.h` | `include/` | `__GLOBL` dropped; sysinit set dropped |
 | LinuxKPI edits `lx-device-of-node`, `lx-bss-conf-fields`, `lx-reg-rule-psd`, `lx-channel-psd`, `lx-regd-sync-copies` in `tools/ath12k-edits.json` | `patches/` | Same effect, restated as exact-match edits |
-| `src/fa_80211.c` | `src/lx_80211.c` | Radio allocation, regulatory domain, channel arithmetic; for stage 4 the interface and scan of `station_up`, `station_scan`, `station_down`, with a timeout, and firmware-death evidence. Joining is not there yet |
+| `src/fa_80211.c` | `src/lx_80211.c` | Radio allocation, regulatory domain, channel arithmetic; for stage 4 the interface and scan of `station_up`, `station_scan`, `station_down`, with a timeout, and firmware-death evidence. For stage 5 `frame_new`, `frame_send`, `station_state`, `station_leave`, `station_join` with the handshake, keys, ciphers and width selection left out, the driver's per-link callbacks, and bounded waits |
 | `src/fa_bss.h` | `src/lx_80211.c` (`element`, `heard`) | Reduced to a table kept apart from the driver, every length checked, the weakest entry replaced when full, SSID text escaped |
+| `src/fa_join.h` | `src/lx_80211.c` (`management`, `management_received`, `station_abilities`, `request_elements`, `protection`) | Plain C apart from the driver, open networks only (no RSN, no WPA, no key material), the HE element added, answers checked against both addresses |
 
 `os/fuxi_ath12k_os.c`, one directory up, is adapted from hackios `drivers/wifi/hakios.lx.c` (APSL 2.0, like the rest of the kernel tree it joins); its printing, options and thread start were rewritten for this kernel.
 

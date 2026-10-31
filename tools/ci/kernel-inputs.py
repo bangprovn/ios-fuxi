@@ -69,6 +69,12 @@ def main():
             cmdlines["cmdline-ath12k1.txt"] = line + " fuxiath12k=1"
             cmdlines["cmdline-ath12k2.txt"] = line + " fuxiath12k=2"
             cmdlines["cmdline-ath12k4.txt"] = line + " fuxiath12k=4"
+            # Room for the network's name, which the test adds along with fuxicores and is not recorded here:
+            # w-m4 ran without these two diagnostics, so stage 5 drops them. Its own check is below.
+            join = line.replace("sweetsample=backboardd,Preferences,PosterBoard ", "").replace("sweetscan=PosterBoard,Preferences ", "")
+            cmdlines["cmdline-ath12k5.txt"] = join + " fuxiath12k=5"
+            if len((join + " fuxiath12k=5 fuxicores=0x7c fuxiath12kq=0x1b fuxiwifissid=" + "x" * 32).encode()) >= 608:
+                ap.error("cmdline-ath12k5.txt leaves no room for a 32-byte network name")
     else:
         cmdlines = {"cmdline.txt": BASE + " fuxiwlan=1",
                     "cmdline-s22.txt": BASE + " fuxiwlan=22",

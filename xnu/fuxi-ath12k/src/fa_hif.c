@@ -13,9 +13,10 @@
  * through ath12k's own error path. Stage 2 takes the data rings no further: hif_irq_enable and
  * ath12k_core_pdev_create() are after it, and no interface exists, so nothing can transmit or scan.
  * Stage 4 goes on through both, runs one scan from fa_80211.c, and stops at the end of the hardware
- * group's start through the same error path, which then also undoes the data rings.
+ * group's start through the same error path, which then also undoes the data rings. Stage 5 does the same
+ * around a join of one open network.
  *
- * Firmware-death evidence, stage 4 only: every WMI command and event is noted, and a WMI timeout, an HTC
+ * Firmware-death evidence, stages 4 and 5 only: every WMI command and event is noted, and a WMI timeout, an HTC
  * credit stall, a transport failure or a scan that does not end logs the credits and the last of both.
  * It also sets ATH12K_FLAG_CRASH_FLUSH, ath12k's own way of failing all further commands at once. fw_thread
  * then stops the rings and forces RDDM through the existing path, before any MODE off.
@@ -59,9 +60,11 @@ _Static_assert(ATH12K_MAX_SPT_ENTRIES * 8 == ATH12K_PAGE_SIZE, "fuxi-ath12k R2: 
 #define FA_IDLE_AFTER		100		/* quiet rounds before backing off */
 #define FA_WMI_EVENTS_SAID	64		/* of the first ones: which, and how long */
 
-#define FA_STAGE_SCAN		4		/* the only stage that touches the radio's RF */
+#define FA_STAGE_SCAN		4		/* stages 4 and 5 are the only ones that touch the radio's RF */
+#define FA_STAGE_JOIN		5
+#define FA_STAGE_USES_RF(stage)	((stage) == FA_STAGE_SCAN || (stage) == FA_STAGE_JOIN)
 
-/* fuxiath12kq=MASK, stage 4 only, each one idea for hunting a dying firmware (design section 6). */
+/* fuxiath12kq=MASK, stages 4 and 5 only, each one idea for hunting a dying firmware (design section 6). */
 #define FA_KNOB_NO_IDLE_PS	0x01u		/* do not ask for idle power save in ops.start */
 #define FA_KNOB_NO_HW_MODE	0x02u		/* do not send WMI_PDEV_SET_HW_MODE */
 #define FA_KNOB_ONE_CREDIT	0x04u		/* the design's "one credit": not built, its bit kept */
@@ -94,6 +97,7 @@ static struct {
 	unsigned long long credits_gone;	/* since when the WMI endpoint has had none; 0: it has some */
 	struct fa_recent commands[FA_RECENT], events[FA_RECENT];
 	unsigned command_count, event_count, mgmt_count;
+	unsigned rx_head_before;		/* design R6: the refill ring's head before the radio started */
 } hif;
 
 /* ---- registers: pci.c:1150-1242 without wake calls ------------------------------------------------- */
@@ -381,6 +385,42 @@ fa_m4_rx_ring(const char *when)
 	    ring->bufs_max, rings, slots);
 }
 
+/*
+ * Design R6, from stage 5 on. How many entries are free says nothing of a leak on this chip: ath12k_dp_rx_bufs_replenish() fills the
+ * ring once, the firmware moves what it can to the rings of its own, and the ring then reads nearly empty while the firmware
+ * holds every buffer (dp_htt.c: "host fills rx buffer to fw and fw fills to rxbuf ring for each rxdma"). WCN7850 has no
+ * host2rxdma interrupt in its ring mask, so nothing else refills: each buffer reaped is put back, one for one, or it is
+ * lost. So this says what came back against how far the head moved. Reaped is the sum of ath12k's counters for the three
+ * places that reap. All of it is memory, no register, and only reads: these counters are not kept under one lock.
+ */
+void
+fa_m5_rx_ring(const char *when)
+{
+	struct ath12k_base *ab = hif.ab;
+	struct ath12k_dp *dp = ath12k_ab_to_dp(ab);
+	struct hal_srng *srng = &ab->hal.srng_list[dp->rx_refill_buf_ring.refill_buf_ring.ring_id];
+	unsigned entry = srng->entry_size, head, reo = 0, err = dp->device_stats.err_ring_pkts, wbm = 0, free;
+
+	spin_lock_bh(&srng->lock);
+	head = srng->u.src_ring.hp / entry;
+	free = ath12k_hal_srng_src_num_free(ab, srng, true);
+	spin_unlock_bh(&srng->lock);
+	for (int i = 0; i < DP_REO_DST_RING_MAX; i++) {
+		reo += dp->device_stats.reo_rx[i][ab->device_id];
+	}
+	for (int i = 0; i < HAL_WBM_REL_SRC_MODULE_MAX; i++) {
+		wbm += dp->device_stats.rx_wbm_rel_source[i][ab->device_id];
+	}
+	lx_tell("FUXI ATH12K: M5 rx refill %s: put back %u, reaped reo %u err %u wbm %u, ring free %u of %u\n", when,
+	    (head + srng->num_entries - hif.rx_head_before) % srng->num_entries, reo, err, wbm, free, srng->num_entries);
+	for (int i = 0; i < ab->hw_params->num_rxdma_per_pdev && ab->hw_params->rx_mac_buf_ring; i++) {
+		struct hal_srng *mac = &ab->hal.srng_list[dp->rx_mac_buf_ring[i].ring_id];
+
+		lx_tell("FUXI ATH12K: M5 firmware's rx ring %d: head %u tail %u of %u\n", i, *mac->u.src_ring.hp_addr / mac->entry_size,
+		    *mac->u.src_ring.tp_addr / mac->entry_size, mac->num_entries);
+	}
+}
+
 /* The first reason gets the whole account; the others a line. From any thread: nothing here waits. */
 void
 fa_m4_evidence(const char *why)
@@ -517,7 +557,7 @@ fa_scan_on_link_zero(struct ath12k_base *ab)
 void
 fa_wmi_command(struct ath12k_base *ab, u32 id, int result)
 {
-	if (hif.stage != FA_STAGE_SCAN) {
+	if (!FA_STAGE_USES_RF(hif.stage)) {
 		return;
 	}
 	recent_note(hif.commands, &hif.command_count, id, (u32)result);
@@ -534,14 +574,18 @@ bool
 fa_stage_up(struct ath12k_base *ab)
 {
 	struct ath12k *ar = ath12k_ah_to_ar(ath12k_ag_to_ah(ab->ag, 0), 0);
+	struct hal_srng *srng;
 
-	if (hif.stage != FA_STAGE_SCAN) {
+	if (!FA_STAGE_USES_RF(hif.stage)) {
 		return (false);
 	}
 	lx_tell("FUXI ATH12K: M4 firmware services 11d %d eth offload %d reg ext %d\n", test_bit(WMI_TLV_SERVICE_11D_OFFLOAD, ab->wmi_ab.svc_map),
 	    test_bit(WMI_TLV_SERVICE_ETH_OFFLOAD, ab->wmi_ab.svc_map), ath12k_wmi_supports_6ghz_cc_ext(ar));
 	fa_m4_rx_ring("before the scan");
-	hif.stage_error = fa_m4_station(ath12k_ar_to_hw(ar), (hif.knobs & FA_KNOB_PASSIVE) != 0);
+	srng = &ab->hal.srng_list[ath12k_ab_to_dp(ab)->rx_refill_buf_ring.refill_buf_ring.ring_id];
+	hif.rx_head_before = srng->u.src_ring.hp / srng->entry_size;
+	hif.stage_error = hif.stage == FA_STAGE_JOIN ? fa_m5_station(ath12k_ar_to_hw(ar), (hif.knobs & FA_KNOB_PASSIVE) != 0) :
+	    fa_m4_station(ath12k_ar_to_hw(ar), (hif.knobs & FA_KNOB_PASSIVE) != 0);
 	lx_memory_say();
 	fa_hif_quiesce();
 	hif.stage_hit = true;
@@ -554,7 +598,7 @@ fa_wmi_event(u32 id, u32 length)
 {
 	static unsigned said;			/* (one poll thread) */
 
-	if (hif.stage == FA_STAGE_SCAN) {
+	if (FA_STAGE_USES_RF(hif.stage)) {
 		recent_note(hif.events, &hif.event_count, id, length);
 		if (id == WMI_MGMT_RX_EVENTID) {
 			hif.mgmt_count++;	/* one for each frame heard: only counted */
@@ -598,7 +642,7 @@ fa_stage_registered(struct ath12k_base *ab)
 		lx_tell("FUXI ATH12K: M2 not proven: ready event %d init status %u\n", ab->wmi_ready, ab->wlan_init_status);
 	}
 	lx_memory_say();
-	if (hif.stage == FA_STAGE_SCAN) {
+	if (FA_STAGE_USES_RF(hif.stage)) {
 		return (false);			/* it goes on: fa_stage_up() */
 	}
 	fa_hif_quiesce();
@@ -639,7 +683,7 @@ fa_firmware_ready(const struct fa_caps *caps, unsigned stage)
 		/* All one-time at this stage, no data path: what WMI_INIT and the regulatory domain did. */
 		ath12k_debug_mask |= ATH12K_DBG_WMI | ATH12K_DBG_REG | ATH12K_DBG_BOOT;
 	}
-	if (stage == FA_STAGE_SCAN) {
+	if (FA_STAGE_USES_RF(stage)) {
 		/* Vdev and scan steps. ATH12K_DBG_MGMT stays off: it would be a line for each frame heard. */
 		ath12k_debug_mask |= ATH12K_DBG_MAC;
 		hif.knobs = lx_os_option("fuxiath12kq");

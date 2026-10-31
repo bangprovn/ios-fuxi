@@ -275,6 +275,12 @@ def ci_plumbing_adds_one_profile(tmp):
     # The way stage 4 is booted: the file's line plus the core mask, with every knob at its longest. Limit: tools/ci/kernel-inputs.py.
     line = (tmp / 'metal4wifi/cmdline-ath12k4.txt').read_text().rstrip('\n')
     assert len((line + ' fuxicores=0x7c fuxiath12kq=0x1b').encode()) < 608
+    # Stage 5 has no name in its file: the test adds it. The longest name, the core mask, every knob and an address still fit.
+    assert not (tmp / 'metal4/cmdline-ath12k5.txt').exists()
+    line = (tmp / 'metal4wifi/cmdline-ath12k5.txt').read_text().rstrip('\n')
+    assert line.endswith(' fuxiath12k=5') and 'fuxiwifissid' not in line and 'sweetsample' not in line and 'sweetscan' not in line
+    longest = line + ' fuxicores=0x7c fuxiath12kq=0x1b fuxiwifimac=02:46:55:58:49:01 fuxiwifissid=' + 'x' * 32
+    assert len(longest.encode()) < 608, len(longest.encode())
 
 
 OS_STUBS = {
@@ -406,6 +412,9 @@ FAKE_HEADERS = {
 #define roundup2(x, y) (((x) + ((y) - 1)) & ~((__typeof__(x))(y) - 1))
 #endif
 typedef uint8_t u8;
+typedef uint16_t u16;
+typedef uint32_t u32;
+typedef uint64_t u64;
 struct list_head { struct list_head *next, *prev; };
 static inline void INIT_LIST_HEAD(struct list_head *h) { h->next = h->prev = h; }
 static inline bool list_empty(const struct list_head *h) { return h->next == h; }
@@ -418,8 +427,18 @@ static inline void list_del_init(struct list_head *n) { n->prev->next = n->next;
 static inline bool is_zero_ether_addr(const u8 *a) { return !(a[0] | a[1] | a[2] | a[3] | a[4] | a[5]); }
 """,
     'linux/skbuff.h': r"""#pragma once
-struct sk_buff { uint8_t cb[48]; uint8_t *data; unsigned len; };
-static inline void dev_kfree_skb_any(struct sk_buff *s) { free(s); }
+struct sk_buff { uint8_t cb[48]; uint8_t *data; unsigned len; uint8_t *head; };
+extern int fail_skb;
+static inline void dev_kfree_skb_any(struct sk_buff *s) { free(s->head); free(s); }
+static inline struct sk_buff *dev_alloc_skb(unsigned n) {
+    if (fail_skb) return NULL;
+    struct sk_buff *s = calloc(1, sizeof(*s));
+    s->head = s->data = malloc(n);
+    return s;
+}
+static inline void skb_reserve(struct sk_buff *s, unsigned n) { s->data += n; }
+static inline uint8_t *skb_put(struct sk_buff *s, unsigned n) { uint8_t *at = s->data + s->len; s->len += n; return at; }
+static inline void skb_trim(struct sk_buff *s, unsigned n) { assert(n <= s->len); s->len = n; }
 """,
     'linux/slab.h': r"""#pragma once
 #define GFP_KERNEL 0
@@ -454,11 +473,28 @@ struct linuxkpi_ieee80211_channel {
     signed char psd; enum nl80211_band band; uint32_t center_freq, flags, orig_flags; int max_power, max_reg_power, max_antenna_gain, orig_mpwr;
 };
 struct ieee80211_rate { int bitrate; };
-struct ieee80211_sband_iftype_data { struct { bool has_he; } he_cap; struct { bool has_eht; } eht_cap; };
+enum nl80211_chan_width { NL80211_CHAN_WIDTH_20 = 1 };
+struct cfg80211_chan_def { struct linuxkpi_ieee80211_channel *chan; enum nl80211_chan_width width; uint32_t center_freq1; };
+struct ieee80211_sta_ht_cap { bool ht_supported; uint8_t ampdu_density, ampdu_factor; uint16_t cap; uint8_t mcs[16]; };
+struct ieee80211_sta_vht_cap { bool vht_supported; uint32_t cap; uint8_t vht_mcs[8]; };
+struct ieee80211_sta_he_cap {
+    bool has_he; struct { uint8_t mac_cap_info[6], phy_cap_info[11]; } he_cap_elem;
+    struct { uint16_t rx_mcs_80, tx_mcs_80, rx_mcs_160, tx_mcs_160, rx_mcs_80p80, tx_mcs_80p80; } he_mcs_nss_supp;
+    uint8_t ppe_thres[25];
+};
+struct ieee80211_sband_iftype_data { enum nl80211_iftype types_mask; struct ieee80211_sta_he_cap he_cap; struct { bool has_eht; } eht_cap; };
 struct ieee80211_supported_band {
     struct linuxkpi_ieee80211_channel *channels; struct ieee80211_rate *bitrates; struct ieee80211_sband_iftype_data *iftype_data;
     int n_channels, n_bitrates, n_iftype_data; enum nl80211_band band;
+    struct ieee80211_sta_ht_cap ht_cap; struct ieee80211_sta_vht_cap vht_cap;
 };
+static inline const struct ieee80211_sta_he_cap *
+ieee80211_get_he_iftype_cap(const struct ieee80211_supported_band *band, enum nl80211_iftype type) {
+    for (int i = 0; i < band->n_iftype_data; i++) {
+        if (band->iftype_data[i].types_mask == type) return &band->iftype_data[i].he_cap;
+    }
+    return NULL;
+}
 struct ieee80211_reg_rule {
     uint32_t flags; signed char psd;
     struct { int start_freq_khz, end_freq_khz; } freq_range;
@@ -491,16 +527,40 @@ struct cfg80211_scan_request {
 #include <linux/workqueue.h>
 #define D80211_TODO 1
 struct ieee80211_vif; struct ieee80211_sta; struct ieee80211_txq; struct ieee80211_chanctx_conf; struct napi_struct;
-struct ieee80211_hw { struct wiphy *wiphy; void *priv; size_t vif_data_size; unsigned long flags; };
+struct ieee80211_hw { struct wiphy *wiphy; void *priv; size_t vif_data_size, sta_data_size, chanctx_data_size; unsigned long flags; struct { uint32_t listen_interval; } conf; };
+enum ieee80211_sta_state { IEEE80211_STA_NOTEXIST, IEEE80211_STA_NONE, IEEE80211_STA_AUTH, IEEE80211_STA_ASSOC, IEEE80211_STA_AUTHORIZED };
+enum { IEEE80211_STA_RX_BW_20 = 1 }; enum { IEEE80211_SMPS_OFF = 1 };
+enum { IEEE80211_AC_VO, IEEE80211_AC_VI, IEEE80211_AC_BE, IEEE80211_AC_BK };
+enum { BSS_CHANGED_ASSOC = 1, BSS_CHANGED_ERP_PREAMBLE = 8, BSS_CHANGED_ERP_SLOT = 16, BSS_CHANGED_BASIC_RATES = 64, BSS_CHANGED_BEACON_INT = 128,
+       BSS_CHANGED_BSSID = 256, BSS_CHANGED_QOS = 512, BSS_CHANGED_BEACON_INFO = 1024 };
+enum { IEEE80211_TX_STAT_ACK = 2 };
+struct ieee80211_chanctx_conf { struct cfg80211_chan_def def, min_def; uint8_t rx_chains_dynamic, rx_chains_static; uint8_t drv_priv[0] __attribute__((aligned(64))); };
+struct ieee80211_tx_info { uint32_t flags; enum nl80211_band band; struct { struct ieee80211_vif *vif; } control; };
+#define IEEE80211_SKB_CB(s) ((struct ieee80211_tx_info *)((s)->cb))
+struct ieee80211_tx_control { struct ieee80211_sta *sta; };
+struct ieee80211_tx_queue_params { uint16_t cw_min, cw_max, txop; uint8_t aifs; int acm; };
+struct ieee80211_link_sta {
+    struct ieee80211_sta *sta; uint8_t addr[ETH_ALEN]; uint32_t supp_rates[NUM_NL80211_BANDS]; struct ieee80211_sta_ht_cap ht_cap;
+    struct ieee80211_sta_vht_cap vht_cap; struct ieee80211_sta_he_cap he_cap; uint8_t rx_nss; int bandwidth, smps_mode;
+};
+struct ieee80211_sta {
+    uint8_t addr[ETH_ALEN]; uint16_t aid; bool wme; struct ieee80211_link_sta deflink; struct ieee80211_link_sta *link[15];
+    uint8_t drv_priv[0] __attribute__((aligned(64)));
+};
 enum { IEEE80211_HW_SUPPORTS_TX_ENCAP_OFFLOAD = 1, IEEE80211_HW_SUPPORTS_RX_DECAP_OFFLOAD = 2 };
 #define ieee80211_hw_check(hw, flag) (((hw)->flags & IEEE80211_HW_ ## flag) != 0)
 enum { IEEE80211_OFFLOAD_ENCAP_ENABLED = 1, IEEE80211_OFFLOAD_DECAP_ENABLED = 2 };
 enum { RX_FLAG_NO_SIGNAL_VAL = 1 << 19, RX_FLAG_8023 = 1 << 27 };
 struct ieee80211_rx_status { uint32_t flag; uint16_t freq; int8_t signal; };
 #define IEEE80211_SKB_RXCB(s) ((struct ieee80211_rx_status *)((s)->cb))
-struct ieee80211_bss_conf { struct ieee80211_vif *vif; const uint8_t *bssid; uint8_t addr[ETH_ALEN]; };
+struct ieee80211_bss_conf {
+    struct ieee80211_vif *vif; const uint8_t *bssid; uint8_t addr[ETH_ALEN]; struct { struct cfg80211_chan_def oper; } chanreq;
+    struct ieee80211_chanctx_conf *chanctx_conf; uint16_t beacon_int, ht_operation_mode; int assoc_capability; uint8_t dtim_period;
+    bool use_short_slot, use_short_preamble, qos, he_support; uint32_t basic_rates; struct { uint32_t params; } he_oper;
+};
+struct ieee80211_vif_cfg { uint16_t aid; bool assoc; size_t ssid_len; uint8_t ssid[32]; uint8_t ap_addr[ETH_ALEN]; };
 struct ieee80211_vif {
-    enum nl80211_iftype type; int offload_flags; uint8_t addr[ETH_ALEN]; struct ieee80211_bss_conf bss_conf; struct ieee80211_bss_conf *link_conf[15];
+    enum nl80211_iftype type; int offload_flags; uint8_t addr[ETH_ALEN]; struct ieee80211_vif_cfg cfg; struct ieee80211_bss_conf bss_conf; struct ieee80211_bss_conf *link_conf[15];
     uint8_t drv_priv[0] __attribute__((aligned(64)));
 };
 struct ieee80211_scan_request { struct { int x; } ies; struct cfg80211_scan_request req; };
@@ -508,6 +568,15 @@ struct ieee80211_ops {
     int (*start)(struct ieee80211_hw *); void (*stop)(struct ieee80211_hw *, bool);
     int (*add_interface)(struct ieee80211_hw *, struct ieee80211_vif *); void (*remove_interface)(struct ieee80211_hw *, struct ieee80211_vif *);
     int (*hw_scan)(struct ieee80211_hw *, struct ieee80211_vif *, struct ieee80211_scan_request *); void (*cancel_hw_scan)(struct ieee80211_hw *, struct ieee80211_vif *);
+    int (*add_chanctx)(struct ieee80211_hw *, struct ieee80211_chanctx_conf *); void (*remove_chanctx)(struct ieee80211_hw *, struct ieee80211_chanctx_conf *);
+    int (*assign_vif_chanctx)(struct ieee80211_hw *, struct ieee80211_vif *, struct ieee80211_bss_conf *, struct ieee80211_chanctx_conf *);
+    void (*unassign_vif_chanctx)(struct ieee80211_hw *, struct ieee80211_vif *, struct ieee80211_bss_conf *, struct ieee80211_chanctx_conf *);
+    int (*sta_state)(struct ieee80211_hw *, struct ieee80211_vif *, struct ieee80211_sta *, enum ieee80211_sta_state, enum ieee80211_sta_state);
+    void (*link_info_changed)(struct ieee80211_hw *, struct ieee80211_vif *, struct ieee80211_bss_conf *, u64);
+    void (*vif_cfg_changed)(struct ieee80211_hw *, struct ieee80211_vif *, u64);
+    int (*conf_tx)(struct ieee80211_hw *, struct ieee80211_vif *, u32, u16, const struct ieee80211_tx_queue_params *);
+    void (*flush)(struct ieee80211_hw *, struct ieee80211_vif *, u32, bool);
+    void (*tx)(struct ieee80211_hw *, struct ieee80211_tx_control *, struct sk_buff *);
 };
 struct ieee80211_tx_status { struct sk_buff *skb; };
 enum ieee80211_iface_iter { IEEE80211_IFACE_ITER_NORMAL };
@@ -516,7 +585,7 @@ enum ieee80211_iface_iter { IEEE80211_IFACE_ITER_NORMAL };
 
 FA_80211_DRIVER = r"""
 #include "fa_80211.c"
-int fail_workqueue, queues_destroyed;
+int fail_workqueue, queues_destroyed, fail_skb;
 static char said[8192];
 static unsigned locks, notified, notified_initiator, rddm;
 static unsigned long long now = 1;
@@ -532,6 +601,7 @@ void fuxi_ath12k_force_rddm(void) { rddm++; }
 /* Stage 4 has its own driver below: nothing here reaches these. */
 void fa_m4_credits(const char *w) { abort(); }
 void fa_m4_rx_ring(const char *w) { abort(); }
+void fa_m5_rx_ring(const char *w) { abort(); }
 void fa_m4_scan_started(void) { abort(); }
 void fa_m4_evidence(const char *w) { abort(); }
 bool fa_m4_trouble(void) { abort(); }
@@ -570,6 +640,7 @@ int main(void) {
     five[0] = (struct linuxkpi_ieee80211_channel){ .center_freq = 5180, .max_power = 30 };
     five[1] = (struct linuxkpi_ieee80211_channel){ .center_freq = 5500, .max_power = 30 };
     b2 = (struct ieee80211_supported_band){ .channels = two, .n_channels = 3, .bitrates = rates, .n_bitrates = 1, .iftype_data = data, .n_iftype_data = 1 };
+    data[0].types_mask = NL80211_IFTYPE_STATION;
     b5 = (struct ieee80211_supported_band){ .channels = five, .n_channels = 2, .bitrates = rates, .n_bitrates = 1, .band = NL80211_BAND_2GHZ };
     w->bands[NL80211_BAND_5GHZ] = &b5;
     data[0].he_cap.has_he = true; data[0].eht_cap.has_eht = true;
@@ -648,7 +719,7 @@ def fa_80211_runs_on_fake_headers(tmp):
 
 STATION_DRIVER = r"""
 #include "fa_80211.c"
-int fail_workqueue, queues_destroyed;
+int fail_workqueue, queues_destroyed, fail_skb;
 static char said[65536];
 static unsigned locks, rddm;
 static char calls[256];
@@ -672,6 +743,7 @@ void fuxi_ath12k_force_rddm(void) { abort(); }
 #define NOTE(x) (strcat(calls, x), strcat(calls, ","))
 void fa_m4_credits(const char *w) { assert(!locks); }
 void fa_m4_rx_ring(const char *w) { assert(!locks); NOTE("ring"); }
+void fa_m5_rx_ring(const char *w) { abort(); }
 void fa_m4_scan_started(void) { NOTE("started"); }
 void fa_m4_evidence(const char *w) { assert(!locks); if (!evidence_count++) strcpy(first_evidence, w); }
 bool fa_m4_trouble(void) { assert(!locks); if (trouble_after >= 0 && (int)trouble_asks++ >= trouble_after) fa_m4_evidence("forced"); return evidence_count != 0; }
@@ -903,6 +975,7 @@ int main(void) {
             linuxkpi_ieee80211_rx(the_hw, skb_of(name, (unsigned)n, (uint8_t)(i + 10), 0x80, 2412, -30 - (int)i, 0), NULL, NULL, NULL);
         }
         radio->collecting = false;
+        radio->say_names = true;
         say_heard(radio);
         unsigned lines = 0;
         for (const char *at = said; (at = strstr(at, "M4 bss 2412")) != NULL; at++) lines++;
@@ -934,6 +1007,938 @@ def station_runs_on_fake_headers(tmp):
                     f'-I{tmp / "fake"}', f'-I{own / "src"}', str(tmp / 'driver.c'), '-o', str(program)], check=True)
     subprocess.run([str(program)], check=True)
 
+
+
+JOIN_DRIVER = r"""
+#include <signal.h>
+#include "fa_80211.c"
+int fail_workqueue, queues_destroyed, fail_skb;
+static char said[65536];
+static unsigned locks, rddm;
+static char calls[1024];
+static unsigned long long now = 1;
+static int trouble_after = -1;
+static unsigned trouble_asks, evidence_count, r6_count;
+static char first_evidence[96];
+void lx_tell(const char *f, ...) { va_list l; va_start(l, f); vsnprintf(said + strlen(said), sizeof(said) - strlen(said), f, l); va_end(l); }
+long lx_stub(const char *n) { return 0; }
+void lx_os_lock(void) { assert(!locks); locks++; }
+void lx_os_unlock(void) { assert(locks); locks--; }
+void lx_os_sleep(const void *a, unsigned long long n) { assert(locks); now += n; }
+void lx_os_wakeup(const void *a) {}
+unsigned long long lx_os_nanoseconds(void) { return now; }
+void fuxi_ath12k_force_rddm(void) { abort(); }
+#define NOTE(x) (strcat(calls, x), strcat(calls, ","))
+void fa_m4_credits(const char *w) { assert(!locks); }
+void fa_m4_rx_ring(const char *w) { assert(!locks); }
+void fa_m5_rx_ring(const char *w) { assert(!locks); r6_count++; }
+void fa_m4_scan_started(void) {}
+void fa_m4_evidence(const char *w) { assert(!locks); if (!evidence_count++) strcpy(first_evidence, w); }
+static void (*tick)(void);
+bool fa_m4_trouble(void) {
+    assert(!locks);
+    if (tick != NULL) tick();
+    if (trouble_after >= 0 && (int)trouble_asks++ >= trouble_after) fa_m4_evidence("forced");
+    return evidence_count != 0;
+}
+void fa_m4_firmware_dead(void) { assert(!locks); if (!rddm++) NOTE("rddm"); }
+
+static const uint8_t AP[6] = {0x02, 0xa1, 0xb2, 0xc3, 0xd4, 0x55}, OTHER[6] = {0x02, 0xa1, 0xb2, 0xc3, 0xd4, 0x66};
+static const uint8_t OWN[6] = {2, 0x46, 0x55, 0x58, 0x49, 1};
+static const char NAME[] = "fuxi-test-net";
+static struct ieee80211_hw *the_hw;
+static struct napi_struct { int x; } a_napi;
+
+static void deliver(const uint8_t *bytes, unsigned length, unsigned freq, int signal, unsigned flag, bool napi) {
+    struct sk_buff *s = calloc(1, sizeof(*s));
+    s->head = s->data = malloc(length ? length : 1); /* of exactly its size: the sanitizer sees a read past its end */
+    memcpy(s->data, bytes, length); s->len = length;
+    struct ieee80211_rx_status *st = IEEE80211_SKB_RXCB(s);
+    st->freq = (uint16_t)freq; st->signal = (int8_t)signal; st->flag = flag;
+    linuxkpi_ieee80211_rx(the_hw, s, NULL, napi ? (void *)&a_napi : NULL, NULL);
+}
+/* A beacon or probe response: its elements are the name's, then those given. */
+static void hear(uint8_t kind, const uint8_t *bssid, const char *name, unsigned cap, const uint8_t *more, unsigned more_length, unsigned freq, int signal) {
+    uint8_t f[1600] = {0};
+    unsigned n = name ? (unsigned)strlen(name) : 0, at = 36;
+    f[0] = kind; memset(f + 4, 0xff, 6); memcpy(f + 10, bssid, 6); memcpy(f + 16, bssid, 6);
+    f[32] = 100; f[34] = (uint8_t)cap; f[35] = (uint8_t)(cap >> 8);
+    f[at++] = 0; f[at++] = (uint8_t)n; memcpy(f + at, name ? name : "", n); at += n;
+    memcpy(f + at, more, more_length); at += more_length;
+    deliver(f, at, freq, signal, 0, false);
+}
+static unsigned answer_frame(uint8_t *f, uint8_t kind, const uint8_t *from, const uint8_t *to) {
+    memset(f, 0, 24); f[0] = kind; memcpy(f + 4, to, 6); memcpy(f + 10, from, 6); memcpy(f + 16, from, 6);
+    return 24;
+}
+static void give_auth(const uint8_t *from, const uint8_t *to, unsigned algorithm, unsigned step, unsigned status) {
+    uint8_t f[64]; unsigned at = answer_frame(f, FA_KIND_AUTH, from, to);
+    f[at] = (uint8_t)algorithm; f[at + 1] = 0; f[at + 2] = (uint8_t)step; f[at + 3] = 0; f[at + 4] = (uint8_t)status; f[at + 5] = (uint8_t)(status >> 8);
+    deliver(f, at + 6, 2412, -40, 0, false);
+}
+static void give_assoc(const uint8_t *from, unsigned status, unsigned aid, const uint8_t *elements, unsigned length) {
+    uint8_t f[1024]; unsigned at = answer_frame(f, FA_KIND_ASSOC_RESPONSE, from, OWN);
+    f[at] = 1; f[at + 1] = 0; f[at + 2] = (uint8_t)status; f[at + 3] = (uint8_t)(status >> 8); f[at + 4] = (uint8_t)aid; f[at + 5] = (uint8_t)(aid >> 8);
+    memcpy(f + at + 6, elements, length);
+    deliver(f, at + 6 + length, 2412, -40, 0, false);
+}
+static void give_door(uint8_t kind, unsigned reason) {
+    uint8_t f[64]; unsigned at = answer_frame(f, kind, AP, OWN);
+    f[at] = (uint8_t)reason; f[at + 1] = 0;
+    deliver(f, at + 2, 2412, -40, 0, false);
+}
+static void give_data(const uint8_t *from, uint8_t kind, bool ethernet) {
+    uint8_t f[64] = {0};
+    f[0] = kind; f[1] = 2; memset(f + 4, 0xff, 6); memcpy(f + 10, from, 6); memcpy(f + 16, from, 6);
+    deliver(f, 40, 2412, 0, RX_FLAG_NO_SIGNAL_VAL | (ethernet ? RX_FLAG_8023 : 0), true);
+}
+
+static const uint8_t OPEN_HT[] = { 1, 8, 0x82, 0x84, 0x8b, 0x96, 12, 18, 24, 36, 50, 4, 48, 72, 96, 108, 3, 1, 6,
+    45, 26, 0x7f, 0x02, 0x1b,
+    0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	/* the MCS set */
+    0, 0, 0, 0, 0, 0, 0,					/* extended, beamforming, selection */
+    61, 22, 6, 0, 4, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    221, 7, 0x00, 0x50, 0xf2, 2, 0, 1, 0 };
+static const uint8_t WMM_PARAM[] = { 221, 24, 0x00, 0x50, 0xf2, 2, 1, 1, 0, 0, 3, 0xa4, 0, 0, 0x27, 0xa4, 0, 0, 0x42, 0x43, 94, 0, 0x62, 0x32, 47, 0 };
+
+static struct {
+    const uint8_t *hear_elements; unsigned hear_length, cap;
+    const char *heard_name;
+    bool not_heard, silent_auth, silent_assoc, no_complete, bad_auth_first, bad_assoc_first;
+    unsigned auth_status, assoc_status, aid, frequency;
+    const uint8_t *response; unsigned response_length;
+    int fail_add, fail_assign, fail_sta_to;
+    void (*also_heard)(void);
+    bool hidden_beacon;
+} ap;
+static unsigned auth_tries, assoc_tries, deauths, scans;
+static uint8_t last_assoc[1024], last_deauth[64], last_auth[64];
+static unsigned last_assoc_length;
+static uint8_t seen_ssid[33]; static int seen_ssid_length;
+static uint64_t first_link_change, second_link_change;
+static unsigned link_changes;
+
+static int op_start(struct ieee80211_hw *hw) { assert(hw->wiphy->mtx.locked); NOTE("start"); return 0; }
+static void op_stop(struct ieee80211_hw *hw, bool s) { assert(hw->wiphy->mtx.locked); NOTE("stop"); }
+static int op_add(struct ieee80211_hw *hw, struct ieee80211_vif *v) { NOTE("add"); return 0; }
+static void op_remove(struct ieee80211_hw *hw, struct ieee80211_vif *v) { assert(hw->wiphy->mtx.locked && v->bss_conf.chanctx_conf == NULL); NOTE("remove"); }
+static void op_cancel(struct ieee80211_hw *hw, struct ieee80211_vif *v) { NOTE("cancel"); }
+static int op_scan(struct ieee80211_hw *hw, struct ieee80211_vif *v, struct ieee80211_scan_request *r) {
+    NOTE("scan"); scans++;
+    seen_ssid_length = r->req.n_ssids ? r->req.ssids[0].ssid_len : -1;
+    if (r->req.n_ssids) memcpy(seen_ssid, r->req.ssids[0].ssid, r->req.ssids[0].ssid_len);
+    /* Neighbours, the wanted name as a prefix of another and the other way round, at any strength. */
+    hear(FA_KIND_BEACON, OTHER, "fuxi-test-net2", 0, OPEN_HT, sizeof(OPEN_HT), 2437, -10);
+    hear(FA_KIND_BEACON, OTHER, "fuxi-test-ne", 0x10, OPEN_HT, sizeof(OPEN_HT), 2437, -10);
+    if (!ap.not_heard) {
+        if (ap.hidden_beacon) hear(FA_KIND_BEACON, AP, "", ap.cap, ap.hear_elements, ap.hear_length, ap.frequency, -40);
+        hear(ap.hidden_beacon ? FA_KIND_PROBE_RESPONSE : FA_KIND_BEACON, AP, ap.heard_name ? ap.heard_name : NAME, ap.cap, ap.hear_elements, ap.hear_length, ap.frequency, -40);
+        if (ap.also_heard != NULL) ap.also_heard();
+    }
+    struct cfg80211_scan_info i = { .aborted = false };
+    linuxkpi_ieee80211_scan_completed(hw, &i);
+    return 0;
+}
+static int op_add_chanctx(struct ieee80211_hw *hw, struct ieee80211_chanctx_conf *c) {
+    assert(hw->wiphy->mtx.locked && c->def.width == NL80211_CHAN_WIDTH_20 && c->def.center_freq1 == c->def.chan->center_freq);
+    NOTE("add_chanctx"); return ap.fail_add;
+}
+static void op_remove_chanctx(struct ieee80211_hw *hw, struct ieee80211_chanctx_conf *c) { assert(hw->wiphy->mtx.locked); NOTE("remove_chanctx"); }
+static int op_assign(struct ieee80211_hw *hw, struct ieee80211_vif *v, struct ieee80211_bss_conf *l, struct ieee80211_chanctx_conf *c) {
+    assert(hw->wiphy->mtx.locked && l == &v->bss_conf && l->chanctx_conf == c);
+    NOTE("assign"); return ap.fail_assign;
+}
+static void op_unassign(struct ieee80211_hw *hw, struct ieee80211_vif *v, struct ieee80211_bss_conf *l, struct ieee80211_chanctx_conf *c) { assert(hw->wiphy->mtx.locked); NOTE("unassign"); }
+static int op_sta_state(struct ieee80211_hw *hw, struct ieee80211_vif *v, struct ieee80211_sta *s, enum ieee80211_sta_state from, enum ieee80211_sta_state to) {
+    char what[16];
+    assert(hw->wiphy->mtx.locked && s == radio_of(hw)->sta && !memcmp(s->addr, AP, 6) && s->link[0] == &s->deflink);
+    assert(from + 1 == (int)to || from == (int)to + 1);
+    /* The way it finds its station: every state it is in, as the driver asks (mac.c, ath12k_bss_assoc()). */
+    assert(linuxkpi_ieee80211_find_sta(v, AP) == s && linuxkpi_ieee80211_find_sta(v, OTHER) == NULL);
+    snprintf(what, sizeof(what), "sta%d%d", from, to); NOTE(what);
+    return ap.fail_sta_to != 0 && ap.fail_sta_to == (int)to && from < to ? -110 : 0;
+}
+static uint32_t he_params_seen;
+static void op_link(struct ieee80211_hw *hw, struct ieee80211_vif *v, struct ieee80211_bss_conf *l, u64 what) {
+    assert(hw->wiphy->mtx.locked && l == &v->bss_conf);
+    he_params_seen = l->he_oper.params;
+    NOTE("link"); *(link_changes++ == 0 ? &first_link_change : &second_link_change) = what;
+    if (what & BSS_CHANGED_BSSID) assert(!memcmp(l->bssid, AP, 6));
+}
+static void op_vif(struct ieee80211_hw *hw, struct ieee80211_vif *v, u64 what) {
+    assert(hw->wiphy->mtx.locked && what == BSS_CHANGED_ASSOC);
+    NOTE(v->cfg.assoc ? "assoc_told" : "disassoc_told");
+    if (v->cfg.assoc) assert(!memcmp(v->cfg.ap_addr, AP, 6) && linuxkpi_ieee80211_find_sta(v, v->cfg.ap_addr) != NULL && v->cfg.aid == ap.aid);
+}
+static int op_conf_tx(struct ieee80211_hw *hw, struct ieee80211_vif *v, u32 link, u16 ac, const struct ieee80211_tx_queue_params *p) { assert(hw->wiphy->mtx.locked); NOTE("conf_tx"); return 0; }
+static void op_flush(struct ieee80211_hw *hw, struct ieee80211_vif *v, u32 q, bool drop) { assert(hw->wiphy->mtx.locked && !drop); NOTE("flush"); }
+static void op_tx(struct ieee80211_hw *hw, struct ieee80211_tx_control *c, struct sk_buff *skb) {
+    assert(!locks && !hw->wiphy->mtx.locked && c->sta == radio_of(hw)->sta);
+    assert(IEEE80211_SKB_CB(skb)->control.vif == radio_of(hw)->vif && skb->len >= 24);
+    uint8_t kind = skb->data[0];
+    assert(!memcmp(skb->data + 4, AP, 6) && !memcmp(skb->data + 10, OWN, 6) && !memcmp(skb->data + 16, AP, 6));
+    if (kind == FA_KIND_AUTH) {
+        NOTE("auth"); auth_tries++; assert(skb->len == FA_AUTH_LENGTH); memcpy(last_auth, skb->data, skb->len);
+    } else if (kind == FA_KIND_ASSOC_REQUEST) {
+        NOTE("assoc"); assoc_tries++; memcpy(last_assoc, skb->data, skb->len); last_assoc_length = skb->len;
+    } else if (kind == FA_KIND_DEAUTH) {
+        NOTE("deauth"); deauths++; assert(skb->len == FA_DEAUTH_LENGTH); memcpy(last_deauth, skb->data, skb->len);
+    } else {
+        abort();
+    }
+    if (ap.no_complete) {
+        dev_kfree_skb_any(skb);
+    } else {
+        IEEE80211_SKB_CB(skb)->flags |= IEEE80211_TX_STAT_ACK;
+        linuxkpi_ieee80211_tx_status(hw, skb);
+    }
+    if (kind == FA_KIND_AUTH && !ap.silent_auth) {
+        if (ap.bad_auth_first) {
+            /* Each of these moves nothing: another BSSID, another station, a step or algorithm that is not the answer, a stale answer to the other frame. */
+            give_auth(OTHER, OWN, 0, 2, 0);
+            give_auth(AP, OTHER, 0, 2, 0);
+            give_auth(AP, OWN, 0, 1, 0);
+            give_auth(AP, OWN, 1, 2, 0);
+            give_assoc(AP, 0, 7, OPEN_HT, 0);
+            uint8_t f[64]; unsigned at = answer_frame(f, FA_KIND_AUTH, AP, OWN);
+            memset(f + at, 0, 6); f[at + 2] = 2;
+            deliver(f, at + 5, 2412, -40, 0, false);	/* one byte short */
+            f[1] = 0x40; deliver(f, at + 6, 2412, -40, 0, false);	/* protected */
+            f[1] = 0;
+            assert(radio_of(hw)->answer == FA_ANSWER_NONE);
+        }
+        give_auth(AP, OWN, 0, 2, ap.auth_status);
+    } else if (kind == FA_KIND_ASSOC_REQUEST && !ap.silent_assoc) {
+        if (ap.bad_assoc_first && assoc_tries == 1) {
+            give_assoc(AP, 0, 0, ap.response, 0);	/* no association number */
+            give_assoc(AP, 0, FA_AID_MOST + 1, ap.response, 0);
+            give_assoc(OTHER, 0, 9, ap.response, 0);
+            assert(radio_of(hw)->answer == FA_ANSWER_NONE);
+            return;
+        }
+        give_assoc(AP, ap.assoc_status, ap.aid | 0xc000, ap.response, ap.response_length);
+    }
+}
+static const struct ieee80211_ops ops = { .start = op_start, .stop = op_stop, .add_interface = op_add, .remove_interface = op_remove,
+    .hw_scan = op_scan, .cancel_hw_scan = op_cancel, .add_chanctx = op_add_chanctx, .remove_chanctx = op_remove_chanctx,
+    .assign_vif_chanctx = op_assign, .unassign_vif_chanctx = op_unassign, .sta_state = op_sta_state, .link_info_changed = op_link,
+    .vif_cfg_changed = op_vif, .conf_tx = op_conf_tx, .flush = op_flush, .tx = op_tx };
+
+static struct linuxkpi_ieee80211_channel two[3], five[3];
+static struct ieee80211_rate rates[12];
+static struct ieee80211_sband_iftype_data he_data;
+static struct ieee80211_supported_band b2, b5;
+#define SAID(text) (strstr(said, text) != NULL)
+
+static void fresh(void) {
+    memset(&ap, 0, sizeof(ap));
+    ap.hear_elements = OPEN_HT; ap.hear_length = sizeof(OPEN_HT); ap.aid = 7; ap.frequency = 2437; ap.cap = FA_CAP_ESS | FA_CAP_SHORT_SLOT;
+    ap.response = WMM_PARAM; ap.response_length = sizeof(WMM_PARAM);
+    trouble_after = -1; trouble_asks = evidence_count = rddm = r6_count = 0; first_evidence[0] = 0; said[0] = 0; calls[0] = 0;
+    auth_tries = assoc_tries = deauths = scans = link_changes = 0; first_link_change = second_link_change = 0;
+    memset(last_deauth, 0, sizeof(last_deauth)); tick = NULL; seen_ssid_length = -2;
+    the_hw = linuxkpi_ieee80211_alloc_hw(256, &ops);
+    the_hw->vif_data_size = 512; the_hw->sta_data_size = 256; the_hw->chanctx_data_size = 128;
+    struct wiphy *w = the_hw->wiphy;
+    memcpy(w->perm_addr, OWN, 6);
+    memset(two, 0, sizeof(two)); memset(five, 0, sizeof(five));
+    two[0].center_freq = 2412; two[1].center_freq = 2437; two[2].center_freq = 2472; two[2].flags = IEEE80211_CHAN_DISABLED;
+    five[0].center_freq = 5180; five[0].band = NL80211_BAND_5GHZ; five[1].center_freq = 5260; five[1].band = NL80211_BAND_5GHZ; five[1].flags = IEEE80211_CHAN_NO_IR | IEEE80211_CHAN_RADAR;
+    five[2].center_freq = 5500; five[2].band = NL80211_BAND_5GHZ; five[2].flags = IEEE80211_CHAN_DISABLED;
+    five[0].max_power = 20;
+    static const int r[12] = {10, 20, 55, 110, 60, 90, 120, 180, 240, 360, 480, 540};
+    for (int i = 0; i < 12; i++) rates[i].bitrate = r[i];
+    memset(&he_data, 0, sizeof(he_data));
+    he_data.types_mask = NL80211_IFTYPE_STATION; he_data.he_cap.has_he = true;
+    memset(he_data.he_cap.he_cap_elem.mac_cap_info, 0x11, 6);
+    memset(he_data.he_cap.he_cap_elem.phy_cap_info, 0x22, 11);
+    he_data.he_cap.he_cap_elem.phy_cap_info[0] = 0x0c; he_data.he_cap.he_cap_elem.phy_cap_info[6] = 0x80;
+    he_data.he_cap.he_mcs_nss_supp.rx_mcs_80 = 0xfffa; he_data.he_cap.he_mcs_nss_supp.tx_mcs_80 = 0xfffa;
+    b2 = (struct ieee80211_supported_band){ .band = NL80211_BAND_2GHZ, .channels = two, .n_channels = 3, .bitrates = rates, .n_bitrates = 12, .iftype_data = &he_data, .n_iftype_data = 1 };
+    b2.ht_cap.ht_supported = true; b2.ht_cap.cap = 0x0163 | FA_HT_CAP_40 | FA_HT_CAP_SGI_40; b2.ht_cap.ampdu_factor = 3; b2.ht_cap.ampdu_density = 5; b2.ht_cap.mcs[0] = 0xff; b2.ht_cap.mcs[1] = 0xff;
+    b5 = b2; b5.band = NL80211_BAND_5GHZ; b5.channels = five; b5.bitrates = rates + 4; b5.n_bitrates = 8;
+    b5.vht_cap.vht_supported = true; b5.vht_cap.cap = 0x338001b2 | FA_VHT_CAP_WIDTH | FA_VHT_CAP_SGI_160;
+    memset(b5.vht_cap.vht_mcs, 0xfa, 8);
+    w->bands[NL80211_BAND_2GHZ] = &b2; w->bands[NL80211_BAND_5GHZ] = &b5;
+    fa_set_target_ssid((const unsigned char *)NAME, sizeof(NAME) - 1);
+}
+static void done(void) {
+    assert(!locks && !the_hw->wiphy->mtx.locked);
+    struct fa_radio *radio = radio_of(the_hw);
+    assert(radio->chanctx == NULL && radio->sta == NULL && radio->vif == NULL && !radio->started && !radio->joining);
+    linuxkpi_ieee80211_unregister_hw(the_hw);
+    linuxkpi_ieee80211_iffree(the_hw);
+    linuxkpi_wiphy_free(the_hw->wiphy);
+}
+/* Never in any line: the network's name, anybody's, or an address. */
+static void log_is_clean(void) {
+    assert(!SAID(NAME) && !SAID("fuxi-test") && !SAID("M4 bss") && !SAID("a1:b2") && !SAID("a1b2") && !SAID("d4:"));
+}
+static const char *const DOWN_TAIL = "unassign,remove_chanctx,remove,stop,";
+
+/* The stay: what comes while it lasts, one each tick of 100 ms. */
+static unsigned ticks;
+static void stay_frames(void) {
+    if (radio_of(the_hw)->vif == NULL || !radio_of(the_hw)->vif->cfg.assoc || ticks > 100) return;
+    ticks++;
+    if (ticks == 2) { give_data(AP, 0x88, false); give_data(AP, 0x08, false); }	/* QoS data, and data */
+    if (ticks == 3) { give_data(AP, 0x88, true); }				/* Ethernet form */
+    if (ticks == 4) { give_data(AP, 0xc8, false); give_data(AP, 0x48, false); give_data(OTHER, 0x88, false); }	/* null, null, another's */
+    if (ticks == 5) hear(FA_KIND_BEACON, AP, NAME, ap.cap, OPEN_HT, sizeof(OPEN_HT), 2437, -41);
+    if (ticks == 6) hear(FA_KIND_BEACON, OTHER, "other", 0, OPEN_HT, 0, 2437, -11);
+    if (ticks == 7) hear(FA_KIND_BEACON, AP, NULL, ap.cap, OPEN_HT, sizeof(OPEN_HT), 2437, -42);	/* it hides its name now: the same access point */
+}
+static void trouble_in_the_stay(void) { stay_frames(); if (ticks == 5) fa_m4_evidence("died"); }
+static void door_in_the_stay(void) { stay_frames(); if (ticks == 5) { ticks = 200; give_door(FA_KIND_DEAUTH, 8); } }
+static void disassoc_in_the_stay(void) { stay_frames(); if (ticks == 5) { ticks = 200; give_door(FA_KIND_DISASSOC, 4); } }
+static void lost_in_the_stay(void) { stay_frames(); if (ticks == 5) { ticks = 200; linuxkpi_ieee80211_beacon_loss(radio_of(the_hw)->vif); linuxkpi_ieee80211_connection_loss(radio_of(the_hw)->vif); } }
+static const uint8_t RSN_ELEMENT[] = { 48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 2, 0, 0 };
+static void rsn_in_the_stay(void) { stay_frames(); if (ticks == 5) { ticks = 200; hear(FA_KIND_BEACON, AP, NAME, ap.cap, RSN_ELEMENT, sizeof(RSN_ELEMENT), 2437, -41); } }
+static void rsn_sibling(void) { hear(FA_KIND_BEACON, OTHER, NAME, 0, RSN_ELEMENT, sizeof(RSN_ELEMENT), 2412, -90); }
+
+static const uint8_t *find_in_request(unsigned number) { return fa_element(last_assoc + 28, last_assoc_length - 28, number); }
+/* What was said and done, when an assertion stops the run. */
+static void on_abort(int s) { fprintf(stderr, "calls: %s\nsaid:\n%s\n", calls, said); signal(SIGABRT, SIG_DFL); }
+
+int main(void) {
+    signal(SIGABRT, on_abort);
+    /* No name: nothing at all. */
+    fresh(); fa_set_target_ssid(NULL, 0);
+    assert(fa_m5_station(the_hw, false) == 0 && !calls[0] && SAID("M5 not run: no usable fuxiwifissid"));
+    done();
+    fresh(); fa_set_target_ssid((const unsigned char *)"x", 33);
+    assert(fa_m5_station(the_hw, false) == 0 && !calls[0]);
+    done();
+
+    /* The whole way, at 2.4 GHz with HT and WMM: in mac80211's order, the proof, the stay, the deauthentication. */
+    fresh(); ticks = 0; tick = stay_frames;
+    linuxkpi_ieee80211_ifattach(the_hw);
+    {
+        unsigned long long began = now;
+        assert(fa_m5_station(the_hw, false) == 0);
+        assert(now - began >= FA_JOIN_STAY_NS && now - began < FA_JOIN_STAY_NS + FA_REGD_WAIT_NS + 2000000000ull);
+    }
+    assert(!strcmp(calls, "start,add,scan,add_chanctx,assign,link,sta01,auth,sta12,assoc,sta23,sta34,assoc_told,conf_tx,conf_tx,conf_tx,conf_tx,link,"
+                          "deauth,flush,sta43,sta32,sta21,sta10,disassoc_told,unassign,remove_chanctx,remove,stop,"));
+    assert(scans == 1 && seen_ssid_length == (int)sizeof(NAME) - 1 && !memcmp(seen_ssid, NAME, sizeof(NAME) - 1));
+    assert(first_link_change == (BSS_CHANGED_BSSID | BSS_CHANGED_BASIC_RATES | BSS_CHANGED_BEACON_INT));
+    assert(second_link_change == (BSS_CHANGED_BEACON_INT | BSS_CHANGED_BEACON_INFO | BSS_CHANGED_ERP_SLOT | BSS_CHANGED_ERP_PREAMBLE | BSS_CHANGED_QOS));
+    assert(SAID("FUXI ATH12K: M5 target ssid length 13\n"));
+    assert(SAID("FUXI ATH12K: M5 auth ok assoc ok aid 7 freq 2437\n"));
+    assert(SAID("FUXI ATH12K: M5 rx data 3 beacons 2 rssi -42\n"));
+    assert(SAID("M5 after 5 s: rx data 3 beacons 2") && SAID("M5 stayed 20") && SAID("M5 deauthentication sent") && SAID("M5 left"));
+    assert(r6_count >= 5 && !rddm && !evidence_count && auth_tries == 1 && assoc_tries == 1 && deauths == 1);
+    assert(strstr(said, "M5 auth ok") < strstr(said, "M5 rx data") && strstr(said, "M5 rx data") < strstr(said, "M5 deauthentication"));
+    log_is_clean();
+    /* The frames themselves: nothing about protection in what we ask, our abilities at 20 MHz, HE and WMM as offered. */
+    assert(last_auth[24] == 0 && last_auth[25] == 0 && last_auth[26] == 1 && last_auth[28] == 0);
+    assert(last_deauth[0] == FA_KIND_DEAUTH && last_deauth[24] == FA_REASON_LEAVING && last_deauth[25] == 0);
+    assert((last_assoc[24] | last_assoc[25] << 8) == (FA_CAP_ESS | FA_CAP_SHORT_SLOT));
+    {
+        const uint8_t *e = find_in_request(FA_EID_SSID);
+        assert(e && e[1] == sizeof(NAME) - 1 && !memcmp(e + 2, NAME, e[1]));
+        assert(fa_elements_whole(last_assoc + 28, last_assoc_length - 28));
+        assert(find_in_request(FA_EID_RSN) == NULL && find_in_request(FA_EID_WAPI) == NULL);
+        assert(fa_vendor_element(last_assoc + 28, last_assoc_length - 28, 0x00, 0x50, 0xf2, 0x01) == NULL);
+        assert(fa_ext_element(last_assoc + 28, last_assoc_length - 28, 108) == NULL); /* no EHT */
+        e = find_in_request(FA_EID_RATES); assert(e && e[1] == 8 && e[2] == 0x82 && e[6] == 12);
+        e = find_in_request(FA_EID_RATES_MORE); assert(e && e[1] == 4);
+        e = find_in_request(FA_EID_HT); assert(e && e[1] == FA_HT_BODY);
+        assert(((e[2] | e[3] << 8) & (FA_HT_CAP_40 | FA_HT_CAP_SGI_40)) == 0 && e[4] == (3 | 5 << 2) && e[5] == 0xff && e[6] == 0xff);
+        assert(find_in_request(FA_EID_VHT) == NULL);
+        assert(fa_ext_element(last_assoc + 28, last_assoc_length - 28, FA_EXT_HE) == NULL); /* it has no HE here */
+        assert(fa_wmm_element(last_assoc + 28, last_assoc_length - 28) != NULL);
+    }
+    done();
+
+    /* 5 GHz with VHT and HE on both sides, no channel element, spectrum management, and the driver's station as asked. */
+    fresh(); ticks = 0; tick = stay_frames;
+    {
+        static uint8_t el[256]; unsigned n = 0;
+        static const uint8_t r[] = {1, 8, 0x8c, 18, 0x98, 36, 0xb0, 72, 96, 108};
+        memcpy(el + n, r, sizeof(r)); n += sizeof(r);
+        el[n++] = 45; el[n++] = 26; memset(el + n, 0, 26); el[n] = 0x6f; el[n + 1] = 0x01; el[n + 2] = 0x17; el[n + 3] = 0xff; el[n + 4] = 0xff; n += 26;
+        el[n++] = 191; el[n++] = 12; memset(el + n, 0, 12); el[n] = 0xb2; el[n + 4] = 0xfa; el[n + 5] = 0xff; n += 12;
+        el[n++] = 255; el[n++] = 1 + 6 + 11 + 4 + 4; el[n++] = 35; memset(el + n, 0, 6 + 11); el[n + 6] = FA_HE_PHY0_160 | 0x04; n += 17; el[n++] = 0xfa; el[n++] = 0xff; el[n++] = 0xfa; el[n++] = 0xff; el[n++] = 0xea; el[n++] = 0xff; el[n++] = 0xea; el[n++] = 0xff;
+        el[n++] = 255; el[n++] = 7; el[n++] = 36; el[n++] = 0x34; el[n++] = 0x12; el[n++] = 0x08; memset(el + n, 0, 3); n += 3;
+        ap.hear_elements = el; ap.hear_length = n; ap.frequency = 5180; ap.cap = FA_CAP_ESS | FA_CAP_SPECTRUM; ap.aid = 2007;
+        ap.response = el; ap.response_length = n;
+        assert(fa_m5_station(the_hw, false) == 0);
+    }
+    assert(SAID("M5 auth ok assoc ok aid 2007 freq 5180\n") && SAID("HT 1 VHT 1 HE 1, 2 streams, QoS 0"));
+    assert(he_params_seen == 0x00081234);	/* three bytes of parameters, and the colour's byte */
+    assert(!strstr(calls, "conf_tx"));
+    {
+        const uint8_t *e = find_in_request(FA_EID_VHT);
+        assert(e && e[1] == FA_VHT_BODY && (e[2] & (FA_VHT_CAP_WIDTH | FA_VHT_CAP_SGI_160)) == 0 && e[6] == 0xfa);
+        e = fa_ext_element(last_assoc + 28, last_assoc_length - 28, FA_EXT_HE);
+        assert(e && e[1] == FA_HE_OFFER_MOST - 2 && e[3] == 0x11 && e[9] == 0 && (e[15] & FA_HE_PHY6_PPE) == 0 && e[9 + 11] == 0xfa);
+        e = find_in_request(FA_EID_POWER_CAP); assert(e && e[1] == 2 && e[3] == 20);
+        e = find_in_request(FA_EID_CHANNELS); assert(e && e[2] == 36 && e[3] == 1);
+        e = find_in_request(FA_EID_RATES); assert(e && e[1] == 8 && e[2] == 0x8c);
+        assert(fa_ext_element(last_assoc + 28, last_assoc_length - 28, 108) == NULL);
+    }
+    log_is_clean();
+    done();
+
+    /* Refused for each kind of protection, before any frame or channel. The name went out in the probes alone. */
+    {
+        static const uint8_t WPA[] = { 221, 6, 0x00, 0x50, 0xf2, 1, 1, 0 }, WAPI[] = { 68, 2, 1, 0 }, LIAR[] = { 3, 1, 6, 48, 250, 0 };
+        const struct { const uint8_t *e; unsigned n, cap; const char *line; } kinds[] = {
+            { RSN_ELEMENT, sizeof(RSN_ELEMENT), FA_CAP_ESS | FA_CAP_PRIVACY, "M5 refused: the target has an RSN element (1 frames), only open networks are allowed at this stage" },
+            { WPA, sizeof(WPA), FA_CAP_ESS, "M5 refused: the target has a WPA element" },
+            { WAPI, sizeof(WAPI), FA_CAP_ESS, "M5 refused: the target has a WAPI element" },
+            { OPEN_HT, sizeof(OPEN_HT), FA_CAP_ESS | FA_CAP_PRIVACY, "M5 refused: the target has the privacy bit" },
+            { LIAR, sizeof(LIAR), FA_CAP_ESS, "M5 refused: the target has elements that cannot be read to their end" },
+        };
+        for (unsigned i = 0; i < sizeof(kinds) / sizeof(kinds[0]); i++) {
+            fresh();
+            ap.hear_elements = kinds[i].e; ap.hear_length = kinds[i].n; ap.cap = kinds[i].cap;
+            assert(fa_m5_station(the_hw, false) == 0);
+            assert(!strcmp(calls, "start,add,scan,remove,stop,") && SAID(kinds[i].line) && !rddm && !evidence_count);
+            assert(!SAID("M5 auth ok") && !auth_tries && !radio_of(the_hw)->joining);
+            log_is_clean();
+            done();
+        }
+    }
+    /* The same name with protection anywhere refuses it all, however weak: a mixed network is no open one. */
+    fresh(); ap.also_heard = rsn_sibling;
+    assert(fa_m5_station(the_hw, false) == 0 && !strcmp(calls, "start,add,scan,remove,stop,") && SAID("M5 refused: the target has an RSN element"));
+    done();
+
+    /* Not heard: two scans, and only the name that was asked for counts. Neighbours are not taken instead. */
+    fresh(); ap.not_heard = true;
+    assert(fa_m5_station(the_hw, false) == 0 && scans == FA_JOIN_SCANS && !auth_tries);
+    assert(!strcmp(calls, "start,add,scan,scan,remove,stop,") && SAID("M5 not proven: the target was not heard in 2 scans"));
+    log_is_clean();
+    done();
+    /* A name that only starts the same way is not it. */
+    fresh(); ap.heard_name = "fuxi-test-netw";
+    assert(fa_m5_station(the_hw, false) == 0 && scans == FA_JOIN_SCANS && !auth_tries);
+    done();
+
+    /* A hidden network answers by name in its probe response. */
+    fresh(); ticks = 0; ap.hidden_beacon = true; tick = stay_frames;
+    assert(fa_m5_station(the_hw, false) == 0 && SAID("M5 auth ok assoc ok aid 7"));
+    done();
+
+    /* Where it says it is, not where it was heard. A channel the domain took away is not used. */
+    fresh(); ticks = 0; ap.frequency = 2412; tick = stay_frames; /* its element says channel 6 */
+    assert(fa_m5_station(the_hw, false) == 0 && SAID("M5 channel 2437 MHz") && SAID("freq 2437\n"));
+    done();
+    fresh(); two[1].flags = IEEE80211_CHAN_DISABLED;
+    assert(fa_m5_station(the_hw, false) == 0 && SAID("M5 not proven: the access point's channel may not be used here") && !strstr(calls, "add_chanctx"));
+    done();
+
+    /* Silence after a frame that came back: three tries, bounded, nothing proven, no firmware blamed. */
+    fresh(); ap.silent_auth = true;
+    {
+        unsigned long long began = now;
+        assert(fa_m5_station(the_hw, false) == 0);
+        assert(auth_tries == 3 && now - began < 3 * FA_JOIN_ANSWER_NS + FA_REGD_WAIT_NS + 1000000000ull);
+    }
+    assert(!strcmp(calls, "start,add,scan,add_chanctx,assign,link,sta01,auth,auth,auth,sta10,unassign,remove_chanctx,remove,stop,"));
+    assert(SAID("M5 not proven: no answer to authentication") && SAID("frames sent 3 done 3 acked 3") && !rddm && !evidence_count && !deauths);
+    done();
+    /* A frame that never came back: the firmware's account, before the way down. */
+    fresh(); ap.silent_auth = true; ap.no_complete = true;
+    assert(fa_m5_station(the_hw, false) == -EIO && rddm && !strcmp(first_evidence, "management frames never came back from the firmware"));
+    assert(strstr(calls, "rddm,sta10,") != NULL && !deauths);
+    done();
+    /* Silence to the association: authenticated, so the deauthentication goes out. */
+    fresh(); ap.silent_assoc = true;
+    assert(fa_m5_station(the_hw, false) == 0 && assoc_tries == 3 && deauths == 1);
+    assert(strstr(calls, "assoc,assoc,assoc,deauth,flush,sta21,sta10,") != NULL && !strstr(calls, "assoc_told"));
+    done();
+
+    /* Refused by the access point. */
+    fresh(); ap.auth_status = 13;
+    assert(fa_m5_station(the_hw, false) == 0 && auth_tries == 1 && SAID("M5 not proven: authentication refused, code 13") && !deauths && !assoc_tries);
+    done();
+    fresh(); ap.assoc_status = 17;
+    assert(fa_m5_station(the_hw, false) == 0 && SAID("M5 not proven: association refused, code 17") && deauths == 1 && !strstr(calls, "sta23"));
+    done();
+
+    /* Answers that are no answers. */
+    fresh(); ticks = 0; ap.bad_auth_first = true; ap.bad_assoc_first = true; tick = stay_frames;
+    assert(fa_m5_station(the_hw, false) == 0 && auth_tries == 1 && assoc_tries == 2 && SAID("M5 auth ok assoc ok aid 7"));
+    done();
+
+    /* The driver or the firmware says no at each step: its account, then what got made is undone. */
+    fresh(); ap.fail_add = -5;
+    assert(fa_m5_station(the_hw, false) == -5 && !strcmp(first_evidence, "channel context refused"));
+    assert(strstr(calls, "add_chanctx,rddm,remove,stop,") != NULL);
+    done();
+    fresh(); ap.fail_assign = -5;
+    assert(fa_m5_station(the_hw, false) == -5 && strstr(calls, "assign,rddm,remove_chanctx,remove,stop,") != NULL && !strstr(calls, "unassign"));
+    done();
+    fresh(); ap.fail_sta_to = IEEE80211_STA_NONE;
+    assert(fa_m5_station(the_hw, false) == -110 && !strcmp(first_evidence, "peer create or vdev start failed"));
+    assert(strstr(calls, "sta01,rddm,unassign,remove_chanctx,remove,stop,") != NULL && !auth_tries);
+    done();
+    fresh(); ap.fail_sta_to = IEEE80211_STA_AUTH;
+    assert(fa_m5_station(the_hw, false) == -110 && strstr(calls, "sta12,rddm,sta10,") != NULL && !deauths);
+    done();
+    fresh(); ap.fail_sta_to = IEEE80211_STA_AUTHORIZED;
+    assert(fa_m5_station(the_hw, false) == -110 && strstr(calls, "sta34,rddm,sta32,sta21,sta10,") != NULL && !deauths && !SAID("M5 auth ok"));
+    done();
+
+    /* The firmware dies during the stay: the end comes at once, its account first, and no frame goes out. */
+    fresh(); ticks = 0; tick = trouble_in_the_stay;
+    {
+        unsigned long long began = now;
+        assert(fa_m5_station(the_hw, false) == -EIO);
+        assert(now - began < FA_JOIN_STAY_NS / 2 && rddm && !deauths && SAID("M5 auth ok assoc ok"));
+    }
+    assert(strstr(calls, "rddm,sta43,sta32,sta21,sta10,disassoc_told,") != NULL && SAID("M5 rx data"));
+    done();
+    /* It dies before anything: the scan is not asked for. */
+    fresh(); trouble_after = 0;
+    assert(fa_m5_station(the_hw, false) == -EIO && !strcmp(calls, "start,add,rddm,remove,stop,"));
+    done();
+
+    /* The access point shows us the door, or the link is gone: no deauthentication after that, and the stay ends. */
+    fresh(); ticks = 0; tick = door_in_the_stay;
+    {
+        unsigned long long began = now;
+        assert(fa_m5_station(the_hw, false) == 0 && now - began < FA_JOIN_STAY_NS / 2 && !deauths && !rddm);
+    }
+    assert(SAID("shown us the door, reason 8") && SAID("M5 rx data") && !strstr(calls, "deauth"));
+    done();
+    fresh(); ticks = 0; tick = disassoc_in_the_stay;
+    assert(fa_m5_station(the_hw, false) == 0 && !deauths && SAID("shown us the door, reason 4"));
+    done();
+    fresh(); ticks = 0; tick = lost_in_the_stay;
+    assert(fa_m5_station(the_hw, false) == 0 && !deauths && SAID("M5 connection loss from the driver") && SAID("M5 beacon losses 1"));
+    done();
+    /* It begins to ask for protection: that is the end of it too, and we say goodbye. */
+    fresh(); ticks = 0; tick = rsn_in_the_stay;
+    assert(fa_m5_station(the_hw, false) == 0 && deauths == 1 && SAID("the access point now asks for protection: leaving"));
+    done();
+
+    /* No buffer: said, bounded, no frame. */
+    fresh(); fail_skb = 1;
+    assert(fa_m5_station(the_hw, false) == 0 && SAID("M5 no buffer for the authentication frame") && !auth_tries);
+    fail_skb = 0;
+    done();
+
+    /* The two iterators: only what exists. */
+    fresh();
+    {
+        struct fa_radio *radio = radio_of(the_hw);
+        assert(radio->sta == NULL && radio->chanctx == NULL);
+        linuxkpi_ieee80211_iterate_stations_atomic(the_hw, (void *)abort, NULL);
+        linuxkpi_ieee80211_iterate_chan_contexts(the_hw, (void *)abort, NULL);
+        assert(linuxkpi_ieee80211_find_sta(NULL, AP) == NULL);
+    }
+    done();
+    assert(!locks);
+    puts("fa_80211: stage 5 order, frames, 5 GHz, refusals, bounds, the stay's counts, the firmware's account before the way down, log holds no name");
+    return 0;
+}
+"""
+
+
+FA_JOIN_HOST = r"""
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "fa_bss.h"
+#include "fa_join.h"
+
+static uint32_t seed = 0x2468ace1;
+static uint32_t next(void) { seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5; return seed; }
+static const uint8_t AP[6] = {0x02, 0xa1, 0xb2, 0xc3, 0xd4, 0x55}, OWN[6] = {2, 0x46, 0x55, 0x58, 0x49, 1}, OTHER[6] = {0x02, 0, 0, 0, 0, 9};
+
+/* A frame in a piece of memory of exactly its size, so the sanitizer sees a read past its end. */
+static uint8_t *exactly(const uint8_t *frame, unsigned length) { uint8_t *e = malloc(length ? length : 1); memcpy(e, frame, length); return e; }
+static enum fa_target_result take(struct fa_target *t, const uint8_t *f, unsigned n, const char *name) {
+    uint8_t *e = exactly(f, n);
+    enum fa_target_result r = fa_target_take(t, e, n, 2412, -50, (const uint8_t *)name, (unsigned)strlen(name));
+    free(e);
+    return r;
+}
+static unsigned beacon(uint8_t *f, uint8_t kind, const uint8_t *bssid, unsigned cap, const void *elements, unsigned length) {
+    memset(f, 0, 36); f[0] = kind; memcpy(f + 10, bssid, 6); memcpy(f + 16, bssid, 6);
+    f[32] = 100; f[34] = (uint8_t)cap; f[35] = (uint8_t)(cap >> 8);
+    memcpy(f + 36, elements, length);
+    return 36 + length;
+}
+
+static void protection(void) {
+    static const uint8_t none[] = {0, 1, 'a', 1, 1, 0x82};
+    static const uint8_t rsn[] = {48, 2, 1, 0};
+    static const uint8_t wpa[] = {221, 4, 0x00, 0x50, 0xf2, 1};
+    static const uint8_t wmm[] = {221, 4, 0x00, 0x50, 0xf2, 2};
+    static const uint8_t wapi[] = {68, 1, 1};
+    static const uint8_t lie[] = {0, 1, 'a', 48, 200, 0};
+    static const uint8_t cut[] = {0, 1, 'a', 3};
+    assert(fa_protection(1, none, sizeof(none)) == FA_OPEN);
+    assert(fa_protection(0x11, none, sizeof(none)) == FA_PROTECT_PRIVACY);
+    assert(fa_protection(1, rsn, sizeof(rsn)) == FA_PROTECT_RSN);
+    assert(fa_protection(1, wpa, sizeof(wpa)) == FA_PROTECT_WPA);
+    assert(fa_protection(1, wmm, sizeof(wmm)) == FA_OPEN);
+    assert(fa_protection(1, wapi, sizeof(wapi)) == FA_PROTECT_WAPI);
+    assert(fa_protection(1, lie, sizeof(lie)) == FA_PROTECT_UNREADABLE);
+    assert(fa_protection(1, cut, sizeof(cut)) == FA_PROTECT_UNREADABLE);
+    assert(fa_protection(1, none, 0) == FA_OPEN);
+    assert(fa_elements_whole(none, sizeof(none)) && !fa_elements_whole(none, sizeof(none) - 1) && fa_elements_whole(none, 3));
+    /* A short vendor element does not read as WPA, nor past its end. */
+    static const uint8_t brief[] = {221, 3, 0x00, 0x50, 0xf2};
+    uint8_t *e = exactly(brief, sizeof(brief));
+    assert(fa_vendor_element(e, sizeof(brief), 0, 0x50, 0xf2, 1) == NULL && fa_protection(1, e, sizeof(brief)) == FA_OPEN);
+    free(e);
+    static const uint8_t emptyext[] = {255, 0, 255, 1, 35};
+    e = exactly(emptyext, sizeof(emptyext));
+    assert(fa_ext_element(e, sizeof(emptyext), 35) == e + 2);
+    free(e);
+    puts("protection: each kind, what cannot be read counts as one");
+}
+
+static void target(void) {
+    static struct fa_target t;
+    uint8_t f[2048];
+    static const uint8_t home[] = {0, 4, 'h', 'o', 'm', 'e', 3, 1, 6};
+    static const uint8_t home_rsn[] = {0, 4, 'h', 'o', 'm', 'e', 48, 2, 1, 0};
+    static const uint8_t hidden[] = {0, 0, 3, 1, 6};
+    unsigned n = beacon(f, FA_KIND_BEACON, AP, 1, home, sizeof(home));
+    /* Every cut of a good frame: never read past its end, and only the whole frame counts as open: a cut one cannot be told from a lie. */
+    for (unsigned cut = 0; cut <= n; cut++) {
+        memset(&t, 0, sizeof(t));
+        enum fa_target_result r = take(&t, f, cut, "home");
+        assert(t.found == (r == FA_TARGET_TAKEN));
+        if (cut < 2) assert(r == FA_TARGET_OTHER);
+        if (cut >= 2 && cut < 36) assert(r == FA_TARGET_MALFORMED);
+        if (cut == n) assert(r == FA_TARGET_TAKEN && t.elements_length == sizeof(home) && !memcmp(t.elements, home, sizeof(home)));
+    }
+    /* What it keeps. */
+    memset(&t, 0, sizeof(t));
+    assert(take(&t, f, n, "home") == FA_TARGET_TAKEN);
+    assert(t.found && !memcmp(t.address, AP, 6) && t.frequency == 2412 && t.interval == 100 && t.capability == 1 && t.rssi == -50 && t.heard == 1);
+    /* Another name, longer and shorter. */
+    assert(take(&t, f, n, "hom") == FA_TARGET_ELSEWHERE && take(&t, f, n, "homer") == FA_TARGET_ELSEWHERE && take(&t, f, n, "HOME") == FA_TARGET_ELSEWHERE);
+    /* Not a beacon or a response. */
+    for (unsigned kind = 0; kind < 256; kind++) {
+        if (kind != FA_KIND_BEACON && kind != FA_KIND_PROBE_RESPONSE) {
+            f[0] = (uint8_t)kind; assert(take(&t, f, n, "home") == FA_TARGET_OTHER);
+        }
+    }
+    f[0] = FA_KIND_PROBE_RESPONSE; assert(take(&t, f, n, "home") == FA_TARGET_TAKEN); f[0] = FA_KIND_BEACON;
+    /* Protected frame, group or empty address, no frequency. */
+    f[1] = 0x40; assert(take(&t, f, n, "home") == FA_TARGET_MALFORMED); f[1] = 0;
+    f[16] |= 1; assert(take(&t, f, n, "home") == FA_TARGET_MALFORMED); f[16] &= 0xfe;
+    assert(fa_target_take(&t, f, n, 0, -50, (const uint8_t *)"home", 4) == FA_TARGET_MALFORMED);
+    assert(fa_target_take(&t, f, n, 0x10000, -50, (const uint8_t *)"home", 4) == FA_TARGET_MALFORMED);
+    uint8_t zero[64]; unsigned z = beacon(zero, FA_KIND_BEACON, (uint8_t[6]){0}, 1, home, sizeof(home));
+    assert(take(&t, zero, z, "home") == FA_TARGET_MALFORMED);
+    /* The strongest hearing wins, across access points; a weaker one changes nothing but the count. */
+    memset(&t, 0, sizeof(t));
+    assert(fa_target_take(&t, f, n, 2412, -60, (const uint8_t *)"home", 4) == FA_TARGET_TAKEN);
+    uint8_t g[128]; unsigned m = beacon(g, FA_KIND_BEACON, OTHER, 1, home, sizeof(home));
+    assert(fa_target_take(&t, g, m, 2437, -40, (const uint8_t *)"home", 4) == FA_TARGET_TAKEN && !memcmp(t.address, OTHER, 6) && t.frequency == 2437 && t.rssi == -40);
+    assert(fa_target_take(&t, f, n, 2412, -70, (const uint8_t *)"home", 4) == FA_TARGET_TAKEN && !memcmp(t.address, OTHER, 6) && t.heard == 3);
+    assert(fa_target_take(&t, f, n, 2412, 1000, (const uint8_t *)"home", 4) == FA_TARGET_TAKEN && t.rssi == 127);
+    assert(fa_target_take(&t, f, n, 2412, -1000, (const uint8_t *)"home", 4) == FA_TARGET_TAKEN && t.rssi == 127);
+    /* Protection sticks, and is of this name only; a neighbour's says nothing. The first kind stays. */
+    memset(&t, 0, sizeof(t));
+    m = beacon(g, FA_KIND_BEACON, AP, 0x11, home_rsn, sizeof(home_rsn));
+    assert(take(&t, g, m, "other") == FA_TARGET_ELSEWHERE && t.protected_frames == 0);
+    assert(take(&t, g, m, "home") == FA_TARGET_PROTECTED && t.protected_frames == 1 && t.why == FA_PROTECT_RSN && !t.found);
+    assert(take(&t, f, n, "home") == FA_TARGET_TAKEN && t.protected_frames == 1);
+    m = beacon(g, FA_KIND_BEACON, AP, 0x11, home, sizeof(home));
+    assert(take(&t, g, m, "home") == FA_TARGET_PROTECTED && t.protected_frames == 2 && t.why == FA_PROTECT_RSN);
+    /* A hidden beacon is not of this name. */
+    memset(&t, 0, sizeof(t));
+    m = beacon(g, FA_KIND_BEACON, AP, 1, hidden, sizeof(hidden));
+    assert(take(&t, g, m, "home") == FA_TARGET_ELSEWHERE && !t.found);
+    /* Fixed: the chosen access point's frames only, its protection whatever name they carry, nothing else moves. */
+    memset(&t, 0, sizeof(t));
+    assert(take(&t, f, n, "home") == FA_TARGET_TAKEN);
+    t.fixed = true;
+    unsigned before = t.elements_length;
+    assert(take(&t, g, m, "home") == FA_TARGET_TAKEN && t.elements_length == before && t.heard == 1);
+    unsigned k = beacon(g, FA_KIND_BEACON, OTHER, 1, home_rsn, sizeof(home_rsn));
+    assert(take(&t, g, k, "home") == FA_TARGET_ELSEWHERE && t.protected_frames == 0);
+    k = beacon(g, FA_KIND_BEACON, AP, 1, home_rsn, sizeof(home_rsn));
+    assert(take(&t, g, k, "home") == FA_TARGET_PROTECTED && t.protected_frames == 1);
+    /* Elements longer than the room are cut at a whole element. */
+    memset(&t, 0, sizeof(t));
+    static uint8_t many[FA_TARGET_ELEMENTS_MOST + 300];
+    unsigned at = 0;
+    memcpy(many, home, sizeof(home)); at = sizeof(home);
+    while (at + 202 <= sizeof(many)) { many[at] = 200; many[at + 1] = 200; at += 202; }
+    k = beacon(f, FA_KIND_BEACON, AP, 1, many, at);
+    assert(take(&t, f, k, "home") == FA_TARGET_TAKEN && t.elements_length <= FA_TARGET_ELEMENTS_MOST && fa_elements_whole(t.elements, t.elements_length));
+    assert(t.elements_length > FA_TARGET_ELEMENTS_MOST - 202);
+    puts("target: the name exactly, the strongest, protection sticks, fixed, bounded");
+}
+
+static void reply(void) {
+    struct fa_reply r;
+    uint8_t f[128];
+    static const uint8_t el[] = {1, 1, 0x82};
+    memset(f, 0, sizeof(f)); memcpy(f + 4, OWN, 6); memcpy(f + 10, AP, 6); memcpy(f + 16, AP, 6);
+#define READ(n) do { uint8_t *e = exactly(f, n); fa_reply_read(&r, e, n, OWN, AP); free(e); } while (0)
+    /* Authentication: algorithm, step, status. */
+    f[0] = FA_KIND_AUTH; f[26] = 2;
+    READ(30); assert(r.answer == FA_ANSWER_AUTH && r.code == 0);
+    for (unsigned cut = 0; cut < 30; cut++) { READ(cut); assert(r.answer == FA_ANSWER_NONE); }
+    f[28] = 13; READ(30); assert(r.answer == FA_ANSWER_REFUSED && r.code == 13); f[28] = 0;
+    f[26] = 1; READ(30); assert(r.answer == FA_ANSWER_NONE); f[26] = 4; READ(30); assert(r.answer == FA_ANSWER_NONE); f[26] = 2;
+    f[24] = 1; READ(30); assert(r.answer == FA_ANSWER_NONE); f[24] = 0;
+    /* Both addresses, and the BSSID field. */
+    f[4] ^= 1; READ(30); assert(r.answer == FA_ANSWER_NONE); f[4] ^= 1;
+    f[10] ^= 1; READ(30); assert(r.answer == FA_ANSWER_NONE); f[10] ^= 1;
+    f[16] ^= 1; READ(30); assert(r.answer == FA_ANSWER_NONE); f[16] ^= 1;
+    /* Protected, or not a management frame of version 0. */
+    f[1] = 0x40; READ(30); assert(r.answer == FA_ANSWER_NONE); f[1] = 0;
+    f[0] = FA_KIND_AUTH | 1; READ(30); assert(r.answer == FA_ANSWER_NONE);
+    f[0] = FA_KIND_AUTH | 8; READ(30); assert(r.answer == FA_ANSWER_NONE); f[0] = FA_KIND_AUTH;
+    /* +HTC moves the fixed fields. */
+    f[1] = 0x80; memset(f + 24, 0xee, 4); memset(f + 28, 0, 6); f[30] = 2;
+    READ(34); assert(r.answer == FA_ANSWER_AUTH); READ(33); assert(r.answer == FA_ANSWER_NONE);
+    f[1] = 0;
+    /* Association response: capabilities, status, number, elements. */
+    memset(f + 24, 0, 40); f[0] = FA_KIND_ASSOC_RESPONSE; f[28] = 7; f[29] = 0xc0; memcpy(f + 30, el, sizeof(el));
+    READ(30 + sizeof(el)); assert(r.answer == FA_ANSWER_ASSOC && r.aid == 7 && r.elements_length == sizeof(el));
+    READ(30); assert(r.answer == FA_ANSWER_ASSOC && r.elements_length == 0);
+    for (unsigned cut = 0; cut < 30; cut++) { READ(cut); assert(r.answer == FA_ANSWER_NONE); }
+    f[28] = 0; f[29] = 0xc0; READ(30); assert(r.answer == FA_ANSWER_NONE && r.aid == 0);
+    f[28] = 0xd8; f[29] = 0xc7; READ(30); assert(r.answer == FA_ANSWER_NONE); /* 2008 */
+    f[28] = 0xd7; f[29] = 0xc7; READ(30); assert(r.answer == FA_ANSWER_ASSOC && r.aid == 2007);
+    f[26] = 17; READ(30); assert(r.answer == FA_ANSWER_REFUSED && r.code == 17 && r.aid == 0); f[26] = 0;
+    /* Deauthentication, disassociation: a reason. */
+    memset(f + 24, 0, 40);
+    f[0] = FA_KIND_DEAUTH; f[24] = 8; READ(26); assert(r.answer == FA_ANSWER_GONE && r.code == 8); READ(25); assert(r.answer == FA_ANSWER_NONE);
+    f[0] = FA_KIND_DISASSOC; READ(26); assert(r.answer == FA_ANSWER_GONE);
+    /* The rest of the kinds say nothing. */
+    for (unsigned kind = 0; kind < 256; kind++) {
+        if (kind != FA_KIND_AUTH && kind != FA_KIND_ASSOC_RESPONSE && kind != FA_KIND_DEAUTH && kind != FA_KIND_DISASSOC) {
+            f[0] = (uint8_t)kind; READ(64); assert(r.answer == FA_ANSWER_NONE);
+        }
+    }
+    puts("replies: every cut, both addresses, association number range, protected refused");
+}
+
+static void builders(void) {
+    uint8_t f[768];
+    assert(fa_auth_request(f, FA_AUTH_LENGTH - 1, OWN, AP) == 0 && fa_auth_request(f, FA_AUTH_LENGTH, OWN, AP) == FA_AUTH_LENGTH);
+    static const uint8_t auth[30] = {0xb0, 0, 0, 0, 2, 0xa1, 0xb2, 0xc3, 0xd4, 0x55, 2, 0x46, 0x55, 0x58, 0x49, 1, 2, 0xa1, 0xb2, 0xc3, 0xd4, 0x55, 0, 0, 0, 0, 1, 0, 0, 0};
+    assert(!memcmp(f, auth, 30));
+    assert(fa_deauth(f, FA_DEAUTH_LENGTH - 1, OWN, AP, 3) == 0 && fa_deauth(f, FA_DEAUTH_LENGTH, OWN, AP, 0x0103) == FA_DEAUTH_LENGTH);
+    assert(f[0] == 0xc0 && f[24] == 3 && f[25] == 1 && !memcmp(f + 16, AP, 6));
+
+    uint8_t he[FA_HE_OFFER_MOST], mac[6], phy[11];
+    memset(mac, 0x11, 6); memset(phy, 0xff, 11);
+    assert(fa_he_offer(he, sizeof(he) - 1, mac, phy, 0xfffa, 0xfff5) == 0);
+    assert(fa_he_offer(he, sizeof(he), mac, phy, 0xfffa, 0xfff5) == FA_HE_OFFER_MOST);
+    assert(he[0] == 255 && he[1] == FA_HE_OFFER_MOST - 2 && he[2] == 35 && he[3] == 0x11);
+    assert(he[9] == 0x01 && he[15] == 0x7f && he[20] == 0xfa && he[21] == 0xff && he[22] == 0xf5);
+    struct fa_he read;
+    assert(fa_he_read(he, &read) && read.rx_mcs_80 == 0xfffa && read.tx_mcs_80 == 0xfff5 && read.phy[0] == 1);
+
+    struct fa_offer o;
+    memset(&o, 0, sizeof(o));
+    o.capability = FA_CAP_ESS; o.ssid = (const uint8_t *)"home"; o.ssid_length = 4;
+    for (unsigned i = 0; i < 12; i++) o.rates[o.rate_count++] = (uint8_t)(2 * (i + 1));
+    unsigned n = fa_assoc_request(f, sizeof(f), OWN, AP, &o);
+    assert(n == 24 + 4 + 2 + 4 + 2 + 8 + 2 + 4 && f[0] == 0 && f[28] == 0 && f[29] == 4 && f[26] == FA_LISTEN_INTERVAL);
+    assert(fa_elements_whole(f + 28, n - 28) && fa_element(f + 28, n - 28, 50) != NULL);
+    /* Everything at once, its largest. */
+    o.ssid_length = 32; o.ssid = (const uint8_t *)"0123456789012345678901234567890123"; o.rate_count = FA_RATES_MOST;
+    o.spectrum = true; o.has_ht = true; o.has_vht = true; o.wmm = true; memcpy(o.he, he, sizeof(he)); o.he_length = sizeof(he);
+    n = fa_assoc_request(f, sizeof(f), OWN, AP, &o);
+    assert(n != 0 && fa_elements_whole(f + 28, n - 28));
+    assert(fa_element(f + 28, n - 28, FA_EID_RSN) == NULL && fa_ext_element(f + 28, n - 28, 108) == NULL);
+    assert(fa_ext_element(f + 28, n - 28, FA_EXT_HE) != NULL && fa_wmm_element(f + 28, n - 28) != NULL);
+    /* Vendor last. */
+    assert(fa_wmm_element(f + 28, n - 28) + 9 == f + n);
+    /* Too little room, each size: nothing written past it, and an answer of 0. */
+    for (unsigned size = 0; size < n; size++) {
+        uint8_t *e = malloc(size ? size : 1);
+        assert(fa_assoc_request(e, size, OWN, AP, &o) == 0);
+        free(e);
+    }
+    /* Nothing a station may ask with. */
+    o.ssid_length = 33; assert(fa_assoc_request(f, sizeof(f), OWN, AP, &o) == 0);
+    o.ssid_length = 0; assert(fa_assoc_request(f, sizeof(f), OWN, AP, &o) == 0);
+    o.ssid_length = 4; o.rate_count = 0; assert(fa_assoc_request(f, sizeof(f), OWN, AP, &o) == 0);
+    o.rate_count = FA_RATES_MOST + 1; assert(fa_assoc_request(f, sizeof(f), OWN, AP, &o) == 0);
+    puts("frames we send: exact, bounded, no protection, no EHT");
+}
+
+static void he_and_streams(void) {
+    uint8_t e[64];
+    struct fa_he he;
+    memset(e, 0, sizeof(e));
+    e[0] = 255; e[2] = 35;
+    /* 80 MHz only, the least it can be. Shorter is refused. */
+    e[1] = 1 + 6 + 11 + 4; e[20] = 0xfa; e[21] = 0xff; e[22] = 0xf5; e[23] = 0xff;
+    assert(fa_he_read(e, &he) && he.rx_mcs_80 == 0xfffa && he.tx_mcs_80 == 0xfff5 && he.rx_mcs_160 == 0);
+    for (unsigned body = 1; body < 22u; body++) { e[1] = (uint8_t)body; assert(!fa_he_read(e, &he)); }
+    /* 160 and 80+80 each take four more. */
+    e[9] = FA_HE_PHY0_160; e[1] = 1 + 6 + 11 + 4; assert(!fa_he_read(e, &he));
+    e[1] = 1 + 6 + 11 + 8; e[24] = 0xaa; assert(fa_he_read(e, &he) && he.rx_mcs_160 == 0x00aa);
+    e[9] |= FA_HE_PHY0_80_80; assert(!fa_he_read(e, &he));
+    e[1] = 1 + 6 + 11 + 12; e[28] = 0xbb; assert(fa_he_read(e, &he) && he.rx_mcs_80_80 == 0x00bb);
+    /* PPE thresholds: said to be there, and there. More than the room is cut. */
+    e[9] = 0; e[15] = FA_HE_PHY6_PPE; e[1] = 1 + 6 + 11 + 4; assert(!fa_he_read(e, &he));
+    e[1] = 1 + 6 + 11 + 4 + 2; e[24] = 0x77; assert(fa_he_read(e, &he) && he.ppe[0] == 0x77);
+    e[1] = 1 + 6 + 11 + 4 + 40; assert(fa_he_read(e, &he));
+    /* Every real length of an element, in memory of exactly its size. */
+    for (unsigned body = 1; body < 60; body++) {
+        uint8_t *x = malloc(2 + body); memset(x, (int)next(), 2 + body); x[0] = 255; x[1] = (uint8_t)body; x[2] = 35;
+        (void)fa_he_read(x, &he);
+        free(x);
+    }
+    assert(fa_mcs_map_streams(0xffff) == 0 && fa_mcs_map_streams(0xfffc) == 1 && fa_mcs_map_streams(0xfffa) == 2 && fa_mcs_map_streams(0xaaaa) == 8);
+    uint8_t ht[28] = {45, 26}, vht[14] = {191, 12};
+    assert(fa_peer_streams(NULL, NULL, NULL) == 1);
+    ht[5] = 0xff; assert(fa_peer_streams(ht, NULL, NULL) == 1);
+    ht[6] = 0xff; assert(fa_peer_streams(ht, NULL, NULL) == 2);
+    ht[1] = 25; assert(fa_peer_streams(ht, NULL, NULL) == 1); ht[1] = 26;
+    vht[6] = 0xea; vht[7] = 0xff; assert(fa_peer_streams(ht, vht, NULL) == 3);
+    he.rx_mcs_80 = 0xff00; assert(fa_peer_streams(ht, vht, &he) == 4);
+    he.rx_mcs_80 = 0xffff; assert(fa_peer_streams(NULL, NULL, &he) == 1);
+    static const uint16_t bits[] = {60, 90, 120, 180};
+    static const uint8_t rates[] = {1, 2, 0x8c, 18, 50, 2, 0x98, 200, 7, 0};
+    uint32_t basic;
+    assert(fa_rates_mask(bits, 4, rates, sizeof(rates), &basic) == (1u | 2u | 4u) && basic == (1u | 4u));
+    assert(fa_rates_mask(bits, 4, rates, 0, &basic) == 0 && basic == 0);
+    puts("HE, streams, rates: every length");
+}
+
+static void kinds(void) {
+    uint8_t f[40] = {0};
+    memcpy(f + 10, AP, 6); memcpy(f + 16, AP, 6);
+    f[0] = FA_KIND_BEACON; assert(fa_rx_kind(f, 24, AP) == FA_RX_BEACON); assert(fa_rx_kind(f, 24, OTHER) == FA_RX_ELSE); assert(fa_rx_kind(f, 23, AP) == FA_RX_ELSE);
+    f[0] = FA_KIND_AUTH; assert(fa_rx_kind(f, 24, AP) == FA_RX_MANAGEMENT);
+    f[0] = 0x88; assert(fa_rx_kind(f, 24, AP) == FA_RX_DATA); assert(fa_rx_kind(f, 24, OTHER) == FA_RX_ELSE);
+    f[0] = 0x08; assert(fa_rx_kind(f, 24, AP) == FA_RX_DATA);
+    f[0] = 0xc8; assert(fa_rx_kind(f, 24, AP) == FA_RX_ELSE);
+    f[0] = 0x48; assert(fa_rx_kind(f, 24, AP) == FA_RX_ELSE);
+    f[0] = 0xd4; assert(fa_rx_kind(f, 24, AP) == FA_RX_ELSE);
+    f[0] = 0x89; assert(fa_rx_kind(f, 24, AP) == FA_RX_ELSE);
+    puts("kinds of frame");
+}
+
+/* Noise, and good frames with some bytes changed. Nothing may read outside its frame, and the result stays sound. */
+static void noise(void) {
+    static struct fa_target t;
+    uint8_t f[1024];
+    struct fa_reply r;
+    struct fa_he he;
+    static const uint8_t good[] = {0, 4, 'h', 'o', 'm', 'e', 1, 1, 0x82, 3, 1, 6, 45, 3, 1, 2, 3, 48, 2, 1, 0, 221, 4, 0, 0x50, 0xf2, 1, 255, 3, 35, 1, 2};
+    for (unsigned round = 0; round < 400000; round++) {
+        unsigned n;
+        if (round % 2) {
+            n = beacon(f, round % 4 == 1 ? FA_KIND_BEACON : FA_KIND_PROBE_RESPONSE, AP, next() & 0xffff, good, sizeof(good));
+            for (unsigned k = next() % 5; k > 0; k--) f[next() % n] = (uint8_t)next();
+            n = next() % 8 == 0 ? next() % (n + 1) : n;
+        } else {
+            n = next() % sizeof(f);
+            for (unsigned i = 0; i < n; i++) f[i] = (uint8_t)next();
+            f[0] = round % 8 == 0 ? (uint8_t)next() : round % 16 == 2 ? FA_KIND_AUTH : round % 16 == 4 ? FA_KIND_ASSOC_RESPONSE : FA_KIND_BEACON;
+        }
+        uint8_t *e = exactly(f, n);
+        t.fixed = round % 64 == 0;
+        (void)fa_target_take(&t, e, n, 1 + next() % 0xffff, (int)(next() % 400) - 200, (const uint8_t *)"home", 4);
+        assert(t.elements_length <= sizeof(t.elements));
+        fa_reply_read(&r, e, n, OWN, AP);
+        assert(r.answer != FA_ANSWER_ASSOC || (r.aid != 0 && r.aid <= FA_AID_MOST && r.elements + r.elements_length == e + n));
+        (void)fa_rx_kind(e, n, AP);
+        if (n >= 36) {
+            const uint8_t *x = fa_ext_element(e + 36, n - 36, FA_EXT_HE);
+            uint32_t basic;
+            static const uint16_t bits[] = {10, 20, 55, 110};
+            if (x != NULL) (void)fa_he_read(x, &he);
+            (void)fa_protection(next(), e + 36, n - 36);
+            (void)fa_rates_mask(bits, 4, e + 36, n - 36, &basic);
+            (void)fa_peer_streams(fa_element(e + 36, n - 36, FA_EID_HT), fa_element(e + 36, n - 36, FA_EID_VHT), NULL);
+        }
+        free(e);
+    }
+    printf("noise: found %d, heard %u, protected %u\n", t.found, t.heard, t.protected_frames);
+}
+
+int main(void) {
+    protection();
+    target();
+    reply();
+    builders();
+    he_and_streams();
+    kinds();
+    noise();
+    return 0;
+}
+"""
+
+
+@check
+def join_runs_on_fake_headers(tmp):
+    """Stage 5's join on the host with a fake driver, access point and clock: every way it can end. Design M5."""
+    for name, text in FAKE_HEADERS.items():
+        path = tmp / 'fake' / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    own = ROOT / 'xnu/fuxi-ath12k'
+    (tmp / 'fake/lx.h').write_bytes((own / 'compat/lx.h').read_bytes())
+    (tmp / 'fake/lx_os.h').write_bytes((own / 'compat/include/lx_os.h').read_bytes())
+    (tmp / 'driver.c').write_text('#include <stdarg.h>\n#include <linux/kernel.h>\n' + JOIN_DRIVER)
+    program = tmp / 'driver'
+    cc = os.environ.get('CC', 'cc')
+    subprocess.run([cc, '-std=gnu11', '-w', '-g', '-fsanitize=address,undefined', '-fno-sanitize-recover=all',
+                    f'-I{tmp / "fake"}', f'-I{own / "src"}', str(tmp / 'driver.c'), '-o', str(program)], check=True)
+    subprocess.run([str(program)], check=True)
+
+
+@check
+def join_frames_on_malformed_input(tmp):
+    """src/fa_join.h under the sanitizers: each frame in memory of exactly its size. Design M5: refuses RSN and WPA."""
+    (tmp / 'join.c').write_text(FA_JOIN_HOST)
+    own = ROOT / 'xnu/fuxi-ath12k/src'
+    cc = os.environ.get('CC', 'cc')
+    flags = ['-std=gnu11', '-Wall', '-Wextra', '-Wno-unused-function', '-g', '-O1', f'-I{own}']
+    program = tmp / 'join'
+    subprocess.run([cc, *flags, '-fsanitize=address,undefined', '-fno-sanitize-recover=all', str(tmp / 'join.c'), '-o', str(program)], check=True)
+    subprocess.run([str(program)], check=True)
+
+
+def code_only(text):
+    """C without its comments and strings: what the program does, not what it says."""
+    return re.sub(r'/\*.*?\*/|//[^\n]*|"(?:[^"\\]|\\.)*"', ' ', text, flags=re.S)
+
+
+@check
+def stage_5_holds_no_secret_and_stays_in_its_place(tmp):
+    """Design change of section 6: the name comes from a boot argument and no secret path exists. No network file either."""
+    own = ROOT / 'xnu/fuxi-ath12k/src'
+    wlan = (ROOT / 'xnu/fuxi-wlan/fuxi_wlan.c').read_text()
+    for path in (own / 'fa_80211.c', own / 'fa_join.h', own / 'fa_hif.c', own / 'fa_qmi.c', ROOT / 'xnu/fuxi-ath12k/os/fuxi_ath12k_os.c'):
+        code = code_only(path.read_text()).lower()
+        for word in ('passphrase', 'psk', 'pmk', 'ptk', 'gtk', 'set_key', 'wpa_', 'vnode', 'vn_open', 'kern_open', 'test-network'):
+            assert word not in code, f'{path.name}: {word}'
+    guarded = wlan[wlan.index('static void\nwl_fa_ssid_configure(void)'):]
+    guarded = guarded[:guarded.index('\n}\n')]
+    assert 'wl_fa_stage != 5' in guarded and 'text);' not in guarded.replace('strlen(text);', '').replace('(const unsigned char *)text', '')
+    assert wlan.count('"fuxiwifissid"') == 1
+    # What transmits sits in the stage 5 block, and that block is reached from stage 5 only.
+    text = (own / 'fa_80211.c').read_text()
+    block = text.index('/* ---- stage 5: one open network')
+    for word in ('ops->tx(', 'ops->sta_state', 'ops->assign_vif_chanctx', 'ops->add_chanctx', 'ops->vif_cfg_changed', 'ops->link_info_changed', 'dev_alloc_skb'):
+        assert text.index(word) > block, word
+    assert 'ops->set_key' not in text
+    assert text.count('radio->say_names = true') == 1 and text.index('radio->say_names = true') > text.index('\nfa_m4_station(')
+    hif = (own / 'fa_hif.c').read_text()
+    assert 'hif.stage == FA_STAGE_JOIN ? fa_m5_station(' in hif and hif.count('fa_m5_station(') == 1
+    # 20 MHz and no EHT: the join sets one width, and no element 108 is built.
+    join = (own / 'fa_join.h').read_text()
+    assert 'NL80211_CHAN_WIDTH_20' in text and 'NL80211_CHAN_WIDTH_40' not in text and 'NL80211_CHAN_WIDTH_80' not in text
+    assert 'eht' not in code_only(join).lower()
 
 
 FA_BSS_DRIVER = r"""
@@ -1328,9 +2333,27 @@ def stage_hooks_are_where_the_design_says(deps, tmp):
     own = (ROOT / 'xnu/fuxi-ath12k/src/fa_80211.c').read_text()
     down = body(own, 'station_down(struct fa_radio *radio)')
     assert down.index('ops->remove_interface') < down.index('ops->stop')
-    # No frame is sent beyond the probes: nothing here asks ath12k to transmit, authenticate or associate.
-    for word in ('ops->tx(', 'ops->sta_state', 'ops->assign_vif_chanctx', 'ops->add_chanctx', 'ops->vif_cfg_changed', 'ops->link_info_changed', 'ops->set_key'):
-        assert word not in own, word
+    # In mac80211's order: the deauthentication and the station's states before the channel is given up.
+    leave = body(own, 'station_leave(struct fa_radio *radio)')
+    assert leave.index('fa_deauth(') < leave.index('ops->flush') < leave.index('station_state(') < leave.index('BSS_CHANGED_ASSOC') < leave.index('ops->unassign_vif_chanctx') < leave.index('ops->remove_chanctx')
+    join = body(own, 'station_join(struct fa_radio *radio, bool *joined)')
+    assert join.index('ops->add_chanctx') < join.index('ops->assign_vif_chanctx') < join.index('link_changed(radio, BSS_CHANGED_BSSID') < join.index('IEEE80211_STA_NOTEXIST, IEEE80211_STA_NONE')
+    assert join.index('IEEE80211_STA_NONE, IEEE80211_STA_AUTH') < join.index('IEEE80211_STA_AUTH, IEEE80211_STA_ASSOC') < join.index('IEEE80211_STA_ASSOC, IEEE80211_STA_AUTHORIZED') < join.index('vif_changed(radio, BSS_CHANGED_ASSOC)')
+    # What the join leans on in ath12k: no RSN or WPA goes to the firmware, the peer is authorized when the vdev comes up, the flush runs the mgmt work.
+    assoc = body(mac, 'static void ath12k_bss_assoc(struct ath12k *ar,')
+    assert assoc.index('ath12k_wmi_vdev_up') < assoc.index('peer->is_authorized') < assoc.index('WMI_PEER_AUTHORIZE')
+    add = body(mac, 'static int ath12k_mac_station_add(struct ath12k *ar,')
+    assert add.index('ath12k_peer_create') < add.index('ath12k_start_vdev_delay')
+    assert 'wiphy_work_flush(hw->wiphy, &ar->wmi_mgmt_tx_work)' in body(mac, 'void ath12k_mac_op_flush(struct ieee80211_hw *hw, struct ieee80211_vif *vif,')
+    # The 5 GHz fix: the first range was right because this condition was not there, and the regd update now has both branches.
+    reg = body((tmp / 'edited/ath12k/reg.c').read_text(), 'int ath12k_regd_update(struct ath12k *ar, bool init)')
+    assert reg.index('reg_freq_2ghz') < reg.index('ar->mac.sbands[NL80211_BAND_5GHZ].channels') < reg.index('reg_freq_5ghz') < reg.index('reg_freq_6ghz')
+    setup = body(mac, 'static int ath12k_mac_setup_channels_rates(struct ath12k *ar,')
+    assert setup.index('sizeof(ath12k_6ghz_channels)') < setup.index('sizeof(ath12k_5ghz_channels)') < setup.index('ab->reg_freq_5ghz.start_freq')
+    # WCN7850 has no host2rxdma group: only what is reaped goes back, which is what the refill reading of design R6 rests on.
+    hw = (tmp / 'edited/ath12k/wifi7/hw.c').read_text() if (tmp / 'edited/ath12k/wifi7/hw.c').exists() else (deps / 'linux' / build.ATH12K / 'wifi7/hw.c').read_text()
+    mask = hw[hw.index('ath12k_wifi7_hw_ring_mask_wcn7850 = {'):]
+    assert re.search(r'\.host2rxdma = \{\s*\}', mask[:mask.index('};')])
     print('ok stage_hooks_are_where_the_design_says')
 
 

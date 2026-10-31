@@ -59,7 +59,7 @@ if $dry; then
         echo 'kernel: arm64e (FUXI_ARM64E=1, patch 0115), metal4 cmdline + cmdline-cpus1.txt, needs ld-classic'
     fi
     if [[ $target == kernel-metal4wifi ]]; then
-        echo 'kernel: metal4 + ath12k (build-ath12k.py, patch 0117, FUXI_OBJECTS), metal4 cmdline + cmdline-ath12k1.txt, cmdline-ath12k2.txt, cmdline-ath12k4.txt'
+        echo 'kernel: metal4 + ath12k (build-ath12k.py, patch 0117, FUXI_OBJECTS), metal4 cmdline + cmdline-ath12k1.txt, cmdline-ath12k2.txt, cmdline-ath12k4.txt, cmdline-ath12k5.txt'
     fi
     echo 'No downloads, builds, signing or packing in dry-run mode.'
     exit 0
