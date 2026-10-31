@@ -302,6 +302,11 @@ failed: 12` (mockfs probes the volume first). APFS logs `ARV enabled` and import
 | G | 16 MiB APFS ramdisk made with `newfs_apfs`, `rd=md0`, no UFS | refused at once, before APFS opens the device |
 | H | prelink binds APFS/Sandbox's 4-byte global to `_rootdev` instead of `_mountroot` | still refused |
 | I | `fuxi_root27_hiderootfs=1`: `MNT_ROOTFS` cleared while APFS mountroot runs | still refused (`fuxi: apfs mountroot without MNT_ROOTFS: 1`) |
+| J | `fuxi_root27_kmount=1`: no apfs mountroot; `VFS_MOUNT` as a kernel mount with the BaseSystem flag and no args, as imageboot does | still refused (`fuxi: apfs kernel mount of /dev/disk2s1 as root: 1`) |
+
+Boots I and J rule out `MNT_ROOTFS` and the mountroot entry point: `apfs_vfsop_mount` itself refuses. What is
+left in the root mount is that nothing is mounted yet (no covered vnode, no `rootvnode`); a pivot from a temporary
+root would change that (GUESS).
 
 Boot G makes the refusal a global APFS gate: it does not depend on the device, the volume or the DT root
 properties. `ios27-prelink.py` now writes `targets.json` (every kernel reference of each root kext with the native
