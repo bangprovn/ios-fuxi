@@ -17,9 +17,12 @@ Steps, each of which stops the build when it fails:
   6. one relocatable object results;
   7. each undefined symbol is on tools/ath12k-undefined-allow.json.
 
-On macOS with Xcode, step 6 is `ld -r`. ld.lld cannot write a relocatable Mach-O,
-so elsewhere the same Mach-O targeted sources are compiled to bitcode, merged by
-llvm-link, internalized and turned into one Mach-O object by llc.
+On macOS with Xcode, step 6 is `ld -r`, tried with -exported_symbols_list, then
+with -ld_classic, then relying on -fvisibility=hidden (everything but FA_PUBLIC
+becomes local). ld.lld cannot write a relocatable Mach-O, so elsewhere the same
+Mach-O targeted sources are compiled to bitcode, merged by llvm-link, internalized
+and turned into one Mach-O object by llc. The Xcode route has not run yet on the
+day this was written: its failure messages say so and name what to look at.
 """
 import argparse
 import concurrent.futures
@@ -63,7 +66,7 @@ FREEBSD_SPARSE = ('/COPYRIGHT',) + tuple(f'/sys/{d}/' for d in (
 EXPORTED_PREFIX = 'fa_'
 TARGET = 'arm64-apple-macos13'
 CFLAGS = ('-mkernel -mgeneral-regs-only -fno-builtin -fno-common -ffreestanding -fno-strict-aliasing '
-          '-funsigned-char -nostdinc -std=gnu17 -O2 -w -ferror-limit=0 '
+          '-funsigned-char -nostdinc -std=gnu17 -O2 -w -ferror-limit=0 -fvisibility=hidden '
           '-Werror=implicit-function-declaration -Werror=int-conversion '
           '-Werror=incompatible-function-pointer-types -Werror=return-type '
           '-D__FreeBSD__=15 -D_KERNEL -DKLD_MODULE -DHAVE_KERNEL_OPTION_HEADERS '
@@ -262,20 +265,40 @@ def generate(sysdir, gen):
     (gen / 'opt_global.h').write_text('#define SMP 1\n')
 
 
+def xcrun_find(name):
+    """A tool of the selected Xcode (DEVELOPER_DIR), or a Stop that says so."""
+    result = subprocess.run(['xcrun', '--find', name], capture_output=True, text=True)
+    path = result.stdout.strip()
+    if result.returncode or not path:
+        raise Stop(f'toolchain: xcrun cannot find {name} in DEVELOPER_DIR='
+                   f"{os.environ.get('DEVELOPER_DIR', '(unset)')}: {result.stderr.strip()}")
+    return path
+
+
 class Toolchain:
     def __init__(self, args):
         self.darwin = platform.system() == 'Darwin'
-        self.clang = args.cc or ('clang' if not self.darwin else
-                                 subprocess.run(['xcrun', '--find', 'clang'], capture_output=True,
-                                                text=True, check=True).stdout.strip())
-        self.ld = shutil.which('ld') if self.darwin else None
-        self.nm = args.nm or shutil.which('llvm-nm') or (
-            subprocess.run(['xcrun', '--find', 'nm'], capture_output=True, text=True).stdout.strip())
+        self.clang = args.cc or (xcrun_find('clang') if self.darwin else 'clang')
+        self.ld = args.ld or (xcrun_find('ld') if self.darwin else None)
+        self.nm = args.nm or (xcrun_find('nm') if self.darwin else shutil.which('llvm-nm'))
         self.route = 'ld64' if self.ld else 'bitcode'
         if self.route == 'bitcode':
             for tool in ('llvm-link', 'opt', 'llc'):
                 if not shutil.which(tool):
                     raise Stop(f'toolchain: no ld64 here and no {tool}: cannot make a Mach-O relocatable')
+        if not self.nm:
+            raise Stop('toolchain: no nm: cannot read the undefined symbols')
+
+    def preflight(self, work, flags):
+        """An empty file with the real flags, so that a flag this clang refuses fails with that as the message."""
+        probe = work / 'preflight.c'
+        probe.write_text('int fa_preflight;\n')
+        result = subprocess.run([self.clang, '-target', TARGET, *flags, '-c', str(probe), '-o', str(work / 'preflight.o')],
+                                capture_output=True, text=True)
+        if result.returncode:
+            version = subprocess.run([self.clang, '--version'], capture_output=True, text=True).stdout.splitlines()[:1]
+            raise Stop(f'toolchain: {self.clang} {version} refuses the driver-domain flags, before any source:\n'
+                       f'{result.stderr[:1500]}')
 
 
 def compile_one(tool, source, output, flags):
@@ -285,15 +308,34 @@ def compile_one(tool, source, output, flags):
     return source, output, result.returncode, result.stderr
 
 
+def link_ld64(tool, objects, output, exported, work):
+    """Xcode's ld. Newer linkers vary in what -r accepts, so each known way is tried and all failures shown."""
+    listing = work / 'exported.txt'
+    listing.write_text(''.join(f'_{name}\n' for name in exported))
+    filelist = work / 'objects.filelist'
+    filelist.write_text(''.join(f'{path}\n' for path in objects))
+    base = ['-r', '-arch', 'arm64', '-filelist', str(filelist), '-o', str(output)]
+    export = ['-exported_symbols_list', str(listing)]
+    attempts = (('ld -r -exported_symbols_list', [tool.ld, *base, *export]),
+                ('ld -ld_classic -r -exported_symbols_list', [tool.ld, '-ld_classic', *base, *export]),
+                ('ld -r with hidden visibility only', [tool.ld, *base]))
+    failures = []
+    for name, command in attempts:
+        output.unlink(missing_ok=True)
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode == 0 and output.exists():
+            print(f'fuxi-ath12k: linked by: {name}')
+            if result.stderr.strip():
+                print(result.stderr.strip()[:1500])
+            return name
+        failures.append(f'--- {name}: exit {result.returncode}\n{result.stderr.strip()[:1500]}')
+    raise Stop('link: every way of `ld -r` failed. This route had never run before its first CI build, so read '
+               'these first; each object also stays in the work directory.\n' + '\n'.join(failures))
+
+
 def link(tool, objects, output, exported, work):
     if tool.route == 'ld64':
-        listing = work / 'exported.txt'
-        listing.write_text(''.join(f'_{name}\n' for name in exported))
-        merged = work / 'all.o'
-        subprocess.run([tool.ld, '-r', '-arch', 'arm64', *map(str, objects), '-o', str(merged)], check=True)
-        subprocess.run([tool.ld, '-r', '-arch', 'arm64', '-exported_symbols_list', str(listing),
-                        str(merged), '-o', str(output)], check=True)
-        return
+        return link_ld64(tool, objects, output, exported, work)
     merged = work / 'all.bc'
     subprocess.run(['llvm-link', *map(str, objects), '-o', str(merged)], check=True)
     internal = work / 'internal.bc'
@@ -303,6 +345,7 @@ def link(tool, objects, output, exported, work):
                     str(merged), '-o', str(internal)], check=True)
     subprocess.run(['llc', '-filetype=obj', '-O2', '--relocation-model=static', '-mtriple=' + TARGET,
                     '-mattr=-fp-armv8,-neon', str(internal), '-o', str(output)], check=True)
+    return 'llvm-link, opt and llc'
 
 
 def symbols(tool, path, *flags):
@@ -382,6 +425,7 @@ def build(args):
     own_flags = [*driver_flags, f'-I{OWN / "src"}', f'-I{compat}']
     jobs = []
     tool = Toolchain(args)
+    tool.preflight(work, flags)
     suffix = '.bc' if tool.route == 'bitcode' else '.o'
     for rel in DRIVER:
         out = work / 'obj' / ('ath12k_' + rel.replace('/', '_').removesuffix('.c') + suffix)
@@ -400,6 +444,9 @@ def build(args):
                 failed.append((source, stderr))
                 output.unlink(missing_ok=True)
     if failed:
+        if tool.route == 'ld64':
+            print('fuxi-ath12k: this source tree compiled with clang 18 in WSL when it was committed; '
+                  'errors here that a newer clang does not give point at the Xcode clang in use.')
         for source, stderr in sorted(failed, key=lambda f: str(f[0])):
             errors = [l for l in stderr.splitlines() if ' error: ' in l or ' fatal error: ' in l]
             print(f'--- {source.name}: {len(errors)} errors')
@@ -415,23 +462,27 @@ def build(args):
     allow = json.loads(ALLOW.read_text())
     exported = allow['exported']
     output = work / 'fuxi_ath12k.o'
-    link(tool, objects, output, exported, work)
+    how = link(tool, objects, output, exported, work)
     kind = subprocess.run(['file', '-b', str(output)], capture_output=True, text=True).stdout.strip()
+    if not kind:
+        raise Stop(f'link: `file` could not describe {output}')
     if 'Mach-O 64-bit' not in kind or 'object' not in kind:
         raise Stop(f'link: not a Mach-O relocatable: {kind}')
 
-    shown = sorted({strip_macho_prefix(line.strip()) for line in
-                    symbols(tool, output, '--defined-only', '--extern-only', '--format=just-symbols')
-                    if line.strip()})
+    shown = sorted({strip_macho_prefix(line.strip()) for line in symbols(tool, output, '-g', '-U', '-j') if line.strip()})
     if shown != sorted(exported) or not all(name.startswith(EXPORTED_PREFIX) for name in shown):
-        raise Stop(f'link: the object must show exactly {sorted(exported)}, it shows {shown}')
+        extra = [name for name in shown if name not in exported]
+        raise Stop(f'link: the object must show exactly {sorted(exported)}, but "{how}" left {len(shown)} names '
+                   f'showing, for example {extra[:20]}, and is missing {[n for n in exported if n not in shown]}. '
+                   'Such names would collide with the kernel at its link.')
 
-    raw = symbols(tool, output, '--undefined-only', '--format=just-symbols')
+    raw = symbols(tool, output, '-u', '-j')
     undefined = sorted({strip_macho_prefix(line.strip()) for line in raw if line.strip()})
     (work / 'undefined.txt').write_text('\n'.join(undefined) + '\n')
     groups, unknown, stale = check_undefined(undefined, allow)
     if unknown:
-        raise Stop('undefined: not on the allow-list: ' + ' '.join(unknown))
+        raise Stop('undefined: not on the allow-list (tools/ath12k-undefined-allow.json), and the kernel link may not '
+                   'define them either: ' + ' '.join(unknown))
     if stale:
         raise Stop('undefined: on the allow-list but not needed: ' + ' '.join(stale))
     for group, names in sorted(groups.items()):
@@ -453,6 +504,7 @@ def main():
     parser.add_argument('--print-digests', action='store_true')
     parser.add_argument('--fetch', action='store_true', help='fetch the pinned sparse trees first, where absent')
     parser.add_argument('--cc')
+    parser.add_argument('--ld', help='use this ld64 and its route, also off macOS (tests)')
     parser.add_argument('--nm')
     parser.add_argument('--jobs', type=int, default=os.cpu_count() or 4)
     parser.add_argument('--show', type=int, default=8, help='errors shown for each failed file')

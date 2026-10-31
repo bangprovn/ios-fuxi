@@ -6,16 +6,20 @@ linux and freebsd checkouts) the edits are also matched against the real files, 
 assertion is shown to fire, and with --full the whole build runs clean.
 """
 import argparse
+import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-BASE_COMMIT = 'fa93d15'
+# sha256 of fuxi_wlan.c at fa93d15, before the port: what metal4 and wlan6g must keep compiling.
+METAL4_WLAN_C = '0c69a14561985958d904c535047a8eb6037e0beaca6499f708f61d6f287c94f7'
 
 
 def load_build():
@@ -119,7 +123,7 @@ def edit_list_is_well_formed(tmp):
     for edit in edits:
         assert set(edit) == {'id', 'why', 'tree', 'file', 'find', 'replace'}, edit['id']
         assert edit['tree'] in ('ath12k', 'freebsd') and edit['why'] and edit['find'] != edit['replace']
-    for wanted in ('ath12k-rfkill-pin', 'ath12k-reo-qdesc-alloc', 'ath12k-rx-refill-guard-a', 'ath12k-mac-override'):
+    for wanted in ('ath12k-rfkill-pin', 'ath12k-reo-qdesc-alloc', 'ath12k-rx-refill-guard-a', 'ath12k-mac-override', 'ath12k-stage-htc'):
         assert wanted in ids, wanted
 
 
@@ -188,20 +192,184 @@ def page_size_assertions_are_in_place(tmp):
     assert '_Static_assert(ATH12K_PAGE_SIZE == 4096' in (ROOT / 'xnu/fuxi-ath12k/src/fa_hif.c').read_text()
 
 
+def without_ath12k(text):
+    """What the C is without FUXI_ATH12K: guarded blocks are whole lines, and never nest."""
+    out, inside = [], False
+    for line in text.splitlines(True):
+        if line == '#ifdef FUXI_ATH12K\n':
+            assert not inside
+            inside = True
+        elif line == '#endif /* FUXI_ATH12K */\n':
+            assert inside
+            inside = False
+        elif not inside:
+            out.append(line)
+    assert not inside
+    return ''.join(out)
+
+
 @check
-def metal4_inputs_are_untouched(tmp):
-    paths = ['tools/ci/build.sh', 'tools/ci/prepare-kernel.py', 'tools/ci/kernel-inputs.py',
-             'xnu/fuxi-wlan/fuxi_wlan.c', 'xnu/patches']
-    result = subprocess.run(['git', '-C', str(ROOT), 'diff', '--stat', BASE_COMMIT, '--', *paths],
-                            capture_output=True, text=True)
-    if 'not a git repository' in result.stderr:
-        # A worktree made by Windows git names its gitdir with a drive letter, which WSL cannot read.
-        print('skip git part of metal4_inputs_are_untouched: this git cannot read the worktree')
-    else:
+def metal4_compiles_the_same_c(tmp):
+    """fuxi_wlan.c without its guarded blocks is byte for byte the file before the port, and nothing in it
+    depends on line numbers, so metal4's object code is unchanged. A deliberate change to the C the other
+    kernels compile must change this digest on purpose."""
+    text = (ROOT / 'xnu/fuxi-wlan/fuxi_wlan.c').read_text()
+    assert hashlib.sha256(without_ath12k(text).encode()).hexdigest() == METAL4_WLAN_C
+    assert 'FUXI_ATH12K' in text
+    for word in ('__LINE__', '__FILE__', '__COUNTER__', 'assert(', 'panic('):
+        assert word not in without_ath12k(text).replace('_Static_assert(', ''), word
+
+
+def fake_builder(tmp):
+    builder = tmp / 'dxb'
+    (builder / 'patches').mkdir(parents=True)
+    (builder / 'build.sh').write_text('ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"\nwarning "Skipping patch ${PATCH}\n')
+    return builder
+
+
+@check
+def only_metal4wifi_gets_patch_0117(tmp):
+    script = ROOT / 'tools/ci/prepare-kernel.py'
+    plain, ath = fake_builder(tmp / 'a'), fake_builder(tmp / 'b')
+    subprocess.run([sys.executable, str(script), str(plain)], check=True)
+    subprocess.run([sys.executable, str(script), str(ath), '--ath12k'], check=True)
+    names = sorted(p.name for p in (plain / 'patches').iterdir())
+    extra = sorted(set(p.name for p in (ath / 'patches').iterdir()) - set(names))
+    assert '0099-fuxi-wlan.patch' in names and not [n for n in names if n.startswith('0117-')]
+    assert extra == ['0117-fuxi-ath12k.patch', '0117-fuxi-ath12k.patch.fuxi-required']
+    patch = (ROOT / 'xnu/patches/0117-fuxi-ath12k.patch').read_text()
+    assert 'LD_KERNEL_ARCHIVES += $(FUXI_OBJECTS)' in patch and '-DFUXI_ATH12K=1' in patch
+    assert 'bsd/dev/fuxi_ath12k_os.c\t\tstandard' in patch
+    subprocess.run([sys.executable, str(ROOT / 'tools/sync-fuxi-ath12k.py'), '--check'], check=True, capture_output=True)
+    for other in (ROOT / 'xnu/patches').glob('*.patch'):
+        if other.name != '0117-fuxi-ath12k.patch':
+            assert 'FUXI_OBJECTS' not in other.read_text(errors='surrogateescape'), other.name
+
+
+@check
+def ci_plumbing_adds_one_profile(tmp):
+    def plan(kernel):
+        result = subprocess.run(['bash', str(ROOT / 'tools/ci/build.sh'), '--plan', kernel, 'false', 'false', 'false'],
+                                capture_output=True, text=True)
         assert result.returncode == 0, result.stderr
-        assert result.stdout == '', f'changed since {BASE_COMMIT}:\n{result.stdout}'
-    assert not (ROOT / 'xnu/patches/0117-fuxi-ath12k.patch').exists()
-    assert 'ath12k' not in (ROOT / 'tools/ci/build.sh').read_text()
+        return json.loads(result.stdout)['target']
+    assert plan('metal4wifi') == ['kernel-metal4wifi']
+    assert plan('metal4') == ['kernel-metal4']
+    assert plan('all') == ['kernel-metal4', 'kernel-wlan6g']
+    workflow = (ROOT / '.github/workflows/fuxi-build.yml').read_text()
+    assert 'options: [none, metal4, wlan6g, metal4e, metal4wifi, all]' in workflow and 'default: metal4\n' in workflow
+    script = (ROOT / 'tools/ci/build.sh').read_text()
+    assert 'unset FUXI_OBJECTS' in script and 'prepare_args=(--ath12k)' in script
+    inputs = ROOT / 'tools/ci/kernel-inputs.py'
+    for variant in ('metal4', 'metal4wifi'):
+        subprocess.run([sys.executable, str(inputs), '--variant', variant, '--out', str(tmp / variant)], check=True, capture_output=True)
+    base = (tmp / 'metal4/cmdline.txt').read_text()
+    assert (tmp / 'metal4wifi/cmdline.txt').read_text() == base and 'fuxiath12k' not in base
+    assert not (tmp / 'metal4/cmdline-ath12k1.txt').exists()
+    line = (tmp / 'metal4wifi/cmdline-ath12k1.txt').read_text()
+    assert line == base.rstrip('\n') + ' fuxiath12k=1\n' and len(line.encode()) - 1 < 608
+
+
+OS_STUBS = {
+    'kern/clock.h': '#include <stddef.h>\n#include <stdint.h>\nuint64_t mach_absolute_time(void);\n'
+                    'void absolutetime_to_nanoseconds(uint64_t, uint64_t *);\n'
+                    'void nanoseconds_to_absolutetime(uint64_t, uint64_t *);\n',
+    'kern/kalloc.h': 'void *kalloc_data(unsigned long, int);void kfree_data(void *, unsigned long);\n'
+                     '#define Z_WAITOK 1\n#define Z_ZERO 2\n'
+                     'void *fake_kalloc(unsigned long);void fake_kfree(void *);\n'
+                     '#define kalloc_type(t, f) ((t *)fake_kalloc(sizeof(t)))\n#define kfree_type(t, p) fake_kfree(p)\n',
+    'kern/locks.h': 'typedef struct { int x; } lck_mtx_t;typedef struct { int x; } lck_grp_t;\n'
+                    '#define LCK_GRP_DECLARE(n, s) lck_grp_t n\n#define LCK_MTX_DECLARE(n, g) lck_mtx_t n\n'
+                    'void lck_mtx_lock(lck_mtx_t *);void lck_mtx_unlock(lck_mtx_t *);\n'
+                    '#define LCK_SLEEP_DEFAULT 0\n#define THREAD_UNINT 0\n'
+                    'typedef void *event_t;int lck_mtx_sleep_deadline(lck_mtx_t *, int, event_t, int, unsigned long long);\n',
+    'kern/sched_prim.h': 'int thread_block(void *);void thread_wakeup(void *);\n#define THREAD_CONTINUE_NULL ((void *)0)\n',
+    'kern/thread.h': 'typedef void *thread_t;typedef int wait_result_t;typedef int kern_return_t;\n#define KERN_SUCCESS 0\n'
+                     'thread_t current_thread(void);void thread_deallocate(thread_t);\n'
+                     'kern_return_t kernel_thread_start(void (*)(void *, wait_result_t), void *, thread_t *);\n',
+    'libkern/libkern.h': '', 'mach/mach_types.h': '',
+    'pexpert/pexpert.h': 'int PE_parse_boot_argn(const char *, void *, int);\n',
+    'sys/errno.h': '#define ENOMEM 12\n#define EAGAIN 35\n',
+    'sys/random.h': 'void read_random(void *, unsigned);typedef unsigned u_int;\n',
+    'sys/systm.h': 'int printf(const char *, ...);void panic(const char *, ...) __attribute__((noreturn));\n'
+                   '#define __unused __attribute__((unused))\n#define __dead2 __attribute__((noreturn))\n',
+}
+
+
+@check
+def os_file_implements_its_allow_list_group(tmp):
+    """Compiles the XNU side on stub headers: every name the object wants from it is defined, and fuxi_wlan.c
+    defines the rest, so a kernel with patches 0099 and 0117 leaves only libkern names for the link."""
+    for name, text in OS_STUBS.items():
+        path = tmp / 'stubs' / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    own = ROOT / 'xnu/fuxi-ath12k'
+    (tmp / 'stubs/fa_lx_os.h').write_bytes((own / 'compat/include/lx_os.h').read_bytes())
+    obj = tmp / 'os.o'
+    cc = os.environ.get('CC', 'cc')
+    subprocess.run([cc, '-std=gnu11', '-Wall', '-Werror', '-Wno-unused-function', '-Wno-unused-variable', '-DFUXI', '-DFUXI_ATH12K=1',
+                    f'-I{tmp / "stubs"}', f'-I{own / "src"}', '-c', str(own / 'os/fuxi_ath12k_os.c'), '-o', str(obj)], check=True)
+    nm = subprocess.run(['nm', '-g', str(obj)], capture_output=True, text=True, check=True).stdout
+    defined = {line.split()[-1].lstrip('_') for line in nm.splitlines() if ' T ' in line}
+    groups = json.loads((ROOT / 'tools/ath12k-undefined-allow.json').read_text())['groups']
+    missing = [s for s in groups['fuxi-ath12k-os']['symbols'] if s not in defined]
+    assert not missing, missing
+    assert {'fuxi_ath12k_mhi_lock', 'fuxi_ath12k_mhi_unlock'} <= defined
+    wlan = (ROOT / 'xnu/fuxi-wlan/fuxi_wlan.c').read_text()
+    for name in groups['fuxi-wlan']['symbols']:
+        assert re.search(r'^(?:\w[\w ]*\*?\s*)?' + name + r'\(', wlan, re.M), name
+    for prototype in ('fa_firmware_ready', 'fa_stop'):
+        assert prototype + '(' in wlan
+
+
+def fake_ld(tmp, fail):
+    """A stand-in `ld` for the Xcode route: fails the listed ways, otherwise copies its first object."""
+    tool = tmp / 'ld'
+    tool.write_text(f"""#!{sys.executable}
+import shutil, sys
+args = sys.argv[1:]
+open({str(tmp / 'calls')!r}, 'a').write(' '.join(args) + chr(10))
+classic, listed = '-ld_classic' in args, '-exported_symbols_list' in args
+key = 'classic' if classic else 'list' if listed else 'plain'
+if key in {sorted(fail)!r}:
+    sys.stderr.write('ld: refused in the ' + key + ' way' + chr(10))
+    sys.exit(1)
+lines = open(args[args.index('-filelist') + 1]).read().split()
+shutil.copyfile(lines[0], args[args.index('-o') + 1])
+""")
+    tool.chmod(0o755)
+    return tool
+
+
+@check
+def xcode_link_tries_each_way_and_says_why(tmp):
+    (tmp / 'a.o').write_text('object')
+    objects = [tmp / 'a.o']
+
+    class Tool:
+        route = 'ld64'
+    for fail, used, calls in ((set(), 'ld -r -exported_symbols_list', 1),
+                              ({'list'}, 'ld -ld_classic -r -exported_symbols_list', 2),
+                              ({'list', 'classic'}, 'ld -r with hidden visibility only', 3)):
+        folder = tmp / ('w' + str(calls))
+        folder.mkdir()
+        Tool.ld = str(fake_ld(folder, fail))
+        output = folder / 'out.o'
+        assert build.link(Tool, objects, output, ['fa_stop'], folder) == used
+        assert output.read_text() == 'object'
+        written = (folder / 'calls').read_text().splitlines()
+        assert len(written) == calls and all(' -r ' in f' {line} ' and '-arch arm64' in line for line in written)
+        assert (folder / 'exported.txt').read_text() == '_fa_stop\n'
+    folder = tmp / 'bad'
+    folder.mkdir()
+    Tool.ld = str(fake_ld(folder, {'list', 'classic', 'plain'}))
+    try:
+        build.link(Tool, objects, folder / 'out.o', ['fa_stop'], folder)
+        raise AssertionError('link must fail')
+    except build.Stop as stop:
+        text = str(stop)
+        assert 'never run before' in text and text.count('ld: refused') == 3 and 'hidden visibility' in text
 
 
 @check

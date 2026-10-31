@@ -5,9 +5,10 @@ root=$(cd "$(dirname "$0")/../.." && pwd)
 usage() {
     cat <<'HELP'
 Usage: tools/ci/build.sh TARGET [--dry-run]
-Targets: kernel-metal4, kernel-wlan6g, kernel-metal4e, metal, nativemetal, mesa, tools
+Targets: kernel-metal4, kernel-wlan6g, kernel-metal4e, kernel-metal4wifi, metal, nativemetal, mesa, tools
        tools/ci/build.sh --plan KERNEL METAL MESA TOOLS [NATIVEMETAL]
-KERNEL: none|metal4|wlan6g|metal4e|all; remaining plan arguments: true|false
+KERNEL: none|metal4|wlan6g|metal4e|metal4wifi|all; remaining plan arguments: true|false
+metal4wifi is the metal4 kernel plus the ath12k driver domain (patch 0117, FUXI_OBJECTS); all does not include it.
 metal4e is the opt-in arm64e build of the metal4 kernel (FUXI_ARM64E=1, patch 0115); all does not include it.
 Outputs: tools/out/ci/TARGET/ (explicit allowlist, logs, SHA256SUMS)
 Caches: deps/ci-downloads/; isolated build directories: deps/ci-work-TARGET/
@@ -24,7 +25,7 @@ case "$1" in
     -h|--help) [[ $# == 1 ]] || die 'unexpected help arguments'; usage; exit 0 ;;
     --plan)
         [[ $# == 5 || $# == 6 ]] || die '--plan needs KERNEL METAL MESA TOOLS [NATIVEMETAL]'
-        case "$2" in none|metal4|wlan6g|metal4e|all) ;; *) die 'invalid kernel selection' ;; esac
+        case "$2" in none|metal4|wlan6g|metal4e|metal4wifi|all) ;; *) die 'invalid kernel selection' ;; esac
         for flag in "$3" "$4" "$5" "${6:-false}"; do
             [[ $flag == true || $flag == false ]] || die 'plan flags must be true or false'
         done
@@ -32,7 +33,7 @@ case "$1" in
 import json, sys
 kernel, *flags = sys.argv[1:]
 targets = ["kernel-" + v for v in ("metal4", "wlan6g") if kernel in (v, "all")]
-targets += ["kernel-metal4e"] if kernel == "metal4e" else []
+targets += ["kernel-" + kernel] if kernel in ("metal4e", "metal4wifi") else []
 targets += [t for t, f in zip(("metal", "mesa", "tools", "nativemetal"), flags) if f == "true"]
 if not targets:
     raise SystemExit("Select at least one target")
@@ -42,7 +43,7 @@ PY
 esac
 target=$1
 shift
-case "$target" in kernel-metal4|kernel-wlan6g|kernel-metal4e|metal|nativemetal|mesa|tools) ;; *) die "unknown target: $target" ;; esac
+case "$target" in kernel-metal4|kernel-wlan6g|kernel-metal4e|kernel-metal4wifi|metal|nativemetal|mesa|tools) ;; *) die "unknown target: $target" ;; esac
 dry=false
 if [[ $# == 1 && $1 == --dry-run ]]; then dry=true; shift; fi
 [[ $# == 0 ]] || die 'unexpected arguments'
@@ -56,6 +57,9 @@ if $dry; then
     printf 'pins: dxb=%s mesa=%s metal2vulkan=%s rust=%s\n' "$DXB_SHA" "$MESA_SHA" "$M2V_SHA" "$RUST_VERSION"
     if [[ $target == kernel-metal4e ]]; then
         echo 'kernel: arm64e (FUXI_ARM64E=1, patch 0115), metal4 cmdline + cmdline-cpus1.txt, needs ld-classic'
+    fi
+    if [[ $target == kernel-metal4wifi ]]; then
+        echo 'kernel: metal4 + ath12k (build-ath12k.py, patch 0117, FUXI_OBJECTS), metal4 cmdline + cmdline-ath12k1.txt'
     fi
     echo 'No downloads, builds, signing or packing in dry-run mode.'
     exit 0
@@ -227,7 +231,7 @@ kernel() {
     python3 tools/test-fuxi-pac.py
     python3 tools/sync-fuxi-pac.py --check
     python3 tools/test-fuxi-arm64e.py
-    if [[ $target == kernel-wlan6g ]]; then
+    if [[ $target == kernel-wlan6g || $target == kernel-metal4wifi ]]; then
         # WLAN source keeps the existing artifact/target and cmdlines. Exercise the
         # exact C carried by patch 0099 before spending a hosted kernel build.
         python3 tools/test-fuxi-wlan-m6.py
@@ -250,8 +254,20 @@ kernel() {
         shasum -a 256 xnu/fuxi-wlan/fuxi_wlan.c xnu/patches/0099-fuxi-wlan.patch \
             shim/fuxi-probe/wlan.c > "$out/wlan-source-SHA256SUMS.txt"
     fi
+    local ath12k_object='' prepare_args=()
+    if [[ $target == kernel-metal4wifi ]]; then
+        python3 tools/test-fuxi-wlan-ath12k.py
+        python3 tools/test-fuxi-ath12k.py
+        python3 tools/sync-fuxi-ath12k.py --check
+        python3 tools/ci/build-ath12k.py --fetch --clean --linux "$work/ath12k-linux" --freebsd "$work/ath12k-freebsd" --work "$work/ath12k"
+        ath12k_object=$work/ath12k/fuxi_ath12k.o
+        [[ $ath12k_object != *' '* ]] || die 'FUXI_OBJECTS cannot hold a path with a space'
+        cp "$work/ath12k/undefined.txt" "$out/ath12k-undefined.txt"
+        cp xnu/fuxi-ath12k/NOTICE "$out/ath12k-NOTICE.txt"
+        prepare_args=(--ath12k)
+    fi
     source_checkout dxb https://github.com/blacktop/darwin-xnu-build.git "$DXB_SHA" "$dxb"
-    python3 tools/ci/prepare-kernel.py "$dxb"
+    python3 tools/ci/prepare-kernel.py "$dxb" ${prepare_args[@]+"${prepare_args[@]}"}
     # MACOS_VERSION selects xnu-8796.141.3 + KDK 13.5/22G74. The pinned
     # builder installs that KDK on this runner when absent; never cache/upload it.
     (
@@ -259,6 +275,8 @@ kernel() {
         export MACOS_VERSION=13.5 KERNEL_CONFIG=DEVELOPMENT ARCH_CONFIG=ARM64 MACHINE_CONFIG=FUXI
         # metal4e: MakeInc.def (patch 0115) switches FUXI to arm64e; unset everywhere else.
         if [[ $arm64e == 1 ]]; then export FUXI_ARM64E=1; else unset FUXI_ARM64E; fi
+        # metal4wifi: patch 0117 links this object; unset everywhere else.
+        if [[ -n $ath12k_object ]]; then export FUXI_OBJECTS=$ath12k_object; else unset FUXI_OBJECTS; fi
         "$native/bin/bash" build.sh
     )
     cp "$dxb/fakeroot/System/Library/Kernels/kernel.development.fuxi" "$out/"

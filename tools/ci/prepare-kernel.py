@@ -6,11 +6,16 @@ import shutil
 
 ap = argparse.ArgumentParser(description=__doc__)
 ap.add_argument("builder", type=Path)
+ap.add_argument("--ath12k", action="store_true",
+                help="kernel-metal4wifi only: also apply patch 0117, which adds the ath12k domain to the kernel")
 args = ap.parse_args()
 root = Path(__file__).resolve().parents[2]
 builder = args.builder
 for source in sorted((root / "xnu/patches").iterdir()):
     if source.suffix not in (".sh", ".patch"):
+        continue
+    # Every other kernel keeps exactly its old inputs: no extra file, flag or link object.
+    if source.name.startswith("0117-") and not args.ath12k:
         continue
     dest = builder / "patches" / source.name
     if source.suffix == ".sh":

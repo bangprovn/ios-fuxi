@@ -100,6 +100,7 @@ have only been built with Xcode 15.4 here; check them separately on the new runn
 | Artifact | Contents in addition to `SHA256SUMS` and `logs/build.log` | Estimated cold runtime |
 | --- | --- | --- |
 | `fuxi-kernel-metal4` | `kernel.development.fuxi`, `kernel.development.fuxi.unstripped`, public `fuxi.adt`, `cmdline.txt` for the Metal smoke host | 15–35 min |
+| `fuxi-kernel-metal4wifi` | The metal4 kernel with the ath12k driver domain (`tools/ci/build-ath12k.py`, patch 0117, `FUXI_OBJECTS`), public `fuxi.adt`, metal4 `cmdline.txt`, `cmdline-ath12k1.txt` (adds `fuxiath12k=1`, off without it), `ath12k-undefined.txt`, `ath12k-NOTICE.txt` | 20–40 min (not yet built) |
 | `fuxi-kernel-metal4e` | arm64e kernel pair (`FUXI_ARM64E=1`: ld-classic `__TEXT,__thread_starts`, keys programmed in start.s), public `fuxi.adt`, metal4 `cmdline.txt`, `cmdline-cpus1.txt` (one-core fallback), `kernel-arch.txt` | 15–35 min (not yet built) |
 | `fuxi-kernel-wlan6g` | Same kernel pair and public ADT, M6g `cmdline.txt` (full) and `cmdline-s22.txt` (stop at BHI completion) and `cmdline-s22-oldiova.txt` (same, old IOVA pool) | 15–35 min |
 | `fuxi-metal` | Complete ad-hoc signed `FuxiMetal.bundle`, `fuxi-metal-smoke`, our compiled `metal-smoke.metallib`, separately signed `libmetal2vulkan.dylib`, `metal2vulkan-source.tar.gz` with licences and vendored crate sources, `metal-clients.conf`, `metal-smoke.conf` | 10–25 min |
@@ -129,6 +130,7 @@ examples assume the reviewed change has been integrated into `main`:
 gh workflow run fuxi-build.yml -R bangprovn/ios-fuxi --ref main -f kernel=metal4 -f metal=false -f mesa=false -f tools=false
 gh workflow run fuxi-build.yml -R bangprovn/ios-fuxi --ref main -f kernel=wlan6g -f metal=false -f mesa=false -f tools=false
 gh workflow run fuxi-build.yml -R bangprovn/ios-fuxi --ref main -f kernel=metal4e -f metal=false -f mesa=false -f tools=false
+gh workflow run fuxi-build.yml -R bangprovn/ios-fuxi --ref main -f kernel=metal4wifi -f metal=false -f mesa=false -f tools=false
 gh workflow run fuxi-build.yml -R bangprovn/ios-fuxi --ref main -f kernel=none -f metal=true -f mesa=false -f tools=false
 gh workflow run fuxi-build.yml -R bangprovn/ios-fuxi --ref main -f kernel=none -f metal=false -f mesa=true -f tools=false
 gh workflow run fuxi-build.yml -R bangprovn/ios-fuxi --ref main -f kernel=none -f metal=false -f mesa=false -f tools=true
