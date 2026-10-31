@@ -6,8 +6,11 @@
 #   build-xnu27.sh WORK OUT
 #
 # WORK must hold clean checkouts at the xnu27/sources.env pins: xnu,
-# AvailabilityVersions, libplatform, libdispatch and trustcache (xnu-8796.101.5,
-# EXTERNAL_HEADERS/TrustCache only). tools/ci/build.sh kernel-ios27 fetches them.
+# AvailabilityVersions, libplatform, libdispatch, libpthread and trustcache
+# (xnu-8796.101.5, EXTERNAL_HEADERS/TrustCache only). tools/ci/build.sh
+# kernel-ios27 fetches them. libpthread's kernel part (libpthread_kernel.a,
+# tools/ci/build-libpthread27.py) is force-loaded into all three kernels below;
+# each link is checked for _pthread_start and _source_pthread_status.
 # OUT receives mach.development.fuxi(.unstripped), fuxi27.adt, cmdline*.txt,
 # kernel-arch.txt, unless FUXI_XNU27_CHAINED=0 the K2 prelink input
 # mach.development.fuxi.chained.unstripped (same objects relinked with
@@ -28,11 +31,12 @@ die() { echo "build-xnu27: $*" >&2; exit 2; }
 source "$root/xnu27/sources.env"
 xnu=$work/xnu fake=$work/fakeroot obj=$work/obj sym=$work/sym dst=$work/dst
 jobs=$(sysctl -n hw.logicalcpu)
-for name in xnu AvailabilityVersions libplatform libdispatch trustcache; do
+for name in xnu AvailabilityVersions libplatform libdispatch libpthread trustcache; do
     [[ -d $work/$name/.git ]] || die "missing checkout $work/$name"
 done
 [[ $(git -C "$xnu" rev-parse HEAD) == "$XNU27_SHA" ]] || die 'xnu is not at XNU27_SHA'
 git -C "$xnu" diff --quiet || die 'xnu checkout is not clean'
+[[ $(git -C "$work/libpthread" rev-parse HEAD) == "$LIBPTHREAD_SHA" ]] || die 'libpthread is not at LIBPTHREAD_SHA'
 
 # ld-classic emits __TEXT,__thread_starts, which a standalone arm64e kernel
 # needs (UniXNU arm64e-threaded-starts.patch). Fail before a long build.
@@ -101,14 +105,42 @@ kflags=(SDKROOT=iphoneos
     copyio.o_CFLAGS_ADD=-march=armv8.1-a pcb.o_CFLAGS_ADD=-march=armv8.1-a platform_tests.o_CFLAGS_ADD=-march=armv8.1-a
     ubc_subr.o_CFLAGS_ADD=-DXNU_NATIVE_CS_HASH_CACHE=1)
 make -C "$xnu" build "${common[@]}" DSTROOT="$dst" "${kflags[@]}" BUILD_LTO=0
-
 kdir=$obj/DEVELOPMENT_ARM64_FUXI
+
+# K2 libpthread (docs-lanes/ios27.md): the pass above links a kernel without
+# pthread (it would panic in pthread_init: "pthread kernel extension not
+# loaded"). Its compile records and link.filelist build libpthread_kernel.a
+# (libpthread's kern/*.c + xnu's source_pthread_bootstrap.c, which xnu itself
+# never compiles), then the same objects are relinked with the archive
+# force-loaded, as UniXNU's build-xnu-4k-baseline.sh XNU_SOURCE_PTHREAD=1 does
+# (LD_KERNEL_ARCHIVES replaces MakeInc.def's default, so it repeats
+# -lfirehose_kernel; XNU_EXTERNAL_KERNEL_ARCHIVES makes the link depend on it).
+# The chained relink and the RELEASE reference take the same pthread arguments.
+python3 "$root/tools/ci/build-libpthread27.py" --libpthread "$work/libpthread" --xnu "$xnu" --kdir "$kdir" \
+    --fakeroot "$fake" --triple "arm64e-apple-ios$XNU27_IOS_VERSION" --out "$work/libpthread-kernel"
+pthread_a=$work/libpthread-kernel/libpthread_kernel.a
+[[ -f $pthread_a ]] || die "no $pthread_a"
+cp "$work/libpthread-kernel/report.json" "$out/libpthread-report.json"
+pthread=("LD_KERNEL_ARCHIVES=-L$fake/usr/local/lib/kernel -L$fake/usr/local/lib/kernel/platform -lfirehose_kernel -Wl,-force_load,$pthread_a"
+         "XNU_EXTERNAL_KERNEL_ARCHIVES=$pthread_a")
+# A kernel without the archive links fine and panics at boot, so every kept link is checked here.
+pthread_linked() {
+    local names
+    names=$(xcrun nm -U -j "$1") || die "nm failed on $1"
+    for sym in _pthread_start _source_pthread_status; do
+        grep -qx "$sym" <<<"$names" || die "$(basename "$1") lacks $sym: libpthread_kernel.a is not linked"
+    done
+    echo "pthread: $(basename "$1") has _pthread_start and _source_pthread_status"
+}
+make -C "$xnu" build "${common[@]}" DSTROOT="$dst" "${kflags[@]}" "${pthread[@]}" BUILD_LTO=0
+
 [[ -f $kdir/mach.development.fuxi ]] || die "no $kdir/mach.development.fuxi"
 cp "$kdir/mach.development.fuxi" "$out/"
 for raw in "$kdir/mach.development.fuxi.unstripped" "$kdir/mach.development.fuxi.unstripped.noctf"; do
     [[ -f $raw ]] && { cp "$raw" "$out/mach.development.fuxi.unstripped"; break; }
 done
 [[ -f $out/mach.development.fuxi.unstripped ]] || die 'no unstripped kernel'
+pthread_linked "$out/mach.development.fuxi.unstripped" | tee -a "$out/libpthread-linked.txt"
 # The loader build accepts a 12377 payload only with this object-path identity.
 grep -q DEVELOPMENT_ARM64_FUXI "$out/mach.development.fuxi" || die 'kernel lacks the DEVELOPMENT_ARM64_FUXI identity'
 python3 - "$out/mach.development.fuxi" "$root/tools" <<'PY' | tee "$out/kernel-arch.txt"
@@ -133,13 +165,14 @@ python3 "$root/tools/ci/kernel-inputs.py" --variant ios27 --out "$out"
 # wins over the =0 in kflags. The K1 standalone kernel above is already copied.
 if [[ ${FUXI_XNU27_CHAINED:-1} == 0 ]]; then
     echo 'chained kernel: skipped (FUXI_XNU27_CHAINED=0)'
-elif make -C "$xnu" build "${common[@]}" DSTROOT="$dst" "${kflags[@]}" BUILD_LTO=0 XNU_KERNEL_CHAINED_FIXUPS=1; then
+elif make -C "$xnu" build "${common[@]}" DSTROOT="$dst" "${kflags[@]}" "${pthread[@]}" BUILD_LTO=0 XNU_KERNEL_CHAINED_FIXUPS=1; then
     chained=
     for raw in "$kdir/mach.development.fuxi.unstripped" "$kdir/mach.development.fuxi.unstripped.noctf"; do
         [[ -f $raw ]] && { chained=$raw; break; }
     done
     [[ -n $chained ]] || die 'no unstripped chained kernel'
     cp "$chained" "$out/mach.development.fuxi.chained.unstripped"
+    pthread_linked "$out/mach.development.fuxi.chained.unstripped" | tee -a "$out/libpthread-linked.txt"
     python3 - "$out/mach.development.fuxi.chained.unstripped" <<'PY' | tee -a "$out/kernel-arch.txt"
 import struct, sys
 b = open(sys.argv[1], 'rb').read()
@@ -176,7 +209,7 @@ mkdir -p "$robj/EXPORT_HDRS/libsa" "$work/release-sym" "$work/release-dst"
 # compared both as written and through c++filt.
 release_make() {
     make -C "$xnu" build "${base[@]}" KERNEL_CONFIGS=RELEASE OBJROOT="$robj" SYMROOT="$work/release-sym" \
-        DSTROOT="$work/release-dst" "${kflags[@]}" BUILD_LTO=1 \
+        DSTROOT="$work/release-dst" "${kflags[@]}" "${pthread[@]}" BUILD_LTO=1 \
         LDFLAGS_KERNEL_LTO="-miphoneos-version-min=$XNU27_IOS_VERSION -Wl,-mllvm,-inline-threshold=100" \
         "$@" 2>&1 | tee "$work/release-make.log"
     return "${PIPESTATUS[0]}"
@@ -203,6 +236,7 @@ if [[ $release_ok == 1 ]]; then
         [[ -f $rdir/$raw ]] && cp "$rdir/$raw" "$out/"
     done
     [[ -f $out/mach.release.fuxi.unstripped || -f $out/mach.release.fuxi.unstripped.noctf ]] || die "no unstripped RELEASE kernel in $rdir"
+    for raw in "$out"/mach.release.fuxi.unstripped*; do pthread_linked "$raw" | tee -a "$out/libpthread-linked.txt"; done
     (cd "$out" && shasum -a 256 mach.release.fuxi.unstripped*) | tee "$out/release-reference.txt"
     if [[ -s $work/release-missing.txt ]]; then cp "$work/release-missing.txt" "$out/release-kpi-removed.txt"; fi
 else

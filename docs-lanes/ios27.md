@@ -61,19 +61,22 @@ gh workflow run fuxi-build.yml -f kernel=ios27 -f runner=macos-26 -f xcode=26.0
 
 Use any Xcode 26 or newer that the runner image has; the "Select Xcode" step lists them. `iig_mode`/`iig_run`
 are ignored for ios27. `tools/ci/build.sh kernel-ios27` runs `test-fuxi-ios27.py` and `test-fuxi-arm64e.py`. It then
-fetches source only, at `xnu27/sources.env`: xnu, AvailabilityVersions, libplatform, libdispatch, and
+fetches source only, at `xnu27/sources.env`: xnu, AvailabilityVersions, libplatform, libdispatch, libpthread, and
 `EXTERNAL_HEADERS/TrustCache` from xnu-8796.101.5. Then `tools/ci/build-xnu27.sh`: apply the series, build the
 kernel SDK root (availability.pl, libplatform and libdispatch headers, `installhdrs`), build `libfirehose_kernel`
 for arm64e, then make with UniXNU's flags (`ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG=arm64e`, link address
 `0xfffffff007004000`, `-UARM_LARGE_MEMORY`, iOS 27.0 deployment, no LTO, native PAN, CS hash cache,
-`XNU_KERNEL_CHAINED_FIXUPS=0` = ld-classic `-threaded_starts_section`). Artifact `fuxi-kernel-ios27`:
+`XNU_KERNEL_CHAINED_FIXUPS=0` = ld-classic `-threaded_starts_section`), build libpthread's kernel part and relink
+with it (K2 libpthread, below). Artifact `fuxi-kernel-ios27`:
 `mach.development.fuxi`, `mach.development.fuxi.unstripped` (keep it for prelinking and the monitor),
 `kernel-arch.txt`, `fuxi27.adt` + `cmdline.txt` (1 CPU), `fuxi27-cpus7.adt` + `cmdline-cpus7.txt`,
-`xnu27-SHA256SUMS.txt`, logs. `bash tools/ci/build.sh kernel-ios27 --dry-run` prints the plan on Linux.
+`xnu27-SHA256SUMS.txt`, `libpthread-report.json`, `libpthread-linked.txt`, logs.
+`bash tools/ci/build.sh kernel-ios27 --dry-run` prints the plan on Linux.
 For K2a the same job also uploads `mach.development.fuxi.chained.unstripped` (the same objects relinked with
 `XNU_KERNEL_CHAINED_FIXUPS=1`; skip with `FUXI_XNU27_CHAINED=0`) and the RELEASE LTO comparison kernel
 `mach.release.fuxi.unstripped(.noctf)` + `release-reference.txt` (own OBJROOT; skip with
-`FUXI_XNU27_RELEASE_REF=0`). Either one failing only warns. Neither has been built yet (no CI run since).
+`FUXI_XNU27_RELEASE_REF=0`). Either one failing to build only warns; one that links without libpthread stops
+the job. Neither has been built yet (no CI run since).
 
 ## Pack and boot (user, local)
 
@@ -159,6 +162,41 @@ are the kind name-based matching needs); missing data at 0 or reviewed; then the
 in the shapes the matcher compares; the relinked chained kernel itself has never booted standalone (it is not
 meant to); Apple kexts touching SoC hardware that the Fuxi lacks (the nine SoC roots).
 
+## K2 libpthread: the pthread kernel part
+
+Why (OBSERVED, K2a prelinked boot): AppleImage4, AMFI, Sandbox, CoreAnalytics and BSD init (mbinit) pass, then
+panic "pthread kernel extension not loaded (function table is NULL). @pthread_shims.c:319". xnu's `pthread_init`
+needs the `pthread_functions` table that Apple's pthread kext registers; we have no such kext.
+
+Before this change: `unixnu/source-pthread-bootstrap.patch` adds `bsd/kern/source_pthread_bootstrap.c`
+(`STARTUP(EARLY_BOOT)` calls `pthread_start`, panics "source libpthread registration failed" on error), but the
+file is not in `bsd/conf/files`, so xnu never compiled it. `pthread_start` is neither weak nor behind a define;
+nothing referenced it, so the kernel linked cleanly and only failed at boot. That is UniXNU's design too: the
+bootstrap lives in the archive, not in xnu's build.
+
+Now (UniXNU's method, `scripts/build-libpthread-kernel.py` + `build-xnu-4k-baseline.sh` `XNU_SOURCE_PTHREAD=1` +
+`build-fileset-release-reference.py`): CI fetches libpthread-539.100.4 (`LIBPTHREAD_SHA` `1f4f5265`, UniXNU's
+ipados-27.0.1-24A446 profile pin) and `tools/ci/build-libpthread27.py` applies `xnu27/libpthread/series` (UniXNU's
+`explicit-kernel-address.patch`, verbatim), compiles `kern/kern_init.c`, `kern_support.c`, `kern_synch.c` for
+`arm64e-apple-ios27.0` (`-mkernel`, the fakeroot Kernel.framework headers, UniXNU's defines), renames definitions
+that collide with kernel names (expected at least `pthread_kern`, `current_uthread`) with an `-include`d
+`#define` header, refuses any import the kernel does not define (except linker-made `___dso_handle`), compiles
+`source_pthread_bootstrap.c` with xnu's own recorded command for `prng_random.o` (`-MJ` JSON, `-M*` outputs
+dropped), and archives all four into `libpthread_kernel.a`. The kernel names and compile record come from a first
+DEVELOPMENT pass (a pthread-less kernel that is never copied out). Then every link gets
+`LD_KERNEL_ARCHIVES=-L… -lfirehose_kernel -Wl,-force_load,libpthread_kernel.a` and
+`XNU_EXTERNAL_KERNEL_ARCHIVES` (UniXNU's `external-archive-dependencies.patch` makes the link depend on it):
+the DEVELOPMENT relink, the chained relink and the RELEASE LTO reference. `build-xnu27.sh` then checks each kept
+unstripped kernel for `_pthread_start` and `_source_pthread_status` (`nm -U`) and stops the job if one lacks them,
+so a pthread-less kernel cannot be produced silently; `libpthread-linked.txt` records the checks.
+
+Expected boot (GUESS, not yet observed): `pthread_start` registers at EARLY_BOOT, so `pthread_init` in bsd_init
+finds the table. Risks (GUESS): the first compile of libpthread against 12377's Kernel.framework headers with
+Xcode 26 (UniXNU builds it, with their toolchain); libpthread is compiled with `-DDEBUG=1 -DMACH_ASSERT=1` as
+UniXNU does, and its imports are audited only against DEVELOPMENT names, so the RELEASE reference link could miss
+one (that only warns, as before); kexts that the prelink matched to the pthread-less kernel's layout must be
+re-prelinked against the new chained kernel (the native kernel changed).
+
 ## K1 on the device: what to expect (GUESS, not yet observed)
 
 1. Loader as today, then `XNU jumping`. The monitor stage word moves through start.s stages 1-4 (`0x10001..4`), then
@@ -175,8 +213,8 @@ ld-classic chains (0x101), ADT parsing in ArmDTPlatform/ArmCpu (after 0x10f), an
 ## Milestones
 
 - **K1** CI kernel, banner + early log over USB, clean stop at root mount. Built, not yet booted.
-- **K2** RAM-disk root (`rd=md0`, mockfs is in the config) and the crypto decision; libpthread-539.100.4 in-tree
-  (UniXNU `source-pthread-bootstrap` is imported but not wired).
+- **K2** RAM-disk root (`rd=md0`, mockfs is in the config) and the crypto decision; libpthread-539.100.4 kernel part
+  force-loaded into every kernel (K2 libpthread above; built in CI, not yet booted).
 - **K3** Local prelink of donor kexts (`unstripped` kernel + the user's kernelcache, UniXNU XnuPrelink approach),
   AMFI/sandbox early init (`native-security-init`), trust cache placement in the loader handoff. Started early as
   K2a (above): tooling, kernel/CI/ADT pieces and a counts-only trial done; no CI run, no boot.

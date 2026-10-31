@@ -13,10 +13,14 @@
     the v1/v2 boot_args layouts (CommandLine at 108, 736 / 1152 bytes); mkpayload --prelinked packs a K2
     MH_FILESET flat and untouched (arm_init slides it), bound to its report and native kernel;
   - fuxi-xnu-monitor.py symbols() on thin and fileset kernels, ring size from _sweet_log_size;
-  - kernel-inputs.py --variant ios27 and the CI plan/dry-run/workflow plumbing (ios27 not in all).
+  - kernel-inputs.py --variant ios27 and the CI plan/dry-run/workflow plumbing (ios27 not in all);
+  - K2 libpthread: the libpthread-539.100.4 pin (UniXNU profile), xnu27/libpthread/series = UniXNU's patch verbatim,
+    NOTICE entries, no Apple binaries or libpthread source in the repo, the bootstrap only in the archive, and
+    libpthread_kernel.a force-loaded and checked in the DEVELOPMENT, chained and RELEASE links.
 
-  --xnu DIR   also apply the series (xnu27/apply.sh) to a temporary worktree of DIR, a git clone of
-              apple-oss-distributions/xnu containing xnu-12377.121.6 (ac9718f), and check the result
+  --xnu DIR         also apply the series (xnu27/apply.sh) to a temporary worktree of DIR, a git clone of
+                    apple-oss-distributions/xnu containing xnu-12377.121.6 (ac9718f), and check the result
+  --libpthread DIR  also apply xnu27/libpthread/series to a copy of DIR, a libpthread checkout at LIBPTHREAD_SHA
 """
 import argparse
 import ast
@@ -124,9 +128,113 @@ def apply_check(xnu):
                 assert (tree / f).is_file(), f
             assert 'BOOT_LINE_LENGTH 1024' in (tree / 'pexpert/pexpert/arm64/boot.h').read_text()
             assert re.search(r'SUPPORTED_ARM64_MACHINE_CONFIGS = .*\bFUXI\b', (tree / 'makedefs/MakeInc.def').read_text())
+            # K2 libpthread: xnu never compiles the bootstrap (only libpthread_kernel.a carries it); the link
+            # default this build replaces and the archive dependency hook are what build-xnu27.sh assumes.
+            boot = (tree / 'bsd/kern/source_pthread_bootstrap.c').read_text()
+            assert 'STARTUP(EARLY_BOOT, STARTUP_RANK_SECOND, source_pthread_bootstrap);' in boot
+            assert 'extern kern_return_t pthread_start(kmod_info_t *, void *);' in boot and 'weak' not in boot
+            assert not any('source_pthread_bootstrap' in f.read_text() for f in tree.glob('*/conf/files*'))
+            mk = (tree / 'makedefs/MakeInc.def').read_text()
+            assert 'LD_KERNEL_ARCHIVES = $(LDFLAGS_KERNEL_SDK) -lfirehose_kernel\n' in mk
+            assert 'LDFLAGS_KERNEL_SDK\t= -L$(KERNEL_SDKROOT)/usr/local/lib/kernel -L$(KERNEL_SDKROOT)/usr/local/lib/kernel/platform' in mk
+            assert ': $(XNU_EXTERNAL_KERNEL_ARCHIVES)' in (tree / 'makedefs/MakeInc.kernel').read_text()
+            assert '-MJ $(@:o=o.json)' in (tree / 'makedefs/MakeInc.rule').read_text()
+            assert (tree / 'osfmk/prng/prng_random.c').is_file() and 'osfmk/prng/prng_random.c\tstandard' in (tree / 'osfmk/conf/files').read_text()
+            assert 'panic("pthread kernel extension not loaded' in (tree / 'bsd/pthread/pthread_shims.c').read_text()
         finally:
             subprocess.run(['git', '-C', str(xnu), 'worktree', 'remove', '--force', str(tree)], check=True)
-    print('PASS: xnu27/apply.sh applies the whole series to xnu-12377.121.6 and stages the components')
+    print('PASS: xnu27/apply.sh applies the whole series to xnu-12377.121.6 and stages the components; the pthread '
+          'bootstrap is outside conf/files and the link/MJ/archive-dependency hooks build-xnu27.sh uses are present')
+
+
+LIBPTHREAD_TAG, LIBPTHREAD_SHA = 'libpthread-539.100.4', '1f4f5265b319111142f1bf3a27d4484ef5a98314'
+# UniXNU 88604d0 patches/libpthread/explicit-kernel-address.patch
+LIBPTHREAD_PATCH_SHA256 = 'e07db8de4ca0bd7f827fd0340482496e5ece1c47e02175771f123e6603aea26d'
+
+
+def lp_series():
+    return [l for l in (X27 / 'libpthread/series').read_text().splitlines() if l and not l.startswith('#')]
+
+
+def pthread_check():
+    env = (X27 / 'sources.env').read_text()
+    assert f'LIBPTHREAD_TAG={LIBPTHREAD_TAG}\n' in env and f'LIBPTHREAD_SHA={LIBPTHREAD_SHA}\n' in env
+    listed = lp_series()
+    assert listed == ['explicit-kernel-address.patch'] and sorted(p.name for p in (X27 / 'libpthread').glob('*.patch')) == listed
+    patch = (X27 / 'libpthread/explicit-kernel-address.patch').read_bytes()
+    assert hashlib.sha256(patch).hexdigest() == LIBPTHREAD_PATCH_SHA256
+    assert set(re.findall(rb'^\+\+\+ b/(\S+)', patch, re.M)) == {b'kern/kern_support.c', b'kern/kern_synch.c', b'kern/kern_trace.h'}
+    notice = (X27 / 'NOTICE').read_text()
+    for need in ('libpthread/explicit-kernel-address.patch', 'tools/ci/build-libpthread27.py', 'build-libpthread-kernel.py',
+                 'build-xnu-4k-baseline.sh', 'build-fileset-release-reference.py', 'LIBPTHREAD_SHA'):
+        assert need in notice, need
+    # No Apple binaries or Apple libpthread/xnu sources: only text, and no copied kern/*.c next to the lane.
+    tracked = subprocess.run(['git', '-C', str(ROOT), 'ls-files', 'xnu27', 'tools/ci', 'tools/xnuprelink'],
+                             capture_output=True, text=True, check=True).stdout.split()
+    for f in tracked:
+        head = (ROOT / f).read_bytes()[:8]
+        assert head[:4] not in (b'\xcf\xfa\xed\xfe', b'\xca\xfe\xba\xbe', b'\xbe\xba\xfe\xca') and head != b'!<arch>\n', f
+        assert not re.search(r'\.(a|o|dylib|kext|ipsw|im4p)$', f) and Path(f).name not in (
+            'kern_init.c', 'kern_support.c', 'kern_synch.c', 'pthread_shims.c', 'source_pthread_bootstrap.c'), f
+    tool = (ROOT / 'tools/ci/build-libpthread27.py').read_text()
+    assert tool.startswith('#!/usr/bin/env python3\n# SPDX-License-Identifier: BSD-2-Clause-Patent\n')
+    for need in ("env['LIBPTHREAD_SHA']", "'xnu27/libpthread/series'", "('kern_init.c', 'kern_support.c', 'kern_synch.c')",
+                 "'bsd/kern/source_pthread_bootstrap.c'", "'osfmk/DEVELOPMENT/prng_random.o.json'", "'link.filelist'",
+                 "{'_pthread_kern', '_current_uthread'} <= collisions", "'-mkernel'", "'___dso_handle'", "'ar', 'rcs'",
+                 "'_source_pthread_status'", "DEPS_ARG = {'-MF', '-MJ', '-MT', '-MQ'}"):
+        assert need in tool, need
+    assert not re.search(r'/(hdd2|home|Users|tmp)/|curl|wget|kernelcache', tool)
+    # The bootstrap is xnu-side (UniXNU patch) but compiled only into the archive.
+    assert 'unixnu/source-pthread-bootstrap.patch' in series()
+    allp = ''.join((X27 / 'patches' / p).read_text() for p in series())
+    assert not re.search(r'^\+.*source_pthread_bootstrap\.c\s+(standard|optional)', allp, re.M)
+    sh = (ROOT / 'tools/ci/build.sh').read_text()
+    assert 'source_checkout libpthread "$apple/libpthread.git" "$LIBPTHREAD_SHA" "$work/src/libpthread"' in sh
+    assert 'xnu27/libpthread/*.patch' in sh
+    b27 = (ROOT / 'tools/ci/build-xnu27.sh').read_text()
+    assert 'libdispatch libpthread trustcache' in b27 and '"$LIBPTHREAD_SHA"' in b27
+    first = b27.index('make -C "$xnu" build "${common[@]}" DSTROOT="$dst" "${kflags[@]}" BUILD_LTO=0\n')
+    build = b27.index('python3 "$root/tools/ci/build-libpthread27.py"')
+    second = b27.index('make -C "$xnu" build "${common[@]}" DSTROOT="$dst" "${kflags[@]}" "${pthread[@]}" BUILD_LTO=0\n')
+    copy = b27.index('cp "$kdir/mach.development.fuxi" "$out/"')
+    assert first < build < second < copy, 'DEVELOPMENT pass, libpthread archive, relink with it, then copy out'
+    assert '--triple "arm64e-apple-ios$XNU27_IOS_VERSION"' in b27 and '--kdir "$kdir"' in b27
+    arch = re.search(r'pthread=\((.*?)\)\n', b27, re.S).group(1)
+    assert '"LD_KERNEL_ARCHIVES=-L$fake/usr/local/lib/kernel -L$fake/usr/local/lib/kernel/platform -lfirehose_kernel -Wl,-force_load,$pthread_a"' in arch
+    assert '"XNU_EXTERNAL_KERNEL_ARCHIVES=$pthread_a"' in arch
+    chained = b27[b27.index('# K2 prelink input'):b27.index('# K2 matching reference')]
+    rel = b27[b27.index('# K2 matching reference'):]
+    assert '"${kflags[@]}" "${pthread[@]}" BUILD_LTO=0 XNU_KERNEL_CHAINED_FIXUPS=1' in chained
+    assert '"${kflags[@]}" "${pthread[@]}" BUILD_LTO=1' in rel
+    assert b27.count('"${pthread[@]}"') == 3 and b27.count('"${kflags[@]}"') == 4
+    # Every kept kernel is checked; the check dies (set -e + pipefail) when a link lacks the archive.
+    assert 'for sym in _pthread_start _source_pthread_status; do' in b27 and 'xcrun nm -U -j "$1"' in b27
+    assert re.search(r'pthread_linked\(\) \{.*?die "\$\(basename "\$1"\) lacks \$sym', b27, re.S)
+    assert 'set -euo pipefail' in b27
+    assert 'pthread_linked "$out/mach.development.fuxi.unstripped"' in b27[copy:b27.index('# K2 prelink input')]
+    assert 'pthread_linked "$out/mach.development.fuxi.chained.unstripped"' in chained
+    assert 'pthread_linked "$raw"' in rel and 'mach.release.fuxi.unstripped*' in rel
+    assert b27.index('pthread_linked() {') < second
+    print(f'PASS: K2 libpthread: {LIBPTHREAD_TAG} {LIBPTHREAD_SHA[:8]} pinned, UniXNU patch verbatim in its series, '
+          'NOTICE entries, no Apple binaries/sources tracked, bootstrap only in the archive, libpthread_kernel.a '
+          'force-loaded into the DEVELOPMENT, chained and RELEASE links, each checked for _pthread_start')
+
+
+def libpthread_apply_check(src):
+    head = subprocess.run(['git', '-C', str(src), 'rev-parse', 'HEAD'], capture_output=True, text=True, check=True).stdout.strip()
+    assert head == LIBPTHREAD_SHA, head
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp) / 'libpthread'
+        subprocess.run(['git', 'clone', '-q', '--shared', str(src), str(work)], check=True)
+        subprocess.run(['git', '-C', str(work), 'checkout', '-q', '--detach', LIBPTHREAD_SHA], check=True)
+        for p in lp_series():
+            subprocess.run(['git', '-C', str(work), 'apply', str(X27 / 'libpthread' / p)], check=True)
+        for f in ('kern/kern_init.c', 'kern/kern_support.c', 'kern/kern_synch.c'):
+            assert (work / f).is_file(), f
+        init = (work / 'kern/kern_init.c').read_text()
+        assert re.search(r'^kern_return_t pthread_start\(', init, re.M) and re.search(r'^pthread_callbacks_t pthread_kern;', init, re.M)
+        assert 'kevent_list = NULL' not in (work / 'kern/kern_support.c').read_text()
+    print(f'PASS: xnu27/libpthread/series applies to {LIBPTHREAD_TAG}; kern_init.c defines pthread_start and pthread_kern')
 
 
 def props(n):
@@ -390,6 +498,7 @@ def ci():
     assert run('--plan', 'all', 'false', 'false', 'false').strip() == '{"target": ["kernel-metal4", "kernel-wlan6g"]}'
     dry = run('kernel-ios27', '--dry-run')
     assert 'artifact=fuxi-kernel-ios27\n' in dry and XNU_SHA in dry and f'{len(series())} patches' in dry
+    assert f'{LIBPTHREAD_TAG}={LIBPTHREAD_SHA}' in dry
     text = (ROOT / 'tools/ci/build.sh').read_text()
     body = text[text.index('\nkernel_ios27() {'):text.index('\nmesa_source() {')]
     assert 'python3 tools/test-fuxi-ios27.py' in body and 'bash tools/ci/build-xnu27.sh' in body
@@ -402,7 +511,7 @@ def ci():
     for need in ('KERNEL_CONFIGS=RELEASE', 'BUILD_LTO=1', 'OBJROOT="$robj"', '"${kflags[@]}"', 'MACHINE_CONFIGS=FUXI',
                  'FUXI_XNU27_RELEASE_REF', 'mach.release.fuxi.unstripped', 'release-reference.txt'):
         assert need in rel or need in b27, need
-    assert b27.count('"${kflags[@]}"') == 3 and 'BUILD_LTO=0' in b27 and 'BUILD_LTO=0' not in rel
+    assert b27.count('"${kflags[@]}"') == 4 and 'BUILD_LTO=0' in b27 and 'BUILD_LTO=0' not in rel
     # K2 prelink input: the same DEVELOPMENT objects relinked with split-seg info (a later make assignment wins).
     chained = b27[b27.index('# K2 prelink input'):b27.index('# K2 matching reference')]
     assert 'XNU_KERNEL_CHAINED_FIXUPS=1' in chained and chained.index('"${kflags[@]}"') < chained.rindex('XNU_KERNEL_CHAINED_FIXUPS=1')
@@ -420,14 +529,18 @@ def ci():
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--xnu', type=Path, help='git clone of apple-oss-distributions/xnu containing ' + XNU_SHA)
+    ap.add_argument('--libpthread', type=Path, help='libpthread checkout at ' + LIBPTHREAD_SHA)
     args = ap.parse_args()
     layout()
+    pthread_check()
     adt_check()
     payload_check()
     monitor_check()
     ci()
     if args.xnu:
         apply_check(args.xnu.resolve())
+    if args.libpthread:
+        libpthread_apply_check(args.libpthread.resolve())
 
 
 if __name__ == '__main__':

@@ -1,0 +1,7 @@
+# libpthread-539.100.4 (LIBPTHREAD_SHA in xnu27/sources.env) kernel-part patch series,
+# applied in order by tools/ci/build-libpthread27.py with `git apply` to a scratch
+# clone (any failure stops the build). Origin and licence: xnu27/NOTICE.
+#
+# UniXNU (github.com/UniXNU/UniXNU 88604d0, patches/libpthread/, copied verbatim):
+# user_addr_t/uintptr_t casts that clang 17+ rejects as int-conversion errors.
+explicit-kernel-address.patch

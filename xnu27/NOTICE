@@ -28,6 +28,18 @@ components/ArmCpu, components/ArmDTPlatform
   https://github.com/UniXNU/ArmCpu and https://github.com/UniXNU/ArmDTPlatform,
   copied unchanged with their own LICENSE files (revisions and hashes in
   components/README.md).
+libpthread/explicit-kernel-address.patch
+  UniXNU 88604d0, patches/libpthread/explicit-kernel-address.patch, copied
+  verbatim; applied to libpthread-539.100.4 (APSL 2.0, fetched by CI at
+  LIBPTHREAD_SHA, never copied here) in the order of libpthread/series.
+tools/ci/build-libpthread27.py (outside this directory)
+  port of UniXNU 88604d0 scripts/build-libpthread-kernel.py (the libpthread
+  kernel sources, compile flags, collision renaming and import audit, and the
+  bootstrap compiled with xnu's own compile record); the -force_load link into
+  the DEVELOPMENT, chained and RELEASE kernels in tools/ci/build-xnu27.sh follows
+  scripts/build-xnu-4k-baseline.sh (XNU_SOURCE_PTHREAD) and
+  scripts/build-fileset-release-reference.py. Its own changes are listed in its
+  docstring ("Fuxi:").
 tools/mkadt-fuxi27.py (outside this directory) follows the tree shape of
   UniXNU-sheng scripts/make-sheng-adt.py.
 tools/xnuprelink/ (outside this directory)

@@ -57,11 +57,13 @@ if $dry; then
     if [[ $target == kernel-ios27 ]]; then
         # shellcheck source=xnu27/sources.env
         source "$root/xnu27/sources.env"
-        printf 'pins: %s=%s trustcache=%s=%s availability=%s libplatform=%s libdispatch=%s\n' "$XNU27_TAG" "$XNU27_SHA" \
-            "$XNU27_TRUSTCACHE_TAG" "$XNU27_TRUSTCACHE_SHA" "$AVAILABILITYVERSIONS_SHA" "$LIBPLATFORM_SHA" "$LIBDISPATCH_SHA"
+        printf 'pins: %s=%s trustcache=%s=%s availability=%s libplatform=%s libdispatch=%s %s=%s\n' "$XNU27_TAG" "$XNU27_SHA" \
+            "$XNU27_TRUSTCACHE_TAG" "$XNU27_TRUSTCACHE_SHA" "$AVAILABILITYVERSIONS_SHA" "$LIBPLATFORM_SHA" "$LIBDISPATCH_SHA" \
+            "$LIBPTHREAD_TAG" "$LIBPTHREAD_SHA"
         printf 'kernel: arm64e FUXI (BCM2837 layer) DEVELOPMENT, %s patches, Xcode >= 26 + ld-classic, iig from Xcode\n' \
             "$(grep -cv '^#' "$root/xnu27/series")"
         echo 'outputs: mach.development.fuxi(.unstripped) fuxi27.adt fuxi27-cpus7.adt cmdline.txt cmdline-cpus7.txt kernel-arch.txt'
+        echo 'libpthread: kernel part force-loaded into the DEVELOPMENT, chained and RELEASE links (libpthread-report.json, libpthread-linked.txt)'
         echo 'No downloads, builds, signing or packing in dry-run mode.'
         exit 0
     fi
@@ -323,6 +325,7 @@ kernel_ios27() {
     source_checkout AvailabilityVersions "$apple/AvailabilityVersions.git" "$AVAILABILITYVERSIONS_SHA" "$work/src/AvailabilityVersions"
     source_checkout libplatform "$apple/libplatform.git" "$LIBPLATFORM_SHA" "$work/src/libplatform"
     source_checkout libdispatch "$apple/libdispatch.git" "$LIBDISPATCH_SHA" "$work/src/libdispatch"
+    source_checkout libpthread "$apple/libpthread.git" "$LIBPTHREAD_SHA" "$work/src/libpthread"
     # Only EXTERNAL_HEADERS/TrustCache of the older tag (dropped after it).
     local tc=$work/src/trustcache
     git init -q "$tc"
@@ -331,7 +334,8 @@ kernel_ios27() {
     git -C "$tc" fetch --no-tags --depth 1 --filter=blob:none origin "$XNU27_TRUSTCACHE_SHA"
     git -C "$tc" checkout -q --detach FETCH_HEAD
     [[ $(git -C "$tc" rev-parse HEAD) == "$XNU27_TRUSTCACHE_SHA" && -d $tc/EXTERNAL_HEADERS/TrustCache ]] || die 'TrustCache headers missing'
-    shasum -a 256 xnu27/series xnu27/patches/*/*.patch xnu27/components/*/*.cpp > "$out/xnu27-SHA256SUMS.txt"
+    shasum -a 256 xnu27/series xnu27/patches/*/*.patch xnu27/components/*/*.cpp xnu27/libpthread/series \
+        xnu27/libpthread/*.patch > "$out/xnu27-SHA256SUMS.txt"
     bash tools/ci/build-xnu27.sh "$work/src" "$out"
 }
 

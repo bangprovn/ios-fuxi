@@ -1,0 +1,120 @@
+diff --git a/kern/kern_support.c b/kern/kern_support.c
+index bdb04ab..8596903 100644
+--- a/kern/kern_support.c
++++ b/kern/kern_support.c
+@@ -902,7 +902,7 @@ workq_kevent(proc_t p, struct workq_thread_addrs *th_addrs,
+ 
+ 	// squash any errors into just empty output
+ 	if (ret != 0 || *kevent_count_out == -1) {
+-		*kevent_list_out = NULL;
++		*kevent_list_out = 0;
+ 		*kevent_count_out = 0;
+ 		return ret;
+ 	}
+@@ -943,7 +943,7 @@ workq_setup_thread(proc_t p, thread_t th, vm_map_t map, user_addr_t stackaddr,
+ {
+ 	struct workq_thread_addrs th_addrs;
+ 	bool first_use = (setup_flags & WQ_SETUP_FIRST_USE);
+-	user_addr_t kevent_list = NULL;
++	user_addr_t kevent_list = 0;
+ 	int kevent_count = 0;
+ 
+ 	workq_thread_get_addrs(map, stackaddr, &th_addrs);
+@@ -976,7 +976,7 @@ workq_setup_thread(proc_t p, thread_t th, vm_map_t map, user_addr_t stackaddr,
+ 		kevent_count = WORKQ_EXIT_THREAD_NKEVENT;
+ 	} else if (upcall_flags & WQ_FLAG_THREAD_KEVENT) {
+ 		unsigned int flags = KEVENT_FLAG_STACK_DATA | KEVENT_FLAG_IMMEDIATE;
+-		workq_kevent(p, &th_addrs, NULL, 0, flags, &kevent_list, &kevent_count);
++		workq_kevent(p, &th_addrs, 0, 0, flags, &kevent_list, &kevent_count);
+ 	}
+ 
+ 	workq_set_register_state(p, th, &th_addrs, kport,
+@@ -996,7 +996,7 @@ workq_handle_stack_events(proc_t p, thread_t th, vm_map_t map,
+ 		user_addr_t events, int nevents, int upcall_flags)
+ {
+ 	struct workq_thread_addrs th_addrs;
+-	user_addr_t kevent_list = NULL;
++	user_addr_t kevent_list = 0;
+ 	int kevent_count = 0, error;
+ 	__assert_only kern_return_t kr;
+ 
+diff --git a/kern/kern_synch.c b/kern/kern_synch.c
+index 97343a3..841473f 100644
+--- a/kern/kern_synch.c
++++ b/kern/kern_synch.c
+@@ -559,7 +559,7 @@ redrive:
+ 			// we have no way of knowing who it is. When it arrives, the lock
+ 			// path will update the turnstile owner and return it to userspace.
+ 			old_owner = _kwq_clear_owner(kwq);
+-			pthread_kern->psynch_wait_update_owner(kwq, THREAD_NULL,
++			pthread_kern->psynch_wait_update_owner((uintptr_t)kwq, THREAD_NULL,
+ 					&kwq->kw_turnstile);
+ 			PTHREAD_TRACE(psynch_mutex_kwqprepost, kwq->kw_addr,
+ 					kwq->kw_prepost.lseq, count, 0);
+@@ -623,7 +623,7 @@ redrive:
+ 						0);
+ 			}
+ 			old_owner = _kwq_clear_owner(kwq);
+-			pthread_kern->psynch_wait_update_owner(kwq, THREAD_NULL,
++			pthread_kern->psynch_wait_update_owner((uintptr_t)kwq, THREAD_NULL,
+ 					&kwq->kw_turnstile);
+ 		}
+ 	}
+@@ -682,7 +682,7 @@ again:
+ 
+ 	if (_kwq_handle_interrupted_wakeup(kwq, KWQ_INTR_WRITE, lseq, retval)) {
+ 		old_owner = _kwq_set_owner(kwq, current_thread(), 0);
+-		pthread_kern->psynch_wait_update_owner(kwq, kwq->kw_owner,
++		pthread_kern->psynch_wait_update_owner((uintptr_t)kwq, kwq->kw_owner,
+ 				&kwq->kw_turnstile);
+ 		ksyn_wqunlock(kwq);
+ 		goto out;
+@@ -719,7 +719,7 @@ again:
+ 				kwq->kw_prepost.lseq, kwq->kw_prepost.count, 1);
+ 
+ 		old_owner = _kwq_set_owner(kwq, current_thread(), 0);
+-		pthread_kern->psynch_wait_update_owner(kwq, kwq->kw_owner,
++		pthread_kern->psynch_wait_update_owner((uintptr_t)kwq, kwq->kw_owner,
+ 				&kwq->kw_turnstile);
+ 
+ 		ksyn_wqunlock(kwq);
+@@ -805,7 +805,7 @@ psynch_mtxcontinue(void *parameter, wait_result_t result)
+ 		}
+ 	}
+ 
+-	pthread_kern->psynch_wait_complete(kwq, &kwq->kw_turnstile);
++	pthread_kern->psynch_wait_complete((uintptr_t)kwq, &kwq->kw_turnstile);
+ 
+ 	ksyn_wqunlock(kwq);
+ 	pthread_kern->psynch_wait_cleanup();
+@@ -2009,7 +2009,7 @@ ksyn_signal_thread(ksyn_wait_queue_t kwq, kwq_queue_type_t kqi,
+ 		tstore = &kwq->kw_turnstile;
+ 	}
+ 
+-	ret = pthread_kern->psynch_wait_wakeup(kwq, kwe, tstore);
++	ret = pthread_kern->psynch_wait_wakeup((uintptr_t)kwq, kwe, tstore);
+ 
+ 	if (ret != KERN_SUCCESS && ret != KERN_NOT_WAITING) {
+ 		panic("ksyn_signal: panic waking up thread %x\n", ret);
+@@ -2053,7 +2053,7 @@ ksyn_signal(ksyn_wait_queue_t kwq, kwq_queue_type_t kqi,
+ 		tstore = &kwq->kw_turnstile;
+ 	}
+ 
+-	ret = pthread_kern->psynch_wait_wakeup(kwq, kwe, tstore);
++	ret = pthread_kern->psynch_wait_wakeup((uintptr_t)kwq, kwe, tstore);
+ 
+ 	if (ret != KERN_SUCCESS && ret != KERN_NOT_WAITING) {
+ 		panic("ksyn_signal: panic waking up thread %x\n", ret);
+diff --git a/kern/kern_trace.h b/kern/kern_trace.h
+index ce87532..bf0f90d 100644
+--- a/kern/kern_trace.h
++++ b/kern/kern_trace.h
+@@ -62,7 +62,7 @@ static __unused void*
+ VM_UNSLIDE(void* ptr)
+ {
+     vm_offset_t unslid_ptr;
+-    vm_kernel_unslide_or_perm_external(ptr, &unslid_ptr);
++    vm_kernel_unslide_or_perm_external((vm_offset_t)ptr, &unslid_ptr);
+     return (void*)unslid_ptr;
+ }
+ 
