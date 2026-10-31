@@ -172,11 +172,12 @@ mkdir -p "$robj/EXPORT_HDRS/libsa" "$work/release-sym" "$work/release-dst"
 # SPTM/IOMMU KPIs (IOUnifiedAddressTranslator, pmap_iommu_*, sart/nvme PPL)
 # that this non-SPTM kernel does not define. The comparison kernel is never
 # booted, so a failed first link is retried once with those names removed from
-# a copy of the list (-no_demangle makes ld report them as listed).
+# a copy of the list. ld reports C++ names demangled, so each list entry is
+# compared both as written and through c++filt.
 release_make() {
     make -C "$xnu" build "${base[@]}" KERNEL_CONFIGS=RELEASE OBJROOT="$robj" SYMROOT="$work/release-sym" \
         DSTROOT="$work/release-dst" "${kflags[@]}" BUILD_LTO=1 \
-        LDFLAGS_KERNEL_LTO="-miphoneos-version-min=$XNU27_IOS_VERSION -Wl,-mllvm,-inline-threshold=100 -Wl,-no_demangle" \
+        LDFLAGS_KERNEL_LTO="-miphoneos-version-min=$XNU27_IOS_VERSION -Wl,-mllvm,-inline-threshold=100" \
         "$@" 2>&1 | tee "$work/release-make.log"
     return "${PIPESTATUS[0]}"
 }
@@ -189,7 +190,11 @@ elif [[ -f $rdir/all-kpi.exp ]]; then
         "$work/release-make.log" | sort -u > "$work/release-missing.txt"
     if [[ -s $work/release-missing.txt ]]; then
         echo "release reference: $(wc -l < "$work/release-missing.txt") exported KPIs undefined; relinking without them"
-        grep -vxF -f "$work/release-missing.txt" "$rdir/all-kpi.exp" > "$work/release-kpi.exp" || true
+        xcrun c++filt -_ < "$rdir/all-kpi.exp" > "$work/release-kpi.demangled"
+        paste -d '\t' "$rdir/all-kpi.exp" "$work/release-kpi.demangled" | awk -F '\t' \
+            'NR == FNR { miss[$0] = 1; next } !(($1 in miss) || ($2 in miss)) { print $1 }' \
+            "$work/release-missing.txt" - > "$work/release-kpi.exp"
+        echo "release reference: kept $(wc -l < "$work/release-kpi.exp") of $(wc -l < "$rdir/all-kpi.exp") exported KPIs"
         release_make LDFLAGS_KERNEL_ONLY_CONFIG_RELEASEARM64="-Wl,-exported_symbols_list,$work/release-kpi.exp" && release_ok=1
     fi
 fi
