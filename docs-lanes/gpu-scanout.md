@@ -1275,6 +1275,8 @@ field: `early_retires=N` on the `SWEET FB: stats` line. Not yet observed.
   queued no buffer is free (acquire refuses, bounding the queue to one frame).
   Offer fates 3 (queued) and 4 (queued, and the offer STARTed the waiting
   frame). Off with autorefresh or direct scanout.
+- 8: per-job GPU stamps (`FUXI GPU ABI: job_stamps ...` below). Off, the
+  client ring and fence page are byte-identical to the build before it.
 
 Logs: `SWEET FB: swapwait busy_mode0= busy_mode1= timeouts= busy_per_swap_x1000=
 busy_swap_max= intervals_1= busy_before_1= intervals_2plus= busy_before_2plus=`
@@ -1284,9 +1286,9 @@ writer_display_waits= timeouts= wait_us avg= max= fifo_queued= fifo_started_at_o
 fifo_dropped=` (bits 2 or 4), `FUXI SCANOUT: present fifo=N` at configure and
 `FUXI SCANOUT: fifo queued= promoted= dropped= full_waits= spin_held=
 stale_replaced=` per 600 STARTs (bit 4), and `FUXI GPU ABI: job_stamps per 600
-jobs submit_to_start_us ... exec_us ... end_to_observed_us ... no_stamp` (always:
-CP_REG_TO_MEM of the always-on counter at the start and end of every client
-job, 12 ring words). SweetFramebuffer lines over 200 characters (stats, stages,
+jobs submit_to_start_us ... exec_us ... end_to_observed_us ... no_stamp` (bit 8,
+announced once by `FUXI GPU ABI: job_stamps on`: CP_REG_TO_MEM of the always-on
+counter at the start and end of every client job, 12 ring words). SweetFramebuffer lines over 200 characters (stats, stages,
 flog, unshown paths, presents) and FuxiMetal frame trace lines are wrapped: a
 continuation starts with `<tag>+`; `tools/fuxi-flog.py` joins them. None of
 this is observed on device yet.
