@@ -1,0 +1,39 @@
+diff --git a/bsd/miscfs/mockfs/mockfs_vfsops.c b/bsd/miscfs/mockfs/mockfs_vfsops.c
+index bea8e6e1..20cec71f 100644
+--- a/bsd/miscfs/mockfs/mockfs_vfsops.c
++++ b/bsd/miscfs/mockfs/mockfs_vfsops.c
+@@ -227,6 +227,27 @@ mockfs_sync(__unused struct mount *mp, __unused int waitfor, __unused vfs_contex
+ 	return 0;
+ }
+ 
++static int
++mockfs_getattr(mount_t mp, struct vfs_attr *attributes, __unused vfs_context_t ctx)
++{
++	mockfs_fsnode_t root = ((mockfs_mount_t)mp->mnt_data)->mockfs_root;
++	uint64_t nodes = 1 + (root->child_a != NULL) + (root->child_b != NULL) + (root->child_c != NULL);
++	uint64_t bytes = mp->mnt_devvp->v_specinfo->si_devsize;
++	uint64_t blocks = bytes / 4096 + ((bytes & 4095) != 0);
++	VFSATTR_RETURN(attributes, f_bsize, 4096);
++	VFSATTR_RETURN(attributes, f_iosize, 4096);
++	VFSATTR_RETURN(attributes, f_blocks, blocks);
++	VFSATTR_RETURN(attributes, f_bused, blocks);
++	VFSATTR_RETURN(attributes, f_bfree, 0);
++	VFSATTR_RETURN(attributes, f_bavail, 0);
++	VFSATTR_RETURN(attributes, f_files, nodes);
++	VFSATTR_RETURN(attributes, f_ffree, 0);
++	VFSATTR_RETURN(attributes, f_objcount, nodes);
++	VFSATTR_RETURN(attributes, f_maxobjcount, nodes);
++	VFSATTR_RETURN(attributes, f_fssubtype, 0);
++	return 0;
++}
++
+ int
+ mockfs_init(__unused struct vfsconf * vfsc)
+ {
+@@ -237,5 +258,6 @@ struct vfsops mockfs_vfsops = {
+ 	.vfs_unmount = mockfs_unmount,
+ 	.vfs_root = mockfs_root,
+ 	.vfs_sync = mockfs_sync,
++	.vfs_getattr = mockfs_getattr,
+ 	.vfs_init = mockfs_init,
+ };

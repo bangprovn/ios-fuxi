@@ -1,0 +1,104 @@
+diff --git a/bsd/conf/Makefile.template b/bsd/conf/Makefile.template
+index c4cbbe93..16c41825 100644
+--- a/bsd/conf/Makefile.template
++++ b/bsd/conf/Makefile.template
+@@ -595,7 +595,7 @@ $(COBJS): .CFLAGS
+ 	$(_v)$(REPLACECONTENTS) $@ $(KCC) $(CFLAGS) $(INCFLAGS)
+ $(CXXOBJS): .CXXFLAGS
+ .CXXFLAGS: ALWAYS
+-	$(_v)$(REPLACECONTENTS) $@ $(KC++) $(CXXFLAGS) $(INCFLAGS)
++	$(_v)$(REPLACECONTENTS) $@ $(KC++) $(CFLAGS) $(CXXFLAGS) $(INCFLAGS)
+ $(SOBJS): .SFLAGS
+ .SFLAGS: ALWAYS
+ 	$(_v)$(REPLACECONTENTS) $@ $(S_KCC) $(SFLAGS) $(INCFLAGS)
+diff --git a/iokit/conf/Makefile.template b/iokit/conf/Makefile.template
+index 1a2bbebc..53ede013 100644
+--- a/iokit/conf/Makefile.template
++++ b/iokit/conf/Makefile.template
+@@ -211,7 +211,7 @@ $(COBJS): .CFLAGS
+ 	$(_v)$(REPLACECONTENTS) $@ $(KCC) $(CFLAGS) $(INCFLAGS)
+ $(CXXOBJS): .CXXFLAGS
+ .CXXFLAGS: ALWAYS
+-	$(_v)$(REPLACECONTENTS) $@ $(KC++) $(CXXFLAGS) $(INCFLAGS)
++	$(_v)$(REPLACECONTENTS) $@ $(KC++) $(CFLAGS) $(CXXFLAGS) $(INCFLAGS)
+ $(SOBJS): .SFLAGS
+ .SFLAGS: ALWAYS
+ 	$(_v)$(REPLACECONTENTS) $@ $(S_KCC) $(SFLAGS) $(INCFLAGS)
+diff --git a/libkern/conf/Makefile.template b/libkern/conf/Makefile.template
+index 6ef0911b..fcf0a199 100644
+--- a/libkern/conf/Makefile.template
++++ b/libkern/conf/Makefile.template
+@@ -144,7 +144,7 @@ $(COBJS): .CFLAGS
+ 	$(_v)$(REPLACECONTENTS) $@ $(KCC) $(CFLAGS) $(INCFLAGS)
+ $(CXXOBJS): .CXXFLAGS
+ .CXXFLAGS: ALWAYS
+-	$(_v)$(REPLACECONTENTS) $@ $(KC++) $(CXXFLAGS) $(INCFLAGS)
++	$(_v)$(REPLACECONTENTS) $@ $(KC++) $(CFLAGS) $(CXXFLAGS) $(INCFLAGS)
+ $(SOBJS): .SFLAGS
+ .SFLAGS: ALWAYS
+ 	$(_v)$(REPLACECONTENTS) $@ $(S_KCC) $(SFLAGS) $(INCFLAGS)
+diff --git a/libsa/conf/Makefile.template b/libsa/conf/Makefile.template
+index 35344540..323c3a33 100644
+--- a/libsa/conf/Makefile.template
++++ b/libsa/conf/Makefile.template
+@@ -59,7 +59,7 @@ $(COBJS): .CFLAGS
+ 	$(_v)$(REPLACECONTENTS) $@ $(KCC) $(CFLAGS) $(INCFLAGS)
+ $(CXXOBJS): .CXXFLAGS
+ .CXXFLAGS: ALWAYS
+-	$(_v)$(REPLACECONTENTS) $@ $(KC++) $(CXXFLAGS) $(INCFLAGS)
++	$(_v)$(REPLACECONTENTS) $@ $(KC++) $(CFLAGS) $(CXXFLAGS) $(INCFLAGS)
+ $(SOBJS): .SFLAGS
+ .SFLAGS: ALWAYS
+ 	$(_v)$(REPLACECONTENTS) $@ $(S_KCC) $(SFLAGS) $(INCFLAGS)
+diff --git a/osfmk/conf/Makefile.template b/osfmk/conf/Makefile.template
+index e23dabed..6db9a388 100644
+--- a/osfmk/conf/Makefile.template
++++ b/osfmk/conf/Makefile.template
+@@ -456,7 +456,7 @@ $(COBJS): .CFLAGS
+ 	$(_v)$(REPLACECONTENTS) $@ $(KCC) $(CFLAGS) $(INCFLAGS)
+ $(CXXOBJS): .CXXFLAGS
+ .CXXFLAGS: ALWAYS
+-	$(_v)$(REPLACECONTENTS) $@ $(KC++) $(CXXFLAGS) $(INCFLAGS)
++	$(_v)$(REPLACECONTENTS) $@ $(KC++) $(CFLAGS) $(CXXFLAGS) $(INCFLAGS)
+ $(SOBJS): .SFLAGS
+ .SFLAGS: ALWAYS
+ 	$(_v)$(REPLACECONTENTS) $@ $(S_KCC) $(SFLAGS) $(INCFLAGS)
+diff --git a/pexpert/conf/Makefile.template b/pexpert/conf/Makefile.template
+index 3711a92d..d1608509 100644
+--- a/pexpert/conf/Makefile.template
++++ b/pexpert/conf/Makefile.template
+@@ -78,7 +78,7 @@ $(COBJS): .CFLAGS
+ 	$(_v)$(REPLACECONTENTS) $@ $(KCC) $(CFLAGS) $(INCFLAGS)
+ $(CXXOBJS): .CXXFLAGS
+ .CXXFLAGS: ALWAYS
+-	$(_v)$(REPLACECONTENTS) $@ $(KC++) $(CXXFLAGS) $(INCFLAGS)
++	$(_v)$(REPLACECONTENTS) $@ $(KC++) $(CFLAGS) $(CXXFLAGS) $(INCFLAGS)
+ $(SOBJS): .SFLAGS
+ .SFLAGS: ALWAYS
+ 	$(_v)$(REPLACECONTENTS) $@ $(S_KCC) $(SFLAGS) $(INCFLAGS)
+diff --git a/san/conf/Makefile.template b/san/conf/Makefile.template
+index a4e1d9f2..32f90cd9 100644
+--- a/san/conf/Makefile.template
++++ b/san/conf/Makefile.template
+@@ -55,7 +55,7 @@ $(COBJS): .CFLAGS
+ 	$(_v)$(REPLACECONTENTS) $@ $(KCC) $(CFLAGS) $(INCFLAGS)
+ $(CXXOBJS): .CXXFLAGS
+ .CXXFLAGS: ALWAYS
+-	$(_v)$(REPLACECONTENTS) $@ $(KC++) $(CXXFLAGS) $(INCFLAGS)
++	$(_v)$(REPLACECONTENTS) $@ $(KC++) $(CFLAGS) $(CXXFLAGS) $(INCFLAGS)
+ $(SOBJS): .SFLAGS
+ .SFLAGS: ALWAYS
+ 	$(_v)$(REPLACECONTENTS) $@ $(S_KCC) $(SFLAGS) $(INCFLAGS)
+diff --git a/security/conf/Makefile.template b/security/conf/Makefile.template
+index 34f0df59..0172ed65 100644
+--- a/security/conf/Makefile.template
++++ b/security/conf/Makefile.template
+@@ -81,7 +81,7 @@ $(COBJS): .CFLAGS
+ 	$(_v)$(REPLACECONTENTS) $@ $(KCC) $(CFLAGS) $(INCFLAGS)
+ $(CXXOBJS): .CXXFLAGS
+ .CXXFLAGS: ALWAYS
+-	$(_v)$(REPLACECONTENTS) $@ $(KC++) $(CXXFLAGS) $(INCFLAGS)
++	$(_v)$(REPLACECONTENTS) $@ $(KC++) $(CFLAGS) $(CXXFLAGS) $(INCFLAGS)
+ $(SOBJS): .SFLAGS
+ .SFLAGS: ALWAYS
+ 	$(_v)$(REPLACECONTENTS) $@ $(S_KCC) $(SFLAGS) $(INCFLAGS)

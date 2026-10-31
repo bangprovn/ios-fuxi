@@ -1,0 +1,30 @@
+diff --git a/EXTERNAL_HEADERS/CoreEntitlements/V2/API.h b/EXTERNAL_HEADERS/CoreEntitlements/V2/API.h
+new file mode 100644
+index 00000000..850a6973
+--- /dev/null
++++ b/EXTERNAL_HEADERS/CoreEntitlements/V2/API.h
+@@ -0,0 +1,12 @@
++/*
++ * Public stand-in for the CoreEntitlements V2 interface. The kernel only
++ * stores the registered implementation pointer and passes context pointers
++ * through, so both types stay opaque.
++ */
++#ifndef CORE_ENTITLEMENTS_V2_API_H
++#define CORE_ENTITLEMENTS_V2_API_H
++
++typedef struct CEKernelAPI CEKernelAPI_t;
++typedef struct CEContext CEContext_t;
++
++#endif /* CORE_ENTITLEMENTS_V2_API_H */
+diff --git a/EXTERNAL_HEADERS/CoreEntitlements/V2/Kernel.h b/EXTERNAL_HEADERS/CoreEntitlements/V2/Kernel.h
+new file mode 100644
+index 00000000..81dd1000
+--- /dev/null
++++ b/EXTERNAL_HEADERS/CoreEntitlements/V2/Kernel.h
+@@ -0,0 +1,6 @@
++#ifndef CORE_ENTITLEMENTS_V2_KERNEL_H
++#define CORE_ENTITLEMENTS_V2_KERNEL_H
++
++#include <CoreEntitlements/V2/API.h>
++
++#endif /* CORE_ENTITLEMENTS_V2_KERNEL_H */

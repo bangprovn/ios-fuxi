@@ -1,0 +1,43 @@
+diff --git a/bsd/kern/sys_work_interval.c b/bsd/kern/sys_work_interval.c
+index 3edde7c2..527f0290 100644
+--- a/bsd/kern/sys_work_interval.c
++++ b/bsd/kern/sys_work_interval.c
+@@ -38,6 +38,22 @@
+ 
+ #include <libkern/libkern.h>
+ 
++#include <sys/proc.h>
++#include <kern/policy_internal.h>
++
++/* Board bring-up diagnostic: the last work-interval CREATE2 results, read by the boot-progress banner. */
++char native_wi_log[4][100];
++volatile unsigned native_wi_count;
++static void
++native_wi_note(const char *what, int error, int kret, uint32_t flags)
++{
++	char name[20];
++	proc_selfname(name, sizeof(name));
++	unsigned slot = native_wi_count++ % 4;
++	snprintf(native_wi_log[slot], sizeof(native_wi_log[slot]), "WI#%u p%d %s %s err=%d kret=%d flags=%x app=%d",
++	    native_wi_count, proc_selfpid(), name, what, error, kret, flags, (int)task_is_app(current_task()));
++}
++
+ int
+ work_interval_ctl(__unused proc_t p, struct work_interval_ctl_args *uap,
+     __unused int32_t *retval)
+@@ -69,6 +85,7 @@ work_interval_ctl(__unused proc_t p, struct work_interval_ctl_args *uap,
+ 		}
+ 
+ 		if ((error = priv_check_cred(kauth_cred_get(), PRIV_WORK_INTERVAL, 0)) != 0) {
++			native_wi_note("priv", error, 0, create_params.wicp_create_flags);
+ 			return error;
+ 		}
+ 
+@@ -79,6 +96,7 @@ work_interval_ctl(__unused proc_t p, struct work_interval_ctl_args *uap,
+ 		};
+ 
+ 		kret = kern_work_interval_create(current_thread(), &create_args);
++		native_wi_note("create", 0, kret, create_params.wicp_create_flags);
+ 
+ 		/* thread already has a work interval */
+ 		if (kret == KERN_FAILURE) {

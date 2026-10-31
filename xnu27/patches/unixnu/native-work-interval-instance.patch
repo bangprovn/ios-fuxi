@@ -1,0 +1,25 @@
+diff --git a/bsd/kern/sys_work_interval.c b/bsd/kern/sys_work_interval.c
+index b544bf30..3edde7c2 100644
+--- a/bsd/kern/sys_work_interval.c
++++ b/bsd/kern/sys_work_interval.c
+@@ -265,6 +265,20 @@ work_interval_ctl(__unused proc_t p, struct work_interval_ctl_args *uap,
+ 
+ 		break;
+ 
++	/*
++	 * sheng: the interval instance operations of the OS's libsystem_kernel (start 6, update 7, finish 8; their numbers and argument
++	 * are not in this source). os_workgroup_interval_start/update/finish use them on every audio IO cycle; refusing them made the
++	 * audio server log a failure from its real-time IO thread each cycle. Without a performance controller there is nothing to
++	 * report them to, so the call succeeds.
++	 */
++	case 6:
++	case 7:
++	case 8:
++		if (uap->arg == USER_ADDR_NULL || uap->work_interval_id == 0) {
++			return EINVAL;
++		}
++		break;
++
+ 	default:
+ 		return ENOTSUP;
+ 	}

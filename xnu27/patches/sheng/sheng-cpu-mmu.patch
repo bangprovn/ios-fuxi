@@ -1,0 +1,614 @@
+UniXNU-sheng (https://github.com/UniXNU/UniXNU-sheng, branch feat/ipados27-gpu-parity
+at 5b7d83c), BSD-2-Clause-Patent, Copyright (c) 2026 UniXNU contributors; see
+xnu27/NOTICE. CPU/MMU subset of patches/xnu-12377/zzzz-sheng-ipados27-bringup.patch
+(arm_init, cpu_common, pmap, pmap.h, pmap_pt_geometry.h, arm_vm_init, cpu, proc_reg,
+sleh first hunk only, start.s, vm_param.h, bootargs.c, BCM2837.h) plus
+patches/xnu-12377/zzye-sheng-cpu-idle.patch (processor.c), extracted per file,
+hunks unchanged.
+
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index d132457..2629e2d 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -356,6 +356,12 @@ arm_init(
+ 	DTEntry chosen = NULL;
+ 	unsigned int dt_entry_size = 0;
+ 
++#if T0SZ_USER != T0SZ_BOOT
++	/* Final TTBR0 size before the first pointer is signed (see TCR_EL1_KVA_ENTRY). */
++	set_tcr(TCR_EL1_KVA_ENTRY);
++	flush_core_tlb();
++#endif /* T0SZ_USER != T0SZ_BOOT */
++
+ 	arm_slide_rebase_and_sign_image();
+ 
+ 	arm_static_if_init(args);
+diff --git a/osfmk/arm/cpu_common.c b/osfmk/arm/cpu_common.c
+index eadffaf..8776f16 100644
+--- a/osfmk/arm/cpu_common.c
++++ b/osfmk/arm/cpu_common.c
+@@ -409,6 +409,21 @@ cpu_immediate_xcall(int cpu_number, broadcastFunc func, void *param)
+ 	return cpu_xcall_internal(SIGPxcallImm, cpu_number, func, param);
+ }
+ 
++/* sheng (UniXNU): a started core whose SIGPdisabled is still set lost the self-IPI that should have cleared it (seen as random early hangs
++ * and UFS root failures under SMP: the I/O thread's wakeup IPI to that core was silently dropped). A core in InitState|StartedState runs and
++ * takes interrupts, so the flag is cleared here and the signal sent. Counted in sheng_sigp_recovered. */
++volatile uint32_t sheng_sigp_recovered;
++bool
++sheng_sigp_recover(cpu_data_t *target_proc)
++{
++	if ((os_atomic_load(&target_proc->cpu_flags, relaxed) & (InitState | StartedState)) != (InitState | StartedState)) {
++		return false;
++	}
++	os_atomic_andnot(&target_proc->cpu_signal, SIGPdisabled, acq_rel);
++	os_atomic_inc(&sheng_sigp_recovered, relaxed);
++	return true;
++}
++
+ static kern_return_t
+ cpu_signal_internal(cpu_data_t *target_proc,
+     cpu_signal_t signal,
+@@ -438,6 +453,9 @@ cpu_signal_internal(cpu_data_t *target_proc,
+ 
+ 		do {
+ 			current_signals = target_proc->cpu_signal;
++			if ((current_signals & SIGPdisabled) == SIGPdisabled && sheng_sigp_recover(target_proc)) {
++				current_signals = target_proc->cpu_signal;
++			}
+ 			if ((current_signals & SIGPdisabled) == SIGPdisabled) {
+ 				ml_set_interrupts_enabled(interruptible);
+ 				return KERN_FAILURE;
+@@ -481,6 +499,9 @@ cpu_signal_internal(cpu_data_t *target_proc,
+ 	} else {
+ 		do {
+ 			current_signals = target_proc->cpu_signal;
++			if ((current_signals & SIGPdisabled) == SIGPdisabled && current_proc != target_proc && sheng_sigp_recover(target_proc)) {
++				current_signals = target_proc->cpu_signal;
++			}
+ 			if ((current_signals & SIGPdisabled) == SIGPdisabled) {
+ 				if (current_proc == target_proc) {
+ 					panic("cpu_signal of self while signals are disabled");
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index 9760c9c..2eadcf0 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -335,6 +335,50 @@ const struct page_table_attr * const native_pt_attr = &pmap_pt_attr_16k;
+ const struct page_table_attr * const native_pt_attr = &pmap_pt_attr_4k;
+ #endif /* !__ARM_16K_PG__ */
+ 
++#if T0SZ_USER != T0SZ_BOOT
++/* User pmaps: the 4K layout with a TTBR0 root at T0SZ_USER (L0 for a 47-bit range). */
++const struct page_table_attr pmap_pt_attr_4k_user = {
++	.pta_level_info = pmap_table_level_info_4k,
++	.pta_root_level = (T0SZ_USER - 16) / 9,
++	.pta_commpage_level = PMAP_TT_L1_LEVEL,
++	.pta_max_level  = PMAP_TT_L3_LEVEL,
++	.pta_ops = &native_pt_ops,
++	.ap_ro = ARM_PTE_AP(AP_RORO),
++	.ap_rw = ARM_PTE_AP(AP_RWRW),
++	.ap_rona = ARM_PTE_AP(AP_RONA),
++	.ap_rwna = ARM_PTE_AP(AP_RWNA),
++	.ap_xn = ARM_PTE_PNX | ARM_PTE_NX,
++	.ap_x = ARM_PTE_PNX,
++	.pta_page_size  = 4096,
++	.pta_pagezero_size = 4096,
++	.pta_page_shift = 12,
++	.pta_va_valid_mask = ARM_PTE_REGION_MASK(T0SZ_USER),
++};
++const struct page_table_attr * const native_user_pt_attr = &pmap_pt_attr_4k_user;
++_Static_assert((ARM_PTE_REGION_MASK(T0SZ_USER) >> ARM_4K_TT_L0_SHIFT) + 1 == PMAP_ROOT_ALLOC_SIZE / sizeof(tt_entry_t),
++    "the user L0 root must fit the root allocation size");
++
++static inline uint64_t
++pmap_user_tcr(uint64_t tcr)
++{
++	return (tcr & ~((TCR_TSZ_MASK << TCR_T0SZ_SHIFT) | TCR_EPD0_DISABLE)) | (T0SZ_USER << TCR_T0SZ_SHIFT);
++}
++
++/*
++ * Turn TTBR0 walks on at the user range. The caller has pointed TTBR0 at the empty table
++ * (or a user root), so no walk sees a table of the boot format.
++ */
++MARK_AS_PMAP_TEXT void
++pmap_apply_user_tcr(void)
++{
++	const uint64_t tcr = get_tcr();
++	if (tcr != pmap_user_tcr(tcr)) {
++		set_tcr(pmap_user_tcr(tcr));
++		flush_core_tlb();
++	}
++}
++#endif /* T0SZ_USER != T0SZ_BOOT */
++
+ 
+ #if DEVELOPMENT || DEBUG
+ int vm_footprint_suspend_allowed = 1;
+@@ -2277,6 +2321,8 @@ pmap_bootstrap(
+ 	/*
+ 	 *	Initialize the kernel pmap.
+ 	 */
++	/* First: the pmap's type selects its page table attributes (see T0SZ_USER). */
++	kernel_pmap->type = PMAP_TYPE_KERNEL;
+ #if ARM_PARAMETERIZED_PMAP
+ 	kernel_pmap->pmap_pt_attr = native_pt_attr;
+ #endif /* ARM_PARAMETERIZED_PMAP */
+@@ -2314,6 +2360,10 @@ pmap_bootstrap(
+ 
+ 	pmap_max_asids = pmap_compute_max_asids();
+ #if HAS_16BIT_ASID
++	/* UniXNU: TCR_EL1.AS is set (TCR_EL1_ASID); on a core with 8-bit ASIDs it is RES0 and the ASIDs above 255 would alias. */
++	if (((__builtin_arm_rsr64("ID_AA64MMFR0_EL1") >> 4) & 0xf) != 2) {
++		panic("pmap: HAS_16BIT_ASID, but ID_AA64MMFR0_EL1 0x%llx has no 16-bit ASIDs", __builtin_arm_rsr64("ID_AA64MMFR0_EL1"));
++	}
+ 	asid_chunk_size = MAX_HW_ASIDS;
+ #else
+ 	pmap_asid_plru = (pmap_max_asids > MAX_HW_ASIDS);
+@@ -6000,7 +6050,8 @@ wimg_to_pte(unsigned int wimg, pmap_paddr_t pa)
+ 		pte |= ARM_PTE_NX | ARM_PTE_PNX;
+ 		break;
+ 	case VM_WIMG_RT:
+-		if (is_dram_addr(pa)) {
++		/* DRAM outside the gDramBase window (more than one physical range) is still managed memory: Normal, not Device. */
++		if (is_dram_addr(pa) || pa_valid(pa)) {
+ 			pte = ARM_PTE_ATTRINDX(CACHE_ATTRINDX_RT);
+ 		} else {
+ #if HAS_FEAT_XS
+@@ -6040,7 +6091,8 @@ wimg_to_pte(unsigned int wimg, pmap_paddr_t pa)
+ 		pte |= ARM_PTE_NX | ARM_PTE_PNX;
+ 		break;
+ 	case VM_WIMG_WCOMB:
+-		if (is_dram_addr(pa)) {
++		/* DRAM outside the gDramBase window (more than one physical range) is still managed memory: Normal, not Device. */
++		if (is_dram_addr(pa) || pa_valid(pa)) {
+ 			pte = ARM_PTE_ATTRINDX(CACHE_ATTRINDX_WRITECOMB);
+ 		} else {
+ #if HAS_FEAT_XS
+@@ -7962,6 +8014,12 @@ pmap_switch_user_ttb(pmap_t pmap, pmap_cpu_data_t *cpu_data_ptr)
+ 
+ 
+ 	if (pmap != kernel_pmap) {
++#if T0SZ_USER != T0SZ_BOOT
++		if (__improbable(get_tcr() != pmap_user_tcr(get_tcr()))) {
++			set_mmu_ttb(invalid_ttep & TTBR_BADDR_MASK);
++			pmap_apply_user_tcr();
++		}
++#endif /* T0SZ_USER != T0SZ_BOOT */
+ 		set_mmu_ttb((pmap->ttep & TTBR_BADDR_MASK) | (((uint64_t)pmap->hw_asid) << TTBR_ASID_SHIFT));
+ 	} else if (!pmap_user_ttb_is_clear()) {
+ 		pmap_clear_user_ttb_internal();
+@@ -7972,6 +8030,9 @@ MARK_AS_PMAP_TEXT void
+ pmap_clear_user_ttb_internal(void)
+ {
+ 	set_mmu_ttb(invalid_ttep & TTBR_BADDR_MASK);
++#if T0SZ_USER != T0SZ_BOOT
++	pmap_apply_user_tcr();
++#endif /* T0SZ_USER != T0SZ_BOOT */
+ }
+ 
+ void
+@@ -10949,6 +11010,14 @@ pmap_batch_set_cache_attributes_internal(
+ 
+ 			pvh_unlock(pai);
+ 
++			/* UniXNU: as pmap_set_cache_attributes() does, a page leaving write-back loses its lines (pmap_sync_page_attributes_phys).
++			 * This SoC does not keep a page's lines coherent across a change of its attributes: a page made write-combined
++			 * would keep the dirty lines of its cacheable zero-fill, and a later device read through a coherent path could see
++			 * them over data written past the cache. */
++			if (wimg_bits_new != wimg_bits_prev && wimg_bits_new != VM_WIMG_RT) {
++				pmap_sync_wimg(pn, wimg_bits_prev, wimg_bits_new);
++			}
++
+ 			page_index++;
+ 
+ #if XNU_MONITOR
+@@ -12965,7 +13034,7 @@ pmap_user_va_bits(pmap_t pmap __unused)
+ 	uint64_t tcr_value = pmap_get_pt_attr(pmap)->pta_tcr_value;
+ 	return 64 - ((tcr_value >> TCR_T0SZ_SHIFT) & TCR_TSZ_MASK);
+ #else
+-	return 64 - T0SZ_BOOT;
++	return 64 - T0SZ_USER;
+ #endif
+ }
+ 
+@@ -15301,3 +15370,76 @@ pmap_pending_preemption(void)
+ 	return _pmap_pending_preemption_real();
+ }
+ #endif /* SCHED_HYGIENE_DEBUG && (DEBUG || DEVELOPMENT) */
++
++
++/*
++ * UniXNU: the mappings of a managed page in CPU pmaps other than the kernel's, and the first one's pmap and address. A driver that
++ * frees pages it handed out through physical-range mappings (NativeAdreno's BO views, which hold no reference to the pages) asks
++ * first: a page a user task still maps is kept rather than freed under the mapping (pmap_assert_free), and not disconnected either,
++ * since the mapping would fault the page in again from its next owner.
++ */
++unsigned int native_pmap_user_mappings(ppnum_t ppnum, void **first_pmap, uint64_t *first_va, char *first_name);
++unsigned int
++native_pmap_user_mappings(ppnum_t ppnum, void **first_pmap, uint64_t *first_va, char *first_name /* 17 bytes, the process's */)
++{
++	const pmap_paddr_t pa = ptoa(ppnum);
++	unsigned int count = 0;
++
++	if (first_pmap) {
++		*first_pmap = NULL;
++	}
++	if (first_va) {
++		*first_va = 0;
++	}
++	if (first_name) {
++		first_name[0] = 0;
++	}
++	if (!pa_valid(pa)) {
++		return 0;
++	}
++	const unsigned int pai = pa_index(pa);
++	pvh_lock(pai);
++	pv_entry_t **pvh = pai_to_pvh(pai);
++	pt_entry_t *ptep = PT_ENTRY_NULL;
++	pv_entry_t *pvep = PV_ENTRY_NULL;
++	int index = 0;
++	if (pvh_test_type(pvh, PVH_TYPE_PTEP)) {
++		ptep = pvh_ptep(pvh);
++	} else if (pvh_test_type(pvh, PVH_TYPE_PVEP)) {
++		pvep = pvh_pve_list(pvh);
++	}
++	while (ptep != PT_ENTRY_NULL || pvep != PV_ENTRY_NULL) {
++		if (pvep != PV_ENTRY_NULL) {
++			ptep = pve_get_ptep(pvep, index);
++		}
++		if (ptep != PT_ENTRY_NULL && !pvh_ptep_is_iommu(ptep)) {
++			pmap_t pmap = ptep_get_pmap(ptep);
++			if (pmap != kernel_pmap) {
++				if (count == 0) {
++					if (first_pmap) {
++						*first_pmap = pmap;
++					}
++					if (first_va) {
++						*first_va = (uint64_t)ptep_get_va(ptep);
++					}
++#if MACH_ASSERT
++					if (first_name) {
++						strlcpy(first_name, pmap->pmap_procname, 17);
++					}
++#endif /* MACH_ASSERT */
++				}
++				count++;
++			}
++		}
++		if (pvep == PV_ENTRY_NULL) {
++			break;
++		}
++		ptep = PT_ENTRY_NULL;
++		if (++index == PTE_PER_PVE) {
++			index = 0;
++			pvep = pve_next(pvep);
++		}
++	}
++	pvh_unlock(pai);
++	return count;
++}
+diff --git a/osfmk/arm/pmap/pmap.h b/osfmk/arm/pmap/pmap.h
+index 0c6ba7c..9b9da2b 100644
+--- a/osfmk/arm/pmap/pmap.h
++++ b/osfmk/arm/pmap/pmap.h
+@@ -295,6 +295,9 @@ extern void set_mmu_ttb(uint64_t);
+ extern void set_mmu_ttb_alternate(uint64_t);
+ extern uint64_t get_tcr(void);
+ extern void set_tcr(uint64_t);
++#if T0SZ_USER != T0SZ_BOOT
++extern void pmap_apply_user_tcr(void);
++#endif
+ extern uint64_t pmap_get_arm64_prot(pmap_t, vm_offset_t);
+ #else /* defined(__arm64__) */
+ #error Unsupported architecture
+diff --git a/osfmk/arm/pmap/pmap_pt_geometry.h b/osfmk/arm/pmap/pmap_pt_geometry.h
+index fc64830..dd93d91 100644
+--- a/osfmk/arm/pmap/pmap_pt_geometry.h
++++ b/osfmk/arm/pmap/pmap_pt_geometry.h
+@@ -168,8 +168,14 @@ extern const struct page_table_ops native_pt_ops;
+ 
+ #else /* ARM_PARAMETERIZED_PMAP */
+ 
++#if T0SZ_USER != T0SZ_BOOT
++/* User pmaps use a wider TTBR0 range than the kernel's TTBR1 (see T0SZ_USER). */
++extern const struct page_table_attr * const native_user_pt_attr;
++#define pmap_get_pt_attr(pmap) ((pmap)->type == PMAP_TYPE_KERNEL ? native_pt_attr : native_user_pt_attr)
++#else
+ /* The page table attributes are fixed (to allow for const propagation) */
+ #define pmap_get_pt_attr(pmap) (native_pt_attr)
++#endif
+ #define pmap_get_pt_ops(pmap) (&native_pt_ops)
+ 
+ #endif /* ARM_PARAMETERIZED_PMAP */
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 01ab93b..f2e883b 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -2182,6 +2182,9 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ #endif
+ 
+ 	set_mmu_ttb(invalid_ttep & TTBR_BADDR_MASK);
++#if T0SZ_USER != T0SZ_BOOT
++	pmap_apply_user_tcr();
++#endif
+ 
+ 	flush_mmu_tlb();
+ 	kva_active = TRUE;
+diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
+index 53f9ce5..8312c43 100644
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -139,12 +139,17 @@ uint64_t expecting_ipi_wfe_timeout_mt = 0x0ULL; /* initialized to a non-zero val
+  * loop. The default.
+  */
+ uint32_t idle_proximate_io_wfe_unmasked = 1;
++/* sheng (UniXNU): off Apple silicon the cores belong to a hypervisor that traps WFI and blocks the vCPU but may run WFE in the guest,
++ * so a core awaiting a proximate timer in WFE keeps its physical core awake. Await it in WFI there. */
++/* Measured on the board (2026-10-28): with WFI in the idle path every core went to sleep and nothing woke the system again (boot stalled
++ * 30 s after the data disk started), so the stock WFE polling stays. */
++#define IDLE_PROXIMATE_TIMER_WFE 1
+ #if DEVELOPMENT || DEBUG
+-uint32_t idle_proximate_timer_wfe = 1;
++uint32_t idle_proximate_timer_wfe = IDLE_PROXIMATE_TIMER_WFE;
+ uint32_t idle_proximate_io_wfe_masked = 0;
+ #else
+ /* Issue WFE in lieu of WFI when awaiting a proximate timer. */
+-static uint32_t idle_proximate_timer_wfe = 1;
++static uint32_t idle_proximate_timer_wfe = IDLE_PROXIMATE_TIMER_WFE;
+ /* When recommended, issue WFE with [FI]IRQ masked in the idle loop.
+  * Non-default, retained for experimentation.
+  */
+@@ -379,7 +384,7 @@ cpu_proximate_timer(void)
+ 	return !SetIdlePop();
+ }
+ 
+-#ifdef ARM64_BOARD_CONFIG_T6000
++#if defined(ARM64_BOARD_CONFIG_T6000)
+ int wfe_allowed = 0;
+ #else
+ int wfe_allowed = 1;
+@@ -477,6 +482,9 @@ wfe_to_deadline_or_interrupt(uint32_t cid, uint64_t wfe_deadline, cpu_data_t *cd
+  *	Routine:	cpu_idle
+  *	Function:
+  */
++extern bool sheng_sigp_recover(cpu_data_t *target_proc);
++volatile uint32_t sheng_idle_sigp_cleared, sheng_idle_sigp_refused, sheng_idle_enter[8], sheng_idle_disallowed[8];
++
+ void __attribute__((noreturn))
+ cpu_idle(void)
+ {
+@@ -488,10 +496,20 @@ cpu_idle(void)
+ 	if (__improbable((!idle_enable))) {
+ 		idle_disallowed = true;
+ 	} else if (__improbable(cpu_data_ptr->cpu_signal & SIGPdisabled)) {
+-		idle_disallowed = true;
++		/* sheng (UniXNU): SIGPdisabled leaves a core only when it takes an IPI, and an idle core is never signalled, so a core that
++		 * missed its start-up self-IPI kept this flag and spun in the idle thread at full speed (every cluster read busy=100% on the
++		 * idle desktop). A started core takes interrupts: clear the flag here instead of refusing to idle. */
++		if (sheng_sigp_recover(cpu_data_ptr)) {
++			sheng_idle_sigp_cleared++;
++		} else {
++			sheng_idle_sigp_refused++;
++			idle_disallowed = true;
++		}
+ 	}
+ 
++	sheng_idle_enter[cpu_data_ptr->cpu_number & 7]++;
+ 	if (__improbable(idle_disallowed)) {
++		sheng_idle_disallowed[cpu_data_ptr->cpu_number & 7]++;
+ 		Idle_load_context();
+ 	}
+ 
+@@ -843,8 +861,10 @@ cpu_data_init(cpu_data_t *cpu_data_ptr)
+ 	pmap_cpu_data_ptr->pv_free_spill_marker = NULL;
+ #if !CONFIG_SPTM
+ 	pmap_cpu_data_ptr->cpu_nested_pmap = (struct pmap *) NULL;
++#if !HAS_16BIT_ASID
+ 	bzero(&(pmap_cpu_data_ptr->cpu_sw_asids[0]), sizeof(pmap_cpu_data_ptr->cpu_sw_asids));
+ #endif
++#endif
+ #endif /* !XNU_MONITOR */
+ 	cpu_data_ptr->halt_status = CPU_NOT_HALTED;
+ #if __ARM_KERNEL_PROTECT__
+@@ -934,6 +954,18 @@ cpu_start(int cpu)
+ 
+ 		flush_dcache((vm_offset_t)&CpuDataEntries[cpu], sizeof(cpu_data_entry_t), FALSE);
+ 		flush_dcache((vm_offset_t)cpu_data_ptr, sizeof(cpu_data_t), FALSE);
++#if !defined(APPLE_ARM64_ARCH_FAMILY)
++		{
++			/* UniXNU: the new core reads these with its MMU off, uncached, from DRAM (reset_vector, start_cpu, common_start):
++			 * written once at boot, they can still be dirty in this core's caches, and a core that reads a stale
++			 * ResetHandlerData, const_boot_args or cpu_ttep finds no cpu data or builds a wrong address space and spins in the
++			 * early vectors. Write them back to the point of coherency, as the cpu data above. */
++			extern boot_args const_boot_args;
++			flush_dcache((vm_offset_t)&ResetHandlerData, sizeof(ResetHandlerData), FALSE);
++			flush_dcache((vm_offset_t)&const_boot_args, sizeof(const_boot_args), FALSE);
++			flush_dcache((vm_offset_t)&cpu_ttep, sizeof(cpu_ttep), FALSE);
++		}
++#endif
+ #if CONFIG_SPTM
+ 		/**
+ 		 * On SPTM devices, CTRR is configured entirely by the SPTM. Due to this, this logic
+diff --git a/osfmk/arm64/proc_reg.h b/osfmk/arm64/proc_reg.h
+index 51fdc9d..8f83d0a 100644
+--- a/osfmk/arm64/proc_reg.h
++++ b/osfmk/arm64/proc_reg.h
+@@ -1103,6 +1103,17 @@
+ #endif /* __ARM64_PMAP_SUBPAGE_L1__ */
+ #endif /* __ARM_16K_PG__ */
+ 
++/*
++ * TTBR0 size once a CPU is past its V=P bootstrap. arm64e user code expects pointer
++ * authentication codes above bit 46 (libobjc strips isa with a 43-bit mask), so a native
++ * 4K kernel gives user pmaps four-level tables with a 47-bit range; TTBR1 keeps T1SZ_BOOT.
++ */
++#if defined(BCM2837) && !defined(__ARM_16K_PG__) && defined(__arm64e__)
++#define T0SZ_USER 17ULL
++#else
++#define T0SZ_USER T0SZ_BOOT
++#endif
++
+ #if __ARM64_PMAP_SUBPAGE_L1__ && CONFIG_SPTM
+ #define T0SZ_EARLY_BOOT 17ULL
+ #endif /*__ARM64_PMAP_SUBPAGE_L1__ && CONFIG_SPTM */
+@@ -1182,6 +1193,17 @@
+ #define TCR_EL1_4KB  (TCR_EL1_BASE | (T1SZ_BOOT << TCR_T1SZ_SHIFT) | (TCR_TG0_GRANULE_4KB))
+ #define TCR_EL1_16KB (TCR_EL1_BASE | (T1SZ_BOOT << TCR_T1SZ_SHIFT) | (TCR_TG0_GRANULE_16KB))
+ 
++#define TCR_EPD0_DISABLE        (1ULL << 7)
++
++#if T0SZ_USER != T0SZ_BOOT
++/*
++ * TCR once a CPU runs at kernel addresses: TTBR0 already has its final size, so every pointer
++ * signed from then on (NULL included, it is a TTBR0-range value) carries its PAC at the final
++ * position. TTBR0 walks stay off until it holds a T0SZ_USER-format table.
++ */
++#define TCR_EL1_KVA_ENTRY ((TCR_EL1_BOOT & ~(TCR_TSZ_MASK << TCR_T0SZ_SHIFT)) | (T0SZ_USER << TCR_T0SZ_SHIFT) | TCR_EPD0_DISABLE)
++#endif /* T0SZ_USER != T0SZ_BOOT */
++
+ /*
+  * Bit 55 of the VA is used to select which TTBR to use during a translation table walk.
+  */
+@@ -1807,7 +1829,11 @@
+ 
+ #endif /* HAS_FEAT_XS */
+ 
+-#if HAS_UCNORMAL_MEM || APPLEVIRTUALPLATFORM
++/*
++ * BCM2837 (the sheng native kernel): real-time memory is Normal non-cacheable, as with HAS_UCNORMAL_MEM, so user code may
++ * use unaligned and vector accesses on real-time-mapped surfaces (Device memory would raise alignment faults).
++ */
++#if HAS_UCNORMAL_MEM || APPLEVIRTUALPLATFORM || defined(BCM2837)
+ #define CACHE_ATTRINDX_RT CACHE_ATTRINDX_WRITECOMB
+ #else
+ #define CACHE_ATTRINDX_RT CACHE_ATTRINDX_POSTED_COMBINED_REORDERED
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 0554aa8..ab492d8 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1661,7 +1661,7 @@ user_fault_matches_pac_error_code(vm_offset_t fault_addr, uint64_t pc, bool data
+ 		 * EnhancedPAC2 CPUs don't encode error codes at fixed positions, so
+ 		 * treat all non-canonical address bits like potential poison bits.
+ 		 */
+-		uint64_t mask = fault_addr_bitmask(64 - T0SZ_BOOT, 54);
++		uint64_t mask = fault_addr_bitmask(64 - T0SZ_USER, 54);
+ 		if (!tbi) {
+ 			mask |= fault_addr_bitmask(56, 63);
+ 		}
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index d66c616..827236a 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -879,6 +879,15 @@ arm_init_tramp:
+ 	 */
+ 
+ 
++#if T0SZ_USER != T0SZ_BOOT
++	MOV64	x1, TCR_EL1_KVA_ENTRY
++	MSR_TCR_EL1_X1
++	isb		sy
++	tlbi	vmalle1
++	dsb		ish
++	isb		sy
++#endif /* T0SZ_USER != T0SZ_BOOT */
++
+ 	mov		x19, lr
+ 	// Convert CPU data PA to VA and set as first argument
+ 	mov		x0, x21
+diff --git a/osfmk/kern/processor.c b/osfmk/kern/processor.c
+index 3e35085..30cf966 100644
+--- a/osfmk/kern/processor.c
++++ b/osfmk/kern/processor.c
+@@ -2032,3 +2032,21 @@ sched_perfcontrol_inherit_recommendation_from_tg(__unused perfcontrol_class_t pe
+ }
+ 
+ #endif /* defined(__arm64__) */
++
++/*
++ * Board CPU governor helper: a CPU's idle time so far in mach absolute time units (recount brings it up to now
++ * while the CPU idles), for board code that cannot see struct processor. 0 for a CPU number without a processor.
++ */
++uint64_t sheng_cpu_idle_mach(int cpu);
++uint64_t
++sheng_cpu_idle_mach(int cpu)
++{
++	processor_t p = cpu_to_processor(cpu);
++	if (p == PROCESSOR_NULL) {
++		return 0;
++	}
++	struct recount_usage usage = {};
++	uint64_t idle = 0;
++	recount_processor_usage(&p->pr_recount, &usage, &idle);
++	return idle;
++}
+diff --git a/osfmk/mach/arm/vm_param.h b/osfmk/mach/arm/vm_param.h
+index 8d11b54..6b12ab1 100644
+--- a/osfmk/mach/arm/vm_param.h
++++ b/osfmk/mach/arm/vm_param.h
+@@ -293,7 +293,7 @@ extern int PAGE_SHIFT_CONST;
+ 
+ #if XNU_KERNEL_PRIVATE
+ #define VM_KERNEL_STRIP_MASK            (-1ULL << (64 - T1SZ_BOOT))
+-#define VM_USER_STRIP_MASK              (-1ULL >> (T0SZ_BOOT))
++#define VM_USER_STRIP_MASK              (-1ULL >> (T0SZ_USER))
+ #define _VM_KERNEL_STRIP_PTR(_va)       ({((_va) & 1ULL << 55) ? ((_va) | VM_KERNEL_STRIP_MASK) : ((_va) & VM_USER_STRIP_MASK);})
+ #else /* XNU_KERNEL_PRIVATE */
+ 
+diff --git a/pexpert/gen/bootargs.c b/pexpert/gen/bootargs.c
+index 1ef8caa..36275ba 100644
+--- a/pexpert/gen/bootargs.c
++++ b/pexpert/gen/bootargs.c
+@@ -188,13 +188,23 @@ gotit:
+ 	return arg_found;
+ }
+ 
++/*
++ * UniXNU: boot arguments a board builds into its kernel, the switches it always sets, so the boot
++ * loader's command line (DarwinBoot keeps at most 1023 bytes) carries only what changes between
++ * boots. An argument on the command line wins; one absent from it is looked up here (a switch the
++ * board sets is turned off with name=0 on the command line). A board that defines none gets this
++ * empty one.
++ */
++__attribute__((weak)) char PE_builtin_boot_args[] = "";
++
+ boolean_t
+ PE_parse_boot_argn(
+ 	const char      *arg_string,
+ 	void            *arg_ptr,
+ 	int                     max_len)
+ {
+-	return PE_parse_boot_argn_internal(PE_boot_args(), arg_string, arg_ptr, max_len, FALSE);
++	return PE_parse_boot_argn_internal(PE_boot_args(), arg_string, arg_ptr, max_len, FALSE) ||
++	       PE_parse_boot_argn_internal(PE_builtin_boot_args, arg_string, arg_ptr, max_len, FALSE);
+ }
+ 
+ boolean_t
+@@ -214,7 +224,8 @@ PE_parse_boot_arg_str(
+ 	char            *arg_ptr,
+ 	int                     strlen)
+ {
+-	return PE_parse_boot_argn_internal(PE_boot_args(), arg_string, arg_ptr, strlen, TRUE);
++	return PE_parse_boot_argn_internal(PE_boot_args(), arg_string, arg_ptr, strlen, TRUE) ||
++	       PE_parse_boot_argn_internal(PE_builtin_boot_args, arg_string, arg_ptr, strlen, TRUE);
+ }
+ 
+ #if defined(CONFIG_XNUPOST)
+diff --git a/pexpert/pexpert/arm64/BCM2837.h b/pexpert/pexpert/arm64/BCM2837.h
+index 5a5574e..75101bc 100644
+--- a/pexpert/pexpert/arm64/BCM2837.h
++++ b/pexpert/pexpert/arm64/BCM2837.h
+@@ -8,6 +8,13 @@
+ #define NO_MONITOR 1
+ #define NO_ECORE 1
+ 
++/*
++ * UniXNU: 16-bit hardware ASIDs (TCR_EL1.AS), one per address space. With 8 bits the pmap shares each hardware ASID among
++ * several address spaces once more than 255 exist and flushes it from the switching CPU's TLB at every switch between them;
++ * iPadOS runs several hundred processes. Every ARMv8.2+ core (sheng's A510/A715/X3) has 16-bit ASIDs; pmap_bootstrap() checks.
++ */
++#define HAS_16BIT_ASID 1
++
+ #define BCM2837
+ #define ARM_ARCH_TIMER
+ 

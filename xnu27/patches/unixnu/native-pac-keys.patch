@@ -1,0 +1,134 @@
+diff --git a/osfmk/arm64/machine_routines_asm.s b/osfmk/arm64/machine_routines_asm.s
+index 864fb208..671dc503 100644
+--- a/osfmk/arm64/machine_routines_asm.s
++++ b/osfmk/arm64/machine_routines_asm.s
+@@ -107,6 +107,11 @@ Lcre_start_\@:
+ 	.globl EXT(ml_enable_user_jop_key)
+ LEXT(ml_enable_user_jop_key)
+ 	ARM64_PROLOG
++#if HAS_NATIVE_PAC
++	/* The kernel and every process share one key set; nothing to switch. */
++	mov		x0, #0
++	ret
++#endif /* HAS_NATIVE_PAC */
+ #if HAS_PARAVIRTUALIZED_PAC
+ 	mov 	x2, x0
+ 	MOV64	x0, VMAPPLE_PAC_SET_EL0_DIVERSIFIER_AT_EL1
+@@ -124,6 +129,9 @@ LEXT(ml_enable_user_jop_key)
+ 	.globl EXT(ml_disable_user_jop_key)
+ LEXT(ml_disable_user_jop_key)
+ 	ARM64_PROLOG
++#if HAS_NATIVE_PAC
++	ret
++#endif /* HAS_NATIVE_PAC */
+ #if HAS_PARAVIRTUALIZED_PAC
+ 	mov 	x2, x1
+ 	MOV64	x0, VMAPPLE_PAC_SET_EL0_DIVERSIFIER_AT_EL1
+diff --git a/osfmk/arm64/pac_asm.h b/osfmk/arm64/pac_asm.h
+index d2114339..3d096ca1 100644
+--- a/osfmk/arm64/pac_asm.h
++++ b/osfmk/arm64/pac_asm.h
+@@ -43,6 +43,10 @@
+ 
+ #if defined(HAS_APPLE_PAC)
+ 
++#if HAS_NATIVE_PAC
++/* IA, IB, DA, DB and GA keys, two words each */
++#define NATIVE_PAC_KEY_WORDS	10
++#endif /* HAS_NATIVE_PAC */
+ 
+ /* BEGIN IGNORE CODESTYLE */
+ 
+@@ -146,6 +150,55 @@
+  *   tmp2 - scratch register
+  */
+ .macro PAC_INIT_KEY_STATE	tmp, tmp2
++#if HAS_NATIVE_PAC
++	/*
++	 * ARMv8.3 keys are shared by EL0 and EL1. The kernel and every process
++	 * use one key set per boot. The first CPU through here derives it from
++	 * the counter with splitmix64; every later entry, including warm resets,
++	 * loads the stored set. The MMU is off on this path, so the stores reach
++	 * memory and later CPUs read them there. Clobbers x2-x6.
++	 */
++	adrp	\tmp, EXT(native_pac_keys)@page
++	add		\tmp, \tmp, EXT(native_pac_keys)@pageoff
++	ldr		\tmp2, [\tmp, #(NATIVE_PAC_KEY_WORDS * 8)]
++	cbnz	\tmp2, 2f
++	mrs		\tmp2, CNTPCT_EL0
++	MOV64	x3, 0x9e3779b97f4a7c15
++	MOV64	x4, 0xbf58476d1ce4e5b9
++	MOV64	x5, 0x94d049bb133111eb
++	mov		x2, #0
++1:
++	add		\tmp2, \tmp2, x3
++	eor		x6, \tmp2, \tmp2, lsr #30
++	mul		x6, x6, x4
++	eor		x6, x6, x6, lsr #27
++	mul		x6, x6, x5
++	eor		x6, x6, x6, lsr #31
++	str		x6, [\tmp, x2, lsl #3]
++	add		x2, x2, #1
++	cmp		x2, #(NATIVE_PAC_KEY_WORDS)
++	b.lo	1b
++	mov		x2, #1
++	str		x2, [\tmp, #(NATIVE_PAC_KEY_WORDS * 8)]
++	dsb		sy
++2:
++	ldp		x2, x3, [\tmp, #0]
++	msr		APIAKeyLo_EL1, x2
++	msr		APIAKeyHi_EL1, x3
++	ldp		x2, x3, [\tmp, #16]
++	msr		APIBKeyLo_EL1, x2
++	msr		APIBKeyHi_EL1, x3
++	ldp		x2, x3, [\tmp, #32]
++	msr		APDAKeyLo_EL1, x2
++	msr		APDAKeyHi_EL1, x3
++	ldp		x2, x3, [\tmp, #48]
++	msr		APDBKeyLo_EL1, x2
++	msr		APDBKeyHi_EL1, x3
++	ldp		x2, x3, [\tmp, #64]
++	msr		APGAKeyLo_EL1, x2
++	msr		APGAKeyHi_EL1, x3
++	isb		sy
++#endif /* HAS_NATIVE_PAC */
+ #if HAS_PARAVIRTUALIZED_PAC
+ #if HIBERNATION
+ 	#error PAC_INIT_KEY_STATE is not implemented for HAS_PARAVIRTUALIZED_PAC && HIBERNATION
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index a757713d..d66c6167 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -892,3 +892,12 @@ arm_init_tramp:
+ //#include	"globals_asm.h"
+ 
+ /* vim: set ts=4: */
++
++#if HAS_NATIVE_PAC
++	/* Key set of PAC_INIT_KEY_STATE and its ready word; written with the MMU off. */
++	.section __DATA, __data
++	.align 4
++	.globl EXT(native_pac_keys)
++LEXT(native_pac_keys)
++	.space	(NATIVE_PAC_KEY_WORDS + 1) * 8, 0
++#endif /* HAS_NATIVE_PAC */
+diff --git a/pexpert/pexpert/arm64/BCM2837.h b/pexpert/pexpert/arm64/BCM2837.h
+index d0cd08cb..8a43b0aa 100644
+--- a/pexpert/pexpert/arm64/BCM2837.h
++++ b/pexpert/pexpert/arm64/BCM2837.h
+@@ -18,6 +18,15 @@
+ #define __ARM_DEBUG__             7
+ #define __ARM64_PMAP_SUBPAGE_L1__ 1
+ 
++/*
++ * arm64e on a non-Apple ARMv8.3 CPU: pointer authentication uses the
++ * architectural key registers (see HAS_NATIVE_PAC in arm64/pac_asm.h).
++ */
++#if defined(__arm64e__)
++#define HAS_APPLE_PAC             1
++#define HAS_NATIVE_PAC            1
++#endif
++
+ #ifndef ASSEMBLER
+ #define PLATFORM_PANIC_LOG_DISABLED
+ #endif /* ! ASSEMBLER */

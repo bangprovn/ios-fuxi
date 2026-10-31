@@ -1,0 +1,21 @@
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -1121,9 +1121,17 @@
+ # arm64e specific linker flags that should be used only when linking the kernel
+ # (and not the static kernel cache / kcgen)
+ #
++ifeq ($(XNU_KERNEL_CHAINED_FIXUPS),1)
+ LDFLAGS_KERNEL_ONLY_SUBARCH_arm64e = \
+ 	-Wl,-add_split_seg_info \
+ 	-Wl,-kernel
++else
++# A standalone arm64e MH_EXECUTE boots without a kernel collection builder:
++# arm_init rebases and signs __TEXT,__thread_starts, which only ld-classic emits.
++LDFLAGS_KERNEL_ONLY_SUBARCH_arm64e = \
++	-fuse-ld=$(shell $(XCRUN) -sdk $(SDKROOT) -find ld-classic) \
++	-Wl,-threaded_starts_section
++endif
+ 
+ LDFLAGS_KERNEL_ONLY_SUBARCH_x86_64 = \
+ 	-Wl,-add_split_seg_info \

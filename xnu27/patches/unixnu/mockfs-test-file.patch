@@ -1,0 +1,280 @@
+diff --git a/bsd/miscfs/mockfs/mockfs_fsnode.c b/bsd/miscfs/mockfs/mockfs_fsnode.c
+index e0001262..378b4c37 100644
+--- a/bsd/miscfs/mockfs/mockfs_fsnode.c
++++ b/bsd/miscfs/mockfs/mockfs_fsnode.c
+@@ -74,6 +74,7 @@ mockfs_fsnode_create(mount_t mp, uint8_t type, mockfs_fsnode_t * fsnpp)
+ 	case MOCKFS_DEV:
+ 		break;
+ 	case MOCKFS_FILE:
++	case MOCKFS_TEST_FILE:
+ 		/*
+ 		 * For a regular file, size is meaningful, but it will always be equal to the
+ 		 * size of the backing device.
+@@ -145,6 +146,12 @@ mockfs_fsnode_destroy(mockfs_fsnode_t fsnp)
+ 		}
+ 	}
+ 
++	if (fsnp->child_c) {
++		if ((rvalue = mockfs_fsnode_destroy(fsnp->child_c))) {
++			panic("mockfs: failed to destroy test node");
++		}
++	}
++
+ 	/*
+ 	 * We need to orphan this node before we destroy it.
+ 	 */
+@@ -202,6 +209,9 @@ mockfs_fsnode_adopt(mockfs_fsnode_t parent, mockfs_fsnode_t child)
+ 	} else if (!parent->child_b) {
+ 		parent->child_b = child;
+ 		child->parent = parent;
++	} else if (!parent->child_c) {
++		parent->child_c = child;
++		child->parent = parent;
+ 	} else {
+ 		rvalue = ENOMEM;
+ 	}
+@@ -243,6 +253,9 @@ mockfs_fsnode_orphan(mockfs_fsnode_t fsnp)
+ 	} else if (parent->child_b == fsnp) {
+ 		parent->child_b = NULL;
+ 		fsnp->parent = NULL;
++	} else if (parent->child_c == fsnp) {
++		parent->child_c = NULL;
++		fsnp->parent = NULL;
+ 	} else {
+ 		panic("mockfs_fsnode_orphan insanity, fsnp->parent != parent->child; fsnp = %p (in case gdb is screwing with you)", fsnp);
+ 	}
+@@ -278,6 +291,8 @@ mockfs_fsnode_child_by_type(mockfs_fsnode_t parent, uint8_t type, mockfs_fsnode_
+ 		*child = parent->child_a;
+ 	} else if ((parent->child_b) && (parent->child_b->type == type)) {
+ 		*child = parent->child_b;
++	} else if ((parent->child_c) && (parent->child_c->type == type)) {
++		*child = parent->child_c;
+ 	} else {
+ 		rvalue = ENOENT;
+ 	}
+@@ -322,7 +337,7 @@ mockfs_fsnode_vnode(mockfs_fsnode_t fsnp, vnode_t * vpp)
+ 		 * We need to create the vnode; this will be unpleasant.
+ 		 */
+ 		vnfs_param.vnfs_mp = fsnp->mnt;
+-		vnfs_param.vnfs_vtype = (fsnp->type == MOCKFS_FILE) ? VREG : VDIR;
++		vnfs_param.vnfs_vtype = ((fsnp->type == MOCKFS_FILE) || (fsnp->type == MOCKFS_TEST_FILE)) ? VREG : VDIR;
+ 		vnfs_param.vnfs_str = "mockfs";
+ 		vnfs_param.vnfs_dvp = (fsnp->type == MOCKFS_ROOT) ? NULL : fsnp->parent->vp;
+ 		vnfs_param.vnfs_fsnode = fsnp;
+diff --git a/bsd/miscfs/mockfs/mockfs_fsnode.h b/bsd/miscfs/mockfs/mockfs_fsnode.h
+index f2620bfb..fcaf6747 100644
+--- a/bsd/miscfs/mockfs/mockfs_fsnode.h
++++ b/bsd/miscfs/mockfs/mockfs_fsnode.h
+@@ -46,7 +46,8 @@
+ enum mockfs_fsnode_type {
+ 	MOCKFS_ROOT,
+ 	MOCKFS_DEV,
+-	MOCKFS_FILE
++	MOCKFS_FILE,
++	MOCKFS_TEST_FILE
+ };
+ 
+ /*
+@@ -58,6 +59,7 @@ enum mockfs_fsnode_type {
+  *   VREG access).
+  */
+ struct mockfs_fsnode {
++	uint64_t               backing_offset; /* Offline two-file image only. */
+ 	uint64_t               size;    /* Bytes of data; 0 unless type is MOCKFS_FILE */
+ 	uint8_t                type;    /* Serves as a unique identifier for now */
+ 	mount_t                mnt;     /* The mount that this node belongs to */
+@@ -66,6 +68,7 @@ struct mockfs_fsnode {
+ 	                                /* TODO: Replace child_a/child_b with something more flexible */
+ 	struct mockfs_fsnode * child_a; /* TEMPORARY */
+ 	struct mockfs_fsnode * child_b; /* TEMPORARY */
++	struct mockfs_fsnode * child_c; /* Offline test input. */
+ };
+ 
+ typedef struct mockfs_fsnode * mockfs_fsnode_t;
+diff --git a/bsd/miscfs/mockfs/mockfs_vfsops.c b/bsd/miscfs/mockfs/mockfs_vfsops.c
+index 20cec71f..ed8f0413 100644
+--- a/bsd/miscfs/mockfs/mockfs_vfsops.c
++++ b/bsd/miscfs/mockfs/mockfs_vfsops.c
+@@ -34,6 +34,8 @@
+ #include <miscfs/mockfs/mockfs_vnops.h>
+ #include <miscfs/specfs/specdev.h>
+ #include <sys/disk.h>
++#include <sys/buf.h>
++#include <sys/kauth.h>
+ #include <sys/errno.h>
+ #include <sys/malloc.h>
+ #include <sys/mount_internal.h>
+@@ -41,6 +43,15 @@
+ 
+ static LCK_GRP_DECLARE(mockfs_mtx_grp, "mockfs-mutex");
+ 
++/* Bounded offline input container, not a deployment filesystem or trust claim.
++ * Two unmodified files: /sbin/launchd and /probe.bin; all offsets native 4K.
++ */
++struct mockfs_test_header {
++	char magic[8];
++	uint32_t version, count;
++	uint64_t launch_offset, launch_size, test_offset, test_size;
++};
++
+ int mockfs_mountroot(mount_t mp, vnode_t rvp, __unused vfs_context_t ctx);
+ 
+ /*
+@@ -68,6 +79,10 @@ mockfs_mountroot(mount_t mp, vnode_t rvp, __unused vfs_context_t ctx)
+ 	mockfs_fsnode_t root_fsnode = NULL;
+ 	mockfs_fsnode_t dev_fsnode = NULL;
+ 	mockfs_fsnode_t file_fsnode = NULL;
++	mockfs_fsnode_t test_fsnode = NULL;
++	struct mockfs_test_header header = {0};
++	buf_t header_buf = NULL;
++	boolean_t test_image = FALSE;
+ 	mockfs_mount_t mockfs_mount_data = NULL;
+ 	dk_memdev_info_t memdev_info;
+ 
+@@ -113,6 +128,42 @@ mockfs_mountroot(mount_t mp, vnode_t rvp, __unused vfs_context_t ctx)
+ 
+ 	lck_mtx_init(&mockfs_mount_data->mockfs_mnt_mtx, &mockfs_mtx_grp, LCK_ATTR_NULL);
+ 
++	mp->mnt_data = (typeof(mp->mnt_data))mockfs_mount_data;
++
++	/* Legacy single-Mach-O images retain their original mapping. */
++	rvalue = buf_meta_bread(rvp, 0, 4096, vfs_context_ucred(ctx), &header_buf);
++	if (!rvalue) {
++		memcpy(&header, (void *)buf_dataptr(header_buf), sizeof(header));
++	}
++	if (header_buf) {
++		buf_brelse(header_buf);
++	}
++	if (rvalue) {
++		goto done;
++	}
++	if (!memcmp(header.magic, "N4KROOT", 8)) {
++		uint64_t bytes = rvp->v_specinfo->si_devsize;
++		if (header.version != 1 || header.count != 2 || bytes > 32 * 1024 * 1024 ||
++		    header.launch_offset != 4096 || !header.launch_size || !header.test_size ||
++		    (header.test_offset & 4095) || header.test_offset < 8192 || header.test_offset > bytes ||
++		    header.launch_size > header.test_offset - header.launch_offset ||
++		    header.test_size > bytes - header.test_offset) {
++			rvalue = EINVAL;
++			goto done;
++		}
++		rvalue = mockfs_fsnode_create(mp, MOCKFS_TEST_FILE, &test_fsnode);
++		if (rvalue) {
++			goto done;
++		}
++		file_fsnode->backing_offset = header.launch_offset;
++		file_fsnode->size = header.launch_size;
++		test_fsnode->backing_offset = header.test_offset;
++		test_fsnode->size = header.test_size;
++		mockfs_mount_data->mockfs_memory_backed = FALSE;
++		test_image = TRUE;
++	}
++
++
+ 	/*
+ 	 * All of the needed nodes/structures have been set up; now we just need to establish the relationships
+ 	 *   between the various mockfs nodes.
+@@ -125,11 +176,18 @@ mockfs_mountroot(mount_t mp, vnode_t rvp, __unused vfs_context_t ctx)
+ 		goto done;
+ 	}
+ 
++	if (test_image && (rvalue = mockfs_fsnode_adopt(root_fsnode, test_fsnode))) {
++		goto done;
++	}
++
+ 	mockfs_mount_data->mockfs_root = root_fsnode;
+ 	mp->mnt_data = (typeof(mp->mnt_data))mockfs_mount_data;
+ 
+ done:
+ 	if (rvalue) {
++		if (test_fsnode) {
++			mockfs_fsnode_destroy(test_fsnode);
++		}
+ 		if (file_fsnode) {
+ 			mockfs_fsnode_destroy(file_fsnode);
+ 		}
+@@ -142,6 +200,7 @@ done:
+ 		if (mockfs_mount_data) {
+ 			lck_mtx_destroy(&mockfs_mount_data->mockfs_mnt_mtx, &mockfs_mtx_grp);
+ 			kfree_type(struct mockfs_mount, mockfs_mount_data);
++		mp->mnt_data = NULL;
+ 		}
+ 	}
+ 
+diff --git a/bsd/miscfs/mockfs/mockfs_vnops.c b/bsd/miscfs/mockfs/mockfs_vnops.c
+index 8ce4c11e..6cbfce25 100644
+--- a/bsd/miscfs/mockfs/mockfs_vnops.c
++++ b/bsd/miscfs/mockfs/mockfs_vnops.c
+@@ -29,6 +29,7 @@
+ #include <miscfs/mockfs/mockfs.h>
+ #include <miscfs/mockfs/mockfs_vnops.h>
+ #include <sys/ubc.h>
++#include <sys/fcntl.h>
+ #include <sys/mount_internal.h>
+ #include <sys/vnode_internal.h>
+ #include <vfs/vfs_support.h>
+@@ -46,6 +47,11 @@
+  *   each function does in generic terms.
+  */
+ int mockfs_lookup(struct vnop_lookup_args * ap);
++static int mockfs_readonly_open(struct vnop_open_args *ap)
++{
++	return (ap->a_mode & FWRITE) ? EROFS : 0;
++}
++
+ int mockfs_getattr(struct vnop_getattr_args * ap);
+ int mockfs_read(struct vnop_read_args * ap);
+ int mockfs_strategy(struct vnop_strategy_args * ap);
+@@ -117,10 +123,15 @@ mockfs_lookup(struct vnop_lookup_args * ap)
+ 		 *   accidentally commit a change to the init_process pathname.  We map from name to node type
+ 		 *   here, as mockfs doesn't current use names; just unique types.
+ 		 */
+-		if (!strncmp(cnp->cn_nameptr, "sbin", 5)) {
++		if (!strncmp(cnp->cn_nameptr, "sbin", 5) ||
++		    !strncmp(cnp->cn_nameptr, "usr", 4) || !strncmp(cnp->cn_nameptr, "lib", 4)) {
+ 			target_fsnode = fsnode;
+ 		} else if (!strncmp(cnp->cn_nameptr, "dev", 4)) {
+ 			mockfs_fsnode_child_by_type(fsnode, MOCKFS_DEV, &target_fsnode);
++		} else if (!strncmp(cnp->cn_nameptr, "dyld", 5)) {
++			mockfs_fsnode_child_by_type(fsnode, MOCKFS_TEST_FILE, &target_fsnode);
++		} else if (!strncmp(cnp->cn_nameptr, "probe.bin", 10)) {
++			mockfs_fsnode_child_by_type(fsnode, MOCKFS_TEST_FILE, &target_fsnode);
+ 		} else if (!strncmp(cnp->cn_nameptr, "launchd", 8)) {
+ 			mockfs_fsnode_child_by_type(fsnode, MOCKFS_FILE, &target_fsnode);
+ 		} else {
+@@ -392,8 +403,12 @@ mockfs_blockmap(struct vnop_blockmap_args * ap)
+ 	 *   This also means that their request should always be contiguous, so the run calculation is easy!
+ 	 */
+ 	if (vp->v_type == VREG) {
+-		*bpn = foffset / blksize;
+-		*run = fsnode->size - foffset;
++		if (foffset < 0 || (uint64_t)foffset > fsnode->size) {
++			return EINVAL;
++		}
++		*bpn = (fsnode->backing_offset + foffset) / blksize;
++		/* File metadata is exact; block I/O may include allocated zero padding. */
++		*run = ((fsnode->size + 4095) & ~4095ULL) - foffset;
+ 
+ 		if (ap->a_size > *run) {
+ 			/* We've been asked for more data than the backing device can provide; we're done. */
+@@ -411,9 +426,9 @@ const struct vnodeopv_entry_desc mockfs_vnodeop_entries[] = {
+ 	{ .opve_op = &vnop_default_desc, .opve_impl = (VOPFUNC) vn_default_error }, /* default */
+ 	{ .opve_op = &vnop_lookup_desc, .opve_impl = (VOPFUNC) mockfs_lookup }, /* lookup */
+ 	{ .opve_op = &vnop_create_desc, .opve_impl = (VOPFUNC) err_create },/* create */
+-	{ .opve_op = &vnop_open_desc, .opve_impl = (VOPFUNC) err_open }, /* open */
++	{ .opve_op = &vnop_open_desc, .opve_impl = (VOPFUNC) mockfs_readonly_open }, /* open */
+ 	{ .opve_op = &vnop_mknod_desc, .opve_impl = (VOPFUNC) err_mknod }, /* mknod */
+-	{ .opve_op = &vnop_close_desc, .opve_impl = (VOPFUNC) err_close }, /* close */
++	{ .opve_op = &vnop_close_desc, .opve_impl = (VOPFUNC) nop_close }, /* close */
+ 	{ .opve_op = &vnop_access_desc, .opve_impl = (VOPFUNC) err_access }, /* access */
+ 	{ .opve_op = &vnop_getattr_desc, .opve_impl = (VOPFUNC) mockfs_getattr }, /* getattr */
+ 	{ .opve_op = &vnop_setattr_desc, .opve_impl = (VOPFUNC) err_setattr }, /* setattr */
+@@ -421,7 +436,7 @@ const struct vnodeopv_entry_desc mockfs_vnodeop_entries[] = {
+ 	{ .opve_op = &vnop_write_desc, .opve_impl = (VOPFUNC) err_write }, /* write */
+ 	{ .opve_op = &vnop_ioctl_desc, .opve_impl = (VOPFUNC) err_ioctl }, /* ioctl */
+ 	{ .opve_op = &vnop_select_desc, .opve_impl = (VOPFUNC) err_select }, /* select */
+-	{ .opve_op = &vnop_mmap_desc, .opve_impl = (VOPFUNC) err_mmap }, /* mmap */
++	{ .opve_op = &vnop_mmap_desc, .opve_impl = (VOPFUNC) nop_mmap }, /* mmap */
+ 	{ .opve_op = &vnop_fsync_desc, .opve_impl = (VOPFUNC) nop_fsync }, /* fsync */
+ 	{ .opve_op = &vnop_remove_desc, .opve_impl = (VOPFUNC) err_remove }, /* remove */
+ 	{ .opve_op = &vnop_link_desc, .opve_impl = (VOPFUNC) err_link }, /* link */

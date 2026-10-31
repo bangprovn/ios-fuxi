@@ -1,0 +1,64 @@
+# xnu-12377.121.6 patch series for the Fuxi iOS 27 kernel, applied in order by
+# xnu27/apply.sh with `git apply` (any failure stops the build). Origins and
+# licenses: xnu27/NOTICE. Paths are relative to xnu27/patches/.
+#
+# UniXNU firmware layer (github.com/UniXNU/UniXNU 88604d0, patches/xnu-12377/,
+# copied verbatim). Left out: source-corecrypto14-bootstrap (builds Apple's
+# corecrypto source, which is under Apple's internal-use license; see
+# docs-lanes/ios27.md), offline-* and zzz-boot-progress (sheng offline boot
+# tooling), zzw*/zzy* (userland and GPU grants: K3 and later).
+unixnu/bcm2837-machine-config.patch
+unixnu/local-availability.patch
+unixnu/cxx-flag-dependencies.patch
+unixnu/external-archive-dependencies.patch
+unixnu/public-entitlements-header.patch
+unixnu/apple-only-cpu-tunables.patch
+unixnu/non-apple-cache-monitor.patch
+unixnu/native-4k-bootstrap-capacity.patch
+unixnu/native-dt-panic-region.patch
+unixnu/armvirt-platform-personality.patch
+unixnu/native-aes-personality.patch
+unixnu/null-root-media.patch
+unixnu/zzx-pmap-sync-64bit-pa.patch
+unixnu/native-quiet-managed-page-report.patch
+unixnu/native-priv-work-interval.patch
+unixnu/native-work-interval-instance.patch
+unixnu/native-work-interval-soft-fail.patch
+unixnu/kernel-sdk-root.patch
+unixnu/source-machine-layer.patch
+unixnu/native-pac-keys.patch
+unixnu/public-entitlements-v2-header.patch
+unixnu/no-apple-cpu-counters.patch
+unixnu/apple-only-core-type.patch
+unixnu/public-pmap-sart.patch
+unixnu/public-pmap-without-monitor.patch
+unixnu/optional-kernel-support-archive.patch
+unixnu/public-missing-definitions.patch
+unixnu/source-pthread-bootstrap.patch
+unixnu/native-arm-pan.patch
+unixnu/mockfs-intermediate-lookup.patch
+unixnu/mockfs-memory-device-width.patch
+unixnu/mockfs-statfs.patch
+unixnu/mockfs-test-file.patch
+unixnu/mockfs-typed-allocation.patch
+unixnu/native-lookup-trace.patch
+unixnu/native-union-getattrlistbulk.patch
+unixnu/native-union-lower-directory.patch
+unixnu/native-work-interval-trace.patch
+unixnu/native-4k-user-abi.patch
+unixnu/native-4k-signature-hash-cache.patch
+unixnu/native-4k-shared-region-slide.patch
+unixnu/native-text-fixup.patch
+unixnu/non-apple-iommu-bootstrap.patch
+unixnu/arm64e-threaded-starts.patch
+unixnu/native-security-init.patch
+unixnu/trustcache-runtime-layout.patch
+unixnu/fileset-unmapped-call.patch
+unixnu/native-4k-block-split.patch
+unixnu/darwin26-syscalls.patch
+unixnu/darwin26-kpi.patch
+unixnu/darwin26-shared-region.patch
+# UniXNU-sheng CPU/MMU layer (same SM8550 SoC): 47-bit user VA, 16-bit ASID, WFE idle, ...
+sheng/sheng-cpu-mmu.patch
+# UniXNU-sm8550-common: secondary-CPU MPIDR mask for BCM2837-based configs
+sm8550/native-smp-secondary-start.patch

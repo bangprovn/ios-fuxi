@@ -1,0 +1,20 @@
+UniXNU-sm8550-common (https://github.com/UniXNU/UniXNU-sm8550-common at 23b2049),
+BSD-2-Clause-Patent, Copyright (c) 2026 UniXNU contributors; see xnu27/NOTICE.
+start.s hunk of patches/xnu/native-smp-secondary.patch (its board_config hunk is
+already covered by the sheng layer).
+
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 827236a..05d38d6 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -145,8 +145,8 @@ LEXT(reset_vector)
+ 	adrp	x19, EXT(ResetHandlerData)@page			// Get address of the reset handler data
+ 	add		x19, x19, EXT(ResetHandlerData)@pageoff
+ 	mrs		x15, MPIDR_EL1						// Load MPIDR to get CPU number
+-#if HAS_CLUSTER
+-	and		x0, x15, #0xFFFF					// CPU number in Affinity0, cluster ID in Affinity1
++#if HAS_CLUSTER || defined(BCM2837)
++	and		x0, x15, #0xFFFF					// CPU number in Affinity0, cluster ID in Affinity1 (SM8550 numbers cores in Affinity1)
+ #else
+ 	and		x0, x15, #0xFF						// CPU number is in MPIDR Affinity Level 0
+ #endif

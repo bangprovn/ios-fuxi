@@ -1,0 +1,16 @@
+diff --git a/pexpert/pexpert/arm64/BCM2837.h b/pexpert/pexpert/arm64/BCM2837.h
+index 9c140d76..5a5574ea 100644
+--- a/pexpert/pexpert/arm64/BCM2837.h
++++ b/pexpert/pexpert/arm64/BCM2837.h
+@@ -18,6 +18,11 @@
+ #define __ARM_DEBUG__             7
+ #define __ARM64_PMAP_SUBPAGE_L1__ 1
+ 
++/* Native ARMv8.1+ targets select PAN explicitly; the original A53 target has none. */
++#if defined(XNU_NATIVE_PAN) && XNU_NATIVE_PAN
++#define __ARM_PAN_AVAILABLE__      1
++#endif
++
+ /*
+  * arm64e on a non-Apple ARMv8.3 CPU: pointer authentication uses the
+  * architectural key registers (see HAS_NATIVE_PAC in arm64/pac_asm.h).

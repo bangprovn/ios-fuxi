@@ -1,0 +1,18 @@
+diff --git a/bsd/miscfs/mockfs/mockfs_vfsops.c b/bsd/miscfs/mockfs/mockfs_vfsops.c
+index 325bb060..bea8e6e1 100644
+--- a/bsd/miscfs/mockfs/mockfs_vfsops.c
++++ b/bsd/miscfs/mockfs/mockfs_vfsops.c
+@@ -99,9 +99,11 @@ mockfs_mountroot(mount_t mp, vnode_t rvp, __unused vfs_context_t ctx)
+ 
+ 	if (!VNOP_IOCTL(rvp, DKIOCGETMEMDEVINFO, (caddr_t)&memdev_info, 0, NULL)) {
+ 		/*
+-		 * For the moment, we won't try to optimize when mi_phys is true.
++		 * The legacy ioctl exposes a 32-bit base page. A 64-bit kernel
++		 * virtual address cannot be represented; use the real device I/O
++		 * path instead. Physical memory is not supported by this optimization.
+ 		 */
+-		if (!mockfs_mount_data->mockfs_physical_memory) {
++		if (!memdev_info.mi_phys && (sizeof(uintptr_t) == sizeof(uint32_t))) {
+ 			mockfs_mount_data->mockfs_memory_backed = memdev_info.mi_mdev;
+ 			mockfs_mount_data->mockfs_physical_memory = memdev_info.mi_phys;
+ 			mockfs_mount_data->mockfs_memdev_base = memdev_info.mi_base;

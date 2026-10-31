@@ -1,0 +1,549 @@
+diff --git a/bsd/kern/kern_codesigning.c b/bsd/kern/kern_codesigning.c
+index 43a6b20..2671137 100644
+--- a/bsd/kern/kern_codesigning.c
++++ b/bsd/kern/kern_codesigning.c
+@@ -945,6 +945,31 @@ unrestrict_local_signing_cdhash(
+ #endif
+ }
+ 
++void
++set_compilation_service_cdhash_ext(
++	const cs_cdhash_ext_t *cdhash)
++{
++	if (cdhash->length == CS_CDHASH_LEN) {
++		set_compilation_service_cdhash(cdhash->hash);
++	}
++}
++
++bool
++match_compilation_service_cdhash_ext(
++	const cs_cdhash_ext_t *cdhash)
++{
++	return cdhash->length == CS_CDHASH_LEN && match_compilation_service_cdhash(cdhash->hash);
++}
++
++void
++unrestrict_local_signing_cdhash_ext(
++	const cs_cdhash_ext_t *cdhash)
++{
++	if (cdhash->length == CS_CDHASH_LEN) {
++		unrestrict_local_signing_cdhash(cdhash->hash);
++	}
++}
++
+ kern_return_t
+ get_trust_level_kdp(
+ 	__unused pmap_t pmap,
+diff --git a/bsd/kern/kern_cs.c b/bsd/kern/kern_cs.c
+index c1c3929..c627b1c 100644
+--- a/bsd/kern/kern_cs.c
++++ b/bsd/kern/kern_cs.c
+@@ -652,6 +652,19 @@ csblob_get_cdhash(struct cs_blob *csblob)
+ 	return csblob->csb_cdhash;
+ }
+ 
++/*
++ * Darwin 26 KPI: the cdhash and its length. Darwin 26 stores cdhashes of up
++ * to 64 bytes; every cdhash of this kernel is CS_CDHASH_LEN bytes.
++ */
++const uint8_t *
++csblob_get_cdhash_with_length(struct cs_blob *csblob, uint8_t *length)
++{
++	if (length) {
++		*length = CS_CDHASH_LEN;
++	}
++	return csblob_get_cdhash(csblob);
++}
++
+ /*
+  * Function: csblob_get_signer_type
+  *
+diff --git a/bsd/kern/kern_proc.c b/bsd/kern/kern_proc.c
+index dfb3a45..5959fa9 100644
+--- a/bsd/kern/kern_proc.c
++++ b/bsd/kern/kern_proc.c
+@@ -2202,6 +2202,33 @@ proc_getcdhash(proc_t p, unsigned char *cdhash)
+ 	return vn_getcdhash(p->p_textvp, p->p_textoff, cdhash, NULL);
+ }
+ 
++/*
++ * Darwin 26 KPI: copy the cdhash into a buffer whose capacity is *length and
++ * return its length there. Fails with ERANGE when the buffer is too small.
++ */
++int
++proc_getcdhash_with_length(proc_t p, unsigned char *cdhash, uint8_t *length)
++{
++	unsigned char hash[CS_CDHASH_LEN];
++	int error;
++
++	if (p == kernproc) {
++		return EINVAL;
++	}
++	error = vn_getcdhash(p->p_textvp, p->p_textoff, hash, NULL);
++	if (error) {
++		return error;
++	}
++	if (*length < CS_CDHASH_LEN) {
++		return ERANGE;
++	}
++	*length = CS_CDHASH_LEN;
++	if (cdhash) {
++		memcpy(cdhash, hash, CS_CDHASH_LEN);
++	}
++	return 0;
++}
++
+ uint64_t
+ proc_getcsflags(proc_t p)
+ {
+diff --git a/bsd/sys/code_signing.h b/bsd/sys/code_signing.h
+index 80740d9..908177d 100644
+--- a/bsd/sys/code_signing.h
++++ b/bsd/sys/code_signing.h
+@@ -380,6 +380,28 @@ void
+ unrestrict_local_signing_cdhash(
+ 	const uint8_t *cdhash);
+ 
++/**
++ * Darwin 26 passes cdhashes as up to 64 bytes followed by their length. The
++ * variants below act on cdhashes of CS_CDHASH_LEN bytes, the only length this
++ * kernel produces, and ignore any other.
++ */
++typedef struct cs_cdhash_ext {
++	uint8_t hash[64];
++	size_t length;
++} cs_cdhash_ext_t;
++
++void
++set_compilation_service_cdhash_ext(
++	const cs_cdhash_ext_t *cdhash);
++
++bool
++match_compilation_service_cdhash_ext(
++	const cs_cdhash_ext_t *cdhash);
++
++void
++unrestrict_local_signing_cdhash_ext(
++	const cs_cdhash_ext_t *cdhash);
++
+ /**
+  * The kernel or the monitor environments allocate some data which is used by AppleImage4
+  * for storing critical system information such as nonces. AppleImage4 uses this API to
+diff --git a/bsd/sys/codesign.h b/bsd/sys/codesign.h
+index 9da328f..4c40502 100644
+--- a/bsd/sys/codesign.h
++++ b/bsd/sys/codesign.h
+@@ -115,6 +115,7 @@ vm_address_t    csblob_get_addr(struct cs_blob *);
+ const char *    csblob_get_teamid(struct cs_blob *);
+ const char *    csblob_get_identity(struct cs_blob *);
+ const uint8_t * csblob_get_cdhash(struct cs_blob *);
++const uint8_t * csblob_get_cdhash_with_length(struct cs_blob *, uint8_t *);
+ const CS_CodeDirectory* csblob_get_code_directory(struct cs_blob *csblob);
+ int             csblob_get_platform_binary(struct cs_blob *);
+ void            csblob_invalidate_flags(struct cs_blob *blob);
+diff --git a/bsd/sys/mount.h b/bsd/sys/mount.h
+index 86cef28..b83975b 100644
+--- a/bsd/sys/mount.h
++++ b/bsd/sys/mount.h
+@@ -1358,6 +1358,8 @@ boolean_t vfs_context_can_resolve_triggers(vfs_context_t);
+ boolean_t vfs_context_can_break_leases(vfs_context_t);
+ boolean_t vfs_context_skip_mtime_update(vfs_context_t ctx);
+ boolean_t vfs_context_allow_entitled_reserve_access(vfs_context_t ctx);
++boolean_t vfs_context_ignores_content_protection(vfs_context_t ctx);
++boolean_t vfs_context_iopolicy_unassigned_0x8000(vfs_context_t ctx);
+ void    vfs_setmntsystem(mount_t mp);
+ void    vfs_setmntsystemdata(mount_t mp);
+ void    vfs_setmntswap(mount_t mp);
+diff --git a/bsd/sys/proc_private.h b/bsd/sys/proc_private.h
+index 0bbd811..b8a6596 100644
+--- a/bsd/sys/proc_private.h
++++ b/bsd/sys/proc_private.h
+@@ -140,6 +140,7 @@ extern uint32_t proc_persona_id(proc_t);
+ extern uint32_t proc_getuid(proc_t);
+ extern uint32_t proc_getgid(proc_t);
+ extern int proc_getcdhash(proc_t, unsigned char *);
++extern int proc_getcdhash_with_length(proc_t, unsigned char *, uint8_t *);
+ 
+ /*!
+  *  @function    proc_pidbackgrounded
+diff --git a/bsd/sys/trust_caches.h b/bsd/sys/trust_caches.h
+index 12d9de1..565b8e4 100644
+--- a/bsd/sys/trust_caches.h
++++ b/bsd/sys/trust_caches.h
+@@ -180,6 +180,23 @@ query_trust_cache_for_rem(
+ 	const uint8_t cdhash[kTCEntryHashSize],
+ 	uint8_t *rem_perms);
+ 
++/**
++ * Darwin 26 variants that take the cdhash length. Trust cache entries hold
++ * kTCEntryHashSize bytes, so a cdhash of any other length is not found.
++ */
++kern_return_t
++query_trust_cache_with_length(
++	TCQueryType_t query_type,
++	const uint8_t *cdhash,
++	size_t cdhash_length,
++	TrustCacheQueryToken_t *query_token);
++
++kern_return_t
++query_trust_cache_for_rem_with_length(
++	const uint8_t *cdhash,
++	size_t cdhash_length,
++	uint8_t *rem_perms);
++
+ __END_DECLS
+ 
+ #endif /* KERNEL_PRIVATE */
+diff --git a/bsd/sys/ubc.h b/bsd/sys/ubc.h
+index ea7199e..9da7573 100644
+--- a/bsd/sys/ubc.h
++++ b/bsd/sys/ubc.h
+@@ -104,6 +104,8 @@ int UBCINFOEXISTS(const struct vnode *);
+ 
+ /* cluster IO routines */
+ void    cluster_update_state(vnode_t, vm_object_offset_t, vm_object_offset_t, boolean_t);
++int     cluster_update_range(vnode_t, off_t, off_t, off_t,
++    int (*)(vnode_t, off_t, off_t, off_t, off_t, off_t, void *), void *);
+ 
+ int     advisory_read(vnode_t, off_t, off_t, int);
+ int     advisory_read_ext(vnode_t, off_t, off_t, int, int (*)(buf_t, void *), void *, int);
+diff --git a/bsd/vfs/kpi_vfs.c b/bsd/vfs/kpi_vfs.c
+index b4a5832..75816a5 100644
+--- a/bsd/vfs/kpi_vfs.c
++++ b/bsd/vfs/kpi_vfs.c
+@@ -1442,6 +1442,29 @@ vfs_context_allow_entitled_reserve_access(vfs_context_t ctx)
+ 	return false;
+ }
+ 
++/*
++ * Darwin 26 KPIs that query the I/O policy of the context's process.
++ * APFS calls them by address; the original kernel resolves the process like
++ * vfs_context_proc() and tests one p_vfs_iopolicy bit.
++ */
++boolean_t
++vfs_context_ignores_content_protection(vfs_context_t ctx)
++{
++	proc_t p = vfs_context_proc(ctx);
++
++	return p && (os_atomic_load(&p->p_vfs_iopolicy, relaxed) & P_VFS_IOPOLICY_IGNORE_CONTENT_PROTECTION);
++}
++
++/*
++ * The original kernel tests policy bit 0x8000, which has no definition and
++ * no setter in this kernel, so the policy is never in effect.
++ */
++boolean_t
++vfs_context_iopolicy_unassigned_0x8000(__unused vfs_context_t ctx)
++{
++	return false;
++}
++
+ /*
+  * vfs_context_proc
+  *
+diff --git a/bsd/vfs/vfs_cluster.c b/bsd/vfs/vfs_cluster.c
+index 7ae2f39..b83d31c 100644
+--- a/bsd/vfs/vfs_cluster.c
++++ b/bsd/vfs/vfs_cluster.c
+@@ -103,6 +103,7 @@
+ #include <sys/sdt.h>
+ 
+ #include <stdbool.h>
++#include <os/overflow.h>
+ 
+ #include <vfs/vfs_disk_conditioner.h>
+ 
+@@ -3894,6 +3895,52 @@ cluster_update_state(vnode_t vp, vm_object_offset_t s_offset, vm_object_offset_t
+ 	    vp->v_un.vu_ubcinfo->ui_size, NULL, NULL, vm_initiated);
+ }
+ 
++static void
++cluster_update_state_internal(vnode_t vp, struct cl_extent *cl, int flags, boolean_t defer_writes,
++    boolean_t *first_pass, off_t write_off, int write_cnt, off_t newEOF,
++    int (*callback)(buf_t, void *), void *callback_arg, boolean_t vm_initiated);
++
++/*
++ * Darwin 26 KPI used by APFS: run a file system callback over the page range
++ * covering [offset, offset + length) in chunks of at most 64 MiB, and mark
++ * each chunk for deferred write-behind once the callback succeeds.
++ */
++#define CLUSTER_UPDATE_RANGE_CHUNK (64ULL * 1024 * 1024)
++
++int
++cluster_update_range(vnode_t vp, off_t offset, off_t length, off_t filesize,
++    int (*callback)(vnode_t, off_t, off_t, off_t, off_t, off_t, void *), void *callback_arg)
++{
++	off_t end, start, last, chunk;
++	struct cl_extent cl;
++	boolean_t first_pass;
++	int error;
++
++	if (callback == NULL || offset < 0 || length < 0 || filesize < 0 ||
++	    os_add_overflow(offset, length, &end) || (off_t)round_page_64(filesize) < end) {
++		return EINVAL;
++	}
++	if (length == 0) {
++		return 0;
++	}
++	start = trunc_page_64(offset);
++	last = round_page_64(end);
++	while (start < last) {
++		chunk = MIN(start + (off_t)CLUSTER_UPDATE_RANGE_CHUNK, last);
++		error = callback(vp, offset, length, filesize, start, chunk, callback_arg);
++		if (error) {
++			return error;
++		}
++		first_pass = TRUE;
++		cl.b_addr = (daddr64_t)(start / PAGE_SIZE_64);
++		cl.e_addr = (daddr64_t)(chunk / PAGE_SIZE_64);
++		cluster_update_state_internal(vp, &cl, 0, TRUE, &first_pass, start, (int)(chunk - start),
++		    vp->v_un.vu_ubcinfo->ui_size, NULL, NULL, FALSE);
++		start = chunk;
++	}
++	return 0;
++}
++
+ 
+ static void
+ cluster_update_state_internal(vnode_t vp, struct cl_extent *cl, int flags, boolean_t defer_writes,
+diff --git a/config/Libkern.exports b/config/Libkern.exports
+index 366d2e4..f822678 100644
+--- a/config/Libkern.exports
++++ b/config/Libkern.exports
+@@ -712,6 +712,7 @@ _gOSKextUnresolved
+ _img4_interface_register
+ _image4_dlxk_link
+ _image4_dlxk_get
++_image4_v2_interface_register
+ _inet_ntop
+ _inflate
+ _inflateEnd
+diff --git a/config/Private.arm64.exports b/config/Private.arm64.exports
+index f767c86..38d9b8b 100644
+--- a/config/Private.arm64.exports
++++ b/config/Private.arm64.exports
+@@ -38,6 +38,7 @@ _ml_satisfies_x86_64_requirements
+ _ml_set_reset_time
+ _ml_thread_is64bit
+ _proc_getcdhash
++_proc_getcdhash_with_length
+ _sched_disable_acc_rail
+ _sched_enable_acc_rail
+ _sched_perfcontrol_abandon_preemption_disable_measurement
+diff --git a/config/Private.exports b/config/Private.exports
+index 9c32b79..28e7500 100644
+--- a/config/Private.exports
++++ b/config/Private.exports
+@@ -392,6 +392,7 @@ _csblob_register_profile_uuid
+ _csblob_get_addr
+ _csblob_get_base_offset
+ _csblob_get_cdhash
++_csblob_get_cdhash_with_length
+ _csblob_get_code_directory
+ _csblob_get_entitlements
+ _csblob_get_der_entitlements
+@@ -786,6 +787,8 @@ _load_trust_cache
+ _load_trust_cache_with_type
+ _load_legacy_trust_cache
+ _query_trust_cache
++_query_trust_cache_with_length
++_query_trust_cache_for_rem_with_length
+ _query_trust_cache_for_rem
+ _m_cat
+ _m_free:_mbuf_free
+@@ -896,10 +899,13 @@ _pktap_output_packet
+ _code_signing_configuration
+ _disable_code_signing_feature
+ _set_compilation_service_cdhash
++_set_compilation_service_cdhash_ext
+ _match_compilation_service_cdhash
++_match_compilation_service_cdhash_ext
+ _set_local_signing_public_key
+ _get_local_signing_public_key
+ _unrestrict_local_signing_cdhash
++_unrestrict_local_signing_cdhash_ext
+ _kernel_image4_monitor_trap
+ _kernel_image4_storage_data
+ _kernel_image4_set_nonce
+@@ -1127,6 +1133,8 @@ _vfs_context_set_special_port
+ _vfs_context_is_dataless_manipulator
+ _vfs_context_skip_mtime_update
+ _vfs_context_allow_entitled_reserve_access
++_vfs_context_ignores_content_protection
++_vfs_context_iopolicy_unassigned_0x8000
+ _vfs_setdevvp
+ _vfs_devvp
+ _vfs_get_thread_fs_private
+@@ -1255,6 +1263,7 @@ _vn_pathconf
+ _vnode_cleardirty
+ _vnode_clearfastdevicecandidate
+ _vnode_getname_printable
++_cluster_update_range
+ _vnode_getfromfd
+ _vnode_parent
+ _vnode_getparent_and_name
+diff --git a/libkern/amfi/amfi.c b/libkern/amfi/amfi.c
+index 58df36b..862718b 100644
+--- a/libkern/amfi/amfi.c
++++ b/libkern/amfi/amfi.c
+@@ -5,12 +5,29 @@
+ SECURITY_READ_ONLY_LATE(const amfi_t*) amfi = NULL;
+ SECURITY_READ_ONLY_LATE(const CEKernelAPI_t*) libCoreEntitlements = NULL;
+ 
++/*
++ * Darwin 26 AMFI registers TrustCache interface version 5, which adds one
++ * function after getUUID, so every later member of amfi_t sits one pointer
++ * further. The members are type-discriminated without address diversity, so
++ * a copy in this kernel's layout keeps them valid.
++ */
++#define AMFI_DARWIN26_TRUST_CACHE_VERSION 5
++static SECURITY_READ_ONLY_LATE(amfi_t) amfi_darwin26;
++
+ void
+ amfi_interface_register(const amfi_t *mfi)
+ {
+ 	if (amfi) {
+ 		panic("AppleMobileFileIntegrity interface already set");
+ 	}
++	if (mfi->TrustCache.version >= AMFI_DARWIN26_TRUST_CACHE_VERSION) {
++		const size_t split = __builtin_offsetof(amfi_t, OSEntitlements);
++
++		memcpy(&amfi_darwin26, mfi, split);
++		memcpy((char *)&amfi_darwin26 + split, (const char *)mfi + split + sizeof(void *),
++		    sizeof(amfi_t) - split);
++		mfi = &amfi_darwin26;
++	}
+ 	amfi = mfi;
+ }
+ 
+diff --git a/libkern/conf/files b/libkern/conf/files
+index c4684c2..70541f7 100644
+--- a/libkern/conf/files
++++ b/libkern/conf/files
+@@ -108,6 +108,7 @@ libkern/apple_encrypted_archive/apple_encrypted_archive.c	standard
+ 
+ libkern/img4/interface.c 		standard
+ libkern/image4/dlxk.c 		standard
++libkern/image4/image4_v2.c 		standard
+ 
+ libkern/amfi/amfi.c 		standard
+ 
+diff --git a/libkern/image4/image4_v2.c b/libkern/image4/image4_v2.c
+new file mode 100644
+index 0000000..5cf8959
+--- /dev/null
++++ b/libkern/image4/image4_v2.c
+@@ -0,0 +1,23 @@
++/*
++ * Registration point of the libImage4_V2 interface (Darwin 26 KPI).
++ *
++ * The Image4 kext publishes its interface table here at start. This kernel
++ * keeps the pointer only; it has no consumers of the table yet.
++ */
++#include <libkern/libkern.h>
++#include <libkern/section_keywords.h>
++
++void image4_v2_interface_register(const void *interface);
++
++#pragma mark Module Globals
++SECURITY_READ_ONLY_LATE(const void *) _image4_v2_interface = NULL;
++
++#pragma mark KPI
++void
++image4_v2_interface_register(const void *interface)
++{
++	if (_image4_v2_interface) {
++		panic("libImage4_V2 interface already set");
++	}
++	_image4_v2_interface = interface;
++}
+diff --git a/security/mac_policy.h b/security/mac_policy.h
+index d1115d9..0f6887f 100644
+--- a/security/mac_policy.h
++++ b/security/mac_policy.h
+@@ -4441,6 +4441,7 @@ typedef int mpo_vnode_check_listextattr_t(
+  *  @param dlabel Policy label for dvp
+  *  @param path Path being looked up
+  *  @param pathlen Length of path in bytes
++ *  @param lookup_flags Lookup state from Darwin 26 callers; 0 from this kernel
+  *
+  *  Determine whether the subject identified by the credential can perform
+  *  a lookup of the passed path relative to the passed directory vnode.
+@@ -4458,7 +4459,8 @@ typedef int mpo_vnode_check_lookup_preflight_t(
+ 	struct vnode *dvp,
+ 	struct label *dlabel,
+ 	const char *path,
+-	size_t pathlen
++	size_t pathlen,
++	uint32_t lookup_flags
+ 	);
+ 
+ /**
+diff --git a/security/mac_vfs.c b/security/mac_vfs.c
+index a2655d1..dd66717 100644
+--- a/security/mac_vfs.c
++++ b/security/mac_vfs.c
+@@ -1602,7 +1602,11 @@ mac_vnode_check_lookup_preflight(vfs_context_t ctx, struct vnode *dvp,
+ 		return 0;
+ 	}
+ 	VFS_KERNEL_DEBUG_START1(50, dvp);
+-	MAC_CHECK(vnode_check_lookup_preflight, cred, dvp, mac_vnode_label(dvp), path, pathlen);
++	/*
++	 * Darwin 26 policies take a sixth lookup-state argument that the Darwin 26
++	 * lookup derives from its own nameidata; this lookup passes no state bits.
++	 */
++	MAC_CHECK(vnode_check_lookup_preflight, cred, dvp, mac_vnode_label(dvp), path, pathlen, 0);
+ 	VFS_KERNEL_DEBUG_END1(50, dvp);
+ 	return error;
+ }
+diff --git a/bsd/kern/kern_trustcache.c b/bsd/kern/kern_trustcache.c
+--- a/bsd/kern/kern_trustcache.c
++++ b/bsd/kern/kern_trustcache.c
+@@ -744,8 +744,11 @@
+ {
+ 	kern_return_t ret = KERN_NOT_FOUND;
+ 
+-	/* Validate the query type preemptively */
+-	if (query_type >= kTCQueryTypeTotal) {
++	/*
++	 * Validate the query type preemptively. Darwin 26 libraries (TrustCache
++	 * interface version 5) define further query types and validate them.
++	 */
++	if (query_type >= kTCQueryTypeTotal && amfi->TrustCache.version < 5) {
+ 		printf("unable to query trust cache: invalid query type: %u\n", query_type);
+ 		return KERN_INVALID_ARGUMENT;
+ 	}
+@@ -1120,8 +1123,33 @@
+ #endif
+ 
+ 	return ret;
++}
++
++kern_return_t
++query_trust_cache_with_length(
++	TCQueryType_t query_type,
++	const uint8_t *cdhash,
++	size_t cdhash_length,
++	TrustCacheQueryToken_t *query_token)
++{
++	if (cdhash != NULL && cdhash_length != kTCEntryHashSize) {
++		return KERN_NOT_FOUND;
++	}
++	return query_trust_cache(query_type, cdhash, query_token);
+ }
+ 
++kern_return_t
++query_trust_cache_for_rem_with_length(
++	const uint8_t *cdhash,
++	size_t cdhash_length,
++	uint8_t *rem_perms)
++{
++	if (cdhash != NULL && cdhash_length != kTCEntryHashSize) {
++		return KERN_NOT_FOUND;
++	}
++	return query_trust_cache_for_rem(cdhash, rem_perms);
++}
++
+ /*
+  * The trust cache management library uses a wrapper data structure to manage each
+  * of the trust cache modules. We know the exact number of static trust caches we

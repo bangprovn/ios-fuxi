@@ -1,0 +1,88 @@
+diff --git a/libkern/c++/OSKext.cpp b/libkern/c++/OSKext.cpp
+index 186c3a9..b921bd8 100644
+--- a/libkern/c++/OSKext.cpp
++++ b/libkern/c++/OSKext.cpp
+@@ -76,6 +76,15 @@ extern "C" {
+ #include <libkern/OSKextLibPrivate.h>
+ #include <libkern/c++/OSKext.h>
+ #include <libkern/c++/OSLib.h>
++#include <ptrauth.h>
++
++#if CONFIG_MACF
++extern "C" int mac_late;
++#endif
++#if defined(XNU_SOURCE_CORECRYPTO14)
++extern "C" kmod_info_t *source_corecrypto14_original(void);
++extern "C" kern_return_t source_corecrypto14_start_once(kmod_info_t *module, void *data);
++#endif
+ 
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOCatalogue.h>
+@@ -8475,9 +8484,67 @@ OSKext::start(bool startDependenciesFlag)
+ 	OSKextLogKextInfo(this, kmod_info->address, kmod_info->size, firehose_tracepoint_code_load);
+ 	result = OSRuntimeInitializeCPP(this);
+ 	if (result == KERN_SUCCESS) {
++#if defined(XNU_SOURCE_CORECRYPTO14)
++		if (kmod_info == source_corecrypto14_original()) {
++			/* The kernel already started the original corecrypto; share that one result. */
++			result = source_corecrypto14_start_once(kmod_info, kmodStartData);
++		} else
++#endif
+ 		result = startfunc(kmod_info, kmodStartData);
+ 	}
+ 
++	/* A boot collection component whose start leaves its security policy unregistered names its
++	 * own registration routine in _NativePrelinkEarlySecurityInit. It runs here, with dependencies
++	 * and constructors ready and before MAC policy lockdown. Original component code runs; no
++	 * policy result is supplied.
++	 */
++	if (result == KERN_SUCCESS && getPropertyForHostArch("_NativePrelinkEarlySecurityInit") != NULL) {
++#if CONFIG_MACF
++		OSNumber *earlyInit = OSDynamicCast(OSNumber, getPropertyForHostArch("_NativePrelinkEarlySecurityInit"));
++		uintptr_t target = 0;
++		bool executable = false;
++		if (!earlyInit || !isPrelinked() || mac_late ||
++		    getPropertyForHostArch(kAppleSecurityExtensionKey) != kOSBooleanTrue ||
++		    __builtin_add_overflow((uintptr_t)earlyInit->unsigned64BitValue(), vm_kernel_slide, &target) ||
++		    (target & 3)) {
++			panic("NativePrelink: invalid early security initializer or phase for %s", getIdentifierCString());
++		}
++		kernel_mach_header_t *header = (kernel_mach_header_t *)kmod_info->address;
++		for (kernel_segment_command_t *seg = firstsegfromheader(header); seg != NULL;
++		    seg = nextsegfromheader(header, seg)) {
++			if (seg->initprot == (VM_PROT_READ | VM_PROT_EXECUTE) && !(seg->maxprot & VM_PROT_WRITE) &&
++			    seg->vmsize >= 4 && target >= seg->vmaddr && target - seg->vmaddr <= seg->vmsize - 4) {
++				executable = true;
++				break;
++			}
++		}
++		if (!executable) {
++			panic("NativePrelink: early security initializer %p outside %s code", (void *)target,
++			    getIdentifierCString());
++		}
++		/*
++		 * A function pointer cast here is signed with the type discriminator but called with a zero one,
++		 * so the call fails authentication. Branch to the checked address directly; the entry is a
++		 * BTI-c function and the clobbers are the AAPCS64 caller-saved set.
++		 */
++		register uint64_t x0 __asm__("x0");
++		register uint64_t x16 __asm__("x16") = target;
++		__asm__ volatile ("blr x16"
++		    : "=r"(x0), "+r"(x16)
++		    :
++		    : "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
++		    "x17", "x30", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v16", "v17", "v18", "v19", "v20",
++		    "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "cc", "memory");
++		result = (int)x0;
++		if (result != KERN_SUCCESS) {
++			OSKextLog(this, kOSKextLogErrorLevel | kOSKextLogLoadFlag,
++			    "Kext %s early security initializer failed: %d", getIdentifierCString(), result);
++		}
++#else
++		panic("NativePrelink: early security initializer requires the MAC framework");
++#endif
++	}
++
+ 	flags.starting = 0;
+ 
+ 	/* On success overlap the setting of started/starting. On failure just

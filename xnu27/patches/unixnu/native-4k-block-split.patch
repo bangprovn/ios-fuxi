@@ -1,0 +1,23 @@
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1031,6 +1031,19 @@
+ 
+ 			ppte = (pt_entry_t*)alloc_ptpage(pa_offset == 0);
+ 			bzero(ppte, ARM_PGBYTES);
++			if ((tmplate & ARM_TTE_VALID) && (tmplate & ARM_TTE_TYPE_MASK) == ARM_TTE_TYPE_BLOCK) {
++				/*
++				 * Keep the rest of the block mapped: with 4 KiB pages a fileset
++				 * collection places kext headers in the same 2 MiB block as the
++				 * end of the kernel __TEXT, and a request for part of the block
++				 * must not unmap them.
++				 */
++				pmap_paddr_t block_pa = tmplate & ARM_TTE_BLOCK_L2_MASK;
++				pt_entry_t attributes = tmplate & ~(ARM_TTE_BLOCK_L2_MASK | ARM_PTE_HINT_MASK | ARM_PTE_TYPE_VALID);
++				for (i = 0; i <= (ARM_TT_L3_INDEX_MASK >> ARM_TT_L3_SHIFT); i++) {
++					ppte[i] = (block_pa + ((pmap_paddr_t)i << ARM_TT_L3_SHIFT)) | attributes | ARM_PTE_TYPE_VALID;
++				}
++			}
+ 			ppte_phys = kvtophys((vm_offset_t)ppte);
+ 
+ 			*tte2 = pa_to_tte(ppte_phys) | ARM_TTE_TYPE_TABLE | ARM_TTE_VALID;

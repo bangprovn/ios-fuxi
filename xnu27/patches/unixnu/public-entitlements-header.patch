@@ -1,0 +1,42 @@
+diff --git a/EXTERNAL_HEADERS/CoreEntitlements/CoreEntitlements.h b/EXTERNAL_HEADERS/CoreEntitlements/CoreEntitlements.h
+index 60e7e8f9..5831a6cd 100644
+--- a/EXTERNAL_HEADERS/CoreEntitlements/CoreEntitlements.h
++++ b/EXTERNAL_HEADERS/CoreEntitlements/CoreEntitlements.h
+@@ -5,6 +5,11 @@
+ #ifndef CORE_ENTITLEMENTS_H
+ #define CORE_ENTITLEMENTS_H
+ 
++#define kCSWebBrowserNetworkEntitlement "com.apple.developer.web-browser-engine.networking"
++#define kCSWebBrowserWebContentEntitlement "com.apple.developer.web-browser-engine.webcontent"
++#define kCSWebBrowserGPUEntitlement "com.apple.developer.web-browser-engine.rendering"
++#define kCSWebBrowserHostEntitlement "com.apple.developer.web-browser-engine.host"
++
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 2467b240..6cbeaadf 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -187,7 +187,7 @@
+ 
+ #include "kern_exec_internal.h"
+ 
+-#include <CodeSignature/Entitlements.h>
++#include <CoreEntitlements/CoreEntitlements.h>
+ 
+ #include <mach/exclaves.h>
+ 
+diff --git a/bsd/net/necp_client.c b/bsd/net/necp_client.c
+index 37885ae9..911cb251 100644
+--- a/bsd/net/necp_client.c
++++ b/bsd/net/necp_client.c
+@@ -76,7 +76,7 @@
+ 
+ #include <os/refcnt.h>
+ 
+-#include <CodeSignature/Entitlements.h>
++#include <CoreEntitlements/CoreEntitlements.h>
+ 
+ #if SKYWALK
+ #include <skywalk/os_skywalk_private.h>

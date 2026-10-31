@@ -1,0 +1,27 @@
+diff --git a/iokit/Kernel/IOService.cpp b/iokit/Kernel/IOService.cpp
+index 6824ed8c..5e280906 100644
+--- a/iokit/Kernel/IOService.cpp
++++ b/iokit/Kernel/IOService.cpp
+@@ -5448,14 +5448,16 @@ IOService::setRootMedia(IOService * root)
+ 	const OSMetaClass * ioblockstoragedriverClass;
+ 	bool unhide;
+ 
+-	ioblockstoragedriverClass = OSMetaClass::getMetaClassWithName(gIOBlockStorageDriverKey);
+-	assert(ioblockstoragedriverClass);
++	if (root) {
++		ioblockstoragedriverClass = OSMetaClass::getMetaClassWithName(gIOBlockStorageDriverKey);
++		assert(ioblockstoragedriverClass);
+ 
+-	while (root) {
+-		if (root->metaCast(ioblockstoragedriverClass)) {
+-			break;
++		while (root) {
++			if (root->metaCast(ioblockstoragedriverClass)) {
++				break;
++			}
++			root = root->getProvider();
+ 		}
+-		root = root->getProvider();
+ 	}
+ 
+ 	LOCKWRITENOTIFY();

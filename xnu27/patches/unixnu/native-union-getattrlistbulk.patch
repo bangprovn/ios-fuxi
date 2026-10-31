@@ -1,0 +1,67 @@
+diff --git a/bsd/vfs/vfs_attrlist.c b/bsd/vfs/vfs_attrlist.c
+index f83e29bc..de5e05a2 100644
+--- a/bsd/vfs/vfs_attrlist.c
++++ b/bsd/vfs/vfs_attrlist.c
+@@ -4372,6 +4372,9 @@ getattrlistbulk(proc_t p, struct getattrlistbulk_args *uap, int32_t *retval)
+ 
+ 	FV_LOCK(fvdata);
+ 
++#if CONFIG_UNION_MOUNTS
++unionread:
++#endif
+ 	/*
+ 	 * getattrlistbulk(2) maintains its offset in fv_offset. However
+ 	 * if the offset in the file glob is set (or reset) to 0, the directory
+@@ -4464,6 +4467,52 @@ getattrlistbulk(proc_t p, struct getattrlistbulk_args *uap, int32_t *retval)
+ 		ut->uu_flag &= ~UT_KERN_RAGE_VNODES;
+ 	}
+ 
++#if CONFIG_UNION_MOUNTS
++	/* Match getdirentriesattr: consume the upper directory before moving
++	 * this open descriptor to the corresponding lower union directory.
++	 * Snapshot enumeration must stay on the requested snapshot directory.
++	 * Recheck lower-directory access before publishing the new vnode.
++	 */
++	if (!error && !count && eofflag &&
++	    !(uap->options & FSOPT_LIST_SNAPSHOT) &&
++	    (dvp->v_mount->mnt_flag & MNT_UNION)) {
++		vnode_t uvp;
++		int union_error = lookup_traverse_union(dvp, &uvp, ctx);
++		if (!union_error) {
++			if (uvp->v_type != VDIR) {
++				union_error = ENOTDIR;
++			}
++#if CONFIG_MACF
++			if (!union_error) {
++				union_error = mac_vnode_check_readdir(ctx, uvp);
++			}
++#endif
++			if (!union_error) {
++				union_error = vnode_authorize(uvp, NULL, action, ctx);
++			}
++			if (!union_error) {
++				union_error = vnode_ref_ext(uvp, fp->fp_glob->fg_flag & O_EVTONLY, 0);
++			}
++			if (!union_error) {
++				fp_set_data(fp, uvp);
++				fp->fp_glob->fg_offset = 0;
++				vnode_rele_internal(dvp, fp->fp_glob->fg_flag & O_EVTONLY, 0, 0);
++				vnode_put(dvp);
++				dvp = uvp;
++				/* The existing zero-offset path discards upper EOF and
++				 * buffered dirents before constructing the lower UIO. */
++				goto unionread;
++			}
++			vnode_put(uvp);
++		}
++		/* No corresponding lower directory is ordinary end-of-directory;
++		 * other failures must not silently hide lower entries. */
++		if (union_error != ENOENT) {
++			error = union_error;
++		}
++	}
++#endif
++
+ 	if (count) {
+ 		fvdata->fv_offset = uio_offset(auio);
+ 		fp->fp_glob->fg_offset = fvdata->fv_offset;

@@ -1,0 +1,34 @@
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index e2f5a63a..9760c9ce 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -85,8 +85,12 @@
+ #include <arm64/proc_reg.h>
+ #include <pexpert/arm64/boot.h>
+ #if __has_include(<arm64/ppl/sart.h>)
++#if XNU_MONITOR_ANS2_SART
+ #include <arm64/ppl/sart.h>
++#endif
++#if XNU_MONITOR_UAT_PPL
+ #include <arm64/ppl/uat.h>
++#endif
+ #else
+ /* Public source omits the SART DMA filter; non-Apple SoCs have none. */
+ static inline void
+@@ -12249,6 +12253,7 @@ pmap_unpin_kernel_pages(vm_offset_t kva __unused, size_t nbytes __unused)
+ #endif /* !XNU_MONITOR */
+ 
+ 
++#if PMAP_CS_PPL_MONITOR || PMAP_CS_INCLUDE_CODE_SIGNING
+ MARK_AS_PMAP_TEXT static inline void
+ pmap_cs_lockdown_pages(vm_address_t kva, vm_size_t size, bool ppl_writable)
+ {
+@@ -12271,6 +12276,8 @@ pmap_cs_unlockdown_pages(vm_address_t kva, vm_size_t size, bool ppl_writable)
+ #endif
+ }
+ 
++#endif /* PMAP_CS_PPL_MONITOR || PMAP_CS_INCLUDE_CODE_SIGNING */
++
+ /**
+  * Perform basic validation checks on the destination only and
+  * corresponding offset/sizes prior to writing to a read only allocation.

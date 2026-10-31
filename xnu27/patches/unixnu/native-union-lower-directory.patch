@@ -1,0 +1,22 @@
+diff --git a/bsd/vfs/vfs_lookup.c b/bsd/vfs/vfs_lookup.c
+index 772cee80..b8cf563c 100644
+--- a/bsd/vfs/vfs_lookup.c
++++ b/bsd/vfs/vfs_lookup.c
+@@ -1926,7 +1926,16 @@ lookup_traverse_union(vnode_t dvp, vnode_t *new_dvp, vfs_context_t ctx)
+ 	nd.ni_dvp = dvp->v_mount->mnt_vnodecovered;
+ 	error = namei(&nd);
+ 	if (error == 0) {
+-		*new_dvp = nd.ni_vp;
++		/*
++		 * Only a directory below can hold the name: the base system keeps a symlink where the
++		 * mounted system has a framework directory, and searching that symlink gave ENOTDIR.
++		 */
++		if (nd.ni_vp->v_type != VDIR) {
++			vnode_put(nd.ni_vp);
++			error = ENOENT;
++		} else {
++			*new_dvp = nd.ni_vp;
++		}
+ 	}
+ 	nameidone(&nd);
+ done:

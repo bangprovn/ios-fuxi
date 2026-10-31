@@ -1,0 +1,19 @@
+diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -2577,3 +2577,15 @@ debug_fatal_panic_begin(void)
+ 	return true;
+ }
+ #endif /* __arm64__ */
++
++/*
++ * Target of original kext calls into kernel functions this kernel does not have (fileset emission
++ * redirects them here). The return address is the call site in the original component.
++ */
++__attribute__((noinline, noreturn, used))
++void
++unixnu_fileset_unmapped(uint64_t arg0, uint64_t arg1)
++{
++	panic("fileset: original component called an unmapped kernel function from %p (x0 0x%llx x1 0x%llx)",
++	    __builtin_ptrauth_strip(__builtin_return_address(0), 0), arg0, arg1);
++}

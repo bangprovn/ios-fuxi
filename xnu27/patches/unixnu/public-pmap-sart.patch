@@ -1,0 +1,21 @@
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index 2f639886..4913a26f 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -84,8 +84,16 @@
+ 
+ #include <arm64/proc_reg.h>
+ #include <pexpert/arm64/boot.h>
++#if __has_include(<arm64/ppl/sart.h>)
+ #include <arm64/ppl/sart.h>
+ #include <arm64/ppl/uat.h>
++#else
++/* Public source omits the SART DMA filter; non-Apple SoCs have none. */
++static inline void
++sart_bootstrap(void)
++{
++}
++#endif
+ 
+ #if defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR) || defined(KERNEL_INTEGRITY_PV_CTRR)
+ #include <arm64/amcc_rorgn.h>

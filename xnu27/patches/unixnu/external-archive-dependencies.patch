@@ -1,0 +1,14 @@
+diff --git a/makedefs/MakeInc.kernel b/makedefs/MakeInc.kernel
+index d34009a6..370e3749 100644
+--- a/makedefs/MakeInc.kernel
++++ b/makedefs/MakeInc.kernel
+@@ -188,6 +188,9 @@ $(TARGET)/lib$(KERNEL_FILE_NAME).a: $(addprefix $(TARGET)/,$(foreach component,$
+ 	$(_v)$(LN) $(call function_convert_build_config_to_objdir,$(CURRENT_BUILD_CONFIG))/lib$(KERNEL_FILE_NAME).a $(OBJROOT)/lib$(KERNEL_FILE_NAME).a
+ endif
+ 
++# Explicit external source archives participate in incremental relinking.
++$(TARGET)/$(KERNEL_FILE_NAME).unstripped.noctf: $(XNU_EXTERNAL_KERNEL_ARCHIVES)
++
+ $(TARGET)/$(KERNEL_FILE_NAME).unstripped.noctf: $(addprefix $(TARGET)/,$(foreach component,$(COMPONENT_LIST),$(component)/$(CURRENT_KERNEL_CONFIG)/$(component).filelist)) lastkerneldataconst.o lastkernelconstructor.o nonlto.o version.o $(LDFILES_KERNEL_ONLY) .LDFLAGS $(filter %/MakeInc.kernel,$(MAKEFILE_LIST))
+ ifeq ($(PRE_LTO),1)
+ 	@$(LOG_LTO) "$(@F)"

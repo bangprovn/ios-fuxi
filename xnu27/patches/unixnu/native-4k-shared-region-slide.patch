@@ -1,0 +1,391 @@
+--- a/osfmk/vm/vm_shared_region_internal.h
++++ b/osfmk/vm/vm_shared_region_internal.h
+@@ -41,6 +41,19 @@
+ 	mach_vm_offset_t              uservaddr,
+ 	uint32_t                      pageIndex,
+ 	uint64_t                      jop_key);
++#if !defined(APPLE_ARM64_ARCH_FAMILY) && !__ARM_16K_PG__
++/* One 4 KiB part of a 16 KiB v5 slide page; offsets count from the start of the 16 KiB page. */
++#define VM_SR_PART_NONE 0xFFFFu
++extern kern_return_t vm_shared_region_slide_part_v5(
++	vm_shared_region_slide_info_t si,
++	vm_offset_t                   vaddr,
++	mach_vm_offset_t              uservaddr,
++	uint32_t                      part,
++	uint32_t                      start,
++	bool                          apply,
++	uint32_t                      *next,
++	uint64_t                      jop_key);
++#endif
+ 
+ #endif /* MACH_KERNEL_PRIVATE */
+ 
+--- a/osfmk/vm/vm_shared_region.c
++++ b/osfmk/vm/vm_shared_region.c
+@@ -3587,7 +3587,98 @@
+ 
+ 
+ 
++#if !defined(APPLE_ARM64_ARCH_FAMILY) && !__ARM_16K_PG__
++/*
++ * A 4 KiB kernel pages a 16 KiB v5 slide page in four parts, each on its own. vaddr holds part `part` of the page and uservaddr is
++ * its user address; start is the offset (in the 16 KiB page) of the first rebase in this part. *next receives the offset of the
++ * first rebase after this part, or VM_SR_PART_NONE when the chain ends here. With apply false the chain is only followed (a source
++ * copy of an earlier part, to find where the chain enters a later one).
++ */
+ kern_return_t
++vm_shared_region_slide_part_v5(
++	vm_shared_region_slide_info_t si,
++	vm_offset_t vaddr,
++	__unused mach_vm_offset_t uservaddr,
++	uint32_t part,
++	uint32_t start,
++	bool apply,
++	uint32_t *next,
++#if !__has_feature(ptrauth_calls)
++	__unused
++#endif /* !__has_feature(ptrauth_calls) */
++	uint64_t jop_key)
++{
++	vm_shared_region_slide_info_entry_v5_t s_info = &si->si_slide_info_entry->v5;
++	const uint32_t slide_amount = si->si_slide;
++	const uint64_t value_add = s_info->value_add;
++	const uint32_t part_start = part * PAGE_SIZE;
++	uint8_t *page_content = (uint8_t *)vaddr;
++
++	*next = VM_SR_PART_NONE;
++	if (start < part_start || start >= part_start + PAGE_SIZE || (start & 7)) {
++		return KERN_FAILURE;
++	}
++	uint32_t location = start;
++	for (;;) {
++		uint8_t *rebaseLocation = page_content + (location - part_start);
++		uint64_t value;
++		memcpy(&value, rebaseLocation, sizeof(value));
++		const uint64_t delta = ((value & 0x7FF0000000000000ULL) >> 52) * sizeof(uint64_t);
++
++		if (apply) {
++			/* The pointer formats and their rebase are those of vm_shared_region_slide_page_v5(). */
++#if __has_feature(ptrauth_calls)
++			bool        addrDiv = ((value & (1ULL << 50)) != 0);
++			bool        keyIsData = ((value & (1ULL << 51)) != 0);
++			ptrauth_key key = keyIsData ? ptrauth_key_asda : ptrauth_key_asia;
++			uint16_t    diversity = (uint16_t)((value >> 34) & 0xFFFF);
++#endif /* __has_feature(ptrauth_calls) */
++			uint64_t    high8 = (value << 22) & 0xFF00000000000000ULL;
++			bool        isAuthenticated = (value & (1ULL << 63)) != 0;
++
++			value = (value & 0x3FFFFFFFFULL) + value_add + slide_amount;
++			if (isAuthenticated) {
++#if __has_feature(ptrauth_calls)
++				uint64_t discriminator = diversity;
++				if (addrDiv) {
++					uintptr_t pageOffset = rebaseLocation - page_content;
++					discriminator = __builtin_ptrauth_blend_discriminator((void*)(((uintptr_t)uservaddr) + pageOffset), discriminator);
++				}
++				if (jop_key != 0 && si->si_ptrauth && !arm_user_jop_disabled()) {
++#if CONFIG_SPTM
++					pmap_batch_sign_user_ptr(rebaseLocation, (void *)value, key, discriminator, jop_key);
++#else /* CONFIG_SPTM */
++					value = (uintptr_t)pmap_sign_user_ptr((void *)value, key, discriminator, jop_key);
++					memcpy(rebaseLocation, &value, sizeof(value));
++#endif /* CONFIG_SPTM */
++				} else {
++					memcpy(rebaseLocation, &value, sizeof(value));
++				}
++#endif /* __has_feature(ptrauth_calls) */
++			} else {
++				value += high8;
++				memcpy(rebaseLocation, &value, sizeof(value));
++			}
++		}
++		if (delta == 0) {
++			break;
++		}
++		location += (uint32_t)delta;
++		if (location >= part_start + PAGE_SIZE) {
++			*next = location < s_info->page_size ? location : VM_SR_PART_NONE;
++			break;
++		}
++	}
++#if CONFIG_SPTM
++	if (apply) {
++		pmap_batch_sign_user_ptr(NULL, NULL, 0, 0, 0);
++	}
++#endif /* CONFIG_SPTM */
++	return KERN_SUCCESS;
++}
++#endif
++
++kern_return_t
+ vm_shared_region_slide_page(
+ 	vm_shared_region_slide_info_t si,
+ 	vm_offset_t vaddr,
+--- a/osfmk/vm/vm_shared_region_pager.c
++++ b/osfmk/vm/vm_shared_region_pager.c
+@@ -320,6 +320,10 @@
+ #if __has_feature(ptrauth_calls)
+ 	uint64_t                srp_jop_key;        /* zero if used for arm64 */
+ #endif /* __has_feature(ptrauth_calls) */
++#if !defined(APPLE_ARM64_ARCH_FAMILY) && !__ARM_16K_PG__
++	uint16_t                *srp_part_starts;   /* 16 KiB slide pages: first rebase of each 4 KiB part, see shared_region_pager_slide_part() */
++	vm_size_t               srp_part_bytes;
++#endif
+ } *shared_region_pager_t;
+ #define SHARED_REGION_PAGER_NULL        ((shared_region_pager_t) NULL)
+ 
+@@ -472,9 +476,191 @@
+ {
+ 	panic("shared_region_pager_data_initialize: should never get called");
+ 	return KERN_FAILURE;
++}
++
++#if !defined(APPLE_ARM64_ARCH_FAMILY) && !__ARM_16K_PG__
++#define SRP_PART_UNKNOWN 0xFFFEu
++
++/* One source page of the shared cache, copied out (a part of a 16 KiB slide page that comes before the one being paged in). */
++static kern_return_t
++shared_region_pager_peek(
++	shared_region_pager_t           pager,
++	vm_object_offset_t              backing_offset,
++	void                            *buffer,
++	struct vm_object_fault_info     *fault_info)
++{
++	vm_object_t object = pager->srp_backing_object;
++	vm_page_t page, top_page;
++	vm_prot_t prot;
++	kern_return_t error_code;
++	vm_fault_return_t vmfr;
++
++retry:
++	vm_page_grab_prime();
++	vm_object_lock(object);
++	vm_object_paging_begin(object);
++	error_code = 0;
++	prot = VM_PROT_READ;
++	page = VM_PAGE_NULL;
++	vmfr = vm_fault_page(object, backing_offset, VM_PROT_READ, FALSE, FALSE, &prot, &page, &top_page, NULL,
++	    &error_code, FALSE, fault_info, NULL);
++	switch (vmfr) {
++	case VM_FAULT_SUCCESS:
++		break;
++	case VM_FAULT_RETRY:
++		goto retry;
++	case VM_FAULT_MEMORY_SHORTAGE:
++		if (vm_page_wait(fault_info->interruptible)) {
++			goto retry;
++		}
++		return KERN_RESOURCE_SHORTAGE;
++	case VM_FAULT_SUCCESS_NO_VM_PAGE:
++		vm_object_paging_end(object);
++		vm_object_unlock(object);
++		return KERN_MEMORY_ERROR;
++	default:
++		return KERN_MEMORY_ERROR;
++	}
++	vm_object_t page_object = VM_PAGE_OBJECT(page);
++	const void *source = (const void *)phystokv((pmap_paddr_t)VM_PAGE_GET_PHYS_PAGE(page) << PAGE_SHIFT);
++	if (page_object->code_signed) {
++		vm_page_validate_cs_mapped(page, PAGE_SIZE, 0, source);
++	}
++	const bool tainted = page->vmp_cs_tainted;
++	if (!tainted) {
++		bcopy(source, buffer, PAGE_SIZE);
++	}
++	vm_page_wakeup_done(page_object, page);
++	vm_object_paging_end(page_object);
++	vm_object_unlock(page_object);
++	if (top_page != VM_PAGE_NULL) {
++		vm_object_lock(object);
++		VM_PAGE_FREE(top_page);
++		vm_object_paging_end(object);
++		vm_object_unlock(object);
++	}
++	return tainted ? KERN_CODESIGN_ERROR : KERN_SUCCESS;
+ }
+ 
+ /*
++ * The v5 slide info of Darwin 26 caches has 16 KiB pages and one chain start per page; this kernel pages 4 KiB. A part slides on
++ * its own once the offset where the chain enters it is known: the page start resolves the parts up to the first rebase, and each
++ * walk of a part (a source copy for earlier parts, the destination for this one) resolves the parts up to the next rebase. The
++ * results are cached per pager, so every part is walked at most once more than it is paged in.
++ */
++static kern_return_t
++shared_region_pager_slide_part(
++	shared_region_pager_t           pager,
++	vm_offset_t                     dst_vaddr,
++	vm_object_offset_t              offset_in_backing_object,
++	mach_vm_offset_t                slide_start_address,
++	struct vm_object_fault_info     *fault_info)
++{
++	vm_shared_region_slide_info_t si = pager->srp_slide_info;
++	if (si->si_slide_info_entry->version != 5) {
++		return KERN_FAILURE;
++	}
++	vm_shared_region_slide_info_entry_v5_t v5 = &si->si_slide_info_entry->v5;
++	const uint32_t parts = (uint32_t)(v5->page_size / PAGE_SIZE);
++	const vm_object_offset_t offset_in_sliding_range = offset_in_backing_object - si->si_start;
++	const uint32_t page_index = (uint32_t)(offset_in_sliding_range / v5->page_size);
++	const uint32_t part = (uint32_t)((offset_in_sliding_range % v5->page_size) / PAGE_SIZE);
++	if (page_index >= v5->page_starts_count || parts > 4) {
++		return KERN_FAILURE;
++	}
++
++	uint16_t *starts = os_atomic_load(&pager->srp_part_starts, acquire);
++	if (starts == NULL) {
++		const vm_size_t bytes = (vm_size_t)v5->page_starts_count * parts * sizeof(uint16_t);
++		uint16_t *fresh = kalloc_data(bytes, Z_WAITOK);
++		if (fresh == NULL) {
++			return KERN_RESOURCE_SHORTAGE;
++		}
++		for (vm_size_t i = 0; i < bytes / sizeof(uint16_t); ++i) {
++			fresh[i] = SRP_PART_UNKNOWN;
++		}
++		pager->srp_part_bytes = bytes;
++		if (os_atomic_cmpxchg(&pager->srp_part_starts, NULL, fresh, acq_rel)) {
++			starts = fresh;
++		} else {
++			kfree_data(fresh, bytes);
++			starts = os_atomic_load(&pager->srp_part_starts, acquire);
++		}
++	}
++	uint16_t *mine = starts + (vm_size_t)page_index * parts;
++
++	/* Every walk resolves the parts from its own up to the one that holds the next rebase (or to the end of the page). */
++#define SRP_RESOLVE(from, next_start) do { \
++	const uint32_t __next = (next_start); \
++	const uint32_t __to = __next == VM_SR_PART_NONE ? parts : __next / PAGE_SIZE; \
++	for (uint32_t __p = (from); __p < parts && __p <= __to; ++__p) { \
++	        uint16_t __v = (__p == __to && __next != VM_SR_PART_NONE) ? (uint16_t)__next : VM_SR_PART_NONE; \
++	        os_atomic_store(&mine[__p], __v, relaxed); \
++	} \
++} while (0)
++
++	if (os_atomic_load(&mine[0], relaxed) == SRP_PART_UNKNOWN) {
++		const uint16_t first = v5->page_starts[page_index];
++		if (first != DYLD_CACHE_SLIDE_V5_PAGE_ATTR_NO_REBASE && (first >= v5->page_size || (first & 7))) {
++			return KERN_FAILURE;
++		}
++		SRP_RESOLVE(0, first == DYLD_CACHE_SLIDE_V5_PAGE_ATTR_NO_REBASE ? VM_SR_PART_NONE : first);
++	}
++	kern_return_t kr = KERN_SUCCESS;
++	if (os_atomic_load(&mine[part], relaxed) == SRP_PART_UNKNOWN) {
++		void *buffer = kalloc_data(PAGE_SIZE, Z_WAITOK);
++		if (buffer == NULL) {
++			return KERN_RESOURCE_SHORTAGE;
++		}
++		while (kr == KERN_SUCCESS && os_atomic_load(&mine[part], relaxed) == SRP_PART_UNKNOWN) {
++			/* The last resolved part before this one holds a rebase whose chain leads further. */
++			uint32_t known = part;
++			while (known > 0 && os_atomic_load(&mine[known], relaxed) == SRP_PART_UNKNOWN) {
++				--known;
++			}
++			const uint16_t start = os_atomic_load(&mine[known], relaxed);
++			if (start == VM_SR_PART_NONE || start == SRP_PART_UNKNOWN) {
++				kr = KERN_FAILURE;
++				break;
++			}
++			kr = shared_region_pager_peek(pager,
++			    si->si_start + (vm_object_offset_t)page_index * v5->page_size + (vm_object_offset_t)known * PAGE_SIZE,
++			    buffer, fault_info);
++			if (kr == KERN_SUCCESS) {
++				uint32_t next;
++				kr = vm_shared_region_slide_part_v5(si, (vm_offset_t)buffer, 0, known, start, false, &next, 0);
++				if (kr == KERN_SUCCESS) {
++					SRP_RESOLVE(known + 1, next);
++				}
++			}
++		}
++		kfree_data(buffer, PAGE_SIZE);
++		if (kr != KERN_SUCCESS) {
++			return kr;
++		}
++	}
++	const uint16_t start = os_atomic_load(&mine[part], relaxed);
++	if (start == VM_SR_PART_NONE) {
++		return KERN_SUCCESS;
++	}
++	uint32_t next;
++	kr = vm_shared_region_slide_part_v5(si, dst_vaddr, (mach_vm_offset_t)(offset_in_sliding_range + slide_start_address), part, start,
++	    true, &next,
++#if __has_feature(ptrauth_calls)
++	    si->si_ptrauth ? pager->srp_jop_key : 0
++#else /* __has_feature(ptrauth_calls) */
++	    0
++#endif /* __has_feature(ptrauth_calls) */
++	    );
++	if (kr == KERN_SUCCESS && part + 1 < parts && os_atomic_load(&mine[part + 1], relaxed) == SRP_PART_UNKNOWN) {
++		SRP_RESOLVE(part + 1, next);
++	}
++#undef SRP_RESOLVE
++	return kr;
++}
++#endif
++
++/*
+  * shared_region_pager_data_request()
+  *
+  * Handles page-in requests from VM.
+@@ -707,6 +893,28 @@
+ 		 * Process the original contents of the source page
+ 		 * into the destination page.
+ 		 */
++#if !defined(APPLE_ARM64_ARCH_FAMILY) && !__ARM_16K_PG__
++		if (slide_info_page_size > PAGE_SIZE) {
++			vm_object_offset_t offset_in_backing_object = offset + cur_offset + pager->srp_backing_offset;
++			bcopy((const char *)src_vaddr, (char *)dst_vaddr, PAGE_SIZE);
++			if (offset_in_backing_object < pager->srp_slide_info->si_start ||
++			    offset_in_backing_object >= pager->srp_slide_info->si_end) {
++				shared_region_pager_copied++;
++			} else {
++				kr = shared_region_pager_slide_part(pager, dst_vaddr, offset_in_backing_object, slide_start_address, &fault_info);
++				if (kr != KERN_SUCCESS) {
++					if (panic_on_dyld_issue) {
++						panic("%s(): shared region 4 KiB part slide error %d", __func__, kr);
++					}
++					shared_region_pager_slid_error++;
++					retval = KERN_MEMORY_ERROR;
++				} else {
++					shared_region_pager_slid++;
++				}
++			}
++			goto part_done;
++		}
++#endif
+ 		for (offset_in_page = 0;
+ 		    offset_in_page < PAGE_SIZE;
+ 		    offset_in_page += slide_info_page_size) {
+@@ -789,6 +997,9 @@
+ 			shared_region_pager_slid++;
+ 		}
+ 
++#if !defined(APPLE_ARM64_ARCH_FAMILY) && !__ARM_16K_PG__
++part_done:
++#endif
+ 		assert(VM_PAGE_OBJECT(src_page) == src_page_object);
+ 		assert(src_page->vmp_busy);
+ 		assert(src_page_object->paging_in_progress > 0);
+@@ -989,6 +1200,12 @@
+ 			pager->srp_slide_info = NULL;
+ 		}
+ 
++#if !defined(APPLE_ARM64_ARCH_FAMILY) && !__ARM_16K_PG__
++		if (pager->srp_part_starts != NULL) {
++			kfree_data(pager->srp_part_starts, pager->srp_part_bytes);
++			pager->srp_part_starts = NULL;
++		}
++#endif
+ 		if (pager->srp_header.mo_control != MEMORY_OBJECT_CONTROL_NULL) {
+ 			memory_object_control_deallocate(pager->srp_header.mo_control);
+ 			pager->srp_header.mo_control = MEMORY_OBJECT_CONTROL_NULL;
+@@ -1180,6 +1397,10 @@
+ 	pager->srp_header.mo_control = MEMORY_OBJECT_CONTROL_NULL;
+ 	pager->srp_header.mo_last_unmap_ctid = 0;
+ 
++#if !defined(APPLE_ARM64_ARCH_FAMILY) && !__ARM_16K_PG__
++	pager->srp_part_starts = NULL;
++	pager->srp_part_bytes = 0;
++#endif
+ 	pager->srp_is_ready = FALSE;/* not ready until it has a "name" */
+ 	/* existence reference (for the cache) + 1 for the caller */
+ 	os_ref_init_count_raw(&pager->srp_ref_count, NULL, 2);
