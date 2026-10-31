@@ -1085,3 +1085,40 @@ index f462f98..5b72705 100644
  
 +# Fuxi iOS 27 root file on UFS (K4): xnu27/patches/fuxi/0007.
 +iokit/Kernel/arm/FuxiRoot27.cpp					optional iokitcpp
+diff --git a/bsd/vfs/vfs_subr.c b/bsd/vfs/vfs_subr.c
+--- a/bsd/vfs/vfs_subr.c
++++ b/bsd/vfs/vfs_subr.c
+@@ -79,6 +79,9 @@
+ 
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#if defined(FUXI)
++#include <pexpert/pexpert.h>
++#endif
+ #include <sys/proc_internal.h>
+ #include <sys/kauth.h>
+ #include <sys/mount_internal.h>
+@@ -1211,6 +1214,11 @@
+ 	int     error;
+ 	mount_t mp;
+ 	vnode_t bdevvp_rootvp;
++#if defined(FUXI)
++	/* fuxi_root27_nomockfs=1: APFS gets the UFS root device first (mockfs probes it and fails with ENOMEM). */
++	uint32_t fuxi_nomockfs = 0;
++	PE_parse_boot_argn("fuxi_root27_nomockfs", &fuxi_nomockfs, sizeof(fuxi_nomockfs));
++#endif
+ 
+ 	/*
+ 	 * Reset any prior "unmounting everything" state.  This handles the
+@@ -1247,6 +1255,11 @@
+ 		    && !ISSET(vfsp->vfc_vfsflags, VFC_VFSCANMOUNTROOT)) {
+ 			continue;
+ 		}
++#if defined(FUXI)
++		if (fuxi_nomockfs == 1 && strcmp(vfsp->vfc_name, "mockfs") == 0) {
++			continue;
++		}
++#endif
+ 
+ 		mp = vfs_rootmountalloc_internal(vfsp, "root_device");
+ 		mp->mnt_devvp = rootvp;

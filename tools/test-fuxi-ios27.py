@@ -697,7 +697,7 @@ def k4_patch_check():
     patch = (X27 / 'patches' / K4_PATCH).read_text()
     files = re.findall(r'^\+\+\+ b/(\S+)', patch, re.M)
     assert files == ['bsd/kern/bsd_init.c', 'iokit/Kernel/arm/FuxiRoot27.cpp', 'iokit/Kernel/arm/fuxi_root27.h',
-                     'iokit/Kernel/arm/fuxi_storage_abi.h', 'iokit/conf/files.arm64'], files
+                     'iokit/Kernel/arm/fuxi_storage_abi.h', 'iokit/conf/files.arm64', 'bsd/vfs/vfs_subr.c'], files
     assert not re.search(r'^-', patch.replace('\n--- ', '\n'), re.M), 'K4 only adds lines'
     drv = patch_new_file(patch, 'iokit/Kernel/arm/FuxiRoot27.cpp')
     abi = patch_new_file(patch, 'iokit/Kernel/arm/fuxi_storage_abi.h')
@@ -705,6 +705,12 @@ def k4_patch_check():
     assert drv.split('*/\n', 1)[1].startswith('#if defined(FUXI)\n') and drv.rstrip().endswith('#endif /* FUXI */')
     init = patch.split('+++ b/bsd/kern/bsd_init.c\n', 1)[1].split('\ndiff --git', 1)[0]
     assert '+#if defined(FUXI)\n+\tfuxi_root27_start();\n+#endif' in init
+    # fuxi_root27_nomockfs=1 drops mockfs from vfs_mountroot's candidates; every added line is FUXI-gated.
+    vfs = patch.split('+++ b/bsd/vfs/vfs_subr.c\n', 1)[1]
+    added = [l[1:] for l in vfs.splitlines() if l.startswith('+')]
+    assert added.count('#if defined(FUXI)') == 3 == added.count('#endif'), added
+    assert 'PE_parse_boot_argn("fuxi_root27_nomockfs", &fuxi_nomockfs, sizeof(fuxi_nomockfs));' in vfs
+    assert 'if (fuxi_nomockfs == 1 && strcmp(vfsp->vfc_name, "mockfs") == 0) {' in vfs
     # Read-only transport: READ(10), TEST UNIT READY and the device-WLUN ACTIVE power command only; once the
     # extents are loaded every READ(10) is checked against them; no write opcode is ever built.
     scsi = drv[drv.index('ufs_scsi(const uint8_t'):drv.index('struct utrd *utrd')]
@@ -871,6 +877,21 @@ def k4_adt_check():
         r = subprocess.run(tool + ['--root-extents', str(tmp / 'e.json'), '--root-bytes', str(4 << 30), '--root-uuid', vol],
                            capture_output=True, text=True)
         assert r.returncode == 0 and 'root 366 extents' in r.stderr, r.stderr
+        assert 'system-volume-auth-blob' not in props(child(adt.parse((tmp / 'o.adt').read_bytes())[0], 'chosen'))
+        blob_in = bytes(range(229))                              # synthetic; the real root hash stays local
+        (tmp / 'rh').write_bytes(blob_in)
+        r = subprocess.run(tool + ['--root-extents', str(tmp / 'e.json'), '--root-bytes', str(4 << 30), '--root-uuid', vol,
+                                   '--root-hash', str(tmp / 'rh')], capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        assert props(child(adt.parse((tmp / 'o.adt').read_bytes())[0], 'chosen'))['system-volume-auth-blob'] == blob_in
+        assert not any(c.name == 'filesystems' for c in adt.parse((tmp / 'o.adt').read_bytes())[0].children)
+        r = subprocess.run(tool + ['--root-extents', str(tmp / 'e.json'), '--root-bytes', str(4 << 30), '--fstab'],
+                           capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        fstab = child(child(adt.parse((tmp / 'o.adt').read_bytes())[0], 'filesystems'), 'fstab')
+        assert props(fstab)['os_env_type'] == struct.pack('<I', 1) and props(fstab)['max_fs_entries'] == struct.pack('<I', 1)
+        sysvol = props(child(fstab, 'system-vol'))
+        assert (sysvol['vol.fs_file'], sysvol['vol.fs_type'], sysvol['vol.fs_role']) == (b'/\0', b'ro\0', struct.pack('<I', 1))
         for bad in (['--root-uuid', vol], ['--root-extents', str(tmp / 'e.json')],
                     ['--root-extents', str(tmp / 'e.json'), '--root-bytes', str((4 << 30) + 4096)],
                     ['--root-extents', str(tmp / 'e.json'), '--root-bytes', str(4 << 30), '--root-uuid', 'nope']):
@@ -907,7 +928,8 @@ def k4_check():
     print(f'PASS: K4 root storage: fuxi/0007 is FUXI-gated, read-only (READ(10)/TUR/WLUN power only, extent guard), '
           f'IOStorage/IOMedia mirror in iOS slot order; fuxi_root27.h (host cc) = Python mirror on {cases} '
           'extent/plan/guard/manifest cases, whole-file reads stay inside the extents, ios27-root.py manifests parse; '
-          'mkadt-fuxi27 --root-extents/--root-bytes/--root-uuid round-trip (366 extents, root-matching XML, /fuxi-ufs), '
+          'mkadt-fuxi27 --root-extents/--root-bytes/--root-uuid/--root-hash/--fstab round-trip (366 extents, root-matching XML, '
+          '/fuxi-ufs, system-volume-auth-blob), --fstab system-vol at /, '
           'v2 payload ADT up to 64 KiB, v1 still 16 KiB')
 
 

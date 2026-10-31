@@ -3,6 +3,7 @@
 
   mkadt-fuxi27.py OUT.adt [--cpus 1|7] [--psci-method smc|hvc] [--product iphone12,3|board] [--dump]
                   [--root-extents EXTENTS.json --root-bytes N --root-uuid OS-VOLUME-UUID]
+                  [--root-hash SYSTEMVOLUME.root_hash] [--fstab]
 
 The xnu-8796 kernel matched its own SweetDTPlatform/SweetCPU; the 12377 kernel
 uses UniXNU's ArmDTPlatform and ArmCpu (docs-lanes/ios27.md), which read a
@@ -34,6 +35,13 @@ exactly as mkadt-fuxi.py does for the xnu-8796 lane, plus /fuxi-ufs (the UFS hos
 reg). --root-uuid adds /chosen root-matching, an IOMedia match on the OS volume's
 UUID that IOFindBSDRoot uses when no rd= is given. The extent table makes the
 ADT larger than 16 KiB; version 2 payloads carry up to 64 KiB (mkpayload.py).
+--root-hash copies a local file (the restore's SystemVolume root-hash IM4P;
+never committed) into /chosen system-volume-auth-blob, where APFS looks for the
+root hash iBoot normally forwards before it mounts a sealed system volume.
+--fstab adds /filesystems/fstab (os_env_type 1, the 'main' environment) with
+the system-vol entry iOS device trees carry: APFS reads the EDT fstab to decide
+which volume role may be mounted at '/' (K4 boots A-D had no /filesystems and
+APFS refused 'not allowed to mount as root').
 
 No chip-id/unique-chip-id at K1: IOPlatformExpert hashes them with SHA-1,
 which only a corecrypto kext provides on this kernel (docs-lanes/ios27.md).
@@ -57,6 +65,8 @@ fuxi = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fuxi)
 
 ARMIO_BASE, ARMIO_SIZE = 0x17000000, 0x08000000
+# EDT fstab entries: node, mount point, ro/rw, options, APFS volume role (1 = System), name, passno.
+FSTAB = (('system-vol', '/', 'ro', '', 1, 'System', 1),)
 GICR_STRIDE = 0x40000
 TIMEBASE = 19200000
 FB_W, FB_H = 1080, 2400
@@ -92,7 +102,7 @@ def root_matching(volume_uuid):
 
 
 def build(cpus=1, psci_method='smc', seed=None, mem_size=fuxi.MEM_SIZE, product='iphone12,3', root_props=(),
-          root_uuid=None):
+          root_uuid=None, root_hash=None, fstab=False):
     if cpus not in (1, len(CPU_REGS)):
         raise ValueError('cpus must be 1 or 7')
     seed = os.urandom(256) if seed is None else seed
@@ -113,7 +123,8 @@ def build(cpus=1, psci_method='smc', seed=None, mem_size=fuxi.MEM_SIZE, product=
         ('certificate-security-mode', u32(1)),
         ('effective-security-mode-sep', u32(1)),
         ('amfi-only-platform-code', u32(1)),
-    ] + nvram_proxy() + list(root_props) + ([('root-matching', root_matching(root_uuid))] if root_uuid else []),
+    ] + nvram_proxy() + list(root_props) + ([('root-matching', root_matching(root_uuid))] if root_uuid else [])
+      + ([('system-volume-auth-blob', root_hash)] if root_hash else []),
         [node('memory-map'), node('manifest-properties')])
     cpu_nodes = [node(f'cpu{i}', [
         ('state', cstr('running' if i == 0 else 'waiting')),
@@ -147,6 +158,13 @@ def build(cpus=1, psci_method='smc', seed=None, mem_size=fuxi.MEM_SIZE, product=
             ('stride', u32(FB_W * 4)),
         ]),
     ]
+    if fstab:
+        children.append(node('filesystems', children=[node('fstab', [
+            ('os_env_type', u32(1)), ('max_fs_entries', u32(len(FSTAB)))],
+            [node(name, [('vol.fs_file', cstr(path)), ('vol.fs_type', cstr(mode)), ('vol.fs_mntopts', cstr(opts)),
+                         ('vol.fs_role', u32(role)), ('vol.fs_name', cstr(label)), ('vol.fs_passno', u32(passno)),
+                         ('vol.fs_mntorder', u32(order))])
+             for order, (name, path, mode, opts, role, label, passno) in enumerate(FSTAB)])]))
     if root_props:
         children.append(node('fuxi-ufs', [('compatible', cstr('qcom,sm8550-ufshc')), ('reg', u64(UFS, UFS_SIZE))]))
     return node('device-tree', [
@@ -168,6 +186,9 @@ def main():
                     help='K4: pinned root file extent JSON (bytes, userdata-relative); needs --root-bytes')
     ap.add_argument('--root-bytes', type=int, help='K4: root image size in bytes (ios27-root.py image)')
     ap.add_argument('--root-uuid', help='K4: OS (system) volume UUID for /chosen root-matching')
+    ap.add_argument('--root-hash', type=Path,
+                    help='K4: SystemVolume root-hash file for /chosen system-volume-auth-blob (local input)')
+    ap.add_argument('--fstab', action='store_true', help='K4: /filesystems/fstab with the system volume at /')
     ap.add_argument('--dump', action='store_true')
     args = ap.parse_args()
     if (args.root_extents is None) != (args.root_bytes is None) or (args.root_uuid and not args.root_extents):
@@ -175,7 +196,9 @@ def main():
     try:
         root_props = fuxi.root_extent_props(args.root_extents, args.root_bytes) if args.root_extents else ()
         blob = adt.serialize(build(args.cpus, args.psci_method, product=args.product, root_props=root_props,
-                                   root_uuid=args.root_uuid))
+                                   root_uuid=args.root_uuid,
+                                   root_hash=args.root_hash.read_bytes() if args.root_hash else None,
+                                   fstab=args.fstab))
     except (ValueError, KeyError, TypeError, OSError, struct.error) as error:
         ap.exit(1, str(error) + '\n')
     limit = ADT_MAX_ROOT if root_props else ADT_MAX

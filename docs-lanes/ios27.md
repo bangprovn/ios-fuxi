@@ -283,6 +283,33 @@ APFS container/volume matching, then `BSD root: diskNsM`. Failure points to look
 the 8796 lane), `IOMedia::init did not take` (mirror wrong), no APFS match (content hint; try
 `fuxi_root27_hint=Apple_APFS`), and the root mount itself (sealed system volume and its snapshot).
 
+### K4 on the device (OBSERVED, boots A-E)
+
+The UFS reader works: `FUXI ROOT27: window OS/SystemOS/AppOS ... read-only` for all three windows, APFS matches and
+mounts every container (`nx_mount ... checkpoint`), and `IOFindBSDRoot` picks the OS volume through
+`root-matching` (`Got boot device = .../AppleAPFSContainer/Rave24A446.D421D431OS@1`, `BSD root: diskNs1`). The root
+mount then fails in a loop: `apfs_vfsop_mount: not allowed to mount as root` (EPERM), after `mockfs_mountroot
+failed: 12` (mockfs probes the volume first). APFS logs `ARV enabled` and imports the root hash before that.
+
+| Boot | Change | Result |
+| --- | --- | --- |
+| A | root-matching only | refused; `could not retrieve system-volume-auth-blob from device tree` |
+| B | + `-apfs_shared_datavolume` | refused (the 24A446 kernelcache has no such string: no-op on iOS 27) |
+| C | + `fuxi_root27_rwmedia=1` (IOMedia writable) | refused |
+| D | `mkadt-fuxi27.py --root-hash` | root hash import succeeds (no error); still refused |
+| E | + `mkadt-fuxi27.py --fstab` | still refused |
+
+Observed about the image: the IPSW OS volume is not sealed (incompat 0x8 only, no snapshots, no integrity
+metadata), like the unsealed iOS 17 OS volume UniXNU mounts as root. The iOS config has no CSR (`kern_csr.c` is
+`config_csr` only), so there is no SIP/ARV bit to set.
+
+Boot-time knobs (no rebuild once the kernel has them): `fuxi_root27_nomockfs=1` (`fuxi/0007`, `vfs_subr.c`) drops mockfs from
+`vfs_mountroot`, so APFS sees the device first. `mkadt-fuxi27.py --root-hash FILE` puts a local root-hash file (the
+restore's `SystemVolume` IM4P; never committed) in `/chosen system-volume-auth-blob`. `--fstab` adds
+`/filesystems/fstab` with the `system-vol` entry (`/`, `ro`, role System, `os_env_type` 1) that iOS device trees
+carry. Fallback if APFS keeps refusing `mountroot`: mount the OS volume as an ordinary read-only mount and
+`vfs_switch_root` into it, as `imageboot_pivot_image` does.
+
 Out of scope for K4a, next: the Data volume (writable, `/private/var`), the SystemOS/AppOS cryptex grafts (union with
 the OS volume), the sealed-volume root snapshot (`root-snapshot-name`/ APFS seal checks), launchd changes, and a
 writable path (extent-guarded WRITE(10) as on the 8796 lane).
