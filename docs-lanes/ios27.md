@@ -118,7 +118,8 @@ through `g_crypto_funcs`, which the kext fills during InitIOKit, before any call
 python3 tools/ios27-prelink.py --kernel OUT/mach.development.fuxi.chained.unstripped \
     --reference OUT/mach.release.fuxi.unstripped --kernelcache KERNELCACHE --out K2DIR --allow-missing
 python3 tools/mkpayload.py OUT/mach.development.fuxi.chained.unstripped OUT/fuxi27.adt payload27k2.bin \
-    --boot-line-length 1024 --cmdline "$(cat OUT/cmdline.txt)" --prelinked K2DIR/kernel.prelinked --allow-incomplete
+    --boot-line-length 1024 --cmdline "$(cat OUT/cmdline.txt) rd=md0" --prelinked K2DIR/kernel.prelinked --allow-incomplete \
+    --ramdisk MOCKFS/k2.img --trustcache MOCKFS/k2-bundle.tc   # tools/ios27-mockfs.py + ios27-root.py trust-bundle
 tools/fuxi-xnu-monitor.py --kernel K2DIR/kernel.prelinked ...   # symbols come from the fileset's kernel entry
 ```
 
@@ -212,12 +213,15 @@ ld-classic chains (0x101), ADT parsing in ArmDTPlatform/ArmCpu (after 0x10f), an
 
 ## Milestones
 
-- **K1** CI kernel, banner + early log over USB, clean stop at root mount. Built, not yet booted.
+- **K1** CI kernel, banner + early log over USB, clean stop at root mount. Booted (stops at the image4 panic
+  without kexts).
 - **K2** RAM-disk root (`rd=md0`, mockfs is in the config) and the crypto decision; libpthread-539.100.4 kernel part
-  force-loaded into every kernel (K2 libpthread above; built in CI, not yet booted).
-- **K3** Local prelink of donor kexts (`unstripped` kernel + the user's kernelcache, UniXNU XnuPrelink approach),
-  AMFI/sandbox early init (`native-security-init`), trust cache placement in the loader handoff. Started early as
-  K2a (above): tooling, kernel/CI/ADT pieces and a counts-only trial done; no CI run, no boot.
+  force-loaded into every kernel (K2 libpthread above). **Booted (OBSERVED):** with the prelinked kexts (8 stubbed
+  kernel functions, 4 missing data references), AppleImage4, AMFI, Sandbox and vnguard initialize, the trust-cache
+  bundle loads (2 modules), APFS and AppleFSCompressionTypeZlib start, `BSD root: md0`, and our arm64e init runs as
+  PID 1 (`/sbin/launchd`, served by mockfs, cdhash in the owner module) and keeps printing its heartbeat.
+- **K3** IPSW `/sbin/launchd` + `/usr/lib/dyld` from mockfs (`k3.img`, static trust cache from the IPSW), then
+  the remaining stubs (Darwin 26 helpers the 12377 source lacks).
 - **K4** UFS root (port our FuxiUFS or UniXNU's UFS layer) and launchd.
 - **K5** Display/backlight/touch/buttons on 12377 (port the xnu-8796 Fuxi drivers).
 - **K6** GPU (Adreno 740 path) and SMP on all 7 usable cores.
