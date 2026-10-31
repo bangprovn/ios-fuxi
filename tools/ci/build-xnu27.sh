@@ -168,15 +168,38 @@ if [[ ${FUXI_XNU27_RELEASE_REF:-1} == 0 ]]; then
 fi
 robj=$work/release-obj
 mkdir -p "$robj/EXPORT_HDRS/libsa" "$work/release-sym" "$work/release-dst"
-if make -C "$xnu" build "${base[@]}" KERNEL_CONFIGS=RELEASE OBJROOT="$robj" SYMROOT="$work/release-sym" \
-    DSTROOT="$work/release-dst" "${kflags[@]}" BUILD_LTO=1 \
-    LDFLAGS_KERNEL_LTO="-miphoneos-version-min=$XNU27_IOS_VERSION -Wl,-mllvm,-inline-threshold=100"; then
-    rdir=$robj/RELEASE_ARM64_FUXI
+# RELEASE links with -exported_symbols_list all-kpi.exp, which names Apple
+# SPTM/IOMMU KPIs (IOUnifiedAddressTranslator, pmap_iommu_*, sart/nvme PPL)
+# that this non-SPTM kernel does not define. The comparison kernel is never
+# booted, so a failed first link is retried once with those names removed from
+# a copy of the list (-no_demangle makes ld report them as listed).
+release_make() {
+    make -C "$xnu" build "${base[@]}" KERNEL_CONFIGS=RELEASE OBJROOT="$robj" SYMROOT="$work/release-sym" \
+        DSTROOT="$work/release-dst" "${kflags[@]}" BUILD_LTO=1 \
+        LDFLAGS_KERNEL_LTO="-miphoneos-version-min=$XNU27_IOS_VERSION -Wl,-mllvm,-inline-threshold=100 -Wl,-no_demangle" \
+        "$@" 2>&1 | tee "$work/release-make.log"
+    return "${PIPESTATUS[0]}"
+}
+rdir=$robj/RELEASE_ARM64_FUXI
+release_ok=0
+if release_make; then
+    release_ok=1
+elif [[ -f $rdir/all-kpi.exp ]]; then
+    sed -n '/^Undefined symbols for architecture/,/^ld: symbol(s) not found/s/^  "\(.*\)", referenced from:$/\1/p' \
+        "$work/release-make.log" | sort -u > "$work/release-missing.txt"
+    if [[ -s $work/release-missing.txt ]]; then
+        echo "release reference: $(wc -l < "$work/release-missing.txt") exported KPIs undefined; relinking without them"
+        grep -vxF -f "$work/release-missing.txt" "$rdir/all-kpi.exp" > "$work/release-kpi.exp" || true
+        release_make LDFLAGS_KERNEL_ONLY_CONFIG_RELEASEARM64="-Wl,-exported_symbols_list,$work/release-kpi.exp" && release_ok=1
+    fi
+fi
+if [[ $release_ok == 1 ]]; then
     for raw in mach.release.fuxi.unstripped mach.release.fuxi.unstripped.noctf; do
         [[ -f $rdir/$raw ]] && cp "$rdir/$raw" "$out/"
     done
     [[ -f $out/mach.release.fuxi.unstripped || -f $out/mach.release.fuxi.unstripped.noctf ]] || die "no unstripped RELEASE kernel in $rdir"
     (cd "$out" && shasum -a 256 mach.release.fuxi.unstripped*) | tee "$out/release-reference.txt"
+    if [[ -s $work/release-missing.txt ]]; then cp "$work/release-missing.txt" "$out/release-kpi-removed.txt"; fi
 else
     echo '::warning::RELEASE reference build failed; DEVELOPMENT outputs kept' >&2
     echo 'release reference: build failed' > "$out/release-reference.txt"
