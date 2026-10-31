@@ -1,8 +1,12 @@
 /*
  * Where ath12k meets 802.11 itself: under Linux that is mac80211 and cfg80211 (GPL, not compiled or
- * read), and here it will be the station layer of design section 4. M0 is a link stub with the
- * parts that are plain: the radio's memory, the regulatory domain, channel arithmetic, the deferred
- * work queues. Everything that a station would do logs its name at runtime through STUB().
+ * read), and here it will be the station layer of design section 4. As of M2 what is real: the radio
+ * as ath12k allocates, registers and frees it, the regulatory domain, channel arithmetic, the
+ * deferred work queues. There is no interface, scan or station yet, so everything that a station
+ * would do logs its name at runtime through STUB().
+ *
+ * EHT is not offered (design section 9): LinuxKPI's EHT constants are not the standard's bits. An
+ * edit keeps ath12k from filling it in, and registration refuses a radio that offers it anyway.
  *
  * Adapted from hackios wifi/lx/src/lx_80211.c (MIT), see compat/PROVENANCE.md and LICENSE.hackios.
  *
@@ -35,7 +39,6 @@ struct fa_radio {
 	struct linuxkpi_ieee80211_regdomain *regd;
 	volatile int applying;			/* domains being applied: _unregister waits for them */
 	bool registered;
-	bool kept;				/* the channels' original limits are kept */
 	volatile unsigned long stopped;		/* transmit queues mac80211 holds stopped */
 	/* wiphy work: runs on the radio's queue with the wiphy lock held */
 	struct list_head wiphy_works;
@@ -43,6 +46,10 @@ struct fa_radio {
 };
 
 static unsigned char radio_mac[ETH_ALEN];
+
+static const char *const band_names[NUM_NL80211_BANDS] = {
+	[NL80211_BAND_2GHZ] = "2 GHz", [NL80211_BAND_5GHZ] = "5 GHz", [NL80211_BAND_6GHZ] = "6 GHz",
+};
 
 static struct fa_radio *
 radio_of(struct ieee80211_hw *hw)
@@ -78,10 +85,16 @@ linuxkpi_ieee80211_alloc_hw(size_t private, const struct ieee80211_ops *ops)
 {
 	size_t ours = roundup2(sizeof(struct fa_radio), 64);
 	uint8_t *memory = kzalloc(64 + offsetof(struct wiphy, priv) + ours + private, GFP_KERNEL);
+	struct workqueue_struct *work;
 	struct fa_radio *radio;
 	struct wiphy *wiphy;
 
 	if (memory == NULL) {
+		return (NULL);
+	}
+	work = alloc_ordered_workqueue("fa-80211", 0);
+	if (work == NULL) {
+		kfree(memory);
 		return (NULL);
 	}
 	wiphy = (struct wiphy *)roundup2((uintptr_t)memory, 64);
@@ -91,10 +104,15 @@ linuxkpi_ieee80211_alloc_hw(size_t private, const struct ieee80211_ops *ops)
 	radio->ops = ops;
 	radio->hw.wiphy = wiphy;
 	radio->hw.priv = (uint8_t *)radio + ours;
-	radio->work = alloc_ordered_workqueue("fa-80211", 0);
+	radio->work = work;
 	INIT_LIST_HEAD(&radio->wiphy_works);
 	INIT_WORK(&radio->wiphy_runner, wiphy_runner);
 	mutex_init(&wiphy->mtx);
+	/* What ath12k reads when an interface comes (M4), as a new wiphy has them: thresholds off. */
+	wiphy->rts_threshold = (uint32_t)-1;
+	wiphy->frag_threshold = (uint32_t)-1;
+	wiphy->retry_short = 7;
+	wiphy->retry_long = 4;
 	return (&radio->hw);
 }
 
@@ -109,21 +127,77 @@ linuxkpi_set_ieee80211_dev(struct ieee80211_hw *hw)
 {
 }
 
-/* BEHAVIOUR STUB, M2: nothing is registered with anything yet; ath12k takes this as done. */
+/*
+ * BEHAVIOUR STUB until M7: nothing above this layer needs telling yet, so registering is checking what
+ * ath12k has set up, and keeping each channel's own limits for the regulatory domain to start from.
+ * Each band says what it holds. A radio without usable
+ * bands or address is refused here, where it can be read, rather than at the first scan; and so is
+ * one that offers EHT.
+ */
 int
 linuxkpi_80211_wiphy_register(struct wiphy *wiphy)
 {
-	STUB();
+	unsigned bands = 0;
+
+	if (is_zero_ether_addr(wiphy->perm_addr)) {
+		lx_tell("FUXI ATH12K: wiphy refused: no address\n");
+		return (-EINVAL);
+	}
+	for (unsigned band = 0; band < NUM_NL80211_BANDS; band++) {
+		struct ieee80211_supported_band *has = wiphy->bands[band];
+		int he = 0, eht = 0;
+
+		if (has == NULL) {
+			continue;
+		}
+		if (has->channels == NULL || has->n_channels <= 0 || has->bitrates == NULL || has->n_bitrates <= 0) {
+			lx_tell("FUXI ATH12K: wiphy refused: band %u has %d channels and %d rates\n", band, has->n_channels, has->n_bitrates);
+			return (-EINVAL);
+		}
+		has->band = band;
+		for (int i = 0; i < has->n_channels; i++) {
+			has->channels[i].band = band;
+			has->channels[i].orig_flags = has->channels[i].flags;
+			has->channels[i].orig_mpwr = has->channels[i].max_power;
+		}
+		for (int i = 0; i < has->n_iftype_data; i++) {
+			he += has->iftype_data[i].he_cap.has_he;
+			eht += has->iftype_data[i].eht_cap.has_eht;
+		}
+		lx_tell("FUXI ATH12K: wiphy %s channels %d rates %d he %d eht %d\n", band_names[band], has->n_channels, has->n_bitrates, he, eht);
+		if (eht != 0) {
+			lx_tell("FUXI ATH12K: wiphy refused: EHT must not be offered (design section 9)\n");
+			return (-EINVAL);
+		}
+		bands++;
+	}
+	if (bands == 0) {
+		lx_tell("FUXI ATH12K: wiphy refused: no bands\n");
+		return (-EINVAL);
+	}
 	return (0);
 }
 
-/* BEHAVIOUR STUB, M2: records the radio; no interface or station is brought up from it yet. */
+/* BEHAVIOUR STUB until M4: the radio exists from here on, and that is all. ath12k takes it as attached. */
 int
 linuxkpi_ieee80211_ifattach(struct ieee80211_hw *hw)
 {
-	STUB();
 	radio_of(hw)->registered = true;
+	lx_tell("FUXI ATH12K: radio registered; no interface, scan or station is brought up from it yet\n");
 	return (0);
+}
+
+/* tools/ath12k-edits.json, ath12k-no-eht: asked only when the firmware's services include 802.11be. */
+bool
+fa_refuse_eht(void)
+{
+	static bool said;
+
+	if (!said) {
+		said = true;
+		lx_tell("FUXI ATH12K: the firmware has 802.11be; not offered, LinuxKPI's EHT constants are wrong (design section 9)\n");
+	}
+	return (true);
 }
 
 /* The driver takes its radio back, and frees the channels next: nobody may be at them when this returns. */
@@ -146,6 +220,7 @@ linuxkpi_ieee80211_iffree(struct ieee80211_hw *hw)
 	struct fa_radio *radio = radio_of(hw);
 
 	if (radio->work != NULL) {
+		cancel_work_sync(&radio->wiphy_runner);	/* its memory goes next, and the queue's thread stays */
 		destroy_workqueue(radio->work);
 		radio->work = NULL;
 	}
@@ -165,12 +240,14 @@ linuxkpi_wiphy_free(struct wiphy *wiphy)
 /*
  * A channel may be used if a rule covers its 20 MHz, and takes the rule's limits; otherwise it is
  * disabled. The driver reads the result off the channels when it tells the firmware which it may
- * use (ath12k_reg_update_chan_list()).
+ * use (ath12k_reg_update_chan_list()). What ath12k itself set before registering stays, such as a
+ * channel disabled because the radio's range does not reach it. Says what came of it.
  */
 static void
 regd_apply(struct fa_radio *radio)
 {
 	const struct linuxkpi_ieee80211_regdomain *regd = radio->regd;
+	int usable[NUM_NL80211_BANDS] = { 0 };
 
 	for (unsigned band = 0; band < NUM_NL80211_BANDS; band++) {
 		struct ieee80211_supported_band *has = radio->wiphy->bands[band];
@@ -179,17 +256,13 @@ regd_apply(struct fa_radio *radio)
 			struct linuxkpi_ieee80211_channel *channel = &has->channels[i];
 			const struct ieee80211_reg_rule *rule = NULL;
 
-			if (!radio->kept) {
-				channel->orig_flags = channel->flags;
-				channel->orig_mpwr = channel->max_power;
-			}
 			for (int r = 0; r < regd->n_reg_rules && rule == NULL; r++) {
 				if (regd->reg_rules[r].freq_range.start_freq_khz <= ((int)channel->center_freq - 10) * 1000 &&
 				    regd->reg_rules[r].freq_range.end_freq_khz >= ((int)channel->center_freq + 10) * 1000) {
 					rule = &regd->reg_rules[r];
 				}
 			}
-			channel->flags = channel->orig_flags & ~(IEEE80211_CHAN_DISABLED | IEEE80211_CHAN_NO_IR | IEEE80211_CHAN_RADAR);
+			channel->flags = channel->orig_flags;
 			if (rule == NULL) {
 				channel->flags |= IEEE80211_CHAN_DISABLED;
 				continue;
@@ -204,9 +277,12 @@ regd_apply(struct fa_radio *radio)
 			channel->max_antenna_gain = rule->power_rule.max_antenna_gain / 100;
 			channel->max_power = channel->orig_mpwr != 0 && channel->orig_mpwr < channel->max_reg_power ?
 			    channel->orig_mpwr : channel->max_reg_power;
+			channel->psd = rule->psd;
+			usable[band] += (channel->flags & IEEE80211_CHAN_DISABLED) == 0;
 		}
 	}
-	radio->kept = true;
+	lx_tell("FUXI ATH12K: regd %c%c rules %d: usable channels 2 GHz %d, 5 GHz %d, 6 GHz %d\n", regd->alpha2[0], regd->alpha2[1],
+	    regd->n_reg_rules, usable[NL80211_BAND_2GHZ], usable[NL80211_BAND_5GHZ], usable[NL80211_BAND_6GHZ]);
 }
 
 /*
@@ -242,6 +318,13 @@ linuxkpi_regulatory_set_wiphy_regd_sync(struct wiphy *wiphy, struct linuxkpi_iee
 	radio->regd = copy;
 	wiphy->regd = copy;
 	regd_apply(radio);
+	/* As cfg80211 tells a self-managed driver that asked. ath12k returns at once while the radio is off. */
+	if ((wiphy->flags & WIPHY_FLAG_NOTIFY_REGDOM_BY_DRIVER) != 0 && wiphy->reg_notifier != NULL) {
+		struct regulatory_request request = { .initiator = NL80211_REGDOM_SET_BY_DRIVER };
+
+		memcpy(request.alpha2, copy->alpha2, sizeof(request.alpha2));
+		wiphy->reg_notifier(wiphy, &request);
+	}
 	lx_os_lock();
 	radio->applying--;
 	lx_os_wakeup(&radio->applying);

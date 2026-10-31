@@ -123,7 +123,8 @@ def edit_list_is_well_formed(tmp):
     for edit in edits:
         assert set(edit) == {'id', 'why', 'tree', 'file', 'find', 'replace'}, edit['id']
         assert edit['tree'] in ('ath12k', 'freebsd') and edit['why'] and edit['find'] != edit['replace']
-    for wanted in ('ath12k-rfkill-pin', 'ath12k-reo-qdesc-alloc', 'ath12k-rx-refill-guard-a', 'ath12k-mac-override', 'ath12k-stage-htc'):
+    for wanted in ('ath12k-rfkill-pin', 'ath12k-reo-qdesc-alloc', 'ath12k-rx-refill-guard-a', 'ath12k-mac-override', 'ath12k-stage-htc',
+                   'ath12k-stage-registered', 'ath12k-stage-quiet', 'ath12k-no-eht', 'ath12k-wmi-event-log'):
         assert wanted in ids, wanted
 
 
@@ -265,9 +266,10 @@ def ci_plumbing_adds_one_profile(tmp):
         subprocess.run([sys.executable, str(inputs), '--variant', variant, '--out', str(tmp / variant)], check=True, capture_output=True)
     base = (tmp / 'metal4/cmdline.txt').read_text()
     assert (tmp / 'metal4wifi/cmdline.txt').read_text() == base and 'fuxiath12k' not in base
-    assert not (tmp / 'metal4/cmdline-ath12k1.txt').exists()
-    line = (tmp / 'metal4wifi/cmdline-ath12k1.txt').read_text()
-    assert line == base.rstrip('\n') + ' fuxiath12k=1\n' and len(line.encode()) - 1 < 608
+    assert not (tmp / 'metal4/cmdline-ath12k1.txt').exists() and not (tmp / 'metal4/cmdline-ath12k2.txt').exists()
+    for stage in (1, 2):
+        line = (tmp / f'metal4wifi/cmdline-ath12k{stage}.txt').read_text()
+        assert line == base.rstrip('\n') + f' fuxiath12k={stage}\n' and len(line.encode()) - 1 < 608
 
 
 OS_STUBS = {
@@ -320,7 +322,7 @@ def os_file_implements_its_allow_list_group(tmp):
     wlan = (ROOT / 'xnu/fuxi-wlan/fuxi_wlan.c').read_text()
     for name in groups['fuxi-wlan']['symbols']:
         assert re.search(r'^(?:\w[\w ]*\*?\s*)?' + name + r'\(', wlan, re.M), name
-    for prototype in ('fa_firmware_ready', 'fa_stop'):
+    for prototype in ('fa_firmware_ready', 'fa_stop', 'fa_set_radio_mac'):
         assert prototype + '(' in wlan
 
 
@@ -373,6 +375,253 @@ def xcode_link_tries_each_way_and_says_why(tmp):
         assert 'never run before' in text and text.count('ld: refused') == 3 and 'hidden visibility' in text
 
 
+# Just enough of LinuxKPI's shapes for fa_80211.c to run on the host. The real headers compile the same file
+# in the object (--full), and they cannot run here: their atomics and machine headers are the phone's.
+FAKE_HEADERS = {
+    'linux/kernel.h': r"""#pragma once
+#include <assert.h>
+#include <errno.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/types.h>
+#ifndef __printflike
+#define __printflike(a, b) __attribute__((format(printf, a, b)))
+#endif
+#ifndef __dead2
+#define __dead2 __attribute__((noreturn))
+#endif
+#ifndef __containerof
+#define __containerof(p, t, m) ((t *)((char *)(p) - offsetof(t, m)))
+#endif
+#ifndef roundup2
+#define roundup2(x, y) (((x) + ((y) - 1)) & ~((__typeof__(x))(y) - 1))
+#endif
+typedef uint8_t u8;
+struct list_head { struct list_head *next, *prev; };
+static inline void INIT_LIST_HEAD(struct list_head *h) { h->next = h->prev = h; }
+static inline bool list_empty(const struct list_head *h) { return h->next == h; }
+static inline void list_add_tail(struct list_head *n, struct list_head *h) { n->prev = h->prev; n->next = h; h->prev->next = n; h->prev = n; }
+static inline void list_del_init(struct list_head *n) { n->prev->next = n->next; n->next->prev = n->prev; INIT_LIST_HEAD(n); }
+#define list_first_entry(h, t, m) __containerof((h)->next, t, m)
+""",
+    'linux/etherdevice.h': r"""#pragma once
+#define ETH_ALEN 6
+static inline bool is_zero_ether_addr(const u8 *a) { return !(a[0] | a[1] | a[2] | a[3] | a[4] | a[5]); }
+""",
+    'linux/skbuff.h': r"""#pragma once
+struct sk_buff { int x; };
+static inline void dev_kfree_skb_any(struct sk_buff *s) { free(s); }
+""",
+    'linux/slab.h': r"""#pragma once
+#define GFP_KERNEL 0
+static inline void *kzalloc(size_t n, int f) { return calloc(1, n); }
+static inline void *kmalloc(size_t n, int f) { return malloc(n); }
+static inline void kfree(const void *p) { free((void *)p); }
+""",
+    'linux/workqueue.h': r"""#pragma once
+struct workqueue_struct { int x; };
+struct work_struct { void (*fn)(struct work_struct *); int queued, cancelled; };
+struct delayed_work { struct work_struct work; };
+extern int fail_workqueue, queues_destroyed;
+static inline struct workqueue_struct *alloc_ordered_workqueue(const char *n, int f) { return fail_workqueue ? NULL : calloc(1, sizeof(struct workqueue_struct)); }
+static inline void destroy_workqueue(struct workqueue_struct *q) { queues_destroyed++; free(q); }
+static inline void INIT_WORK(struct work_struct *w, void (*f)(struct work_struct *)) { w->fn = f; w->queued = w->cancelled = 0; }
+static inline bool queue_work(struct workqueue_struct *q, struct work_struct *w) { w->queued++; return true; }
+static inline bool queue_delayed_work(struct workqueue_struct *q, struct delayed_work *w, int d) { w->work.queued++; return true; }
+static inline bool cancel_work_sync(struct work_struct *w) { w->cancelled++; return false; }
+""",
+    'net/cfg80211.h': r"""#pragma once
+#include <linux/etherdevice.h>
+enum nl80211_band { NL80211_BAND_2GHZ, NL80211_BAND_5GHZ, NL80211_BAND_6GHZ, NUM_NL80211_BANDS };
+enum { NL80211_REGDOM_SET_BY_USER, NL80211_REGDOM_SET_BY_DRIVER };
+enum { IEEE80211_CHAN_DISABLED = 1, IEEE80211_CHAN_NO_IR = 2, IEEE80211_CHAN_RADAR = 8 };
+enum { NL80211_RRF_NO_IR = 1, NL80211_RRF_DFS = 2 };
+#define WIPHY_FLAG_NOTIFY_REGDOM_BY_DRIVER (1u << 24)
+struct linuxkpi_ieee80211_channel {
+    signed char psd; enum nl80211_band band; uint32_t center_freq, flags, orig_flags; int max_power, max_reg_power, max_antenna_gain, orig_mpwr;
+};
+struct ieee80211_rate { int bitrate; };
+struct ieee80211_sband_iftype_data { struct { bool has_he; } he_cap; struct { bool has_eht; } eht_cap; };
+struct ieee80211_supported_band {
+    struct linuxkpi_ieee80211_channel *channels; struct ieee80211_rate *bitrates; struct ieee80211_sband_iftype_data *iftype_data;
+    int n_channels, n_bitrates, n_iftype_data; enum nl80211_band band;
+};
+struct ieee80211_reg_rule {
+    uint32_t flags; signed char psd;
+    struct { int start_freq_khz, end_freq_khz; } freq_range;
+    struct { int max_eirp, max_antenna_gain; } power_rule;
+};
+struct linuxkpi_ieee80211_regdomain { uint8_t alpha2[2]; int n_reg_rules; struct ieee80211_reg_rule reg_rules[]; };
+struct regulatory_request { uint8_t alpha2[2]; int initiator, dfs_region, user_reg_hint_type; };
+struct fake_mutex { int locked; };
+struct wiphy {
+    struct fake_mutex mtx; uint32_t flags; struct ieee80211_supported_band *bands[NUM_NL80211_BANDS]; uint8_t perm_addr[ETH_ALEN];
+    const struct linuxkpi_ieee80211_regdomain *regd; void (*reg_notifier)(struct wiphy *, struct regulatory_request *);
+    uint32_t rts_threshold, frag_threshold; int retry_long, retry_short;
+    uint8_t priv[0] __attribute__((aligned(64)));
+};
+struct wiphy_work { struct list_head entry; void (*fn)(struct wiphy *, struct wiphy_work *); };
+#define mutex_init(m) ((m)->locked = 0)
+static inline void wiphy_lock(struct wiphy *w) { assert(!w->mtx.locked); w->mtx.locked = 1; }
+static inline void wiphy_unlock(struct wiphy *w) { assert(w->mtx.locked); w->mtx.locked = 0; }
+enum ieee80211_bss_type { IEEE80211_BSS_TYPE_ANY }; enum ieee80211_privacy { IEEE80211_PRIVACY_ANY };
+struct cfg80211_bss; struct cfg80211_scan_info;
+""",
+    'net/mac80211.h': r"""#pragma once
+#include <linux/skbuff.h>
+#include <linux/workqueue.h>
+#define D80211_TODO 1
+struct ieee80211_ops; struct ieee80211_vif; struct ieee80211_sta; struct ieee80211_txq; struct ieee80211_chanctx_conf; struct napi_struct;
+struct ieee80211_hw { struct wiphy *wiphy; void *priv; };
+struct ieee80211_tx_status { struct sk_buff *skb; };
+enum ieee80211_iface_iter { IEEE80211_IFACE_ITER_NORMAL };
+""",
+}
+
+FA_80211_DRIVER = r"""
+#include "fa_80211.c"
+int fail_workqueue, queues_destroyed;
+static char said[8192];
+static unsigned locks, notified, notified_initiator, rddm;
+static uint8_t notified_alpha2[2];
+void lx_tell(const char *f, ...) { va_list l; va_start(l, f); vsnprintf(said + strlen(said), sizeof(said) - strlen(said), f, l); va_end(l); }
+long lx_stub(const char *n) { return 0; }
+void lx_os_lock(void) { assert(!locks); locks++; }
+void lx_os_unlock(void) { assert(locks); locks--; }
+void lx_os_sleep(const void *a, unsigned long long n) { abort(); }
+void lx_os_wakeup(const void *a) {}
+void fuxi_ath12k_force_rddm(void) { rddm++; }
+static void notifier(struct wiphy *w, struct regulatory_request *r) {
+    assert(!locks);
+    notified++; notified_initiator = r->initiator; memcpy(notified_alpha2, r->alpha2, 2);
+}
+static struct linuxkpi_ieee80211_channel two[3], five[2];
+static struct ieee80211_rate rates[1];
+static struct ieee80211_sband_iftype_data data[1];
+static struct ieee80211_supported_band b2, b5;
+#define SAID(text) (strstr(said, text) != NULL)
+int main(void) {
+    fail_workqueue = 1; assert(!linuxkpi_ieee80211_alloc_hw(32, NULL)); fail_workqueue = 0;
+    struct ieee80211_hw *hw = linuxkpi_ieee80211_alloc_hw(256, NULL);
+    struct wiphy *w = hw->wiphy;
+    assert(hw && !((uintptr_t)hw->priv & 63) && linuxkpi_wiphy_to_ieee80211_hw(w) == hw);
+    assert(w->rts_threshold == (uint32_t)-1 && w->frag_threshold == (uint32_t)-1 && w->retry_short == 7 && w->retry_long == 4);
+    memset(hw->priv, 0xa5, 256);
+
+    /* The address: nothing given leaves the firmware's. */
+    u8 a[6] = {1, 2, 3, 4, 5, 6}; static const u8 ours[6] = {2, 0x46, 0x55, 0x58, 0x49, 1};
+    fa_radio_mac(a); assert(a[0] == 1 && SAID("no station address given"));
+    fa_set_radio_mac(ours); fa_radio_mac(a); assert(!memcmp(a, ours, 6));
+
+    /* Refused, each with a line: no address, no bands, an empty band, EHT. */
+    said[0] = 0; assert(linuxkpi_80211_wiphy_register(w) == -EINVAL && SAID("refused: no address"));
+    memcpy(w->perm_addr, ours, 6);
+    said[0] = 0; assert(linuxkpi_80211_wiphy_register(w) == -EINVAL && SAID("refused: no bands"));
+    w->bands[NL80211_BAND_2GHZ] = &b2;
+    said[0] = 0; assert(linuxkpi_80211_wiphy_register(w) == -EINVAL && SAID("refused: band 0 has 0 channels"));
+    two[0] = (struct linuxkpi_ieee80211_channel){ .center_freq = 2412, .max_power = 30 };
+    two[1] = (struct linuxkpi_ieee80211_channel){ .center_freq = 2472, .max_power = 10 };
+    two[2] = (struct linuxkpi_ieee80211_channel){ .center_freq = 2484, .max_power = 30, .flags = IEEE80211_CHAN_DISABLED };
+    five[0] = (struct linuxkpi_ieee80211_channel){ .center_freq = 5180, .max_power = 30 };
+    five[1] = (struct linuxkpi_ieee80211_channel){ .center_freq = 5500, .max_power = 30 };
+    b2 = (struct ieee80211_supported_band){ .channels = two, .n_channels = 3, .bitrates = rates, .n_bitrates = 1, .iftype_data = data, .n_iftype_data = 1 };
+    b5 = (struct ieee80211_supported_band){ .channels = five, .n_channels = 2, .bitrates = rates, .n_bitrates = 1, .band = NL80211_BAND_2GHZ };
+    w->bands[NL80211_BAND_5GHZ] = &b5;
+    data[0].he_cap.has_he = true; data[0].eht_cap.has_eht = true;
+    said[0] = 0; assert(linuxkpi_80211_wiphy_register(w) == -EINVAL && SAID("eht 1") && SAID("refused: EHT must not be offered"));
+    data[0].eht_cap.has_eht = false;
+    said[0] = 0; assert(linuxkpi_80211_wiphy_register(w) == 0);
+    assert(SAID("wiphy 2 GHz channels 3 rates 1 he 1 eht 0") && SAID("wiphy 5 GHz channels 2 rates 1 he 0 eht 0"));
+    assert(b5.band == NL80211_BAND_5GHZ && five[1].band == NL80211_BAND_5GHZ);
+    assert(two[1].orig_mpwr == 10 && two[2].orig_flags == IEEE80211_CHAN_DISABLED);
+
+    /* The firmware's domain: refused until attached, then a copy that outlives the caller's. */
+    size_t size = sizeof(struct linuxkpi_ieee80211_regdomain) + 2 * sizeof(struct ieee80211_reg_rule);
+    struct linuxkpi_ieee80211_regdomain *regd = calloc(1, size);
+    regd->alpha2[0] = 'C'; regd->alpha2[1] = 'N'; regd->n_reg_rules = 2;
+    regd->reg_rules[0].freq_range.start_freq_khz = 2402000; regd->reg_rules[0].freq_range.end_freq_khz = 2500000;
+    regd->reg_rules[0].power_rule.max_eirp = 2000; regd->reg_rules[0].power_rule.max_antenna_gain = 300; regd->reg_rules[0].psd = 7;
+    regd->reg_rules[1].freq_range.start_freq_khz = 5170000; regd->reg_rules[1].freq_range.end_freq_khz = 5250000;
+    regd->reg_rules[1].power_rule.max_eirp = 3000; regd->reg_rules[1].flags = NL80211_RRF_NO_IR | NL80211_RRF_DFS;
+    w->reg_notifier = notifier; w->flags = WIPHY_FLAG_NOTIFY_REGDOM_BY_DRIVER;
+    assert(linuxkpi_regulatory_set_wiphy_regd_sync(w, NULL) == -EINVAL);
+    assert(linuxkpi_regulatory_set_wiphy_regd_sync(w, regd) == -ENODEV && !notified && !w->regd);
+    assert(linuxkpi_ieee80211_ifattach(hw) == 0 && SAID("radio registered; no interface"));
+    said[0] = 0; assert(linuxkpi_regulatory_set_wiphy_regd_sync(w, regd) == 0);
+    memset(regd, 0, size); free(regd);
+    assert(w->regd && w->regd->alpha2[0] == 'C' && w->regd->reg_rules[1].power_rule.max_eirp == 3000);
+    assert(notified == 1 && notified_initiator == NL80211_REGDOM_SET_BY_DRIVER && notified_alpha2[1] == 'N');
+    assert(SAID("regd CN rules 2: usable channels 2 GHz 2, 5 GHz 1, 6 GHz 0"));
+    /* The channel ath12k disabled stays so although a rule covers it. Limits come from the rule and the channel. */
+    assert(two[0].flags == 0 && two[0].max_reg_power == 20 && two[0].max_antenna_gain == 3 && two[0].max_power == 20 && two[0].psd == 7);
+    assert(two[1].max_power == 10 && (two[2].flags & IEEE80211_CHAN_DISABLED));
+    assert(five[0].flags == (IEEE80211_CHAN_NO_IR | IEEE80211_CHAN_RADAR) && five[1].flags == IEEE80211_CHAN_DISABLED);
+    /* A later domain starts again from what ath12k set, not from the last one's flags. */
+    regd = calloc(1, size); regd->alpha2[0] = '0'; regd->alpha2[1] = '0'; regd->n_reg_rules = 1;
+    regd->reg_rules[0].freq_range.start_freq_khz = 5170000; regd->reg_rules[0].freq_range.end_freq_khz = 5510000;
+    regd->reg_rules[0].power_rule.max_eirp = 2300;
+    said[0] = 0; assert(linuxkpi_regulatory_set_wiphy_regd_sync(w, regd) == 0); free(regd);
+    assert(five[0].flags == 0 && five[1].flags == 0 && (two[0].flags & IEEE80211_CHAN_DISABLED) && notified == 2);
+    assert(SAID("regd 00 rules 1: usable channels 2 GHz 0, 5 GHz 2, 6 GHz 0"));
+    /* No EHT, ever: and said once. */
+    said[0] = 0; assert(fa_refuse_eht() && fa_refuse_eht());
+    assert(SAID("802.11be; not offered") && !strstr(strstr(said, "802.11be") + 1, "802.11be"));
+    /* Going away: nothing more is applied, and the runner cannot outlive the memory. */
+    linuxkpi_ieee80211_unregister_hw(hw);
+    regd = calloc(1, size); regd->n_reg_rules = 0;
+    assert(linuxkpi_regulatory_set_wiphy_regd_sync(w, regd) == -ENODEV && notified == 2); free(regd);
+    struct fa_radio *radio = radio_of(hw);
+    linuxkpi_ieee80211_iffree(hw);
+    assert(radio->wiphy_runner.cancelled == 1 && queues_destroyed == 1 && radio->work == NULL);
+    linuxkpi_ieee80211_iffree(hw); assert(queues_destroyed == 1);
+    linuxkpi_wiphy_free(w);
+    assert(!locks);
+    puts("fa_80211: alloc, register, refusals, EHT, regd, notifier, address, free");
+    return 0;
+}
+"""
+
+
+@check
+def fa_80211_runs_on_fake_headers(tmp):
+    """The radio as ath12k makes, registers and frees it, on the host. Design M2: no EHT, regd kept right."""
+    for name, text in FAKE_HEADERS.items():
+        path = tmp / 'fake' / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    own = ROOT / 'xnu/fuxi-ath12k'
+    (tmp / 'fake/lx.h').write_bytes((own / 'compat/lx.h').read_bytes())
+    (tmp / 'fake/lx_os.h').write_bytes((own / 'compat/include/lx_os.h').read_bytes())
+    (tmp / 'driver.c').write_text('#include <stdarg.h>\n#include <linux/kernel.h>\n' + FA_80211_DRIVER)
+    program = tmp / 'driver'
+    cc = os.environ.get('CC', 'cc')
+    subprocess.run([cc, '-std=gnu11', '-w', '-g', f'-I{tmp / "fake"}', f'-I{own / "src"}', str(tmp / 'driver.c'), '-o', str(program)], check=True)
+    subprocess.run([str(program)], check=True)
+
+
+@check
+def whole_wlan_file_parses_with_and_without_ath12k(tmp):
+    """Every guard of fuxi_wlan.c, not only the block the W15 harness compiles. M1's first CI run failed on a
+    guard's closing comment inside a block comment: -Wcomment sees that, and the guards must balance both ways.
+    The includes are dropped, so this checks the preprocessor's view of the text only; the XNU build compiles it."""
+    text = (ROOT / 'xnu/fuxi-wlan/fuxi_wlan.c').read_text()
+    source = tmp / 'wlan.c'
+    source.write_text(''.join(line for line in text.splitlines(True) if not line.startswith('#include')))
+    cc = os.environ.get('CC', 'cc')
+    outputs = {}
+    for flags in (['-DFUXI'], ['-DFUXI', '-DFUXI_ATH12K=1']):
+        result = subprocess.run([cc, '-E', '-P', '-Wcomment', '-Werror=comment', *flags, str(source)], capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr[:1500]
+        assert 'fuxi_wlan_init' in result.stdout, flags
+        outputs[len(flags)] = result.stdout
+    for word in ('wl_fa_mac_configure', 'wl_fa_handoff', 'fuxi_ath12k_firmware_start', 'fw_bar_window'):
+        assert word in outputs[2] and word not in outputs[1], word
+
+
 @check
 def pins_are_recorded(tmp):
     pins = build.read_pins()
@@ -389,6 +638,39 @@ def real_edits_match_once(deps, tmp):
         return (deps / 'linux' / build.ATH12K / rel) if tree == 'ath12k' else (deps / 'freebsd' / rel)
     build.apply_edits(edits, source_of, lambda tree, rel: tmp / 'edited' / tree / rel)
     print(f'ok real_edits_match_once ({len(edits)})')
+
+
+def stage_hooks_are_where_the_design_says(deps, tmp):
+    """Order in the edited core.c and mac.c: what each stage has behind it when it stops, and that no radio work is."""
+    edits = json.loads((ROOT / 'tools/ath12k-edits.json').read_text())['edits']
+
+    def source_of(tree, rel):
+        return (deps / 'linux' / build.ATH12K / rel) if tree == 'ath12k' else (deps / 'freebsd' / rel)
+    build.apply_edits(edits, source_of, lambda tree, rel: tmp / 'edited' / tree / rel)
+    core = (tmp / 'edited/ath12k/core.c').read_text()
+
+    def body(text, signature):
+        start = text.index(signature)
+        return text[start:text.index('\n}\n', start)]
+    start = body(core, 'static int ath12k_core_start(struct ath12k_base *ab)')
+    assert start.index('ath12k_htc_wait_target') < start.index('fa_stage_htc_ready') < start.index('ath12k_dp_htt_connect')
+    for later in ('ath12k_wmi_wait_for_unified_ready', 'ath12k_wmi_set_hw_mode', 'ath12k_dp_tx_htt_h2t_ver_req_msg'):
+        assert 'fa_stage_registered' not in start and start.index('fa_stage_htc_ready') < start.index(later)
+    group = body(core, 'static int ath12k_core_hw_group_start(struct ath12k_hw_group *ag)')
+    assert group.index('ath12k_mac_register(ag)') < group.index('fa_stage_registered') < group.index('set_bit(ATH12K_GROUP_FLAG_REGISTERED')
+    stop = group[group.index('fa_stage_registered'):]
+    assert stop.index('ath12k_mac_unregister(ag)') < stop.index('-ECANCELED') < stop.index('goto err_mlo_teardown') < stop.index('ath12k_core_pdev_create(ab)')
+    assert group.index('fa_stage_registered') < group.index('ath12k_hif_irq_enable(ab)')
+    ready = body(core, 'int ath12k_core_qmi_firmware_ready(struct ath12k_base *ab)')
+    assert ready.index('ath12k_core_hw_group_start(ag)') < ready.index('ret != -ECANCELED') < ready.index('goto err_core_stop')
+    assert 'ath12k_mac_op_start' not in core and 'ath12k_mac_start' not in core
+    mac = (tmp / 'edited/ath12k/mac.c').read_text()
+    eht = body(mac, 'static void ath12k_mac_copy_eht_cap(struct ath12k *ar,')
+    assert eht.index('fa_refuse_eht()') < eht.index('eht_cap->has_eht = true')
+    assert 'fa_radio_mac(ar->mac_addr)' in body(mac, 'static int ath12k_mac_hw_register(struct ath12k_hw *ah)')
+    wmi = body((tmp / 'edited/ath12k/wmi.c').read_text(), 'static void ath12k_wmi_op_rx(struct ath12k_base *ab, struct sk_buff *skb)')
+    assert wmi.index('fa_wmi_event(id, skb->len)') < wmi.index('switch (id)')
+    print('ok stage_hooks_are_where_the_design_says')
 
 
 def page_size_assertion_fires(deps, tmp):
@@ -436,7 +718,7 @@ def main():
         finally:
             shutil.rmtree(tmp)
     if args.deps:
-        for function in (real_edits_match_once, page_size_assertion_fires):
+        for function in (real_edits_match_once, stage_hooks_are_where_the_design_says, page_size_assertion_fires):
             tmp = Path(tempfile.mkdtemp(prefix='fa-test-'))
             try:
                 function(args.deps, tmp)

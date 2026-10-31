@@ -10,6 +10,7 @@ int	lx_pool_init(void);		/* lx_base.c: the memory the radio reads and writes; 0,
 long	lx_stub(const char *name);	/* lx_base.c: logs that a function has no real work yet */
 void	lx_tell(const char *format, ...) __printflike(1, 2);	/* lx_base.c: a line that is always said */
 void	lx_memory_say(void);		/* lx_base.c: what the layer holds of memory */
+void	lx_pool_peaks(unsigned *rings_kb, unsigned *slots);	/* lx_base.c: the most of the radio's memory out so far */
 void	lx_pause_ms(unsigned ms);	/* lx_base.c: sleep */
 void	lx_mark(const char *what);	/* lx_base.c: a point reached, said and waited at if the kernel was asked to */
 

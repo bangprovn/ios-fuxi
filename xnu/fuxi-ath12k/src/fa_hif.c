@@ -9,6 +9,10 @@
  * pool is never freed, and containment on fw_thread is the only other step. `ab` stays too, which
  * is the price of not unwinding what those workers may name; the radio needs a reboot anyway.
  *
+ * Stages: 1 stops after HTC ready, 2 after WMI ready, hw_mode and mac registration. A stage stop goes
+ * through ath12k's own error path. Stage 2 takes the data rings no further: hif_irq_enable and
+ * ath12k_core_pdev_create() are after it, and no interface exists, so nothing can transmit or scan.
+ *
  * SPDX-License-Identifier: MIT
  */
 #include <linux/kernel.h>
@@ -46,6 +50,7 @@ _Static_assert(ATH12K_MAX_SPT_ENTRIES * 8 == ATH12K_PAGE_SIZE, "fuxi-ath12k R2: 
 #define FA_ACTIVE_NS		(1 * 1000000ull)
 #define FA_IDLE_NS		(10 * 1000000ull)
 #define FA_IDLE_AFTER		100		/* quiet rounds before backing off */
+#define FA_WMI_EVENTS_SAID	64		/* of the first ones: which, and how long */
 
 static struct {
 	struct ath12k_base *ab;
@@ -280,6 +285,50 @@ fa_stage_htc_ready(struct ath12k_base *ab)
 	return (true);
 }
 
+/* tools/ath12k-edits.json, ath12k-wmi-event-log. Nothing else shows how far a silent firmware got. */
+void
+fa_wmi_event(u32 id, u32 length)
+{
+	static unsigned said;			/* (one poll thread) */
+
+	if (said < FA_WMI_EVENTS_SAID) {
+		said++;
+		lx_tell("FUXI ATH12K: wmi event %#x bytes %u%s\n", id, length, said == FA_WMI_EVENTS_SAID ? " (said for the last time)" : "");
+	}
+}
+
+/*
+ * tools/ath12k-edits.json, ath12k-stage-registered: core.c asks once ath12k_mac_register() has finished,
+ * which needs WMI ready and hw_mode behind it. The address is reported from the radio, after the edit
+ * that sets it; the firmware's own is the phone's, so only whether it gave one is said. The rings stop
+ * here so that no event finds the radio half gone while it is taken down.
+ */
+bool
+fa_stage_registered(struct ath12k_base *ab)
+{
+	struct ath12k_hw *ah = ath12k_ag_to_ah(ab->ag, 0);
+	struct ath12k *ar = ath12k_ah_to_ar(ah, 0);
+	const u8 *mac = ar->mac_addr;
+	unsigned rings, slots;
+
+	lx_pool_peaks(&rings, &slots);
+	lx_tell("FUXI ATH12K: M2 firmware init status %u address %s radios %d phys %u hw mode %d max macs %u 11be %d eth offload %d regd %s\n",
+	    ab->wlan_init_status, is_zero_ether_addr(ab->mac_addr) ? "zero" : "given", ab->num_radios, ab->fw_pdev_count,
+	    ab->wmi_ab.preferred_hw_mode, ab->target_caps.max_supported_macs, test_bit(WMI_TLV_SERVICE_11BE, ab->wmi_ab.svc_map),
+	    test_bit(WMI_TLV_SERVICE_ETH_OFFLOAD, ab->wmi_ab.svc_map), ab->default_regd[ar->pdev_idx] != NULL ? "firmware" : "world");
+	if (ab->wmi_ready && ab->wlan_init_status == 0) {
+		lx_tell("FUXI ATH12K: M2 WMI ready mac %02x:%02x:%02x:%02x:%02x:%02x macs %d %s pool peak %u/%u\n",
+		    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], ab->num_radios,
+		    ab->hw_params->single_pdev_only ? "hw_mode sent" : "hw_mode none", rings, slots);
+	} else {
+		lx_tell("FUXI ATH12K: M2 not proven: ready event %d init status %u\n", ab->wmi_ready, ab->wlan_init_status);
+	}
+	lx_memory_say();
+	fa_hif_quiesce();
+	hif.stage_hit = true;
+	return (true);
+}
+
 int
 fa_firmware_ready(const struct fa_caps *caps, unsigned stage)
 {
@@ -309,6 +358,10 @@ fa_firmware_ready(const struct fa_caps *caps, unsigned stage)
 	hif.window = ~0u;			/* unknown: fuxi_wlan.c's diagnostics move and restore it too */
 	hif.stage = stage;
 	ath12k_debug_mask |= ATH12K_DBG_HTC;	/* design M1: "Target ready!" is part of the proof */
+	if (stage >= 2) {
+		/* All one-time at this stage, no data path: what WMI_INIT and the regulatory domain did. */
+		ath12k_debug_mask |= ATH12K_DBG_WMI | ATH12K_DBG_REG | ATH12K_DBG_BOOT;
+	}
 
 	ab = ath12k_core_alloc(&device, 0, ATH12K_BUS_PCI);
 	if (ab == NULL) {

@@ -67,6 +67,7 @@ def main():
         if args.variant == "metal4wifi":
             # One argument: the WLAN recipe is the default of fuxiath12k>0 (design R7).
             cmdlines["cmdline-ath12k1.txt"] = line + " fuxiath12k=1"
+            cmdlines["cmdline-ath12k2.txt"] = line + " fuxiath12k=2"
     else:
         cmdlines = {"cmdline.txt": BASE + " fuxiwlan=1",
                     "cmdline-s22.txt": BASE + " fuxiwlan=22",

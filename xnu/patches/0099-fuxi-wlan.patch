@@ -29,7 +29,7 @@
  	sweet_sample_start();
 --- a/bsd/dev/fuxi_wlan.c
 +++ b/bsd/dev/fuxi_wlan.c
-@@ -0,0 +1,5688 @@
+@@ -0,0 +1,5730 @@
 +/*
 + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
 + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -132,7 +132,10 @@
 +/*
 + *   fuxiath12k=N  kernel-metal4wifi only: hand the chip to Linux ath12k at FW_READY. N>0 alone
 + *                 implies the working recipe as defaults, each still overridable. Stage 1 stops
-+ *                 after HTC ready, then contains; later stages are not built yet.
++ *                 after HTC ready, stage 2 after WMI ready, hw_mode and mac registration, each then
++ *                 contains. N above the last stage built runs that stage, and says so.
++ *   fuxiwifimac=aa:bb:cc:dd:ee:ff  with fuxiath12k: the radio's address, instead of the locally
++ *                 administered default. Malformed, all-zero or group addresses are refused, and say so.
 + */
 +#include "fa_xnu.h"
 +#include "fa_lx_os.h" /* lx_os_radio_memory is defined below */
@@ -980,6 +983,7 @@
 +#ifdef FUXI_ATH12K
 +/* Design R7: the working recipe does not fit the 608-byte command line, so fuxiath12k>0 alone
 + * makes it the default for each argument that is absent. Absent fuxiath12k changes nothing. */
++#define WL_FA_STAGE_MOST 2
 +static unsigned wl_fa_stage;
 +static bool wl_fa_started;
 +static struct fa_caps wl_fa_caps;
@@ -996,8 +1000,9 @@
 +{
 +	int stage = 0;
 +	if (PE_parse_boot_argn("fuxiath12k", &stage, sizeof(stage)) && stage > 0) {
-+		wl_fa_stage = 1;
-+		printf("FUXI ATH12K: fuxiath12k=%d, recipe defaults on, stage 1 is the last one built\n", stage);
++		wl_fa_stage = stage > WL_FA_STAGE_MOST ? WL_FA_STAGE_MOST : (unsigned)stage;
++		printf("FUXI ATH12K: fuxiath12k=%d, recipe defaults on, running stage %u; stage %d is the last one built\n",
++		    stage, wl_fa_stage, WL_FA_STAGE_MOST);
 +	}
 +}
 +
@@ -1031,6 +1036,40 @@
 +}
 +#define PE_parse_boot_argn wl_fa_argn
 +#define PE_parse_boot_arg_str wl_fa_arg_str
++
++/* Design section 4: the fake backend's address in patch 0104, so that en0 keeps its identity. */
++static const unsigned char wl_fa_default_mac[6] = {0x02, 0x46, 0x55, 0x58, 0x49, 0x01};
++
++/* Exactly aa:bb:cc:dd:ee:ff, and an address a station may have. */
++static bool
++wl_fa_mac_parse(const char *text, unsigned char *mac)
++{
++	unsigned any = 0;
++	for (unsigned i = 0; i < 17; i++) {
++		char c = text[i];
++		unsigned digit = c >= '0' && c <= '9' ? (unsigned)(c-'0') : c >= 'a' && c <= 'f' ? (unsigned)(c-'a'+10) :
++		    c >= 'A' && c <= 'F' ? (unsigned)(c-'A'+10) : 16;
++		if (i % 3 == 2 ? c != ':' : digit == 16) { return false; }
++		if (i % 3 == 0) { mac[i/3] = (unsigned char)(digit << 4); }
++		if (i % 3 == 1) { mac[i/3] |= (unsigned char)digit; any |= mac[i/3]; }
++	}
++	return text[17] == 0 && any != 0 && !(mac[0] & 1);
++}
++
++static void
++wl_fa_mac_configure(void)
++{
++	char text[32] = ""; /* a bare fuxiwifimac has no string to copy */
++	unsigned char mac[6];
++	bool given = PE_parse_boot_arg_str("fuxiwifimac", text, sizeof(text));
++	if (given && !wl_fa_mac_parse(text, mac)) {
++		printf("FUXI ATH12K: fuxiwifimac refused; default address\n");
++		given = false;
++	}
++	if (!given) { memcpy(mac, wl_fa_default_mac, sizeof(mac)); }
++	printf("FUXI ATH12K: station address from %s\n", given ? "fuxiwifimac" : "the default");
++	fa_set_radio_mac(mac);
++}
 +#endif /* FUXI_ATH12K */
 +static unsigned
 +wl_variant_arg(const char *name, const char *const *names, unsigned count)
@@ -4906,12 +4945,15 @@
 +	    wl_fa_stage, wl_fa_caps.chip_id, wl_fa_caps.chip_family, wl_fa_caps.board_id, wl_fa_caps.soc_id,
 +	    wl_fa_caps.fw_version, wl_fa_caps.dev_mem[0].start, wl_fa_caps.dev_mem[0].size);
 +	wl_fa_started = true;
++	wl_fa_mac_configure();
 +	int e = fa_firmware_ready(&wl_fa_caps, wl_fa_stage);
 +	/* Poll thread and ath12k's register access end here, before this thread's own MHI work. */
 +	fa_stop();
 +	wl_keep = false; /* every stage built so far ends in containment */
 +	if (e) {
 +		printf("FUXI ATH12K: hand-off failed %d; contain\n", e);
++		/* A WMI timeout says nothing by itself: the firmware's dump gives its assert, or that it had none. */
++		if (wl_mrd(wl_bhi+0x28) == 3) { wl_wlfw_diagnostics("ATH12K hand-off"); } else { fuxi_ath12k_force_rddm(); }
 +		return wl_w11_fail("ath12k hand-off");
 +	}
 +	printf("FUXI ATH12K: stage %u done; containment follows\n", wl_fa_stage);

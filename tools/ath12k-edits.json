@@ -240,6 +240,38 @@
       "file": "core.c",
       "find": "\t\tath12k_err(ab, \"failed to connect to HTC: %d\\n\", ret);\n\t\tgoto err_hif_stop;\n\t}\n",
       "replace": "\t\tath12k_err(ab, \"failed to connect to HTC: %d\\n\", ret);\n\t\tgoto err_hif_stop;\n\t}\n\n\tif (fa_stage_htc_ready(ab)) {\n\t\tret = -ECANCELED;\n\t\tgoto err_hif_stop;\n\t}\n"
+    },
+    {
+      "id": "ath12k-stage-registered",
+      "why": "Design M2: stop once the radio is registered, with WMI ready and hw_mode behind it, before the data rings are set up. What ath12k_mac_register() did is undone, then the error path below it and the caller's ath12k_core_stop() run.",
+      "tree": "ath12k",
+      "file": "core.c",
+      "find": "\tret = ath12k_mac_register(ag);\n\tif (WARN_ON(ret))\n\t\tgoto err_mlo_teardown;\n",
+      "replace": "\tret = ath12k_mac_register(ag);\n\tif (WARN_ON(ret))\n\t\tgoto err_mlo_teardown;\n\n\tif (fa_stage_registered(ag->ab[0])) {\n\t\tath12k_mac_unregister(ag);\n\t\tret = -ECANCELED;\n\t\tgoto err_mlo_teardown;\n\t}\n"
+    },
+    {
+      "id": "ath12k-stage-quiet",
+      "why": "Design M2: upstream error lines must be absent when the stage stops as planned. Any other failure still says it.",
+      "tree": "ath12k",
+      "file": "core.c",
+      "find": "\t\t\tath12k_warn(ab, \"unable to start hw group\\n\");\n",
+      "replace": "\t\t\tif (ret != -ECANCELED)\n\t\t\t\tath12k_warn(ab, \"unable to start hw group\\n\");\n"
+    },
+    {
+      "id": "ath12k-no-eht",
+      "why": "Design section 9: LinuxKPI's IEEE80211_EHT_PHY_CAP* and PPE threshold values are running counters, so this function would filter the wrong bits and offer the result. eht_cap stays zero, has_eht false. linuxkpi_80211_wiphy_register() refuses a radio that offers it.",
+      "tree": "ath12k",
+      "file": "mac.c",
+      "find": "\tif (!(test_bit(WMI_TLV_SERVICE_11BE, ar->ab->wmi_ab.svc_map)) ||\n\t    ath12k_acpi_get_disable_11be(ar->ab))\n\t\treturn;\n\n\teht_cap->has_eht = true;\n",
+      "replace": "\tif (!(test_bit(WMI_TLV_SERVICE_11BE, ar->ab->wmi_ab.svc_map)) ||\n\t    ath12k_acpi_get_disable_11be(ar->ab) || fa_refuse_eht())\n\t\treturn;\n\n\teht_cap->has_eht = true;\n"
+    },
+    {
+      "id": "ath12k-wmi-event-log",
+      "why": "Design M2: WMI_INIT and service_ready_ext on this CNSS-class image are unknown offline, and a silent firmware leaves only a timeout. The boot shows which events came, in order. Says only the first ones.",
+      "tree": "ath12k",
+      "file": "wmi.c",
+      "find": "\tif (!skb_pull(skb, sizeof(struct wmi_cmd_hdr)))\n\t\tgoto out;\n\n\tswitch (id) {\n\t\t/* Process all the WMI events here */\n",
+      "replace": "\tif (!skb_pull(skb, sizeof(struct wmi_cmd_hdr)))\n\t\tgoto out;\n\n\tfa_wmi_event(id, skb->len);\n\n\tswitch (id) {\n\t\t/* Process all the WMI events here */\n"
     }
   ]
 }

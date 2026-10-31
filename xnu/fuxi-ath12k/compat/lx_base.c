@@ -1460,6 +1460,13 @@ lx_memory_say(void)
 	    POOL_SLOTS - pool.free_count, POOL_SLOTS, pool.slots_peak);
 }
 
+void
+lx_pool_peaks(unsigned *rings_kb, unsigned *slots)
+{
+	*rings_kb = pool.rings_peak >> 10;
+	*slots = pool.slots_peak;
+}
+
 int
 lx_base_init(void)
 {

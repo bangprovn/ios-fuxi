@@ -120,6 +120,9 @@ void lx_dma_free(void *memory, size_t size);
 void fa_radio_mac(u8 *mac);		/* src/fa_80211.c: design section 4, station.address */
 struct ath12k_base;
 bool fa_stage_htc_ready(struct ath12k_base *ab);	/* src/fa_hif.c: stops ath12k_core_start at stage 1 */
+bool fa_stage_registered(struct ath12k_base *ab);	/* src/fa_hif.c: stops the hardware group's start at stage 2 */
+void fa_wmi_event(u32 id, u32 length);			/* src/fa_hif.c: the order firmware's WMI events come in */
+bool fa_refuse_eht(void);				/* src/fa_80211.c: says so once; always true */
 
 /* --- the six functions LinuxKPI 15.1 lacks (design section 4) */
 

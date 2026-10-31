@@ -4,7 +4,8 @@
 A stand-in for the object plays ath12k: it receives the CAP data at FW_READY, takes its DMA pool, starts the
 firmware with the same tables W15 sends (the peer checks every byte), and stops it again. Then the real
 containment runs. Also: the recipe defaults, ath12k's own tables on the wire, the CAL_DONE upload size,
-and that nothing changes without fuxiath12k. No object from build-ath12k.py is involved.
+the stages and the station address, and that nothing changes without fuxiath12k. No object from
+build-ath12k.py is involved.
 """
 from pathlib import Path
 import importlib.util
@@ -52,8 +53,10 @@ static void boot15(unsigned c,bool keep) {
     target_cursor=wl_iova_next;
 }
 static uint32_t golden_ce[9][6];
-static unsigned fa_case;
+static unsigned fa_case, fa_stage_wanted=1;
 static int fa_result;
+static unsigned char seen_mac[6];
+static unsigned macs_set;
 static struct fa_caps seen_caps;
 static void *pool;
 static unsigned long long pool_iova;
@@ -66,7 +69,8 @@ static struct fa_wlan_cfg stock_cfg(void) {
 /* Stands in for ath12k in fa_hif.c, in the order of design section 2. */
 int fa_firmware_ready(const struct fa_caps *caps, unsigned stage) {
     fa_entries++;
-    assert(stage==1 && !mhi_depth);
+    assert(stage==fa_stage_wanted && !mhi_depth);
+    assert(macs_set==1); /* design section 4: known before anything of ath12k runs */
     seen_caps=*caps;
     assert(wl14_ready && !seen15);
     unsigned long length=0;
@@ -80,6 +84,7 @@ int fa_firmware_ready(const struct fa_caps *caps, unsigned stage) {
         assert(walk(pool_iova+off)==(wl_phys((uintptr_t)pool+off)|WL_DMA_PTE));
     unsigned long long again=0;assert(!lx_os_radio_memory(4096,&again));
     if(fa_case==1)return -5;
+    if(fa_case==3){setreg(WL_BAR0+wl_bhi+0x28,3);return -5;}
     struct fa_wlan_cfg cfg=stock_cfg();
     /* Refusals never reach the wire. */
     unsigned before=seen15;
@@ -100,14 +105,14 @@ int fa_firmware_ready(const struct fa_caps *caps, unsigned stage) {
     return fa_result;
 }
 void fa_stop(void) { fa_stops++; assert(!mhi_depth); }
-void fa_set_radio_mac(const unsigned char *mac) { abort(); }
+void fa_set_radio_mac(const unsigned char *mac) { memcpy(seen_mac,mac,6); macs_set++; }
 
 static void boot_fa(unsigned c,bool keep) {
-    fa_case=c;fa_entries=fa_stops=mode_offs=0;fa_result=0;pool=NULL;
+    fa_case=c;fa_entries=fa_stops=mode_offs=macs_set=0;fa_result=0;pool=NULL;
     memset(&seen_caps,0,sizeof(seen_caps));
     /* The peer speaks W15 as configured by the test's own arguments, not the recipe, whose values have
      * their own table test below: the stage turns on after configuration, before the conversation. */
-    wl_fa_stage=0;boot15(0,keep);wl_fa_stage=1;
+    wl_fa_stage=0;boot15(0,keep);wl_fa_stage=fa_stage_wanted;
 }
 /* Like the W11 suite's contain(), except that the pool is never given back. */
 static void contain_fa(void) {
@@ -130,8 +135,13 @@ int main(void) {
     wl_finish(28);dev_on=false;
 
     /* fuxiath12k>0 alone is the recipe of design section 5, argument by argument. */
-    ath12k_arg=7;wl_fa_configure();assert(wl_fa_stage==1);
-    assert(strstr(logbuf,"fuxiath12k=7, recipe defaults on, stage 1 is the last one built"));
+    ath12k_arg=1;wl_fa_configure();assert(wl_fa_stage==1);
+    assert(strstr(logbuf,"fuxiath12k=1, recipe defaults on, running stage 1; stage 2 is the last one built"));
+    ath12k_arg=2;wl_fa_configure();assert(wl_fa_stage==2);
+    assert(strstr(logbuf,"fuxiath12k=2, recipe defaults on, running stage 2; stage 2 is the last one built"));
+    /* Above the last one built: runs that one, and says so. */
+    ath12k_arg=7;wl_fa_configure();assert(wl_fa_stage==2);
+    assert(strstr(logbuf,"fuxiath12k=7, recipe defaults on, running stage 2; stage 2 is the last one built"));
     const struct {const char *name;int v;} numbers[]={{"fuxiwlan",1},{"fuxiwlanclk",1},{"fuxiwlanqrtr",5},
         {"fuxiwlanmlo",0x1c1},{"fuxiwlanp18",6},{"fuxiwlankeep",1}};
     for(unsigned i=0;i<6;i++){assert(wl_fa_recipe_arg(numbers[i].name,&number,sizeof(number)) && number==numbers[i].v);}
@@ -167,6 +177,35 @@ int main(void) {
         assert(strstr(logbuf,"abort buffers freed"));
         wl_dma_free(&wl_fa_pool);wl_fa_started=false;dev_on=false;
     }
+    /* Stage 2 goes the same way in this file: fa_hif.c and core.c are what stop it elsewhere. */
+    fa_stage_wanted=2;
+    boot_fa(0,true);
+    {
+        int e=finish_step();assert(!e && fa_entries==1 && !wl_keep && wl_w11_ok && fa_stops==1);
+        assert(strstr(logbuf,"FUXI ATH12K: hand-off stage 2 chip 0x2"));
+        assert(strstr(logbuf,"FUXI ATH12K: stage 2 done; containment follows"));
+    }
+    contain_fa();
+    fa_stage_wanted=1;
+    /* The address: the default, a good one, and each kind that is refused. */
+    {
+        static const unsigned char fallback[6]={0x02,0x46,0x55,0x58,0x49,0x01};
+        const char *const refused[]={"","02:46:55:58:49","02:46:55:58:49:0","02-46-55-58-49-01","02:46:55:58:49:0g",
+            "02:46:55:58:49:011","00:00:00:00:00:00","01:00:5e:00:00:01","ff:ff:ff:ff:ff:ff"};
+        macs_set=0;mac_arg=NULL;loglen=0;logbuf[0]=0;
+        wl_fa_mac_configure();
+        assert(macs_set==1 && !memcmp(seen_mac,fallback,6) && strstr(logbuf,"FUXI ATH12K: station address from the default"));
+        static const unsigned char given[6]={0x0a,0xbc,0xde,0xf0,0x12,0x34};
+        mac_arg="0a:BC:de:F0:12:34";
+        wl_fa_mac_configure();
+        assert(macs_set==2 && !memcmp(seen_mac,given,6) && strstr(logbuf,"FUXI ATH12K: station address from fuxiwifimac"));
+        for(unsigned i=0;i<sizeof(refused)/sizeof(refused[0]);i++){
+            mac_arg=refused[i];loglen=0;logbuf[0]=0;
+            wl_fa_mac_configure();
+            assert(!memcmp(seen_mac,fallback,6) && strstr(logbuf,"FUXI ATH12K: fuxiwifimac refused; default address"));
+        }
+        mac_arg=NULL;
+    }
     /* A board-less CAP becomes ath12k's default. */
     boot_fa(0,true);io_case=21;{int e=finish_step();assert(!e && !wl14_board_valid && seen_caps.board_id==0xff);}
     contain_fa();
@@ -174,6 +213,10 @@ int main(void) {
     boot_fa(1,true);assert(finish_step() && fa_entries==1 && seen15==0 && fa_stops==1 && !wl_keep);
     assert(strstr(logbuf,"FUXI ATH12K: hand-off failed -5; contain"));
     contain_fa();
+    /* A firmware already in RDDM is read as it is, and not asked again. */
+    boot_fa(3,true);assert(finish_step());
+    assert(strstr(logbuf,"FUXI WLAN: ATH12K hand-off diagnostic BHI_EXECENV 0x3") && !strstr(logbuf,"P18 before SYS_ERR"));
+    setreg(WL_BAR0+wl_bhi+0x28,2);contain_fa();
     /* A pool that cannot be mapped is an answer of NULL, not a stop of the thread. */
     fail_nth_alloc=0;
 
@@ -207,7 +250,7 @@ int main(void) {
         uint8_t q[]={4,0,0,0x3e,0,7,0,0x10,4,0,1,2,3,4};
         assert(!wl_qmi_w12(q,sizeof(q)) && strstr(logbuf,"msg 0x3e unknown TLV 0x10 bytes 4"));
     }
-    puts("ATH12K hand-off: recipe defaults, CAP data, pool map, exact INI/CFG/MODE, ath12k tables, mode off, fa_stop before containment, pool kept, off by default, CAL_DONE size");
+    puts("ATH12K hand-off: recipe defaults, stages 1 and 2 and above, station address, CAP data, pool map, exact INI/CFG/MODE, ath12k tables, mode off, fa_stop before containment, RDDM on failure, pool kept, off by default, CAL_DONE size");
     return 0;
 }
 '''
@@ -219,7 +262,8 @@ def main():
     preamble = preamble.replace('return 0x12345; }', 'return (uint64_t)sleeps*1000000ull; }')
     assert 'static bool PE_parse_boot_argn(const char *name, void *out, int size) {' in preamble
     preamble = preamble.replace('static bool PE_parse_boot_argn(const char *name, void *out, int size) {',
-                                'static int ath12k_arg;\nstatic bool PE_parse_boot_argn(const char *name, void *out, int size) {\n'
+                                'static int ath12k_arg;\nstatic const char *mac_arg;\nstatic bool PE_parse_boot_argn(const char *name, void *out, int size) {\n'
+                                '    if(!strcmp(name,"fuxiwifimac")){if(!mac_arg)return false;strlcpy(out,mac_arg,size);return true;}\n'
                                 '    if(!strcmp(name,"fuxiath12k")){if(!ath12k_arg)return false;memcpy(out,&ath12k_arg,size);return true;}')
     m6.PREAMBLE = PREAMBLE_HEAD + preamble + PREAMBLE_TAIL
     w15.w14.TESTS = TESTS
