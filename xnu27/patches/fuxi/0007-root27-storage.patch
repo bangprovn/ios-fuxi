@@ -25,7 +25,7 @@ new file mode 100644
 index 0000000..e6d5bd6
 --- /dev/null
 +++ b/iokit/Kernel/arm/FuxiRoot27.cpp
-@@ -0,0 +1,683 @@
+@@ -0,0 +1,685 @@
 +/*
 + * Fuxi iOS 27 root storage (K4).
 + *
@@ -485,6 +485,7 @@ index 0000000..e6d5bd6
 +	return kIOReturnUnsupported;
 +}
 +
++static uint32_t media_rw;	/* fuxi_root27_rwmedia=1: IOMedia reports writable; write() still refuses */
 +/* A kext IOMedia, initialised through the mirror and checked through its properties. */
 +static IOMedia *
 +media_create(const OSMetaClass *meta, UInt64 size, UInt64 block, bool whole, const char *hint, OSDictionary *props)
@@ -498,7 +499,7 @@ index 0000000..e6d5bd6
 +	OSNumber *n;
 +	OSBoolean *b;
 +	OSString *s;
-+	if (!m->init(0, size, block, 0, whole, false, hint, props) ||
++	if (!m->init(0, size, block, 0, whole, media_rw != 0, hint, props) ||
 +	    !(n = OSDynamicCast(OSNumber, m->getProperty(kIOMediaSizeKey))) || n->unsigned64BitValue() != size ||
 +	    !(b = OSDynamicCast(OSBoolean, m->getProperty(kIOMediaWholeKey))) || b->getValue() != whole ||
 +	    !(s = OSDynamicCast(OSString, m->getProperty(kIOMediaContentHintKey))) ||
@@ -677,6 +678,7 @@ index 0000000..e6d5bd6
 +	const OSSymbol *name = OSSymbol::withCStringNoCopy("IOMedia");
 +	const OSMetaClass *meta = NULL;
 +	PE_parse_boot_argn("fuxi_root27_hint", hint, sizeof(hint));
++	PE_parse_boot_argn("fuxi_root27_rwmedia", &media_rw, sizeof(media_rw));
 +	if (root_open() || root_manifest()) {
 +		OSSafeReleaseNULL(name);
 +		return;

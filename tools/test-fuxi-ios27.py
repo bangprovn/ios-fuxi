@@ -714,7 +714,7 @@ def k4_patch_check():
     assert "ucd->cmd[1] = len ? 0x40 : 0x00;" in drv and '(len ? 2u : 0u) << 25' in drv   # data in only
     assert drv.count('fx27_io_allowed(') == 2 and 'fr.guard = true;' in drv
     assert 'media_create(meta, w->size, 512, true, NULL, NULL)' in drv and 'media_create(meta, w->size, 512, false, hint, pp)' in drv
-    assert 'm->init(0, size, block, 0, whole, false, hint, props)' in drv   # isWritable false
+    assert 'm->init(0, size, block, 0, whole, media_rw != 0, hint, props)' in drv and 'static uint32_t media_rw;' in drv   # isWritable only with fuxi_root27_rwmedia=1; write() refuses either way
     assert 'return kIOReturnNotWritable;' in drv and 'kIOReturnNotWritable, 0);' in drv
     for need in ('"fuxi_root27"', '"fuxi_root27_hint"', '"7C3457EF-0000-11AA-AA11-00306543ECAC"', '"fuxi-root-extents"',
                  '"fuxi-root-blocks"', '"/fuxi-ufs"', '"GUID_partition_scheme"', 'part->setLocation("1");',
