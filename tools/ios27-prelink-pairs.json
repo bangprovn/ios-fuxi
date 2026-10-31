@@ -34,6 +34,8 @@
     "0xfffffe0007ed04f0": {"name": "__ZN5IOCPU9metaClassE", "confidence": "high", "evidence": "IOPlatformIO MetaClass vtable+0x88, same offset in the reference"},
     "0xfffffe0007f07698": {"name": "__ZN24IOBufferMemoryDescriptor9metaClassE", "confidence": "high", "evidence": "IOPMServiceInterestNotifier MetaClass vtable+0xc0, same offset in the reference"},
     "0xfffffe000b9293b8": {"name": "_gIODTAAPLInterruptsKey", "confidence": "medium", "evidence": "gIODTNameKey+0x48 in both"},
-    "0xfffffe000b8b3ce8": {"name": "_kext_assertions_enable", "confidence": "medium", "evidence": "debugger_current_op+0x34 in both"}
+    "0xfffffe000b8b3ce8": {"name": "_kext_assertions_enable", "confidence": "medium", "evidence": "debugger_current_op+0x34 in both"},
+    "0xfffffe000b929a00": {"name": "_gIOMatchCategoryKey", "confidence": "high", "evidence": "__DATA,__common in both; bound by the matcher's reference-data pass against the pre-K4 kernel, lost when K4 globals shifted __common; used by IOStorageFamily"},
+    "0xfffffe000b92b500": {"name": "_gIOGeneralInterest", "confidence": "high", "evidence": "__DATA,__common in both; bound by the matcher's reference-data pass against the pre-K4 kernel, lost the same way; used by IOStorageFamily, AppleIISController, AppleM2ScalerCSCDriver"}
   }
 }
