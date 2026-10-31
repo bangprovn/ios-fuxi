@@ -407,6 +407,28 @@ def payload_check():
         (tmp / 'p').write_bytes(bad)
         assert subprocess.run([sys.executable, '-', str(tmp / 'p')], input=check, text=True, capture_output=True).returncode
         prelinked_check(tmp, check)
+        # --ramdisk then --trustcache: one segment each after the kernel, memory-map ranges point at them.
+        mod = struct.pack('<I16sI', 2, b'\1' * 16, 1) + b'\2' * 20 + bytes(4)
+        (tmp / 'tc').write_bytes(struct.pack('<2I', 1, 8) + mod)
+        (tmp / 'rd').write_bytes(b'N4KROOT\0' + bytes(100))
+        rt, it = mkpayload.build(tmp / 'k', tmp / 'a', 'rd=md0', ramdisk_path=tmp / 'rd', trustcache_path=tmp / 'tc',
+                                 boot_line_length=1024)
+        n = struct.unpack_from('<I', rt, 12)[0]
+        segs = [struct.unpack_from('<4Q', rt, 0x448 + 32 * i) for i in range(n)]
+        (rva, _, roff, rsz), (tva, tvs, toff, tsz) = segs[-2:]
+        assert rt[roff:roff + 7] == b'N4KROOT' and rt[toff:toff + tsz] == (tmp / 'tc').read_bytes()
+        assert tva >= rva + rsz and tva + tvs == int(it['kernel_end'], 16) and it['trustcache'][2] == 1
+        adt_off, adt_size = struct.unpack_from('<2Q', rt, 0x20)
+        root, _ = adt.parse(rt[adt_off:adt_off + adt_size])
+        mmap = next(c for c in next(c for c in root.children if c.name == 'chosen').children if c.name == 'memory-map')
+        assert struct.unpack('<2Q', mmap.prop('TrustCache')) == (int(it['trustcache'][0], 16), tsz)
+        assert struct.unpack('<2Q', mmap.prop('RAMDisk'))[0] == int(it['ramdisk'][0], 16)
+        (tmp / 'tc').write_bytes(struct.pack('<2I', 2, 12) + mod)
+        try:
+            mkpayload.build(tmp / 'k', tmp / 'a', 'x', trustcache_path=tmp / 'tc', boot_line_length=1024)
+            raise AssertionError('a bundle with a bad module table was accepted')
+        except SystemExit:
+            pass
     loader = (ROOT / 'shim/fuxi-loader/loader.c').read_text()
     for need in ('#define BOOT_LINE_V1\t\t608', '#define BOOT_LINE_V2\t\t1024',
                  '_Static_assert(BOOT_ARGS_FLAGS(BOOT_LINE_V1) + 16 == 736',

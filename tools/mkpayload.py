@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pack an xnu kernel Mach-O + ADT into the payload the sweet shim boots.
 
-  mkpayload.py KERNEL ADT OUT [--cmdline "..."] [--ramdisk IMAGE]
+  mkpayload.py KERNEL ADT OUT [--cmdline "..."] [--ramdisk IMAGE] [--trustcache BUNDLE]
 
 The kernel is linked as a PIE with LC_DYLD_CHAINED_FIXUPS. Nobody else
 (no kmutil, no iBoot) resolves those for us, and xnu only rebases static
@@ -36,6 +36,12 @@ kernel_end past it, so the shim needs no changes: the image lands below the
 ADT and boot_args, inside topOfKernelData (never handed to the VM), and the
 ADT gets /chosen/memory-map "RAMDisk" = <phys, size> for IOFindBSDRoot to
 turn into md0 (boot with rd=md0).
+
+--trustcache BUNDLE (xnu-12377) appends a trust-cache bundle the same way (after
+the RAM disk) and sets /chosen/memory-map "TrustCache" = <phys, length>, the
+DTTrustCacheRange that load_static_trust_cache reads. BUNDLE is a
+trust_cache_offsets_t (u32 count, u32 offsets[count], modules), as written by
+tools/ios27-root.py trust-bundle; the first module loads as the static one.
 
 --prelinked FILESET (K2, docs-lanes/ios27.md#k2) packs the MH_FILESET that
 tools/ios27-prelink.py emitted from KERNEL instead of KERNEL itself. KERNEL must
@@ -201,14 +207,32 @@ def decode(raw, fmt, image_base):
     raise ValueError(f'unsupported chained pointer format {fmt}')
 
 
-def add_ramdisk_to_adt(adt_blob, phys, size):
-    """Return the ADT with /chosen/memory-map RAMDisk = <phys, size> (two uintptr_t)."""
+def add_range_to_adt(adt_blob, name, phys, size):
+    """Return the ADT with /chosen/memory-map NAME = <phys, size> (two 64-bit words)."""
     root, _ = adt.parse(adt_blob)
     chosen = next(c for c in root.children if c.name == 'chosen')
     mmap = next(c for c in chosen.children if c.name == 'memory-map')
-    assert mmap.prop('RAMDisk') is None, 'ADT already has a RAMDisk'
-    mmap.props.append(('RAMDisk', 0, struct.pack('<2Q', phys, size)))
+    assert mmap.prop(name) is None, f'ADT already has a {name}'
+    mmap.props.append((name, 0, struct.pack('<2Q', phys, size)))
     return adt.serialize(root)
+
+
+def add_ramdisk_to_adt(adt_blob, phys, size):
+    return add_range_to_adt(adt_blob, 'RAMDisk', phys, size)
+
+
+def check_trust_bundle(data):
+    """The bounds load_static_trust_cache relies on: 1..128 modules, ordered offsets inside the bundle."""
+    if len(data) < 8:
+        raise SystemExit('trust bundle too short')
+    n, = struct.unpack_from('<I', data)
+    if not 0 < n <= 128 or len(data) < 4 + 4 * n:
+        raise SystemExit(f'trust bundle module count {n}')
+    offs = list(struct.unpack_from(f'<{n}I', data, 4)) + [len(data)]
+    for i in range(n):
+        if offs[i] < 4 + 4 * n or offs[i] & 3 or offs[i + 1] - offs[i] < 24:
+            raise SystemExit(f'trust bundle module {i} bounds {offs[i]}..{offs[i + 1]}')
+    return n
 
 
 def adt_dram(adt_blob):
@@ -223,7 +247,7 @@ CPU_SUBTYPE_ARM64E = 2
 
 
 def build(kernel_path, adt_path, cmdline, ramdisk_path=None, allow_unsigned_auth=False, boot_line_length=BOOT_LINE_LENGTH,
-          prelinked_path=None, allow_incomplete=False):
+          prelinked_path=None, allow_incomplete=False, trustcache_path=None):
     version = next((v for v, n in BOOT_LINES.items() if n == boot_line_length), None)
     if version is None:
         raise SystemExit(f'boot line length must be one of {sorted(BOOT_LINES.values())}')
@@ -269,6 +293,16 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None, allow_unsigned_auth
         pieces.append((rd_va, rd_size, image))
         adt_blob = add_ramdisk_to_adt(adt_blob, rd_pa, rd_size)
         ramdisk = (hex(rd_pa), hex(rd_size))
+    trustcache = None
+    if trustcache_path:
+        bundle = open(trustcache_path, 'rb').read()
+        modules = check_trust_bundle(bundle)
+        tc_va = kernel_end
+        kernel_end = tc_va + ((len(bundle) + PAGE - 1) & ~(PAGE - 1))
+        tc_pa = tc_va - virt_base + PHYS_BASE
+        pieces.append((tc_va, kernel_end - tc_va, bundle))
+        adt_blob = add_range_to_adt(adt_blob, 'TrustCache', tc_pa, len(bundle))
+        trustcache = (hex(tc_pa), hex(len(bundle)), modules)
 
     hdr_size = seg_table_off + 32 * len(pieces)
     out = bytearray(hdr_size)
@@ -296,7 +330,8 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None, allow_unsigned_auth
     info = dict(version=version, cputype=hex(m['cputype']), cpusub=m['cpusub'], fixups=nfix, auth_fixups=m['auth_fixups'],
                 thread_starts=m['thread_starts'] and (hex(m['thread_starts'][0]), hex(m['thread_starts'][1])),
                 virt_base=hex(virt_base),
-                entry=hex(m['entry']), kernel_end=hex(kernel_end), ramdisk=ramdisk, prelinked=prelinked, size=len(out),
+                entry=hex(m['entry']), kernel_end=hex(kernel_end), ramdisk=ramdisk, trustcache=trustcache,
+                prelinked=prelinked, size=len(out),
                 segs=[(s['name'], hex(s['vmaddr']), hex(s['vmsize'])) for s in segs])
     return bytes(out), info
 
@@ -306,6 +341,8 @@ if __name__ == '__main__':
     ap.add_argument('kernel'); ap.add_argument('adt'); ap.add_argument('out')
     ap.add_argument('--cmdline', default='debug=0xc serial=3 cpus=1 keepsyms=1')
     ap.add_argument('--ramdisk', help='root image for md0 (boot with rd=md0)')
+    ap.add_argument('--trustcache', metavar='BUNDLE',
+                    help='trust-cache bundle for /chosen/memory-map TrustCache (xnu-12377 load_static_trust_cache)')
     ap.add_argument('--allow-unsigned-auth', action='store_true',
                     help='pack arm64e authenticated fixups unsigned (stock VMAPPLE kernel experiments only)')
     ap.add_argument('--boot-line-length', type=int, choices=sorted(BOOT_LINES.values()), default=BOOT_LINE_LENGTH,
@@ -318,7 +355,7 @@ if __name__ == '__main__':
     if a.allow_incomplete and not a.prelinked:
         ap.error('--allow-incomplete needs --prelinked')
     blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, a.allow_unsigned_auth, a.boot_line_length,
-                       a.prelinked, a.allow_incomplete)
+                       a.prelinked, a.allow_incomplete, a.trustcache)
     open(a.out, 'wb').write(blob)
     for k, v in info.items():
         if k != 'segs':
