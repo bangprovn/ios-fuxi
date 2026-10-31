@@ -8,8 +8,11 @@
 # WORK must hold clean checkouts at the xnu27/sources.env pins: xnu,
 # AvailabilityVersions, libplatform, libdispatch and trustcache (xnu-8796.101.5,
 # EXTERNAL_HEADERS/TrustCache only). tools/ci/build.sh kernel-ios27 fetches them.
-# OUT receives mach.development.fuxi(.unstripped), fuxi27.adt, cmdline*.txt and
-# kernel-arch.txt. Nothing Apple-binary is fetched: no KDK, IPSW or kernelcache.
+# OUT receives mach.development.fuxi(.unstripped), fuxi27.adt, cmdline*.txt,
+# kernel-arch.txt and, unless FUXI_XNU27_RELEASE_REF=0, the symbol-bearing RELEASE
+# comparison kernel mach.release.fuxi.unstripped(.noctf) plus release-reference.txt
+# (K2 prelink matching, tools/ios27-prelink.py --reference; never booted).
+# Nothing Apple-binary is fetched: no KDK, IPSW or kernelcache.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/../.." && pwd)
 work=$(cd "${1:?Usage: build-xnu27.sh WORK OUT}" && pwd)
@@ -54,9 +57,9 @@ for header in "$work"/libdispatch/os/*.h; do
         -o "$fake/usr/local/include/os/$(basename "$header")" "$header" || [[ $? == 1 ]]
 done
 
-common=(ARCH_CONFIGS=ARM64 MACHINE_CONFIGS=FUXI KERNEL_CONFIGS=DEVELOPMENT
-        RC_DARWIN_KERNEL_VERSION="$XNU27_DARWIN" RC_ProjectSourceVersion="${XNU27_TAG#xnu-}"
-        MAKEJOBS=-j"$jobs" OBJROOT="$obj" SYMROOT="$sym")
+base=(ARCH_CONFIGS=ARM64 MACHINE_CONFIGS=FUXI
+      RC_DARWIN_KERNEL_VERSION="$XNU27_DARWIN" RC_ProjectSourceVersion="${XNU27_TAG#xnu-}" MAKEJOBS=-j"$jobs")
+common=("${base[@]}" KERNEL_CONFIGS=DEVELOPMENT OBJROOT="$obj" SYMROOT="$sym")
 make -C "$xnu" installhdrs SDKROOT=macosx "${common[@]}" DSTROOT="$fake"
 
 # libfirehose_kernel from libdispatch, against the headers just installed.
@@ -85,15 +88,16 @@ xcrun lipo -info "$lib/libfirehose_kernel.a"
 
 # UniXNU's arm64e/ipados-27 build: BCM2837-style layer, 4K, no LTO; FUXI wraps it.
 # PAN instructions need armv8.1 in the three files that use them (native-arm-pan).
-make -C "$xnu" build SDKROOT=iphoneos "${common[@]}" DSTROOT="$dst" \
-    ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG=arm64e LARGE_MEMORY_DEFINE=-UARM_LARGE_MEMORY \
-    ARM64_LINK_ADDR=0xfffffff007004000 ARM64_PLKSEG_ADDR=0xfffffff004004000 \
-    DEPLOYMENT_TARGET_FLAGS="-miphoneos-version-min=$XNU27_IOS_VERSION -DXNU_TARGET_OS_IOS" \
-    DEPLOYMENT_LINKER_FLAGS="-Wl,-ios_version_min,$XNU27_IOS_VERSION" \
-    BUILD_LTO=0 BOUND_CHECKS=0 BUILD_WERROR=0 XNU_KERNEL_CHAINED_FIXUPS=0 \
-    CFLAGS_EXTRA="-Wno-reserved-identifier -Wno-pre-c11-compat -Wno-missing-designated-field-initializers -Wno-suggest-override -Wno-unnecessary-virtual-specifier -Wno-suggest-destructor-override -Wno-ms-bitfield-padding -DXNU_NATIVE_PAN=1" \
-    copyio.o_CFLAGS_ADD=-march=armv8.1-a pcb.o_CFLAGS_ADD=-march=armv8.1-a platform_tests.o_CFLAGS_ADD=-march=armv8.1-a \
-    ubc_subr.o_CFLAGS_ADD=-DXNU_NATIVE_CS_HASH_CACHE=1
+kflags=(SDKROOT=iphoneos
+    ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG=arm64e LARGE_MEMORY_DEFINE=-UARM_LARGE_MEMORY
+    ARM64_LINK_ADDR=0xfffffff007004000 ARM64_PLKSEG_ADDR=0xfffffff004004000
+    DEPLOYMENT_TARGET_FLAGS="-miphoneos-version-min=$XNU27_IOS_VERSION -DXNU_TARGET_OS_IOS"
+    DEPLOYMENT_LINKER_FLAGS="-Wl,-ios_version_min,$XNU27_IOS_VERSION"
+    BOUND_CHECKS=0 BUILD_WERROR=0 XNU_KERNEL_CHAINED_FIXUPS=0
+    CFLAGS_EXTRA="-Wno-reserved-identifier -Wno-pre-c11-compat -Wno-missing-designated-field-initializers -Wno-suggest-override -Wno-unnecessary-virtual-specifier -Wno-suggest-destructor-override -Wno-ms-bitfield-padding -DXNU_NATIVE_PAN=1"
+    copyio.o_CFLAGS_ADD=-march=armv8.1-a pcb.o_CFLAGS_ADD=-march=armv8.1-a platform_tests.o_CFLAGS_ADD=-march=armv8.1-a
+    ubc_subr.o_CFLAGS_ADD=-DXNU_NATIVE_CS_HASH_CACHE=1)
+make -C "$xnu" build "${common[@]}" DSTROOT="$dst" "${kflags[@]}" BUILD_LTO=0
 
 kdir=$obj/DEVELOPMENT_ARM64_FUXI
 [[ -f $kdir/mach.development.fuxi ]] || die "no $kdir/mach.development.fuxi"
@@ -117,3 +121,28 @@ if m['cpusub'] != mkpayload.CPU_SUBTYPE_ARM64E or not m['thread_starts']:
     raise SystemExit('ios27 kernel is not arm64e with __TEXT,__thread_starts')
 PY
 python3 "$root/tools/ci/kernel-inputs.py" --variant ios27 --out "$out"
+
+# K2 matching reference (docs-lanes/ios27.md#k2), after UniXNU's
+# build-fileset-release-reference.py --lto: the same patched tree, machine,
+# arch and flags as above, KERNEL_CONFIGS=RELEASE with LTO, in its own
+# OBJROOT/SYMROOT. Its symbols name the functions the stripped Apple kexts call;
+# its addresses are never emitted. A failure here keeps the DEVELOPMENT outputs.
+if [[ ${FUXI_XNU27_RELEASE_REF:-1} == 0 ]]; then
+    echo 'release reference: skipped (FUXI_XNU27_RELEASE_REF=0)' | tee "$out/release-reference.txt"
+    exit 0
+fi
+robj=$work/release-obj
+mkdir -p "$robj/EXPORT_HDRS/libsa" "$work/release-sym" "$work/release-dst"
+if make -C "$xnu" build "${base[@]}" KERNEL_CONFIGS=RELEASE OBJROOT="$robj" SYMROOT="$work/release-sym" \
+    DSTROOT="$work/release-dst" "${kflags[@]}" BUILD_LTO=1 \
+    LDFLAGS_KERNEL_LTO="-miphoneos-version-min=$XNU27_IOS_VERSION -Wl,-mllvm,-inline-threshold=100"; then
+    rdir=$robj/RELEASE_ARM64_FUXI
+    for raw in mach.release.fuxi.unstripped mach.release.fuxi.unstripped.noctf; do
+        [[ -f $rdir/$raw ]] && cp "$rdir/$raw" "$out/"
+    done
+    [[ -f $out/mach.release.fuxi.unstripped || -f $out/mach.release.fuxi.unstripped.noctf ]] || die "no unstripped RELEASE kernel in $rdir"
+    (cd "$out" && shasum -a 256 mach.release.fuxi.unstripped*) | tee "$out/release-reference.txt"
+else
+    echo '::warning::RELEASE reference build failed; DEVELOPMENT outputs kept' >&2
+    echo 'release reference: build failed' > "$out/release-reference.txt"
+fi
