@@ -66,6 +66,8 @@ CMDLINE = 0x48
 SEG_TABLE = CMDLINE + BOOT_LINE_LENGTH	# 0x2a8
 # payload version -> boot_args.CommandLine size of the kernel it carries
 BOOT_LINES = {1: 608, 2: 1024}
+# payload version -> largest ADT the loader copies (shim/fuxi-loader/loader.c ADT_MAX_V2)
+ADT_MAX = {1: 0x4000, 2: 0x10000}
 
 
 def parse_macho(buf):
@@ -312,6 +314,8 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None, allow_unsigned_auth
         out += data
         out += b'\0' * (-len(out) & 0xf)
         seg_table.append((vmaddr, vmsize, off, len(data)))
+    if len(adt_blob) > ADT_MAX[version]:
+        raise SystemExit(f'ADT is {len(adt_blob)} bytes; a version {version} payload carries at most {ADT_MAX[version]}')
     adt_off = len(out)
     out += adt_blob
     out += b'\0' * (-len(out) & 0xf)

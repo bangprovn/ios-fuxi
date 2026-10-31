@@ -2,6 +2,7 @@
 """Build the Fuxi ADT for the iOS 27 kernel (xnu-12377, UniXNU machine layer).
 
   mkadt-fuxi27.py OUT.adt [--cpus 1|7] [--psci-method smc|hvc] [--product iphone12,3|board] [--dump]
+                  [--root-extents EXTENTS.json --root-bytes N --root-uuid OS-VOLUME-UUID]
 
 The xnu-8796 kernel matched its own SweetDTPlatform/SweetCPU; the 12377 kernel
 uses UniXNU's ArmDTPlatform and ArmCpu (docs-lanes/ios27.md), which read a
@@ -27,6 +28,13 @@ values from mkadt-fuxi.py:
   /defaults  sleep-disabled, vmm-present, kern.maxvnodes; /options (empty)
   /sweet-fbcon  the splash framebuffer ABL leaves scanned out (pe_serial FUXI)
 
+K4 root on UFS (iokit/Kernel/arm/FuxiRoot27.cpp, xnu27/patches/fuxi/0007):
+--root-extents/--root-bytes add /chosen fuxi-root-extents and fuxi-root-blocks
+exactly as mkadt-fuxi.py does for the xnu-8796 lane, plus /fuxi-ufs (the UFS host
+reg). --root-uuid adds /chosen root-matching, an IOMedia match on the OS volume's
+UUID that IOFindBSDRoot uses when no rd= is given. The extent table makes the
+ADT larger than 16 KiB; version 2 payloads carry up to 64 KiB (mkpayload.py).
+
 No chip-id/unique-chip-id at K1: IOPlatformExpert hashes them with SHA-1,
 which only a corecrypto kext provides on this kernel (docs-lanes/ios27.md).
 """
@@ -36,12 +44,13 @@ import os
 from pathlib import Path
 import struct
 import sys
+import uuid
 import zlib
 
 TOOLS = Path(__file__).resolve().parent
 sys.path.insert(0, str(TOOLS))
 import adt  # noqa: E402
-from mkadt import cstr, node, u32, u64  # noqa: E402
+from mkadt import UFS, UFS_SIZE, cstr, node, u32, u64  # noqa: E402
 
 spec = importlib.util.spec_from_file_location('fuxi_adt', TOOLS / 'mkadt-fuxi.py')
 fuxi = importlib.util.module_from_spec(spec)
@@ -52,6 +61,7 @@ GICR_STRIDE = 0x40000
 TIMEBASE = 19200000
 FB_W, FB_H = 1080, 2400
 CPU_REGS = (0x000, 0x200, 0x300, 0x400, 0x500, 0x600, 0x700)
+ADT_MAX, ADT_MAX_ROOT = 0x4000, 0x10000   # loader: v1 payloads 16 KiB, v2 64 KiB
 PRODUCTS = {'iphone12,3': ('iPhone 11 Pro', 'iPhone12,3'), 'board': ('Xiaomi 13', 'xiaomi,fuxi')}
 
 
@@ -74,7 +84,15 @@ def nvram_proxy():
             ('nvram-current-bank', u32(0)), ('nvram-proxy-data', bytes(image))]
 
 
-def build(cpus=1, psci_method='smc', seed=None, mem_size=fuxi.MEM_SIZE, product='iphone12,3'):
+def root_matching(volume_uuid):
+    """IOFindBSDRoot's /chosen root-matching: the IOMedia whose UUID is the OS (system) volume's."""
+    u = str(uuid.UUID(volume_uuid)).upper()
+    return cstr('<dict><key>IOProviderClass</key><string>IOMedia</string><key>IOPropertyMatch</key>'
+                f'<dict><key>UUID</key><string>{u}</string></dict></dict>')
+
+
+def build(cpus=1, psci_method='smc', seed=None, mem_size=fuxi.MEM_SIZE, product='iphone12,3', root_props=(),
+          root_uuid=None):
     if cpus not in (1, len(CPU_REGS)):
         raise ValueError('cpus must be 1 or 7')
     seed = os.urandom(256) if seed is None else seed
@@ -95,7 +113,8 @@ def build(cpus=1, psci_method='smc', seed=None, mem_size=fuxi.MEM_SIZE, product=
         ('certificate-security-mode', u32(1)),
         ('effective-security-mode-sep', u32(1)),
         ('amfi-only-platform-code', u32(1)),
-    ] + nvram_proxy(), [node('memory-map'), node('manifest-properties')])
+    ] + nvram_proxy() + list(root_props) + ([('root-matching', root_matching(root_uuid))] if root_uuid else []),
+        [node('memory-map'), node('manifest-properties')])
     cpu_nodes = [node(f'cpu{i}', [
         ('state', cstr('running' if i == 0 else 'waiting')),
         ('reg', u32(reg)),
@@ -128,6 +147,8 @@ def build(cpus=1, psci_method='smc', seed=None, mem_size=fuxi.MEM_SIZE, product=
             ('stride', u32(FB_W * 4)),
         ]),
     ]
+    if root_props:
+        children.append(node('fuxi-ufs', [('compatible', cstr('qcom,sm8550-ufshc')), ('reg', u64(UFS, UFS_SIZE))]))
     return node('device-tree', [
         ('model', cstr('fuxi-first-boot')),
         ('compatible', cstr('xiaomi,fuxi') + cstr('qcom,sm8550')),
@@ -143,15 +164,28 @@ def main():
     ap.add_argument('--psci-method', choices=('smc', 'hvc'), default='smc')
     ap.add_argument('--product', choices=sorted(PRODUCTS), default='iphone12,3',
                     help='/product identity: the userland device (default) or the K1 board strings')
+    ap.add_argument('--root-extents', type=Path,
+                    help='K4: pinned root file extent JSON (bytes, userdata-relative); needs --root-bytes')
+    ap.add_argument('--root-bytes', type=int, help='K4: root image size in bytes (ios27-root.py image)')
+    ap.add_argument('--root-uuid', help='K4: OS (system) volume UUID for /chosen root-matching')
     ap.add_argument('--dump', action='store_true')
     args = ap.parse_args()
-    blob = adt.serialize(build(args.cpus, args.psci_method, product=args.product))
-    if len(blob) > 0x4000:
-        ap.error(f'ADT is {len(blob)} bytes; the loader accepts at most 16 KiB')
+    if (args.root_extents is None) != (args.root_bytes is None) or (args.root_uuid and not args.root_extents):
+        ap.error('--root-extents and --root-bytes go together; --root-uuid needs them')
+    try:
+        root_props = fuxi.root_extent_props(args.root_extents, args.root_bytes) if args.root_extents else ()
+        blob = adt.serialize(build(args.cpus, args.psci_method, product=args.product, root_props=root_props,
+                                   root_uuid=args.root_uuid))
+    except (ValueError, KeyError, TypeError, OSError, struct.error) as error:
+        ap.exit(1, str(error) + '\n')
+    limit = ADT_MAX_ROOT if root_props else ADT_MAX
+    if len(blob) > limit:
+        ap.error(f'ADT is {len(blob)} bytes; the loader accepts at most {limit // 1024} KiB here')
     args.out.write_bytes(blob)
     if args.dump:
         adt.dump(adt.parse(blob)[0])
-    print(f'{args.out}: {len(blob)} bytes, {args.cpus} cpu(s)', file=sys.stderr)
+    print(f'{args.out}: {len(blob)} bytes, {args.cpus} cpu(s)'
+          + (f', root {len(root_props[0][1]) // 24} extents' if root_props else ''), file=sys.stderr)
 
 
 if __name__ == '__main__':

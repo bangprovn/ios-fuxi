@@ -12,7 +12,7 @@ ArmDTPlatform, plus a small Fuxi layer.
 | `series` | patch order; `apply.sh XNU_DIR` applies it with `git apply` (stops on the first failure) and stages the components |
 | `patches/unixnu/` | UniXNU firmware layer, verbatim (BSD-2-Clause-Patent) |
 | `patches/sheng/`, `patches/sm8550/` | UniXNU-sheng CPU/MMU subset, SM8550 secondary-CPU fix |
-| `patches/fuxi/` | `FUXI` machine config (wraps BCM2837, adds mockfs), built-in PRNG/SHA-2/kmem RNG while no corecrypto is registered, early console (fbcon, USB monitor ring, stage marks), component wiring |
+| `patches/fuxi/` | `FUXI` machine config (wraps BCM2837, adds mockfs), built-in PRNG/SHA-2/kmem RNG while no corecrypto is registered, early console (fbcon, USB monitor ring, stage marks), component wiring, K4a UFS root storage (`0007`, read-only IOMedia windows) |
 | `components/` | ArmCpu, ArmDTPlatform sources (compiled into the kernel) |
 | `libpthread/` | UniXNU's libpthread-539.100.4 kernel patch and its `series` (`tools/ci/build-libpthread27.py`, K2) |
 | `sources.env` | Apple open-source pins (fetched by CI, never committed) |

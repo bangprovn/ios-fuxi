@@ -108,3 +108,13 @@ patches/fuxi/*.patch are this repository's own changes (same terms as the rest o
 the repository); the code they add to Apple files is under that file's APSL 2.0
 header. 0002-builtin-crypto.patch ports the repository's xnu-8796 HMAC-SHA256
 DRBG (xnu/patches/0014-sweet-kernel-hmac-prng.patch) and calls the digests already in xnu's osfmk/corecrypto.
+
+patches/fuxi/0007-root27-storage.patch (K4) adds iokit/Kernel/arm/FuxiRoot27.cpp and
+fuxi_root27.h, this repository's own code: the UFS transport is the default
+(non-UniXNU) path of the xnu-8796 lane's sweet_ufs.c, reduced to read-only
+commands; the UniXNU NativeUfs completion/quarantine policy that file also
+carries is not used. iokit/Kernel/arm/fuxi_storage_abi.h restates the
+IOStorage and IOMedia class declarations (virtual method order, names and
+argument types only, no code) from Apple's IOStorageFamily-337.100.1
+IOStorage.h and IOMedia.h (https://github.com/apple-oss-distributions/IOStorageFamily,
+APSL 2.0) and keeps their APSL header; nothing from Apple binaries is in it.

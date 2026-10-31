@@ -31,6 +31,7 @@ Nothing on this page has run on the device: device effects are not yet observed.
 | `patches/fuxi/0004` + `components/` | UniXNU ArmCpu `4bd3230`, ArmDTPlatform `417ff95` | BSD-2-Clause-Patent | GICv3/timer/PSCI CPU driver and DT platform expert, compiled into the kernel |
 | `patches/fuxi/0005` | ours | APSL file headers | K2 crypto handoff: the kmem RNG backend is latched once (built-in or corecrypto), log lines say which; the fallback never calls `register_crypto_functions` |
 | `patches/fuxi/0006` | ours | APSL file headers | K2: `sweet_log_ring` 256 KiB (native `__DATA` must fit the fileset gap), size exported as `sweet_log_size` |
+| `patches/fuxi/0007` | ours (UFS path of xnu-8796 `sweet_ufs.c`); IOStorage/IOMedia declarations from IOStorageFamily-337.100.1 | APSL file headers | K4a: read-only, extent-guarded UFS reads of the pinned root file; its windows published as Apple IOMedia (`fuxi_root27=1`) |
 
 Left out of the UniXNU series: `source-corecrypto14-bootstrap` (see below), `offline-*` and `zzz-boot-progress`
 (sheng offline tooling; `zzz-boot-progress` depends on them), `zzw*`/`zzy*` (sandbox grants, GPU addon mount,
@@ -198,6 +199,94 @@ UniXNU does, and its imports are audited only against DEVELOPMENT names, so the 
 one (that only warns, as before); kexts that the prelink matched to the pthread-less kernel's layout must be
 re-prelinked against the new chained kernel (the native kernel changed).
 
+## K4a: the root file on UFS as IOStorageFamily media (`xnu27/patches/fuxi/0007`)
+
+Kernel and host side only; nothing here has run on the device (every effect below is **not yet observed**).
+
+Input: the root image of `tools/ios27-root.py image` (4 KiB SHNGROOT manifest, then the OS, SystemOS and AppOS APFS
+images at 1 MiB-aligned windows) stored raw in one pinned, preallocated file in f2fs `userdata` (UFS LUN 0, 4 KiB
+blocks). Its extents reach the kernel as on the xnu-8796 lane (`xnu/patches/0088`): ADT `/chosen`
+`fuxi-root-extents` = u64 triples {file block, userdata block, blocks} and `fuxi-root-blocks`, built by
+`mkadt-fuxi27.py --root-extents EXTENTS.json --root-bytes N` (same JSON and checks as `mkadt-fuxi.py`), plus a
+`/fuxi-ufs` node with the UFS host `reg` (0x1d84000/0x3000).
+
+`iokit/Kernel/arm/FuxiRoot27.cpp` (FUXI only, off unless boot-arg `fuxi_root27=1`), started from `bsd_init()` right
+after `vfsinit()` on its own thread:
+
+1. UFS transport: the default (non-UniXNU) path of `xnu/fuxi-unixnu/sweet_ufs.c`, unchanged in substance: the
+   GCC UFS PHY AHB auto-gating step, take over the bootloader-initialised host (verify `UTRLBA` readback before any
+   doorbell), polled UTP requests in slot 0, full clean+invalidate around DMA, 1 MiB bounce buffer
+   (physically contiguous `IOBufferMemoryDescriptor`), 5 s timeout. Only three commands can be built: ACTIVE power
+   (START STOP UNIT to the device WLUN 0xd0), TEST UNIT READY and READ(10) on LUN 0. There is no write path at all.
+2. GPT `userdata`, then the extent table is validated (file blocks contiguous from 0, every extent inside
+   `userdata`, no two extents sharing blocks, covering `fuxi-root-blocks`). From then on every READ(10) must lie
+   inside one extent (`fx27_io_allowed`, checked again in the command builder).
+3. File block 0: SHA-256 of the manifest checked (`libkern/crypto/sha2.h`), windows parsed (`fx27_manifest`).
+4. Each window is published read-only, like an iPhone's `disk0`/`disk0s1`:
+   `FuxiRootWindow` (on the platform expert) -> whole `IOMedia` -> `FuxiRootWindow` with `IOMatchCategory` =
+   `IOStorage` and `Content Mask` = `GUID_partition_scheme` -> partition `IOMedia` named after the window, location
+   `1`, `Partition ID` 1, `Base` 0, block size 512, `Content Hint` = the APFS GPT type
+   `7C3457EF-0000-11AA-AA11-00306543ECAC` (boot-arg `fuxi_root27_hint=` replaces it, e.g. `Apple_APFS`), `UUID` =
+   the first 16 bytes of the window's manifest SHA-256 as a v4 UUID (`fx27_window_uuid`). Our providers serve
+   `read` directly from the window (async and sync); writes complete with `kIOReturnNotWritable` and both IOMedia
+   are created with `isWritable = false`. The `rw` manifest flag is logged only.
+
+Pure logic (extent table, map, guard, read planning, manifest, UUID) lives in `iokit/Kernel/arm/fuxi_root27.h`, which
+`tools/test-fuxi-ios27.py` compiles with the host cc and compares with its Python mirror (random tables including
+overlaps, gaps, out-of-partition and short tables; plans at every alignment; manifests from `ios27-root.py image`
+and damaged copies), and checks that a whole-file read through the plans returns exactly the file's blocks.
+
+### Why an IOMedia mirror, not an IOBlockStorageDevice
+
+IOStorageFamily and APFS are prelinked Apple kexts; the native kernel cannot link against kext symbols
+(`tools/xnuprelink` resolves kext->kernel only), so an in-kernel `IOBlockStorageDevice` subclass is not possible,
+and adding our own kext to the prelink is a larger step (bundle, personalities, signing). Instead
+`iokit/Kernel/arm/fuxi_storage_abi.h` restates IOStorage's and IOMedia's virtual methods from Apple's public
+IOStorageFamily-337.100.1 headers as compiled for iOS (`TARGET_OS_OSX` 0: no `attach`/`synchronizeCache`/`discard`
+slots; no vtable padding on iOS, so the reserved slots do not exist). The classes keep Apple's names because arm64e
+signs every vtable entry with a discriminator derived from the mangled name of the method that introduced the slot;
+the same declarations give the same slot index and the same signature. The IOMedia objects are the kext's own:
+allocated with `OSMetaClass::copyMetaClassWithName("IOMedia")->alloc()` (after waiting up to 60 s for the class),
+initialised with the virtual `IOMedia::init(...)`, then checked through their properties (`Size`, `Whole`,
+`Content Hint`); a mismatch is logged as "vtable mirror out of date" and nothing is published. Our providers are
+not kext `IOStorage` instances (`OSDynamicCast(IOStorage)` fails), so `IOMedia::handleOpen` skips the provider open,
+while `IOMedia::read` calls `getProvider()->read(...)` unchecked through the mirrored slot. UniXNU's NativeUfs
+(an IOBlockStorageDevice built into their kernel) and null-root-media were read for reference only; no code taken.
+
+### Root selection
+
+`mkadt-fuxi27.py --root-uuid OS-VOLUME-UUID` adds `/chosen root-matching`:
+`<dict><key>IOProviderClass</key><string>IOMedia</string><key>IOPropertyMatch</key><dict><key>UUID</key><string>…</string></dict></dict>`.
+`IOFindBSDRoot` reads it before `boot-uuid` and the default `Content = Apple_HFS` match, so the boot needs **no
+`rd=`** (`rd=md0`/`rootdev=` would override it) and **no `--ramdisk`**. The UUID is the APFS system volume's UUID
+from `ios27-root.py image --report` (`volumes.OS[*].uuid`, the `System` role), upper case. GUESS: APFS publishes each
+volume as an IOMedia under its container with `UUID` = the volume UUID (as on a Mac); if not, the per-window
+partition UUID (`fx27_window_uuid`) or `rd=diskNsM` from the log are the fallbacks.
+
+### Next boot (not yet observed)
+
+A CI kernel with `fuxi/0007` (the native kernel changes, so re-run `ios27-prelink.py` as in K2a), then:
+
+```
+python3 tools/mkadt-fuxi27.py fuxi27-k4.adt --root-extents EXTENTS.json --root-bytes ROOT_BYTES \
+    --root-uuid OS_SYSTEM_VOLUME_UUID          # 20 KiB with 366 extents (cpus 7: 22 KiB)
+python3 tools/mkpayload.py OUT/mach.development.fuxi.chained.unstripped fuxi27-k4.adt payload27k4.bin \
+    --boot-line-length 1024 --cmdline "$(cat OUT/cmdline.txt) fuxi_root27=1 dyld_flags=8" \
+    --prelinked K2DIR/kernel.prelinked --allow-incomplete --trustcache K3-BUNDLE.tc   # as K3 without rd=md0/--ramdisk
+```
+
+The ADT with the extent table exceeds the loader's old 16 KiB cap: `shim/fuxi-loader/loader.c` now accepts up to
+64 KiB for version 2 payloads (v1 unchanged) and `mkpayload.py` refuses larger ADTs per version, so the loader must
+be rebuilt. Expected log: `FUXI ROOT27: CAP=...`, `userdata first block ...; root 366 extents`, one
+`FUXI ROOT27: window OS/SystemOS/AppOS ... read-only, UUID ..., hint ...` line per window, IOMediaBSDClient nodes,
+APFS container/volume matching, then `BSD root: diskNsM`. Failure points to look for: the GCC/host checks (same as
+the 8796 lane), `IOMedia::init did not take` (mirror wrong), no APFS match (content hint; try
+`fuxi_root27_hint=Apple_APFS`), and the root mount itself (sealed system volume and its snapshot).
+
+Out of scope for K4a, next: the Data volume (writable, `/private/var`), the SystemOS/AppOS cryptex grafts (union with
+the OS volume), the sealed-volume root snapshot (`root-snapshot-name`/ APFS seal checks), launchd changes, and a
+writable path (extent-guarded WRITE(10) as on the 8796 lane).
+
 ## K1 on the device: what to expect (GUESS, not yet observed)
 
 1. Loader as today, then `XNU jumping`. The monitor stage word moves through start.s stages 1-4 (`0x10001..4`), then
@@ -226,7 +315,9 @@ ld-classic chains (0x101), ADT parsing in ArmDTPlatform/ArmCpu (after 0x10f), an
   as UniXNU sets it; the DEVELOPMENT kernel passes the tunable to every exec) dyld runs and stops as expected:
   `Library not loaded: /usr/lib/libSystem.B.dylib ... no dyld cache`, then "initproc failed to start". The panic
   path itself nests (open). Next: a real root with the shared cache (K4).
-- **K4** UFS root (port our FuxiUFS or UniXNU's UFS layer) and launchd.
+- **K4** UFS root and launchd. **K4a (kernel + host tools, not yet observed):** `fuxi/0007` reads the pinned root
+  file over UFS (read-only, extent-guarded) and publishes the OS/SystemOS/AppOS windows as Apple IOMedia; root by
+  `/chosen root-matching` on the OS volume UUID (section above).
 - **K5** Display/backlight/touch/buttons on 12377 (port the xnu-8796 Fuxi drivers).
 - **K6** GPU (Adreno 740 path) and SMP on all 7 usable cores.
 
@@ -239,4 +330,8 @@ ld-classic chains (0x101), ADT parsing in ArmDTPlatform/ArmCpu (after 0x10f), an
 - iig and SDK: 12377 with Xcode 26+ iig (GUESS: matches; UniXNU builds 12377 with a current Xcode).
 - `deviceTreeP`/`virtBase` alignment for 4K start.s: the loader keeps the 32 MiB-aligned virt_base (GUESS fine).
 - PSCI method (`smc` under Gunyah, as the xnu-8796 kernel) and 7 of 8 cores; cpu@100 stays with the loader monitor.
+- K4a: the IOStorage/IOMedia mirror is checked only against the public 337.100.1 headers; the iOS 27 kext may
+  differ (the property check after `init` catches an init slot mismatch, not a read slot mismatch). APFS matching
+  keys and root mounting from an IOMedia without iBoot's `boot-uuid` are GUESSES. Polled UFS reads run in the
+  caller's thread under one lock (no queueing, no interrupts): slow but simple.
 - The CI ADT seed is fixed per build (random per run, the same on every boot of that artifact).

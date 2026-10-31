@@ -1,0 +1,1084 @@
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index 190aa96..a8d7e53 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -81,6 +81,7 @@
+ 
+ #if defined(FUXI)
+ extern void fuxi_early_mark(unsigned int stage, const char *label); /* osfmk/arm64/fuxi_console.c */
++extern void fuxi_root27_start(void); /* iokit/Kernel/arm/FuxiRoot27.cpp */
+ #endif
+ #include <sys/param.h>
+ #include <sys/filedesc.h>
+@@ -703,6 +704,9 @@ bsd_init(void)
+ 	/* Initialize the file systems. */
+ 	bsd_init_kprintf("calling vfsinit\n");
+ 	vfsinit();
++#if defined(FUXI)
++	fuxi_root27_start();
++#endif
+ 
+ #if CONFIG_PROC_UUID_POLICY
+ 	/* Initial proc_uuid_policy subsystem */
+diff --git a/iokit/Kernel/arm/FuxiRoot27.cpp b/iokit/Kernel/arm/FuxiRoot27.cpp
+new file mode 100644
+index 0000000..e6d5bd6
+--- /dev/null
++++ b/iokit/Kernel/arm/FuxiRoot27.cpp
+@@ -0,0 +1,682 @@
++/*
++ * Fuxi iOS 27 root storage (K4).
++ *
++ * The root is one pinned file inside Android's f2fs userdata (UFS LUN 0); see
++ * fuxi_root27.h for the ADT extent table and the SHNGROOT manifest. This file
++ * reads it over the bootloader-initialised Qualcomm UFS host (polled UTP
++ * transfer requests in slot 0: the default, non-UniXNU path of the xnu-8796
++ * lane's sweet_ufs.c) and publishes every manifest window as IOStorageFamily media
++ * the way an iPhone shows disk0 / disk0s1:
++ *
++ *   platform - FuxiRootWindow - IOMedia (whole) - FuxiRootWindow ("IOStorage",
++ *   Content Mask GUID_partition_scheme) - IOMedia (window name, location 1,
++ *   Content Hint = APFS GPT type, UUID from the window's manifest SHA-256)
++ *
++ * IOMedia belongs to the prelinked Apple IOStorageFamily, which the kernel
++ * cannot link against: it is created through its OSMetaClass and driven
++ * through the vtable mirror in fuxi_storage_abi.h; the providers are ours and
++ * serve reads directly from the window. Every window is read-only (writes are
++ * refused here and IOMedia is not writable); the only commands are TEST UNIT
++ * READY, the device-WLUN ACTIVE power START STOP UNIT and READ(10), and once
++ * the extent table is loaded no READ(10) leaves the file's extents.
++ *
++ * Off unless boot-arg fuxi_root27=1. fuxi_root27_hint= replaces the content
++ * hint. Started from bsd_init() after vfsinit(); IOFindBSDRoot waits for the
++ * media (ADT /chosen root-matching, tools/mkadt-fuxi27.py --root-uuid).
++ */
++#if defined(FUXI)
++#include <IOKit/system.h>
++#include <kern/clock.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <libkern/c++/OSKext.h>
++#include <libkern/crypto/sha2.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include "fuxi_root27.h"
++#include "fuxi_storage_abi.h"
++
++extern "C" {
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern void flush_dcache64(addr64_t addr, unsigned count, int phys);
++void fuxi_root27_start(void);
++}
++
++#define REG_CAP         0x00
++#define REG_IS          0x20
++#define REG_IE          0x24
++#define REG_HCS         0x30
++#define REG_HCE         0x34
++#define REG_UTRLBA      0x50
++#define REG_UTRLBAU     0x54
++#define REG_UTRLDBR     0x58
++#define REG_UTRLCLR     0x5c
++#define REG_UTRLRSR     0x60
++#define HCS_DP          (1u << 0)
++#define HCS_UTRLRDY     (1u << 1)
++#define CAP_64AS        (1u << 24)
++#define PRDT_CHUNK      (256u << 10)
++#define DMA_UTRL        0x0000
++#define DMA_UCD         0x1000
++#define DMA_BOUNCE      0x4000
++#define DMA_SIZE        (DMA_BOUNCE + FX27_BOUNCE)
++#define WLUN_DEVICE     0xd0
++#define APFS_GPT_TYPE   "7C3457EF-0000-11AA-AA11-00306543ECAC"
++
++struct utrd { uint32_t dw0, dw1, dw2, dw3, ucdba, ucdbau, resp, prdt; };
++struct ucd {
++	uint8_t cmd[512], resp[512];
++	struct { uint32_t addr_lo, addr_hi, rsvd, dbc; } prdt[FX27_BOUNCE / PRDT_CHUNK];
++};
++
++static struct {
++	vm_offset_t regs;
++	IOBufferMemoryDescriptor *dmamd;
++	uint8_t *dma;
++	uint64_t dma_pa;
++	uint8_t lun, tag;
++	bool guard;                     /* extents loaded: READ(10) only inside them */
++	uint64_t part_first, part_blocks, root_blocks;
++	struct fx27_extent ext[FX27_MAX_EXTENTS];
++	unsigned next;
++	struct fx27_window win[FX27_MAX_WINDOWS];
++	unsigned nwin;
++	IOLock *lock;
++} fr;
++
++static inline uint32_t
++ufs_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(fr.regs + off);
++}
++
++static inline void
++ufs_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(fr.regs + off) = v;
++}
++
++static void
++dma_sync(uint32_t off, uint32_t len)
++{
++	flush_dcache64((addr64_t)(fr.dma_pa + off), len, TRUE);
++}
++
++/* One read-only command in slot 0, data into the bounce buffer. Lock held. */
++static IOReturn
++ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len)
++{
++	bool power = len == 0 && cdb_len == 6 && fr.lun == WLUN_DEVICE && cdb[0] == 0x1b &&
++	    !cdb[1] && !cdb[2] && !cdb[3] && cdb[4] == 0x10 && !cdb[5];
++	bool tur = len == 0 && cdb_len == 6 && fr.lun == 0 && cdb[0] == 0x00;
++	bool rd = cdb_len == 10 && fr.lun == 0 && cdb[0] == 0x28 && len > 0 && len <= FX27_BOUNCE &&
++	    len == ((uint32_t)cdb[7] << 8 | cdb[8]) * FX27_BLOCK && (!fr.guard ||
++	    fx27_io_allowed(fr.ext, fr.next, fr.part_first,
++	    (uint64_t)cdb[2] << 24 | cdb[3] << 16 | cdb[4] << 8 | cdb[5], (uint64_t)cdb[7] << 8 | cdb[8]));
++	if (!power && !tur && !rd) {
++		IOLog("FUXI ROOT27: refusing command 0x%02x lun 0x%x len %u\n", cdb[0], fr.lun, len);
++		return kIOReturnNotPermitted;
++	}
++	struct utrd *utrd = (struct utrd *)(void *)(fr.dma + DMA_UTRL);
++	struct ucd *ucd = (struct ucd *)(void *)(fr.dma + DMA_UCD);
++	uint64_t ucd_pa = fr.dma_pa + DMA_UCD, bounce_pa = fr.dma_pa + DMA_BOUNCE;
++	bzero(utrd, sizeof(*utrd));
++	bzero(ucd, sizeof(*ucd));
++	ucd->cmd[0] = 0x01;
++	ucd->cmd[1] = len ? 0x40 : 0x00;
++	ucd->cmd[2] = fr.lun;
++	ucd->cmd[3] = ++fr.tag;
++	ucd->cmd[12] = (uint8_t)(len >> 24);
++	ucd->cmd[13] = (uint8_t)(len >> 16);
++	ucd->cmd[14] = (uint8_t)(len >> 8);
++	ucd->cmd[15] = (uint8_t)len;
++	memcpy(&ucd->cmd[16], cdb, cdb_len);
++	utrd->dw0 = (1u << 28) | ((len ? 2u : 0u) << 25) | (1u << 24);
++	utrd->dw2 = 0x0f;
++	utrd->ucdba = (uint32_t)ucd_pa;
++	utrd->ucdbau = (uint32_t)(ucd_pa >> 32);
++	utrd->resp = (512u / 4) << 16 | (512u / 4);
++	if (len) {
++		uint32_t n = 0;
++		for (uint32_t done = 0; done < len; done += PRDT_CHUNK, n++) {
++			uint32_t chunk = len - done < PRDT_CHUNK ? len - done : PRDT_CHUNK;
++			ucd->prdt[n].addr_lo = (uint32_t)(bounce_pa + done);
++			ucd->prdt[n].addr_hi = (uint32_t)((bounce_pa + done) >> 32);
++			ucd->prdt[n].dbc = chunk - 1;
++		}
++		utrd->prdt = (1024u / 4) << 16 | n;
++	}
++	dma_sync(DMA_UTRL, sizeof(*utrd));
++	dma_sync(DMA_UCD, sizeof(*ucd));
++	if (len) {
++		dma_sync(DMA_BOUNCE, len);
++	}
++	__builtin_arm_dsb(0xf);
++	ufs_wr(REG_UTRLDBR, 1);
++	uint64_t deadline;
++	clock_interval_to_deadline(5, kSecondScale, &deadline);
++	while (ufs_rd(REG_UTRLDBR) & 1) {
++		if (mach_absolute_time() > deadline) {
++			ufs_wr(REG_UTRLCLR, ~1u);
++			IOLog("FUXI ROOT27: command 0x%02x timed out\n", cdb[0]);
++			return kIOReturnTimeout;
++		}
++		IODelay(2);
++	}
++	__builtin_arm_dsb(0xf);
++	ufs_wr(REG_IS, ufs_rd(REG_IS));
++	dma_sync(DMA_UTRL, sizeof(*utrd));
++	dma_sync(DMA_UCD, sizeof(*ucd));
++	if (len) {
++		dma_sync(DMA_BOUNCE, len);
++	}
++	uint32_t ocs = utrd->dw2 & 0xff;
++	if (ocs || ucd->resp[0] != 0x21 || ucd->resp[6] || ucd->resp[7]) {
++		IOLog("FUXI ROOT27: command 0x%02x failed: ocs 0x%x upiu 0x%x response 0x%x status 0x%x\n",
++		    cdb[0], ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7]);
++		return kIOReturnIOError;
++	}
++	return kIOReturnSuccess;
++}
++
++static IOReturn
++ufs_read_blocks(uint64_t lba, uint32_t count)
++{
++	if (count == 0 || lba + count - 1 > UINT32_MAX || count > FX27_BOUNCE / FX27_BLOCK) {
++		return kIOReturnBadArgument;
++	}
++	uint8_t cdb[10] = {
++		0x28, 0, (uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
++		0, (uint8_t)(count >> 8), (uint8_t)count, 0
++	};
++	return ufs_scsi(cdb, sizeof(cdb), count * FX27_BLOCK);
++}
++
++static IOReturn
++ufs_find_userdata(void)
++{
++	const uint8_t *b = fr.dma + DMA_BOUNCE;
++	IOReturn ret = ufs_read_blocks(1, 1);
++	if (ret) {
++		return ret;
++	}
++	if (memcmp(b, "EFI PART", 8)) {
++		return kIOReturnNotFound;
++	}
++	uint64_t entry_lba = fx27_le64(b + 72);
++	uint32_t nent = fx27_le32(b + 80), esz = fx27_le32(b + 84);
++	if (esz != 128 || nent == 0 || nent > FX27_BOUNCE / esz) {
++		return kIOReturnUnsupported;
++	}
++	if ((ret = ufs_read_blocks(entry_lba, (nent * esz + FX27_BLOCK - 1) / FX27_BLOCK))) {
++		return ret;
++	}
++	static const char want[] = "userdata";         /* UTF-16LE name at 56, NUL terminated */
++	for (uint32_t i = 0; i < nent; i++) {
++		const uint8_t *e = b + i * esz;
++		unsigned c = 0;
++		while (c < sizeof(want) && e[56 + 2 * c] == (uint8_t)want[c] && !e[57 + 2 * c]) {
++			c++;
++		}
++		if (c != sizeof(want)) {
++			continue;
++		}
++		uint64_t first = fx27_le64(e + 32), last = fx27_le64(e + 40);
++		if (last < first) {
++			return kIOReturnNotFound;
++		}
++		fr.part_first = first;
++		fr.part_blocks = last - first + 1;
++		return kIOReturnSuccess;
++	}
++	return kIOReturnNotFound;
++}
++
++static IOReturn
++ufs_take_over_host(void)
++{
++	uint32_t hce = ufs_rd(REG_HCE), hcs = ufs_rd(REG_HCS);
++	if (!(hce & 1) || !(hcs & HCS_DP) || !(hcs & HCS_UTRLRDY) || ufs_rd(REG_UTRLDBR)) {
++		IOLog("FUXI ROOT27: host not idle (hce 0x%x hcs 0x%x)\n", hce, hcs);
++		return kIOReturnNotReady;
++	}
++	if (((fr.dma_pa + DMA_SIZE - 1) >> 32) && !(ufs_rd(REG_CAP) & CAP_64AS)) {
++		return kIOReturnUnsupported;
++	}
++	ufs_wr(REG_IE, 0);
++	ufs_wr(REG_IS, ufs_rd(REG_IS));
++	ufs_wr(REG_UTRLRSR, 0);
++	uint64_t list = fr.dma_pa + DMA_UTRL;
++	ufs_wr(REG_UTRLBA, (uint32_t)list);
++	ufs_wr(REG_UTRLBAU, (uint32_t)(list >> 32));
++	ufs_wr(REG_UTRLRSR, 1);
++	if (ufs_rd(REG_UTRLBA) != (uint32_t)list || ufs_rd(REG_UTRLBAU) != (uint32_t)(list >> 32) ||
++	    !(ufs_rd(REG_UTRLRSR) & 1)) {
++		IOLog("FUXI ROOT27: host did not take our request list\n");
++		return kIOReturnIOError;
++	}
++	return kIOReturnSuccess;
++}
++
++/* Disable only the UFS PHY AHB clock auto-gating (GCC 0x177024), as the 8796 lane. */
++static IOReturn
++ufs_power(void)
++{
++	vm_offset_t gcc = ml_io_map(0x177000, 0x1000);
++	if (!gcc) {
++		return kIOReturnNoMemory;
++	}
++	volatile uint32_t *ahb = (volatile uint32_t *)(gcc + 0x24);
++	uint32_t old = *ahb;
++	if (!(old & 1) || !(*(volatile uint32_t *)(gcc + 4) & 0x80000000) ||
++	    ((*(volatile uint32_t *)(gcc + 0x18) | *(volatile uint32_t *)(gcc + 0x68)) & 0x80000000)) {
++		IOLog("FUXI ROOT27: UFS power/AXI/UniPro not ready\n");
++		return kIOReturnNotReady;
++	}
++	*ahb = old & ~2u;
++	__builtin_arm_dsb(0xf);
++	uint64_t deadline;
++	clock_interval_to_deadline(1, kMillisecondScale, &deadline);
++	while ((*ahb & 0x80000000) && mach_absolute_time() < deadline) {
++	}
++	if (*ahb & 0x80000000) {
++		*ahb = old;
++		return kIOReturnTimeout;
++	}
++	return kIOReturnSuccess;
++}
++
++/* Root bytes [pos, pos + len) into buffer at offset, through the extent map. */
++static IOReturn
++root_read(uint64_t pos, uint64_t len, IOMemoryDescriptor *buffer, IOByteCount offset, uint64_t *done)
++{
++	struct fx27_io io;
++	IOReturn ret = kIOReturnSuccess;
++	*done = 0;
++	IOLockLock(fr.lock);
++	while (*done < len) {
++		if (fx27_plan(fr.ext, fr.next, fr.part_first, pos + *done, len - *done, &io) ||
++		    !fx27_io_allowed(fr.ext, fr.next, fr.part_first, io.lba, io.blocks)) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		if ((ret = ufs_read_blocks(io.lba, io.blocks))) {
++			break;
++		}
++		if (buffer) {
++			if (buffer->writeBytes(offset + *done, fr.dma + DMA_BOUNCE + io.skip, io.want) != io.want) {
++				ret = kIOReturnUnderrun;
++				break;
++			}
++		}
++		*done += io.want;
++	}
++	IOLockUnlock(fr.lock);
++	return ret;
++}
++
++class FuxiRootWindow : public IOStorage
++{
++	OSDeclareDefaultStructors(FuxiRootWindow);
++	unsigned window;
++public:
++	bool initWindow(unsigned index, OSDictionary *props);
++	IOReturn serve(UInt64 byteStart, IOMemoryDescriptor *buffer, UInt64 *actual);
++	virtual bool open(IOService *client, IOOptionBits options, IOStorageAccess access) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn read(IOService *client, UInt64 byteStart, IOMemoryDescriptor *buffer,
++	    IOStorageAttributes *attributes = 0, UInt64 *actualByteCount = 0) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn write(IOService *client, UInt64 byteStart, IOMemoryDescriptor *buffer,
++	    IOStorageAttributes *attributes = 0, UInt64 *actualByteCount = 0) APPLE_KEXT_OVERRIDE;
++	virtual void read(IOService *client, UInt64 byteStart, IOMemoryDescriptor *buffer,
++	    IOStorageAttributes *attributes, IOStorageCompletion *completion) APPLE_KEXT_OVERRIDE;
++	virtual void write(IOService *client, UInt64 byteStart, IOMemoryDescriptor *buffer,
++	    IOStorageAttributes *attributes, IOStorageCompletion *completion) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn unmap(IOService *client, IOStorageExtent *extents, UInt32 extentsCount,
++	    IOStorageUnmapOptions options = 0) APPLE_KEXT_OVERRIDE;
++	virtual bool lockPhysicalExtents(IOService *client) APPLE_KEXT_OVERRIDE;
++	virtual IOStorage * copyPhysicalExtent(IOService *client, UInt64 *byteStart, UInt64 *byteCount) APPLE_KEXT_OVERRIDE;
++	virtual void unlockPhysicalExtents(IOService *client) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn setPriority(IOService *client, IOStorageExtent *extents, UInt32 extentsCount,
++	    IOStoragePriority priority) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn synchronize(IOService *client, UInt64 byteStart, UInt64 byteCount,
++	    IOStorageSynchronizeOptions options = 0) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn getProvisionStatus(IOService *client, UInt64 byteStart, UInt64 byteCount,
++	    UInt32 *extentsCount, IOStorageProvisionExtent *extents,
++	    IOStorageGetProvisionStatusOptions options = 0) APPLE_KEXT_OVERRIDE;
++};
++
++const OSMetaClass &IOStorage::gMetaClass = IOService::gMetaClass;
++OSDefineMetaClassAndStructors(FuxiRootWindow, IOStorage);
++
++bool
++FuxiRootWindow::initWindow(unsigned index, OSDictionary *props)
++{
++	window = index;
++	return IOService::init(props);
++}
++
++IOReturn
++FuxiRootWindow::serve(UInt64 byteStart, IOMemoryDescriptor *buffer, UInt64 *actual)
++{
++	const struct fx27_window *w = &fr.win[window];
++	UInt64 length = buffer ? buffer->getLength() : 0, done = 0;
++	IOReturn ret = kIOReturnBadArgument;
++	if (buffer && byteStart <= w->size && length <= w->size - byteStart) {
++		ret = root_read(w->offset + byteStart, length, buffer, 0, &done);
++	}
++	if (actual) {
++		*actual = done;
++	}
++	return ret;
++}
++
++bool
++FuxiRootWindow::open(IOService *, IOOptionBits, IOStorageAccess access)
++{
++	return !(access & 0x2);         /* kIOStorageAccessWriter */
++}
++
++IOReturn
++FuxiRootWindow::read(IOService *, UInt64 byteStart, IOMemoryDescriptor *buffer, IOStorageAttributes *,
++    UInt64 *actualByteCount)
++{
++	return serve(byteStart, buffer, actualByteCount);
++}
++
++IOReturn
++FuxiRootWindow::write(IOService *, UInt64, IOMemoryDescriptor *, IOStorageAttributes *, UInt64 *actualByteCount)
++{
++	if (actualByteCount) {
++		*actualByteCount = 0;
++	}
++	return kIOReturnNotWritable;
++}
++
++void
++FuxiRootWindow::read(IOService *, UInt64 byteStart, IOMemoryDescriptor *buffer, IOStorageAttributes *,
++    IOStorageCompletion *completion)
++{
++	UInt64 actual = 0;
++	IOReturn ret = serve(byteStart, buffer, &actual);
++	if (completion && completion->action) {
++		completion->action(completion->target, completion->parameter, ret, actual);
++	}
++}
++
++void
++FuxiRootWindow::write(IOService *, UInt64, IOMemoryDescriptor *, IOStorageAttributes *,
++    IOStorageCompletion *completion)
++{
++	if (completion && completion->action) {
++		completion->action(completion->target, completion->parameter, kIOReturnNotWritable, 0);
++	}
++}
++
++IOReturn
++FuxiRootWindow::unmap(IOService *, IOStorageExtent *, UInt32, IOStorageUnmapOptions)
++{
++	return kIOReturnUnsupported;
++}
++
++bool
++FuxiRootWindow::lockPhysicalExtents(IOService *)
++{
++	return false;
++}
++
++IOStorage *
++FuxiRootWindow::copyPhysicalExtent(IOService *, UInt64 *, UInt64 *)
++{
++	return NULL;
++}
++
++void
++FuxiRootWindow::unlockPhysicalExtents(IOService *)
++{
++}
++
++IOReturn
++FuxiRootWindow::setPriority(IOService *, IOStorageExtent *, UInt32, IOStoragePriority)
++{
++	return kIOReturnUnsupported;
++}
++
++IOReturn
++FuxiRootWindow::synchronize(IOService *, UInt64, UInt64, IOStorageSynchronizeOptions)
++{
++	return kIOReturnSuccess;
++}
++
++IOReturn
++FuxiRootWindow::getProvisionStatus(IOService *, UInt64, UInt64, UInt32 *, IOStorageProvisionExtent *,
++    IOStorageGetProvisionStatusOptions)
++{
++	return kIOReturnUnsupported;
++}
++
++/* A kext IOMedia, initialised through the mirror and checked through its properties. */
++static IOMedia *
++media_create(const OSMetaClass *meta, UInt64 size, UInt64 block, bool whole, const char *hint, OSDictionary *props)
++{
++	OSObject *obj = meta->alloc();
++	if (!obj || !obj->metaCast("IOMedia")) {
++		OSSafeReleaseNULL(obj);
++		return NULL;
++	}
++	IOMedia *m = static_cast<IOMedia *>(obj);
++	OSNumber *n;
++	OSBoolean *b;
++	OSString *s;
++	if (!m->init(0, size, block, 0, whole, false, hint, props) ||
++	    !(n = OSDynamicCast(OSNumber, m->getProperty(kIOMediaSizeKey))) || n->unsigned64BitValue() != size ||
++	    !(b = OSDynamicCast(OSBoolean, m->getProperty(kIOMediaWholeKey))) || b->getValue() != whole ||
++	    !(s = OSDynamicCast(OSString, m->getProperty(kIOMediaContentHintKey))) ||
++	    !s->isEqualTo(hint ? hint : "")) {
++		IOLog("FUXI ROOT27: IOMedia::init did not take (vtable mirror out of date?)\n");
++		m->release();
++		return NULL;
++	}
++	return m;
++}
++
++static bool
++put(OSDictionary *d, const char *key, OSObject *value)
++{
++	bool ok = value && d->setObject(key, value);
++	OSSafeReleaseNULL(value);
++	return ok;
++}
++
++static bool
++publish(const OSMetaClass *meta, unsigned i, const char *hint)
++{
++	const struct fx27_window *w = &fr.win[i];
++	char uuid[37];
++	fx27_window_uuid(w->sha256, uuid);
++	FuxiRootWindow *top = new FuxiRootWindow, *scheme = new FuxiRootWindow;
++	OSDictionary *sp = OSDictionary::withCapacity(2), *pp = OSDictionary::withCapacity(4);
++	IOMedia *whole = NULL, *part = NULL;
++	bool ok = false;
++	if (!top || !scheme || !sp || !pp || !top->initWindow(i, NULL)) {
++		goto out;
++	}
++	if (!put(sp, gIOMatchCategoryKey->getCStringNoCopy(), OSString::withCString(kIOStorageCategory)) ||
++	    !put(sp, kIOMediaContentMaskKey, OSString::withCString("GUID_partition_scheme")) ||
++	    !put(pp, kIOMediaPartitionIDKey, OSNumber::withNumber(1ULL, 32)) ||
++	    !put(pp, kIOMediaBaseKey, OSNumber::withNumber(0ULL, 64)) ||
++	    !put(pp, kIOMediaUUIDKey, OSString::withCString(uuid)) || !scheme->initWindow(i, sp) ||
++	    !(whole = media_create(meta, w->size, 512, true, NULL, NULL)) ||
++	    !(part = media_create(meta, w->size, 512, false, hint, pp))) {
++		goto out;
++	}
++	top->setName(w->name);
++	part->setName(w->name);
++	part->setLocation("1");
++	if (!top->attach(IOService::getPlatform()) || !whole->attach(top) || !scheme->attach(whole) ||
++	    !part->attach(scheme)) {
++		goto out;
++	}
++	top->registerService();
++	whole->registerService();
++	scheme->registerService();
++	part->registerService();
++	IOLog("FUXI ROOT27: window %s at %#llx, %llu bytes, read-only, UUID %s, hint %s\n",
++	    w->name, w->offset, w->size, uuid, hint);
++	ok = true;
++out:
++	OSSafeReleaseNULL(sp);
++	OSSafeReleaseNULL(pp);
++	OSSafeReleaseNULL(top);
++	OSSafeReleaseNULL(scheme);
++	OSSafeReleaseNULL(whole);
++	OSSafeReleaseNULL(part);
++	return ok;
++}
++
++static IOReturn
++root_open(void)
++{
++	DTEntry node;
++	const uint64_t *reg = NULL;
++	const uint8_t *table = NULL, *blocks = NULL;
++	unsigned int size = 0, tsize = 0;
++	IOReturn ret;
++	if (SecureDTLookupEntry(NULL, "/chosen", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "fuxi-root-extents", (void const **)&table, &tsize) != kSuccess ||
++	    SecureDTGetProperty(node, "fuxi-root-blocks", (void const **)&blocks, &size) != kSuccess ||
++	    size != 8 || SecureDTLookupEntry(NULL, "/fuxi-ufs", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess || size < 16) {
++		IOLog("FUXI ROOT27: no /chosen fuxi-root-extents/-blocks or /fuxi-ufs reg\n");
++		return kIOReturnNotFound;
++	}
++	fr.root_blocks = fx27_le64(blocks);
++	if ((ret = ufs_power())) {
++		return ret;
++	}
++	fr.dmamd = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, DMA_SIZE, 0xFFFFFFFFF000ULL);
++	if (!fr.dmamd || fr.dmamd->prepare() != kIOReturnSuccess) {
++		return kIOReturnNoMemory;
++	}
++	fr.dma = (uint8_t *)fr.dmamd->getBytesNoCopy();
++	fr.dma_pa = fr.dmamd->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
++	fr.regs = ml_io_map(reg[0], reg[1]);
++	fr.lock = IOLockAlloc();
++	if (!fr.dma || !fr.dma_pa || !fr.regs || !fr.lock) {
++		return kIOReturnNoMemory;
++	}
++	bzero(fr.dma, DMA_SIZE);
++	IOLockLock(fr.lock);
++	IOLog("FUXI ROOT27: CAP=0x%x HCS=0x%x HCE=0x%x DMA=0x%llx\n", ufs_rd(REG_CAP), ufs_rd(REG_HCS),
++	    ufs_rd(REG_HCE), fr.dma_pa);
++	ret = ufs_take_over_host();
++	if (!ret) {
++		static const uint8_t active[6] = { 0x1b, 0, 0, 0, 0x10, 0 };
++		fr.lun = WLUN_DEVICE;
++		for (int i = 0; i < 3 && (ret = ufs_scsi(active, sizeof(active), 0)); i++) {
++		}
++		fr.lun = 0;
++	}
++	if (!ret) {
++		static const uint8_t tur[6] = { 0x00 };
++		for (int i = 0; i < 3 && (ret = ufs_scsi(tur, sizeof(tur), 0)); i++) {
++		}
++	}
++	if (!ret) {
++		ret = ufs_find_userdata();
++	}
++	if (!ret) {
++		int e = fx27_load_extents(table, tsize, fr.root_blocks, fr.part_blocks, fr.ext, &fr.next);
++		if (e) {
++			IOLog("FUXI ROOT27: bad extent table (%d)\n", e);
++			ret = kIOReturnBadArgument;
++		} else {
++			fr.guard = true;
++		}
++	}
++	IOLockUnlock(fr.lock);
++	if (ret) {
++		IOLog("FUXI ROOT27: UFS/userdata/extents failed: 0x%x\n", ret);
++		return ret;
++	}
++	IOLog("FUXI ROOT27: userdata first block 0x%llx, %llu blocks; root %u extents, %llu blocks\n",
++	    fr.part_first, fr.part_blocks, fr.next, fr.root_blocks);
++	return kIOReturnSuccess;
++}
++
++static IOReturn
++root_manifest(void)
++{
++	static uint8_t hdr[FX27_HDR];
++	IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::withCapacity(FX27_HDR, kIODirectionIn);
++	uint8_t digest[32];
++	uint64_t done;
++	SHA256_CTX ctx;
++	int e;
++	if (!md) {
++		return kIOReturnNoMemory;
++	}
++	md->setLength(FX27_HDR);
++	IOReturn ret = root_read(0, FX27_HDR, md, 0, &done);
++	if (!ret) {
++		memcpy(hdr, md->getBytesNoCopy(), FX27_HDR);
++	}
++	md->release();
++	if (ret) {
++		return ret;
++	}
++	SHA256_Init(&ctx);
++	SHA256_Update(&ctx, hdr, FX27_HDR - 32);
++	SHA256_Final(digest, &ctx);
++	if (memcmp(digest, hdr + FX27_HDR - 32, 32)) {
++		IOLog("FUXI ROOT27: manifest hash mismatch\n");
++		return kIOReturnBadMedia;
++	}
++	if ((e = fx27_manifest(hdr, fr.root_blocks * FX27_BLOCK, fr.win, &fr.nwin))) {
++		IOLog("FUXI ROOT27: bad manifest (%d)\n", e);
++		return kIOReturnBadMedia;
++	}
++	return kIOReturnSuccess;
++}
++
++static void
++fuxi_root27_thread(void *, wait_result_t)
++{
++	char hint[64] = APFS_GPT_TYPE;
++	const OSSymbol *name = OSSymbol::withCStringNoCopy("IOMedia");
++	const OSMetaClass *meta = NULL;
++	PE_parse_boot_argn("fuxi_root27_hint", hint, sizeof(hint));
++	if (root_open() || root_manifest()) {
++		OSSafeReleaseNULL(name);
++		return;
++	}
++	OSKext::loadKextWithIdentifier("com.apple.iokit.IOStorageFamily", false);
++	for (int i = 0; i < 600 && !(meta = OSMetaClass::copyMetaClassWithName(name)); i++) {
++		IOSleep(100);
++	}
++	OSSafeReleaseNULL(name);
++	if (!meta) {
++		IOLog("FUXI ROOT27: IOStorageFamily (IOMedia) never loaded\n");
++		return;
++	}
++	for (unsigned i = 0; i < fr.nwin; i++) {
++		publish(meta, i, hint);
++	}
++	meta->releaseMetaClass();
++}
++
++void
++fuxi_root27_start(void)
++{
++	uint32_t on = 0;
++	thread_t thread;
++	if (!PE_parse_boot_argn("fuxi_root27", &on, sizeof(on)) || on != 1) {
++		return;
++	}
++	if (kernel_thread_start(fuxi_root27_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* FUXI */
+diff --git a/iokit/Kernel/arm/fuxi_root27.h b/iokit/Kernel/arm/fuxi_root27.h
+new file mode 100644
+index 0000000..d32ff30
+--- /dev/null
++++ b/iokit/Kernel/arm/fuxi_root27.h
+@@ -0,0 +1,229 @@
++/*
++ * Fuxi iOS 27 root file (K4): pure logic shared by FuxiRoot27.cpp and the host
++ * tests (tools/test-fuxi-ios27.py compiles this header with the host cc and
++ * compares it with its Python mirror). No kernel headers, no libc.
++ *
++ * The root is one pinned, preallocated file inside Android's f2fs userdata.
++ * ADT /chosen "fuxi-root-extents" lists it as u64 triples {file block,
++ * partition block, blocks} (4 KiB units, userdata-relative, file blocks
++ * contiguous from 0) and "fuxi-root-blocks" is the root size in blocks, the
++ * same properties as the xnu-8796 lane (xnu/patches/0088). The file starts with
++ * the 4 KiB SHNGROOT manifest of tools/ios27-root.py image: magic, version 1,
++ * window count, image bytes, 128-byte entries {name[32], offset, size,
++ * block_size 512, flags (bit 0 read-only), sha256, reserved}, SHA-256 of bytes
++ * 0..4063 at 4064 (checked by the caller), windows 1 MiB aligned from 1 MiB.
++ */
++#ifndef FUXI_ROOT27_H
++#define FUXI_ROOT27_H
++#include <stdint.h>
++
++#define FX27_BLOCK              4096u
++#define FX27_MIB                0x100000u
++#define FX27_HDR                4096u
++#define FX27_ENTRY              128u
++#define FX27_MAX_WINDOWS        31u             /* (4064 - 32 - 24) / 128 */
++#define FX27_MAX_EXTENTS        1024u
++#define FX27_BOUNCE             (1u << 20)
++
++enum {
++	FX27_OK = 0,
++	FX27_E_TABLE,           /* property missing, empty, not triples or too many */
++	FX27_E_EXTENT,          /* file block out of order, empty or outside the partition */
++	FX27_E_OVERLAP,         /* two extents share partition blocks */
++	FX27_E_SHORT,           /* the extents end before fuxi-root-blocks */
++	FX27_E_MAGIC,           /* manifest magic or version */
++	FX27_E_COUNT,           /* window count */
++	FX27_E_WINDOW,          /* window name, alignment, order, block size or bounds */
++	FX27_E_SIZE,            /* manifest image bytes beyond the root file */
++	FX27_E_MAP,             /* a file block has no extent */
++};
++
++struct fx27_extent { uint64_t file, part, count; };
++struct fx27_window { char name[32]; uint64_t offset, size; uint32_t flags; uint8_t sha256[32]; };
++struct fx27_io { uint64_t lba; uint32_t blocks, skip, want; };
++
++static inline uint64_t
++fx27_le64(const uint8_t *p)
++{
++	uint64_t v = 0;
++	for (int i = 7; i >= 0; i--) {
++		v = v << 8 | p[i];
++	}
++	return v;
++}
++
++static inline uint32_t
++fx27_le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++/*
++ * Validate the ADT table against the partition (part_blocks long) and keep the
++ * extents that cover root blocks [0, want); the last one is cut at want.
++ */
++static inline int
++fx27_load_extents(const uint8_t *table, uint64_t size, uint64_t want, uint64_t part_blocks,
++    struct fx27_extent *ext, unsigned *count)
++{
++	unsigned n = 0;
++	uint64_t pos = 0;
++	*count = 0;
++	if (!table || size == 0 || size % 24 || size / 24 > FX27_MAX_EXTENTS || want == 0) {
++		return FX27_E_TABLE;
++	}
++	for (uint64_t i = 0; i < size / 24 && pos < want; i++) {
++		uint64_t file = fx27_le64(table + 24 * i), part = fx27_le64(table + 24 * i + 8);
++		uint64_t blocks = fx27_le64(table + 24 * i + 16);
++		if (file != pos || blocks == 0 || part >= part_blocks || blocks > part_blocks - part) {
++			return FX27_E_EXTENT;
++		}
++		if (blocks > want - pos) {
++			blocks = want - pos;
++		}
++		for (unsigned j = 0; j < n; j++) {
++			if (part < ext[j].part + ext[j].count && ext[j].part < part + blocks) {
++				return FX27_E_OVERLAP;
++			}
++		}
++		ext[n].file = file;
++		ext[n].part = part;
++		ext[n].count = blocks;
++		n++;
++		pos += blocks;
++	}
++	if (pos != want) {
++		return FX27_E_SHORT;
++	}
++	*count = n;
++	return FX27_OK;
++}
++
++/* Device LBA of root block lblk; *run = blocks left in its extent. */
++static inline int
++fx27_map(const struct fx27_extent *ext, unsigned n, uint64_t part_first, uint64_t lblk,
++    uint64_t *lba, uint64_t *run)
++{
++	for (unsigned i = 0; i < n; i++) {
++		if (lblk >= ext[i].file && lblk - ext[i].file < ext[i].count) {
++			*lba = part_first + ext[i].part + (lblk - ext[i].file);
++			*run = ext[i].count - (lblk - ext[i].file);
++			return 1;
++		}
++	}
++	return 0;
++}
++
++/* The I/O guard: device blocks [lba, lba + count) lie inside one extent. */
++static inline int
++fx27_io_allowed(const struct fx27_extent *ext, unsigned n, uint64_t part_first, uint64_t lba,
++    uint64_t count)
++{
++	if (count == 0) {
++		return 0;
++	}
++	for (unsigned i = 0; i < n; i++) {
++		uint64_t first = part_first + ext[i].part;
++		if (lba >= first && lba - first < ext[i].count && count <= ext[i].count - (lba - first)) {
++			return 1;
++		}
++	}
++	return 0;
++}
++
++/*
++ * Next device read for root bytes [pos, pos + left): at most one bounce
++ * buffer, never across an extent. want bytes of the result start skip bytes
++ * into the first block.
++ */
++static inline int
++fx27_plan(const struct fx27_extent *ext, unsigned n, uint64_t part_first, uint64_t pos,
++    uint64_t left, struct fx27_io *io)
++{
++	uint64_t run;
++	io->skip = (uint32_t)(pos % FX27_BLOCK);
++	io->want = (uint32_t)(left < FX27_BOUNCE - io->skip ? left : FX27_BOUNCE - io->skip);
++	io->blocks = (io->skip + io->want + FX27_BLOCK - 1) / FX27_BLOCK;
++	if (left == 0 || !fx27_map(ext, n, part_first, pos / FX27_BLOCK, &io->lba, &run)) {
++		return FX27_E_MAP;
++	}
++	if (io->blocks > run) {
++		io->blocks = (uint32_t)run;
++		io->want = io->blocks * FX27_BLOCK - io->skip;
++	}
++	return FX27_OK;
++}
++
++/* Parse the manifest (hash checked by the caller) of a root file root_bytes long. */
++static inline int
++fx27_manifest(const uint8_t *hdr, uint64_t root_bytes, struct fx27_window *win, unsigned *count)
++{
++	static const char magic[8] = { 'S', 'H', 'N', 'G', 'R', 'O', 'O', 'T' };
++	uint64_t prev = FX27_MIB, total = fx27_le64(hdr + 16);
++	uint32_t n = fx27_le32(hdr + 12);
++	*count = 0;
++	for (int i = 0; i < 8; i++) {
++		if (hdr[i] != (uint8_t)magic[i]) {
++			return FX27_E_MAGIC;
++		}
++	}
++	if (fx27_le32(hdr + 8) != 1) {
++		return FX27_E_MAGIC;
++	}
++	if (n == 0 || n > FX27_MAX_WINDOWS) {
++		return FX27_E_COUNT;
++	}
++	if (total > root_bytes) {
++		return FX27_E_SIZE;
++	}
++	for (uint32_t i = 0; i < n; i++) {
++		const uint8_t *e = hdr + 24 + FX27_ENTRY * i;
++		uint64_t off = fx27_le64(e + 32), size = fx27_le64(e + 40);
++		unsigned len = 0;
++		while (len < 32 && e[len]) {
++			len++;
++		}
++		if (len == 0 || len == 32 || off % FX27_MIB || off < prev || size == 0 || size % 512 ||
++		    off > total || size > total - off || fx27_le32(e + 48) != 512) {
++			return FX27_E_WINDOW;
++		}
++		for (unsigned c = 0; c < 32; c++) {
++			win[i].name[c] = c < len ? (char)e[c] : 0;
++		}
++		win[i].offset = off;
++		win[i].size = size;
++		win[i].flags = fx27_le32(e + 52);
++		for (unsigned c = 0; c < 32; c++) {
++			win[i].sha256[c] = e[56 + c];
++		}
++		prev = off + size;
++	}
++	*count = n;
++	return FX27_OK;
++}
++
++/*
++ * The partition UUID published for a window: the first 16 bytes of its manifest
++ * SHA-256 as an RFC 4122 version 4 UUID, upper case (37 bytes with the NUL).
++ */
++static inline void
++fx27_window_uuid(const uint8_t *sha256, char *out)
++{
++	static const char hex[] = "0123456789ABCDEF";
++	unsigned o = 0;
++	for (unsigned i = 0; i < 16; i++) {
++		uint8_t b = sha256[i];
++		if (i == 6) {
++			b = (uint8_t)((b & 0x0f) | 0x40);
++		} else if (i == 8) {
++			b = (uint8_t)((b & 0x3f) | 0x80);
++		}
++		if (i == 4 || i == 6 || i == 8 || i == 10) {
++			out[o++] = '-';
++		}
++		out[o++] = hex[b >> 4];
++		out[o++] = hex[b & 15];
++	}
++	out[o] = 0;
++}
++#endif /* FUXI_ROOT27_H */
+diff --git a/iokit/Kernel/arm/fuxi_storage_abi.h b/iokit/Kernel/arm/fuxi_storage_abi.h
+new file mode 100644
+index 0000000..d2aad1a
+--- /dev/null
++++ b/iokit/Kernel/arm/fuxi_storage_abi.h
+@@ -0,0 +1,123 @@
++/*
++ * Copyright (c) 1998-2015 Apple Inc. All rights reserved.
++ *
++ * @APPLE_LICENSE_HEADER_START@
++ *
++ * This file contains Original Code and/or Modifications of Original Code
++ * as defined in and that are subject to the Apple Public Source License
++ * Version 2.0 (the 'License'). You may not use this file except in
++ * compliance with the License. Please obtain a copy of the License at
++ * http://www.opensource.apple.com/apsl/ and read it before using this
++ * file.
++ *
++ * The Original Code and all software distributed under the License are
++ * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
++ * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
++ * INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
++ * Please see the License for the specific language governing rights and
++ * limitations under the License.
++ *
++ * @APPLE_LICENSE_HEADER_END@
++ */
++/*
++ * Fuxi K4: the vtable shape of IOStorageFamily's IOStorage and IOMedia, so the
++ * native kernel can create an IOMedia of the prelinked (Apple) IOStorageFamily
++ * and serve its I/O without linking against the kext. Declarations only, taken
++ * from IOStorageFamily-337.100.1 IOStorage.h / IOMedia.h (APSL 2.0,
++ * github.com/apple-oss-distributions/IOStorageFamily) as compiled for iOS:
++ * TARGET_OS_OSX 0 (no attach/synchronizeCache/discard slots, unmap and
++ * synchronize pure) and no vtable padding (APPLE_KEXT_VTABLE_PADDING 0, so the
++ * reserved slots do not exist). Only the slot order and the method names and
++ * types matter: arm64e signs each vtable entry with the mangled name of the
++ * method that introduced the slot, so the classes keep Apple's names.
++ *
++ * IOStorage here is never registered as a class: its gMetaClass is IOService's,
++ * so subclasses (FuxiRootWindow) metaCast to IOService, not to the kext's
++ * IOStorage, and IOMedia::handleOpen skips the provider open. IOMedia is never
++ * constructed here: FuxiRoot27.cpp allocates it through the kext's metaclass
++ * and calls only init().
++ */
++#ifndef FUXI_STORAGE_ABI_H
++#define FUXI_STORAGE_ABI_H
++#include <IOKit/IOService.h>
++#include <IOKit/IOMemoryDescriptor.h>
++
++typedef UInt32 IOStorageUnmapOptions;
++typedef UInt32 IOStorageAccess;
++typedef UInt8 IOStoragePriority;
++typedef UInt32 IOStorageSynchronizeOptions;
++typedef UInt64 IOStorageGetProvisionStatusOptions;
++typedef UInt32 IOMediaAttributeMask;
++struct IOStorageAttributes;
++struct IOStorageExtent;
++struct IOStorageProvisionExtent;
++typedef void (*IOStorageCompletionAction)(void *target, void *parameter, IOReturn status, UInt64 actualByteCount);
++struct IOStorageCompletion {
++	void *target;
++	IOStorageCompletionAction action;
++	void *parameter;
++};
++
++#define kIOStorageCategory              "IOStorage"
++#define kIOMediaContentMaskKey          "Content Mask"
++#define kIOMediaBaseKey                 "Base"
++#define kIOMediaPartitionIDKey          "Partition ID"
++#define kIOMediaUUIDKey                 "UUID"
++#define kIOMediaSizeKey                 "Size"
++#define kIOMediaWholeKey                "Whole"
++#define kIOMediaContentHintKey          "Content Hint"
++
++class IOStorage : public IOService
++{
++protected:
++	IOStorage(const OSMetaClass *meta) : IOService(meta)
++	{
++	}
++	virtual ~IOStorage() APPLE_KEXT_OVERRIDE
++	{
++	}
++	void *_expansionData;           /* IOStorage::ExpansionData *, kept for the layout */
++public:
++	static const OSMetaClass &gMetaClass;
++
++	virtual bool open(IOService *client, IOOptionBits options, IOStorageAccess access) = 0;
++	virtual IOReturn read(IOService *client, UInt64 byteStart, IOMemoryDescriptor *buffer,
++	    IOStorageAttributes *attributes = 0, UInt64 *actualByteCount = 0) = 0;
++	virtual IOReturn write(IOService *client, UInt64 byteStart, IOMemoryDescriptor *buffer,
++	    IOStorageAttributes *attributes = 0, UInt64 *actualByteCount = 0) = 0;
++	virtual void read(IOService *client, UInt64 byteStart, IOMemoryDescriptor *buffer,
++	    IOStorageAttributes *attributes, IOStorageCompletion *completion) = 0;
++	virtual void write(IOService *client, UInt64 byteStart, IOMemoryDescriptor *buffer,
++	    IOStorageAttributes *attributes, IOStorageCompletion *completion) = 0;
++	virtual IOReturn unmap(IOService *client, IOStorageExtent *extents, UInt32 extentsCount,
++	    IOStorageUnmapOptions options = 0) = 0;
++	virtual bool lockPhysicalExtents(IOService *client) = 0;
++	virtual IOStorage * copyPhysicalExtent(IOService *client, UInt64 *byteStart, UInt64 *byteCount) = 0;
++	virtual void unlockPhysicalExtents(IOService *client) = 0;
++	virtual IOReturn setPriority(IOService *client, IOStorageExtent *extents, UInt32 extentsCount,
++	    IOStoragePriority priority) = 0;
++	virtual IOReturn synchronize(IOService *client, UInt64 byteStart, UInt64 byteCount,
++	    IOStorageSynchronizeOptions options = 0) = 0;
++	virtual IOReturn getProvisionStatus(IOService *client, UInt64 byteStart, UInt64 byteCount,
++	    UInt32 *extentsCount, IOStorageProvisionExtent *extents, IOStorageGetProvisionStatusOptions options = 0) = 0;
++};
++
++class IOMedia : public IOStorage
++{
++	IOMedia() = delete;
++public:
++	virtual UInt64 getPreferredBlockSize() const = 0;
++	virtual UInt64 getSize() const = 0;
++	virtual UInt64 getBase() const = 0;
++	virtual bool isEjectable() const = 0;
++	virtual bool isFormatted() const = 0;
++	virtual bool isWhole() const = 0;
++	virtual bool isWritable() const = 0;
++	virtual const char * getContent() const = 0;
++	virtual const char * getContentHint() const = 0;
++	virtual bool init(UInt64 base, UInt64 size, UInt64 preferredBlockSize, IOMediaAttributeMask attributes,
++	    bool isWhole, bool isWritable, const char *contentHint = 0, OSDictionary *properties = 0) = 0;
++	virtual IOMediaAttributeMask getAttributes() const = 0;
++};
++#endif /* FUXI_STORAGE_ABI_H */
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index f462f98..5b72705 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -10,3 +10,5 @@ iokit/Kernel/arm/AppleARMSMP.cpp    					optional iokitcpp
+ iokit/Kernel/arm/ArmCpu.cpp					optional iokitcpp
+ iokit/Kernel/arm/ArmDTPlatform.cpp				optional iokitcpp
+ 
++# Fuxi iOS 27 root file on UFS (K4): xnu27/patches/fuxi/0007.
++iokit/Kernel/arm/FuxiRoot27.cpp					optional iokitcpp

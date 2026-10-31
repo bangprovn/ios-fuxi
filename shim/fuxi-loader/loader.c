@@ -13,6 +13,7 @@ uint32_t probe_fdt_bytes(void);
 #define BOOT_LINE_V1		608
 #define BOOT_LINE_V2		1024
 #define PAGE_16K		0x4000UL
+#define ADT_MAX_V2		(4 * PAGE_16K)
 
 struct payload_seg {
 	uint64_t vmaddr, vmsize, file_off, file_size;
@@ -112,6 +113,8 @@ static const char *loader_boot(void)
  if (length < sizeof(*p) || !magic_ok(p->magic) || (p->version != 1 && p->version != 2))
   return "bad embedded payload header";
  const uint64_t line = p->version == 1 ? BOOT_LINE_V1 : BOOT_LINE_V2;
+ /* v2 (iOS 27) ADTs may carry the K4 root extent table (tools/mkadt-fuxi27.py). */
+ const uint64_t adt_max = p->version == 1 ? PAGE_16K : ADT_MAX_V2;
  const struct payload_seg *segs = (const struct payload_seg *)(rd_start + sizeof(*p) + line);
  if (p->nsegs == 0 || p->nsegs > 32 ||
      length < sizeof(*p) + line + p->nsegs * sizeof(struct payload_seg))
@@ -119,8 +122,8 @@ static const char *loader_boot(void)
  if (p->phys_base != 0x8c0000000ULL || (p->mem_size != 0x40000000ULL && p->mem_size != FG_RAM_SIZE) ||
      (p->virt_base & (0x2000000-1)) || (p->kernel_end & (PAGE_16K-1)) ||
      p->kernel_end < p->virt_base ||
-     p->kernel_end - p->virt_base > p->mem_size - 2*PAGE_16K ||
-     !p->adt_size || p->adt_size > PAGE_16K || (p->adt_off & 7) ||
+     p->kernel_end - p->virt_base > p->mem_size - adt_max - PAGE_16K ||
+     !p->adt_size || p->adt_size > adt_max || (p->adt_off & 7) ||
      p->adt_off > length || p->adt_size > length-p->adt_off ||
      p->cmdline[line-1])
   return "unsafe Fuxi memory layout";
