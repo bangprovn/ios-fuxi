@@ -34,11 +34,6 @@
  *   fuxiwlanw15=1  W15 only: omit WLAN_CFG shadow-v3 TLV (default 0)
  *   fuxiwlanw16=N  qrtr=5 only: 1 larger IPCR, 2 doorbell redrive, 3 both,
  *                 4 diagnostics only; all include MODE context diagnostics
-#ifdef FUXI_ATH12K
- *   fuxiath12k=N  kernel-metal4wifi only: hand the chip to Linux ath12k at FW_READY. N>0 alone
- *                 implies the working recipe as defaults, each still overridable. Stage 1 stops
- *                 after HTC ready, then contains; later stages are not built yet.
-#endif /* FUXI_ATH12K */
  * Steps 17..28 probe DMA safety and load rootfs firmware through BHI/BHIe.
  * Completion is polled; M6o can enable MSI to a RAM sink. W11 channels/QMI are opt-in;
  * see docs-lanes/wlan-bt.md M6.
@@ -102,6 +97,11 @@ extern kern_return_t pmap_enter_options_addr(pmap_t, vm_map_offset_t,
 extern unsigned fuxi_gpu_access(uintptr_t, uint64_t *, unsigned, unsigned);
 void fuxi_wlan_init(void);
 #ifdef FUXI_ATH12K
+/*
+ *   fuxiath12k=N  kernel-metal4wifi only: hand the chip to Linux ath12k at FW_READY. N>0 alone
+ *                 implies the working recipe as defaults, each still overridable. Stage 1 stops
+ *                 after HTC ready, then contains; later stages are not built yet.
+ */
 #include "fa_xnu.h"
 #include "fa_lx_os.h" /* lx_os_radio_memory is defined below */
 #endif /* FUXI_ATH12K */
