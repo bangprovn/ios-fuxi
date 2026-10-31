@@ -25,4 +25,6 @@ Build: GitHub Actions `fuxi-build.yml` with `kernel=ios27`
 
 Not here on purpose: UniXNU's source-corecrypto patch and its corecrypto source
 (Apple internal-use licence), Apple kexts (prelinked locally from your own
-kernelcache in a later milestone, never in CI), userland patches (K3+).
+kernelcache with `tools/ios27-prelink.py`, docs-lanes/ios27.md K2a; never in CI
+or git), userland patches (K3+). CI also uploads the K2a prelink inputs
+`mach.development.fuxi.chained.unstripped` and `mach.release.fuxi.unstripped`.

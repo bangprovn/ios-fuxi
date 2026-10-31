@@ -70,6 +70,10 @@ for arm64e, then make with UniXNU's flags (`ARCH_STRING_FOR_CURRENT_MACHINE_CONF
 `mach.development.fuxi`, `mach.development.fuxi.unstripped` (keep it for prelinking and the monitor),
 `kernel-arch.txt`, `fuxi27.adt` + `cmdline.txt` (1 CPU), `fuxi27-cpus7.adt` + `cmdline-cpus7.txt`,
 `xnu27-SHA256SUMS.txt`, logs. `bash tools/ci/build.sh kernel-ios27 --dry-run` prints the plan on Linux.
+For K2a the same job also uploads `mach.development.fuxi.chained.unstripped` (the same objects relinked with
+`XNU_KERNEL_CHAINED_FIXUPS=1`; skip with `FUXI_XNU27_CHAINED=0`) and the RELEASE LTO comparison kernel
+`mach.release.fuxi.unstripped(.noctf)` + `release-reference.txt` (own OBJROOT; skip with
+`FUXI_XNU27_RELEASE_REF=0`). Either one failing only warns. Neither has been built yet (no CI run since).
 
 ## Pack and boot (user, local)
 
@@ -83,6 +87,77 @@ fastboot boot <image>; tools/fuxi-xnu-monitor.py --kernel OUT/mach.development.f
 Payload v2 (`--boot-line-length 1024`): 12377 grew `boot_args.CommandLine` from 608 to 1024 bytes, so the
 segment table moves to 0x448 and `bootFlags`/`memSizeActual` to 1136/1144. The loader, its build check and the
 monitor read the version (OBSERVED in `test-fuxi-ios27.py`). v1 payloads are byte-identical to before.
+
+## K2a: prelinked Apple kexts
+
+Why (OBSERVED, `ios-0098-k27` boot log): K1 reaches VM/zone init, prints "SDT: unable to find prelink info" and
+panics "image4 interface not available" at `kern_trustcache.c:592`. AppleImage4, AMFI and sandbox are kexts.
+
+Approach (UniXNU's): keep the original arm64e kexts of one kernelcache and emit an `MH_FILESET` around our
+native kernel. `tools/xnuprelink/` is XnuPrelink `76452c6` (the revision UniXNU `88604d0` pins), verbatim apart
+from one marked `Fuxi:` change (no `__fips_hmacs` seal: we build no corecrypto into the kernel). Its matcher
+pairs the stripped Apple kernel's functions/data with ours (strings, call graphs, PAC shapes, reviewed fixtures for
+24A446); the emitter places native segments around the retained kexts using split-segment info, rebinds every
+kext pointer, branch and adrp into the old kernel, stubs unmatched functions to `_unixnu_fileset_unmapped`
+(`--allow-missing`) and leaves unmatched data references listed as missing. xnu's `arm_init` slides the collection
+itself, so `mkpayload.py --prelinked` copies the root segments flat and untouched.
+
+Kernel side (in the series): `native-security-init` (`_NativePrelinkEarlySecurityInit`, AMFI's original
+initializer before lockdown), `fileset-unmapped-call`, `trustcache-runtime-layout`, `arm64e-threaded-starts`,
+`sheng-kernel-stack-shift` (the symbol a reviewed AMFI site needs), `fuxi/0005` (the corecrypto kext registers
+crypto once, our kmem RNG backend is latched once; log `FUXI crypto: kmem RNG built-in|from corecrypto`,
+`FUXI PRNG: corecrypto registered the kernel PRNG; built-in DRBG unused`), `fuxi/0006` (256 KiB console ring so
+native `__DATA` fits the 0x1e8000 gap before the first retained kext data; `_sweet_log_size`, read by the monitor).
+No double `register_crypto_functions` (only the kext calls it). AES and SHA-1 have no fallback; they are reached only
+through `g_crypto_funcs`, which the kext fills during InitIOKit, before any caller found (GUESS: no earlier caller).
+
+```
+python3 tools/ios27-prelink.py --kernel OUT/mach.development.fuxi.chained.unstripped \
+    --reference OUT/mach.release.fuxi.unstripped --kernelcache KERNELCACHE --out K2DIR --allow-missing
+python3 tools/mkpayload.py OUT/mach.development.fuxi.chained.unstripped OUT/fuxi27.adt payload27k2.bin \
+    --boot-line-length 1024 --cmdline "$(cat OUT/cmdline.txt)" --prelinked K2DIR/kernel.prelinked --allow-incomplete
+tools/fuxi-xnu-monitor.py --kernel K2DIR/kernel.prelinked ...   # symbols come from the fileset's kernel entry
+```
+
+`KERNELCACHE` is the decompressed iPad17,3 24A446 `kernelcache.release.j820` (sha256 `38e6d9fa…780a`, the input
+the 24A446 fixtures and the AMFI address `0xfffffe00092551ac` are keyed to); it never goes into git. Roots: UniXNU's
+31 profile roots, all kept (`--drop-soc` drops the nine SoC hardware ones; no trouble from them shown yet). The
+script preflights before the minute-long matcher and writes `summary.json` (per bundle: distinct old-kernel
+targets, matched/stubbed/missing, neighbour-name hints) and `checks.json` (UniXNU `check-prelink-xml` lexer rules,
+flat root, entries, load addresses, entry pc, fixup targets; `check-prelink-rebuild-equivalence` covers plain
+arm64 static prelinks only and is recorded as not applicable). The ADT carries what AppleImage4/AMFI read
+(`/chosen` security tuple, `crypto-hash-method` sha2-384, `amfi-only-platform-code`, `manifest-properties`) and a
+`/product` node for iPhone12,3 (iPhone 11 Pro, the userland identity; `mkadt-fuxi27.py --product board` gives
+Xiaomi 13 / xiaomi,fuxi).
+
+Trial (OBSERVED 2026-10-31, local, K1 DEVELOPMENT kernel, no RELEASE reference, `--allow-missing`). The K1 kernel
+fails three preflight checks, all fixed in this branch but not yet built: no split-segment info (CI chained relink),
+no `_unixnu_kernel_stack_shift` (sheng patch), native `__DATA` 0x54c000 > 0x1e8000 gap (fuxi/0006). The trial
+therefore used a scratch kit copy outside the repo that skips native relocation, empties the reviewed sites and
+parks `__DATA` in linkedit, so its image is counts only, not loadable:
+
+| | |
+|---|---|
+| matcher | 6622 / 21792 original functions matched (49524 native), 644 data; 56 s |
+| closure | 39 bundles (31 roots, 7 `kpi.*`, `com.apple.security.Image4`), 32 fileset entries |
+| stubbed functions | 952 distinct (4738 summed per bundle) |
+| missing data refs | 156 distinct (597 references) |
+| output | 102 219 776 bytes; payload v2 99 987 600 bytes (K1: 18.5 MB kernel) |
+| checks.json | 12/12 pass (rebuild-equivalence n/a) |
+
+Per root, distinct old-kernel targets (matched / stubbed / missing): AMFI 457 (223 / 213 / 21), AppleImage4 305
+(130 / 168 / 7), Image4 255 (103 / 146 / 6), sandbox 274 (140 / 115 / 19), apfs 858 (392 / 387 / 79), corecrypto 36
+(25 / 9 / 2), CoreTrust 7 (6 / 0 / 1), AppleMatch 12 (7 / 4 / 1); the IOKit families around 40 % matched. The
+most shared unmatched targets are OSMetaClass/OSObject/IORegistryEntry functions (hints, GUESS) and one page-aligned
+`__DATA,__common` object every bundle uses. With these stubs any kext start would hit `_unixnu_fileset_unmapped`
+(GUESS: immediately).
+
+Before a device boot: a CI run producing the chained and RELEASE kernels; a prelink against both (GUESS: the
+RELEASE reference is required: UniXNU's profile always passes it, and the shared metaclass/registry functions
+are the kind name-based matching needs); missing data at 0 or reviewed; then the boot itself. Risks (GUESS): the
+~100 MB boot image vs ABL `fastboot boot` limits and where ABL places it; DEVELOPMENT vs RELEASE layout drift
+in the shapes the matcher compares; the relinked chained kernel itself has never booted standalone (it is not
+meant to); Apple kexts touching SoC hardware that the Fuxi lacks (the nine SoC roots).
 
 ## K1 on the device: what to expect (GUESS, not yet observed)
 
@@ -103,7 +178,8 @@ ld-classic chains (0x101), ADT parsing in ArmDTPlatform/ArmCpu (after 0x10f), an
 - **K2** RAM-disk root (`rd=md0`, mockfs is in the config) and the crypto decision; libpthread-539.100.4 in-tree
   (UniXNU `source-pthread-bootstrap` is imported but not wired).
 - **K3** Local prelink of donor kexts (`unstripped` kernel + the user's kernelcache, UniXNU XnuPrelink approach),
-  AMFI/sandbox early init (`native-security-init`), trust cache placement in the loader handoff.
+  AMFI/sandbox early init (`native-security-init`), trust cache placement in the loader handoff. Started early as
+  K2a (above): tooling, kernel/CI/ADT pieces and a counts-only trial done; no CI run, no boot.
 - **K4** UFS root (port our FuxiUFS or UniXNU's UFS layer) and launchd.
 - **K5** Display/backlight/touch/buttons on 12377 (port the xnu-8796 Fuxi drivers).
 - **K6** GPU (Adreno 740 path) and SMP on all 7 usable cores.
