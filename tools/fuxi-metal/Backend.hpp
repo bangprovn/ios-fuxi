@@ -265,7 +265,8 @@ private:
  static constexpr size_t frameCacheLimit=512,viewCacheLimit=512;
  static uint64_t frameKey(const std::array<Texture *,8> &t,VkRenderPass render,const std::array<uint32_t,8> &levels){uint64_t h=0xcbf29ce484222325ull;for(size_t i=0;i<8;++i)h=((h^uint64_t(uintptr_t(t[i])))*0x100000001b3ull^levels[i])*0x100000001b3ull;return (h^uint64_t(uintptr_t(render)))*0x100000001b3ull;}
  static uint64_t viewKey(const Texture *t,VkFormat format,const std::array<uint32_t,4> &c,uint32_t base,uint32_t count){uint64_t h=0xcbf29ce484222325ull;for(uint64_t x:{uint64_t(uintptr_t(t)),uint64_t(format),uint64_t(c[0])|uint64_t(c[1])<<8|uint64_t(c[2])<<16|uint64_t(c[3])<<24,uint64_t(base)<<32|count})h=(h^x)*0x100000001b3ull;return h;}
- static constexpr uint32_t passStampLimit=255;static inline PassTimes passTimes;static inline DrawPipeTimes drawPipes;uint64_t drawSampleSerial=0;
+ static constexpr uint32_t passStampLimit=255;static inline PassTimes passTimes;static inline DrawPipeTimes drawPipes;uint64_t drawSampleSerial=0,passSampleSerial=0;
+ static unsigned passReportSubmits(){unsigned e=systemTranslationPolicy().passTimesEvery;return e>1?std::max(30u,300u/e):300u;} // sampled submits per 'gpu pass' report
  void readDrawTimes(VkQueryPool pool,const std::vector<DrawInfo> &infos){
   if(!pool || infos.empty())return;std::vector<uint64_t> ticks(infos.size()+1),delta(infos.size());
   if(GetQueryPoolResults(device,pool,0,uint32_t(ticks.size()),ticks.size()*sizeof(uint64_t),ticks.data(),sizeof(uint64_t),VK_QUERY_RESULT_64_BIT)!=VK_SUCCESS)return;
@@ -279,7 +280,7 @@ private:
   uint64_t mask=timestampBits>=64?UINT64_MAX:(uint64_t(1)<<timestampBits)-1;
   for(size_t i=0;i<infos.size();++i)delta[i]=uint64_t(double((ticks[i+1]-ticks[i])&mask)*timestampPeriod);
   for(auto g:gaps)if(g.first<delta.size())delta[g.first]-=std::min(delta[g.first],g.second);
-  passTimes.add(infos,delta,whole);if(passTimes.submitCount()>=300){reportRtCounters();passTimes.report(stderr);}
+  passTimes.add(infos,delta,whole);if(passTimes.submitCount()>=passReportSubmits()){reportRtCounters();passTimes.report(stderr,5,systemTranslationPolicy().passTimesEvery);}
  }
  // FUXI_MTL_SPLIT_SUBMIT: GPU idle between chunks, from each chunk's closing BOTTOM stamp (2k+1) to the next chunk's opening TOP stamp (2k+2).
  // passStarts[k] is the pass-stamp index whose delta spans the gap before chunk k+1; that delta loses the gap, so pass times stay GPU busy time.
@@ -548,7 +549,7 @@ public:
   for(auto &slot:slots)clearSubmitObjects(slot);clearFrames();clearViews();for(auto &slot:slots){destroyUnlocked(slot.aliasScratch);slot.aliasScratch=nullptr;}
   objects.clear([&](Pipeline *p){drawPlans.invalidate(p);destroyPipelineUnlocked(p);});
   releaseRtShadows();releaseRenamePool();releaseSampleShadows();
-  pipelineCache.close();trimMemoryUnlocked(true);reportRtCounters();passTimes.report(stderr);
+  pipelineCache.close();trimMemoryUnlocked(true);reportRtCounters();passTimes.report(stderr,5,systemTranslationPolicy().passTimesEvery);
   if(device && DestroyDevice) DestroyDevice(device,nullptr);
   if(instance && DestroyInstance) DestroyInstance(instance,nullptr);
   if(library) dlclose(library);
@@ -2191,7 +2192,8 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
     if(splitting && supportsTimestamps() && !slot.chunkPool){VkQueryPoolCreateInfo ci{};ci.sType=VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;ci.queryType=VK_QUERY_TYPE_TIMESTAMP;ci.queryCount=chunkStamps;check(CreateQueryPool(device,&ci,nullptr,&slot.chunkPool));}
     if(supportsTimestamps() && !queryPool){VkQueryPoolCreateInfo qi{};qi.sType=VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;qi.queryType=VK_QUERY_TYPE_TIMESTAMP;qi.queryCount=2;check(CreateQueryPool(device,&qi,nullptr,&queryPool));++reuseCounts.queries;++submitObjectCreates;++submitPoolCreates;}
    }
-   VkCommandBuffer cmd=command;VkQueryPool timestamps=queryPool;VkFence fence=submitFence;VkQueryPool passQ=timestamps && systemTranslationPolicy().passTimes?slot.passPool:VkQueryPool{};
+   VkCommandBuffer cmd=command;VkQueryPool timestamps=queryPool;VkFence fence=submitFence;VkQueryPool passQ{};
+   if(timestamps && systemTranslationPolicy().passTimes){unsigned every=systemTranslationPolicy().passTimesEvery;if(every<=1 || passSampleSerial++%every==0)passQ=slot.passPool;else passTimes.skip();} // FUXI_MTL_GPU_PASS_TIMES_EVERY: unsampled submits record no pass stamps
    VkQueryPool drawQ=timestamps && systemTranslationPolicy().drawTimes && drawSampleSerial++%30==0?slot.drawPool:VkQueryPool{};std::vector<DrawInfo> drawInfos;
    auto recordStart=std::chrono::steady_clock::now();uint64_t recordObjects=objectNanos;
    VkCommandBufferBeginInfo bi{};bi.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;bi.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;{PhaseTimer phase(SubPhase::cmdBegin);check(BeginCommandBuffer(cmd,&bi));}

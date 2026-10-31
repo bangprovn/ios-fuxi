@@ -198,6 +198,32 @@ void main() {color=textureLod(image,vec2(0.5),constants.lod);}
             for level in '012':
                 assert invoke(d/'lean', extra, FUXI_MTL_SUBMIT_LEAN=level, **chunked) == invoke(d/'lean', extra), 'split submit changed lean fixture output: lean='+level+' '+extra
         print('PASS: FUXI_MTL_SPLIT_SUBMIT identical pixels/counts (sync, two flights, early release, drained failure; barrier/lean 0/1/2 fixtures), faults poison')
+        # FUXI_MTL_GPU_PASS_TIMES_EVERY: pass stamps on 1 submit in N leave pixels and per-submit counts identical; the gpu pass line averages over sampled submits only.
+        def pass_every(args, every, **extra):
+            e = dict(env, FUXI_MTL_TEST_BOOTARGS='fuxigpuframetrace=1 '+args, FUXI_MTL_SUBMIT_LEAN='0', **dict(rewrites, **timed), **extra)
+            if every is not None:
+                e['FUXI_MTL_GPU_PASS_TIMES_EVERY'] = every
+            p = subprocess.run([str(d/'lean')], env=e, text=True, capture_output=True, timeout=90)
+            assert p.returncode == 0 and 'AddressSanitizer' not in p.stderr and 'runtime error:' not in p.stderr, p.stderr[-3000:]
+            return p
+        for args in ('', 'fuxigpumerge=1 fuxigpuoverlap=1 fuxigpusubmit=1 fuxigpuperf=7'):
+            base = pass_every(args, None)
+            assert 'FUXI MTL: policy gpu_pass_times_every=1' in base.stderr and 'sampled_every=' not in base.stderr
+            for every in ('0', '1', '3', '1000'):
+                p = pass_every(args, every)
+                assert p.stdout == base.stdout, 'pass times sampling changed output: %r every=%s' % (args, every)
+                want = '1' if every in ('0', '1') else every
+                assert 'FUXI MTL: policy gpu_pass_times_every='+want in p.stderr
+                lines = re.findall(r'FUXI MTL: gpu pass times submits=(\d+) .*', p.stderr)
+                assert lines, p.stderr[-2000:]
+                if want == '1':
+                    assert 'sampled_every=' not in p.stderr
+                else:
+                    m = re.findall(r'gpu pass times submits=(\d+) .* sampled_every=%s all_submits=(\d+)' % want, p.stderr)
+                    assert m and all(len(l) < 200 for l in re.findall(r'FUXI MTL: gpu pass times .*', p.stderr)), p.stderr[-2000:]
+                    sampled, total = sum(int(x) for x, _ in m), sum(int(y) for _, y in m)
+                    assert sampled == (total+int(want)-1)//int(want), (sampled, total)
+        print('PASS: FUXI_MTL_GPU_PASS_TIMES_EVERY=0/1/3/1000 identical pixels/counts on the CA-shaped lean fixture; pass lines count sampled submits')
         subprocess.run(common+['-O2']+definitions+[str(ROOT/'tools/fuxi-metal/SubmitBench.cpp'), '-ldl', '-pthread', '-o', str(d/'bench')], check=True)
         for uncached in (True, False, False, True):
             overrides = {'PIPE_BENCH_UNCACHED': '1'} if uncached else {}

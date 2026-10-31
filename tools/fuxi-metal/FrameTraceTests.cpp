@@ -113,6 +113,13 @@ int main(){
   assert(strstr(b4,"FUXI MTL: gpu pass fetch draws per submit: passes=2.00 mixed=1.00 fetch=4.00 nofetch=5.00 runs=5.00 fetch_barriers=2.00 ms=1.500"));
   assert(strstr(b4,"FUXI MTL: gpu pass top1 fetch passes_pct=66.7 fetch=2.0 nofetch=2.5 runs=2.5 fetch_barriers=1.00 avg_ms=0.750") && !strstr(b4,"top2 fetch"));
   for(char *l=strtok(b4,"\n");l;l=strtok(nullptr,"\n"))assert(!strstr(l,"fetch") || strlen(l)<200);
+  // FUXI_MTL_GPU_PASS_TIMES_EVERY: averages over sampled submits only; every>1 adds the period and the window's submit count, every<=1 prints the old line
+  for(int i=0;i<5;++i){if(i%2)times.skip();else times.add({big},{2000000},3000000);}
+  char b5[1024]{};o=fmemopen(b5,sizeof b5,"w");times.report(o,5,2);fclose(o);
+  assert(strstr(b5,"FUXI MTL: gpu pass times submits=3 stamps/submit=1.0 pass_sum_ms/submit=2.000 whole_top_of_pipe_ms/submit=3.000 sampled_every=2 all_submits=5\n") && strlen(strtok(b5,"\n"))<200);
+  times.skip();times.add({big},{1000000},1000000);char b6[1024]{};o=fmemopen(b6,sizeof b6,"w");times.report(o);fclose(o);
+  assert(strstr(b6,"submits=1 stamps/submit=1.0 pass_sum_ms/submit=1.000 whole_top_of_pipe_ms/submit=1.000\n") && !strstr(b6,"sampled_every")); // every=1: the line is unchanged
+  times.skip();char b7[64]{};o=fmemopen(b7,sizeof b7,"w");times.report(o,5,4);fclose(o);assert(!b7[0]); // no sampled submit: no line
  }
  { // per-draw GPU times: the pass with the largest draw sum wins, draws ranked, begin markers skipped; SPIR-V statistics
   std::vector<DrawInfo> infos;std::vector<uint64_t> ns;

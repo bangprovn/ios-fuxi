@@ -50,6 +50,11 @@ def main():
                     e=dict(os.environ);e.pop('FUXI_MTL_BUFFER_CACHED',None)
                     if env is not None:e['FUXI_MTL_BUFFER_CACHED']=env
                     subprocess.run([str(d/name),'cached',want],env=e,check=True,timeout=15)
+                # FUXI_MTL_GPU_PASS_TIMES_EVERY: 0..100000 (0 means 1, default 1); malformed values keep 1
+                for env,want in ((None,'1'),('0','1'),('1','1'),('16','16'),('100000','100000'),('100001','1'),('-2','1'),('16 ','1'),('x','1'),('','1')):
+                    e=dict(os.environ);e.pop('FUXI_MTL_GPU_PASS_TIMES_EVERY',None)
+                    if env is not None:e['FUXI_MTL_GPU_PASS_TIMES_EVERY']=env
+                    subprocess.run([str(d/name),'passevery',want],env=e,check=True,timeout=15)
                 for env,want in ((None,'0'),('1','1'),('0','0'),('2','0'),('1 ','0'),('','0')):
                     e=dict(os.environ);e.pop('FUXI_MTL_FETCH_SPLIT',None)
                     if env is not None:e['FUXI_MTL_FETCH_SPLIT']=env

@@ -8,6 +8,7 @@ int main(int argc,char **argv){
  if(argc==3 && !strcmp(argv[1],"lean")){auto q=fuxi::systemTranslationPolicy();assert(q.submitLeanLevel==unsigned(argv[2][0]-'0') && q.submitLean==(q.submitLeanLevel!=0));return 0;} // FUXI_MTL_SUBMIT_LEAN: exactly "1" or "2"
  if(argc==5 && !strcmp(argv[1],"split")){auto p=fuxi::systemTranslationPolicy();assert(p.splitSubmit==(argv[2][0]=='1') && p.splitSubmitUs==unsigned(atoi(argv[3])) && p.splitSubmitMax==unsigned(atoi(argv[4])));return 0;} // FUXI_MTL_SPLIT_SUBMIT(_US/_MAX)
  if(argc==3 && !strcmp(argv[1],"fetchsplit")){assert(fuxi::systemTranslationPolicy().fetchSplit==(argv[2][0]=='1'));return 0;} // FUXI_MTL_FETCH_SPLIT: exactly "1"
+ if(argc==3 && !strcmp(argv[1],"passevery")){assert(fuxi::systemTranslationPolicy().passTimesEvery==unsigned(atoi(argv[2])));return 0;} // FUXI_MTL_GPU_PASS_TIMES_EVERY: 1..100000, 0 means 1
  if(argc==3 && !strcmp(argv[1],"cached")){assert(fuxi::systemTranslationPolicy().bufferCached==(argv[2][0]=='1'));return 0;} // FUXI_MTL_BUFFER_CACHED: exactly "1"
  if(argc==3 && !strcmp(argv[1],"rename")){assert(fuxi::systemTranslationPolicy().shadowRename==(argv[2][0]=='1'));return 0;}
  if(argc==2){auto p=fuxi::systemTranslationPolicy();assert(p.stages==(argv[1][0]=='1') && p.trace==(argv[1][1]=='1') && p.async==(argv[1][2]=='1') && p.compileBoost==(argv[1][3]=='1'));if(strlen(argv[1])==6)assert(p.frameTrace==(argv[1][4]=='1') && p.pipelined==(argv[1][5]=='1'));return 0;}

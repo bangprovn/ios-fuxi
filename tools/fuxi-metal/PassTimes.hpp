@@ -91,7 +91,7 @@ public:
 class PassTimes {
  struct Row {PassInfo info;uint64_t count=0,totalNs=0,maxNs=0,draws=0,copies=0,barriers=0,areaPixels=0,fullPixels=0,fetchPasses=0,fetchNs=0,fetchRec=0,nofetchRec=0,runs=0,fetchBarriers=0;};
  struct FetchSum {uint64_t passes=0,ns=0,fetch=0,nofetch=0,runs=0,barriers=0,mixed=0;void add(const PassInfo &p,uint64_t dns){++passes;ns+=dns;fetch+=p.fetchRec;nofetch+=p.nofetchRec;runs+=p.runs;barriers+=p.fetchBarriers;if(p.fetchRec && p.nofetchRec)++mixed;}};
- std::mutex mutex;std::unordered_map<uint64_t,Row> rows;uint64_t submits=0,passes=0,passNs=0,wholeNs=0,clsCount[3]{},clsNs[3]{},areaCount[3]{},areaNs[3]{},areaPx[3]{},areaFull[3]{};FetchSum fetchSum; // passes with recorded fetch draws
+ std::mutex mutex;std::unordered_map<uint64_t,Row> rows;uint64_t skipped=0,submits=0,passes=0,passNs=0,wholeNs=0,clsCount[3]{},clsNs[3]{},areaCount[3]{},areaNs[3]{},areaPx[3]{},areaFull[3]{};FetchSum fetchSum; // passes with recorded fetch draws
  static uint64_t key(const PassInfo &p){uint64_t h=0xcbf29ce484222325ull;for(uint64_t x:{uint64_t(p.width),uint64_t(p.height),uint64_t(p.colors),uint64_t(p.load),uint64_t(p.store),uint64_t(p.kind),uint64_t(p.tiling)})h=(h^x)*0x100000001b3ull;return h;}
  static void text(const PassInfo &p,char *out,size_t size){
   char load[17]{},store[9]{};unsigned n=std::min(p.colors,8u);for(unsigned i=0;i<n;++i){unsigned v=(p.load>>(i*2))&3;load[i]=v==2?'C':v==1?'L':'D';store[i]=(p.store>>i)&1?'S':'-';}
@@ -104,13 +104,16 @@ public:
   for(size_t i=0;i<infos.size() && i<deltaNs.size();++i){if(infos[i].kind==0){unsigned c=infos[i].nofetch?0:infos[i].fetchDraws?2:1;++clsCount[c];clsNs[c]+=deltaNs[i];unsigned a=infos[i].areaClass<3?infos[i].areaClass:0;uint64_t full=uint64_t(infos[i].width)*infos[i].height;++areaCount[a];areaNs[a]+=deltaNs[i];areaFull[a]+=full;areaPx[a]+=infos[i].areaW?uint64_t(infos[i].areaW)*infos[i].areaH:full;}auto &r=rows[key(infos[i])];if(!r.count)r.info=infos[i];++r.count;r.totalNs+=deltaNs[i];r.maxNs=std::max(r.maxNs,deltaNs[i]);r.draws+=infos[i].draws;r.copies+=infos[i].copies;r.barriers+=infos[i].barriers;if(infos[i].kind==0 && infos[i].fetchRec){++r.fetchPasses;r.fetchNs+=deltaNs[i];r.fetchRec+=infos[i].fetchRec;r.nofetchRec+=infos[i].nofetchRec;r.runs+=infos[i].runs;r.fetchBarriers+=infos[i].fetchBarriers;fetchSum.add(infos[i],deltaNs[i]);}{uint64_t full=uint64_t(infos[i].width)*infos[i].height;r.fullPixels+=full;r.areaPixels+=infos[i].areaW?uint64_t(infos[i].areaW)*infos[i].areaH:full;}++passes;passNs+=deltaNs[i];}
  }
  uint64_t submitCount(){std::lock_guard<std::mutex> guard(mutex);return submits;}
+ void skip(){std::lock_guard<std::mutex> guard(mutex);++skipped;} // FUXI_MTL_GPU_PASS_TIMES_EVERY: a submit recorded without pass stamps
  // Prints the summary and the top rows by total time, then starts a new window.
- void report(FILE *out,size_t top=5){
+ // every>1 (FUXI_MTL_GPU_PASS_TIMES_EVERY): submits= counts sampled submits only; the line adds the sampling period and all submits of the window.
+ void report(FILE *out,size_t top=5,unsigned every=1){
   std::lock_guard<std::mutex> guard(mutex);if(!submits)return;
   std::vector<const Row *> order;for(auto &e:rows)order.push_back(&e.second);
   std::sort(order.begin(),order.end(),[](const Row *a,const Row *b){return a->totalNs>b->totalNs;});
   double n=double(submits);
-  fprintf(out,"FUXI MTL: gpu pass times submits=%llu stamps/submit=%.1f pass_sum_ms/submit=%.3f whole_top_of_pipe_ms/submit=%.3f\n",(unsigned long long)submits,passes/n,passNs/n/1e6,wholeNs/n/1e6);
+  fprintf(out,"FUXI MTL: gpu pass times submits=%llu stamps/submit=%.1f pass_sum_ms/submit=%.3f whole_top_of_pipe_ms/submit=%.3f",(unsigned long long)submits,passes/n,passNs/n/1e6,wholeNs/n/1e6);
+  if(every>1)fprintf(out," sampled_every=%u all_submits=%llu",every,(unsigned long long)(submits+skipped));fprintf(out,"\n");
   for(size_t i=0;i<top && i<order.size();++i){auto &r=*order[i];char t[112];text(r.info,t,sizeof t);
    fprintf(out,"FUXI MTL: gpu pass top%zu %s n/submit=%.2f draws=%.1f copies=%.1f barriers=%.1f render_area_pct=%.1f avg_ms=%.3f max_ms=%.3f ms/submit=%.3f share_pct=%.1f\n",i+1,t,r.count/n,double(r.draws)/r.count,double(r.copies)/r.count,double(r.barriers)/r.count,r.fullPixels?100.0*r.areaPixels/r.fullPixels:100.0,r.totalNs/double(r.count)/1e6,r.maxNs/1e6,r.totalNs/n/1e6,passNs?100.0*r.totalNs/passNs:0.0);
    // per pass of this shape that recorded a fetch draw: draw mix, same-kind runs and FUXI_MTL_FETCH_SPLIT barriers (<200 chars)
@@ -120,7 +123,7 @@ public:
   // Only with FUXI_MTL_DRAW_AREA: passes it shrank vs eligible passes it could not shrink. Compare avg_ms against the same row without the knob (V227: 1125x2436 rt-shadow 0.616 ms).
   if(areaCount[1] || areaCount[2])fprintf(out,"FUXI MTL: gpu pass draw area per submit: shrunk passes=%.2f ms=%.3f avg_ms=%.3f area_pct=%.1f | eligible not shrunk passes=%.2f ms=%.3f avg_ms=%.3f area_pct=%.1f | not eligible passes=%.2f ms=%.3f\n",
    areaCount[2]/n,areaNs[2]/n/1e6,areaCount[2]?areaNs[2]/1e6/double(areaCount[2]):0.0,areaFull[2]?100.0*areaPx[2]/areaFull[2]:0.0,areaCount[1]/n,areaNs[1]/n/1e6,areaCount[1]?areaNs[1]/1e6/double(areaCount[1]):0.0,areaFull[1]?100.0*areaPx[1]/areaFull[1]:0.0,areaCount[0]/n,areaNs[0]/n/1e6);
-  rows.clear();submits=passes=passNs=wholeNs=0;fetchSum={};for(auto &x:clsCount)x=0;for(auto &x:clsNs)x=0;for(auto *a:{areaCount,areaNs,areaPx,areaFull})for(int k=0;k<3;++k)a[k]=0;
+  rows.clear();skipped=submits=passes=passNs=wholeNs=0;fetchSum={};for(auto &x:clsCount)x=0;for(auto &x:clsNs)x=0;for(auto *a:{areaCount,areaNs,areaPx,areaFull})for(int k=0;k<3;++k)a[k]=0;
  }
 };
 }
