@@ -25,7 +25,6 @@ void assert_wait_timeout(event_t, int, uint32_t, uint32_t);
 int thread_block(thread_continue_t);
 uint64_t mach_absolute_time(void);
 void absolutetime_to_nanoseconds(uint64_t, uint64_t *);
-void thread_terminate(thread_t);
 thread_t current_thread(void);
 void thread_deallocate(thread_t);
 kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);

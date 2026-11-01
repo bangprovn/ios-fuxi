@@ -800,7 +800,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/fuxi_audio_dsp.c
-@@ -0,0 +1,361 @@
+@@ -0,0 +1,363 @@
 +/* Fuxi audio lane, P-AU3 and P-AU4 in XNU: the ADSP the loader left running (boot/ios-remote.sh ADSP=1), spoken to from a kernel thread.
 + * boot-arg fuxiaudio=1: GLINK over SMEM, polled, as shim/fuxi-probe/au_glink.h; the APM's state; LPASS's votes; the secondary TDM endpoint's graph and a stream into
 + * it, started on a second of zeros, and taken down again. What a-play2 did before iOS, here beside iOS. No pin is muxed, no amplifier reached, nothing is heard.
@@ -819,6 +819,7 @@
 +#include "fuxi_audioreach.h"
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
 +void fuxi_audio_dsp_init(void);
 +
 +#define FA_SMEM         0x81d00000ull   /* smem_region */
@@ -1143,7 +1144,8 @@
 +	}
 +	printf("FUXI AUDIO: done, %u steps failed; rx %u tx %u full %u\n", bad, fa_g.rx_msgs, fa_g.tx_msgs, fa_g.tx_full);
 +out:
-+	thread_terminate(current_thread());
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
 +}
 +
 +void

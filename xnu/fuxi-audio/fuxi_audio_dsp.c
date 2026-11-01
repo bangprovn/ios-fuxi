@@ -16,6 +16,7 @@
 #include "fuxi_audioreach.h"
 
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+extern kern_return_t thread_terminate(thread_t);
 void fuxi_audio_dsp_init(void);
 
 #define FA_SMEM         0x81d00000ull   /* smem_region */
@@ -340,7 +341,8 @@ fa_thread(void *arg, wait_result_t result)
 	}
 	printf("FUXI AUDIO: done, %u steps failed; rx %u tx %u full %u\n", bad, fa_g.rx_msgs, fa_g.tx_msgs, fa_g.tx_full);
 out:
-	thread_terminate(current_thread());
+	(void)thread_terminate(current_thread());
+	thread_block(THREAD_CONTINUE_NULL);
 }
 
 void
