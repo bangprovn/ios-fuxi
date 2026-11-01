@@ -134,15 +134,15 @@
 + *                 implies the working recipe as defaults, each still overridable. Stage 1 stops
 + *                 after HTC ready, stage 2 after WMI ready, hw_mode and mac registration, stage 4
 + *                 after one scan, stage 5 after joining one open network for 20 s, stage 6 after the same
-+ *                 with WPA2, each then contains.
-+ *                 Stages 4, 5 and 6 are the only ones that use the radio's RF, and only N exactly 4, 5 or 6
++ *                 with WPA2, stage 7 after that with an address by DHCP and two echoes, each then contains.
++ *                 Stages 4 to 7 are the only ones that use the radio's RF, and only N exactly 4, 5, 6 or 7
 + *                 runs them: any other N runs stage 2 at most, and says so. Stage 4 alone logs SSIDs.
 + *   fuxiwifissid=NAME  with fuxiath12k=5: the open network to join, 1 to 32 bytes, and it cannot hold a
 + *                 space. Logged by length only. Without it stage 5 does no radio work.
-+ *   /chosen fuxi-wifi-join  with fuxiath12k=6: what boot/add-wifi-adt.py put in the device tree, a length, the
-+ *                 network's name, its 32-byte key. Not a boot argument: those reach the logs. Without it stage 6
++ *   /chosen fuxi-wifi-join  with fuxiath12k=6 or 7: what boot/add-wifi-adt.py put in the device tree, a length, the
++ *                 network's name, its 32-byte key. Not a boot argument: those reach the logs. Without it stages 6, 7
 + *                 does no radio work.
-+ *   fuxiath12kq=MASK  with fuxiath12k=4, 5 or 6: 0x1 no idle power save, 0x2 no hw mode command, 0x8 settle
++ *   fuxiath12kq=MASK  with fuxiath12k=4 to 7: 0x1 no idle power save, 0x2 no hw mode command, 0x8 settle
 + *                 after vdev create, 0x10 passive scan. Read and logged by the driver domain.
 + *   fuxiwifimac=aa:bb:cc:dd:ee:ff  with fuxiath12k: the radio's address, instead of the locally
 + *                 administered default. Malformed, all-zero or group addresses are refused, and say so.
@@ -1010,8 +1010,8 @@
 +{
 +	int stage = 0;
 +	if (PE_parse_boot_argn("fuxiath12k", &stage, sizeof(stage)) && stage > 0) {
-+		wl_fa_stage = stage == 1 || stage == 4 || stage == 5 || stage == 6 ? (unsigned)stage : 2;
-+		printf("FUXI ATH12K: fuxiath12k=%d, recipe defaults on, running stage %u; stages built are 1, 2, 4, 5 and 6\n",
++		wl_fa_stage = stage == 1 || stage == 4 || stage == 5 || stage == 6 || stage == 7 ? (unsigned)stage : 2;
++		printf("FUXI ATH12K: fuxiath12k=%d, recipe defaults on, running stage %u; stages built are 1, 2, 4, 5, 6 and 7\n",
 +		    stage, wl_fa_stage);
 +	}
 +}
@@ -1097,7 +1097,7 @@
 +	fa_set_target_ssid((const unsigned char *)text, (unsigned)length);
 +}
 +
-+/* Stage 6 only: the network and its key, from the device tree. Its name is said by its length alone, and the key never. */
++/* Stages 6 and 7 only: the network and its key, from the device tree. Its name is said by its length alone, and the key never. */
 +static void
 +wl_fa_join_configure(void)
 +{
@@ -1105,7 +1105,7 @@
 +	void const *value = NULL;
 +	unsigned int size = 0;
 +	const unsigned char *bytes;
-+	if (wl_fa_stage != 6) { return; }
++	if (wl_fa_stage != 6 && wl_fa_stage != 7) { return; }
 +	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
 +	    SecureDTGetProperty(chosen, "fuxi-wifi-join", &value, &size) != kSuccess) {
 +		printf("FUXI ATH12K: no network in the device tree, so no radio work\n");

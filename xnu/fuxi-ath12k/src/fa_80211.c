@@ -8,7 +8,8 @@
  * point as a station from none to authorized, its authentication and association frames, some seconds of
  * listening, and away again. Stage 6 joins one WPA2 network the same way, with its key from fuxi_wlan.c: between the
  * association and the authorized state comes the four-way handshake, then the two keys. The key itself and what is made
- * from it are never said, and are wiped on the way out. What stands in for mac80211 without
+ * from it are never said, and are wiped on the way out. Stage 7 then asks for an address by DHCP, finds the router, sends
+ * it and a host beyond it one echo, and gives the address back: all from here, nothing above this layer. What stands in for mac80211 without
  * doing its work logs its name at runtime through STUB(). The probe request offers legacy rates only.
  *
  * What the scan hears comes here by both of ath12k's routes: linuxkpi_ieee80211_rx() below. wmi.c says
@@ -38,12 +39,15 @@
 #include "fa_bss.h"
 #include "fa_join.h"
 #include "fa_wpa.h"
+#include "fa_net.h"
 
 /* Says the name a few times and keeps going; each caller then gives its own documented answer. */
 #define STUB()	lx_stub(__func__)
 
 /* LinuxKPI's inline TODO() stubs say their name at runtime: they answer without doing the work. */
 int linuxkpi_debug_80211 = D80211_TODO;
+
+#define FA_INBOX		4
 
 struct fa_radio {
 	struct ieee80211_hw hw;			/* what the driver knows of */
@@ -103,6 +107,14 @@ struct fa_radio {
 	struct ieee80211_key_conf *pairwise_key, *group_key;	/* set for as long as the driver has them */
 	void *key_memory[2];			/* kept until the wiphy goes, wiped: the driver's peer may still name them */
 	unsigned rx_ok, rx_clear;		/* with the keys in: data the radio deciphered, and data it did not */
+	/* the address of stage 7 */
+	volatile bool net_on;			/* the poll thread keeps what fa_net_wanted() wants, once it was deciphered */
+	struct { unsigned type, length; uint8_t from[6]; uint8_t bytes[FA_NET_MOST]; } inbox[FA_INBOX];
+	unsigned inbox_first, inbox_count, inbox_lost;
+	bool leased;
+	uint8_t own_address[4], server[4], server_hardware[6];
+	uint32_t xid;
+	unsigned net_sent;
 };
 
 enum { SCAN_NONE, SCAN_RUNNING, SCAN_OVER, SCAN_ABORTED };
@@ -134,6 +146,13 @@ enum { SCAN_NONE, SCAN_RUNNING, SCAN_OVER, SCAN_ABORTED };
 #define FA_HANDSHAKE_NS		(8 * 1000000000ull)
 #define FA_HANDSHAKE_LOOK_NS	(20 * 1000000ull)
 #define FA_LAST_MESSAGE_NS	(300 * 1000000ull)	/* message 4 on its way, unciphered, before there is a key to cipher it with */
+/* Bounds of stage 7. */
+#define FA_DHCP_TRIES		4
+#define FA_DHCP_ANSWER_NS	(2 * 1000000000ull)
+#define FA_NET_TRIES		3
+#define FA_ARP_ANSWER_NS	(500 * 1000000ull)
+#define FA_ECHO_ANSWER_NS	(1000 * 1000000ull)
+#define FA_NET_LOOK_NS		(20 * 1000000ull)
 
 /* The address of the network an interface has joined while it has joined none: mac.c compares beacons with it. */
 static const uint8_t no_network[ETH_ALEN];
@@ -145,6 +164,7 @@ static uint8_t target_name[FA_SSID_MOST];
 static unsigned target_name_length;
 static uint8_t target_key[32];			/* stage 6: wiped when the join is over */
 static bool target_protected;
+static bool target_address;			/* stage 7 */
 
 /* find_sta has only the interface to go by, and there is one radio. */
 static struct fa_radio *the_radio;
@@ -172,6 +192,7 @@ void
 fa_set_target_ssid(const unsigned char *name, unsigned length)
 {
 	target_protected = false;
+	target_address = false;
 	target_name_length = length >= 1 && length <= FA_SSID_MOST ? length : 0;
 	if (target_name_length != 0) {
 		memcpy(target_name, name, target_name_length);
@@ -187,6 +208,13 @@ fa_set_target_join(const unsigned char *name, unsigned length, const unsigned ch
 		memcpy(target_key, key, sizeof(target_key));
 		target_protected = true;
 	}
+}
+
+/* From fa_hif.c on stage 7, after fa_set_target_join(): the join goes on to ask for an address. */
+void
+fa_m7_ask(void)
+{
+	target_address = true;
 }
 
 /* tools/ath12k-edits.json, ath12k-mac-override. mac.c has no device-address fallback. */
@@ -764,16 +792,38 @@ join_eapol(struct fa_radio *radio, const struct sk_buff *skb, const struct ieee8
 	return (true);
 }
 
-/* Design W3: nothing goes up from here yet, but what came unciphered once there are keys is counted as what it is. */
+/*
+ * Design W3: nothing goes up from here, and what came unciphered once there are keys is counted as what it is and never
+ * kept for stage 7. What was deciphered and is wanted is copied for the join, on its own thread. Under the layer's lock.
+ */
 static void
-join_data_count(struct fa_radio *radio, const struct ieee80211_rx_status *status)
+join_data_count(struct fa_radio *radio, const struct sk_buff *skb, const struct ieee80211_rx_status *status)
 {
+	struct fa_data data;
+
 	radio->link_data++;
-	if ((status->flag & (RX_FLAG_8023 | RX_FLAG_DECRYPTED)) != 0) {
-		radio->rx_ok++;
-	} else {
+	if ((status->flag & (RX_FLAG_8023 | RX_FLAG_DECRYPTED)) == 0) {
 		radio->rx_clear++;
+		return;
 	}
+	radio->rx_ok++;
+	if (!radio->net_on || !fa_data_read(skb->data, skb->len, (status->flag & RX_FLAG_8023) != 0, (status->flag & RX_FLAG_IV_STRIPPED) != 0,
+	    radio->vif->addr, radio->target.address, &data) || !fa_net_wanted(data.type, data.body, data.length)) {
+		return;
+	}
+	if (radio->inbox_count == FA_INBOX) {
+		radio->inbox_lost++;
+		return;
+	}
+	{
+		unsigned slot = (radio->inbox_first + radio->inbox_count++) % FA_INBOX;
+
+		radio->inbox[slot].type = data.type;
+		radio->inbox[slot].length = data.length;
+		memcpy(radio->inbox[slot].from, data.from, 6);
+		memcpy(radio->inbox[slot].bytes, data.body, data.length);
+	}
+	lx_os_wakeup(&radio->answer);
 }
 
 /* What the join reads of a frame from the air: under the layer's lock, on the poll thread. */
@@ -788,13 +838,13 @@ join_rx(struct fa_radio *radio, const struct sk_buff *skb, const struct ieee8021
 		return;
 	}
 	if ((status->flag & RX_FLAG_8023) != 0) {
-		join_data_count(radio, status);
+		join_data_count(radio, skb, status);
 		lx_os_unlock();
 		return;
 	}
 	switch (fa_rx_kind(skb->data, skb->len, radio->target.address)) {
 	case FA_RX_DATA:
-		join_data_count(radio, status);
+		join_data_count(radio, skb, status);
 		break;
 	case FA_RX_BEACON:
 		radio->link_beacons++;
@@ -1954,6 +2004,209 @@ station_stay(struct fa_radio *radio)
 	fa_m5_rx_ring("after the stay");
 }
 
+/* ---- stage 7: an address, the router, and beyond ---------------------------------------------------------- */
+
+/* A message for the network, ciphered by the firmware with the key we gave it. */
+static bool
+net_send(struct fa_radio *radio, const uint8_t *to, unsigned type, const uint8_t *body, unsigned length)
+{
+	bool qos = radio->sta->wme;
+	unsigned total = (qos ? FA_QOS_HEADER : FA_FRAME_HEADER) + FA_LLC_LENGTH + length;
+	struct sk_buff *skb;
+	uint8_t *bytes;
+
+	if ((skb = frame_new(radio, total, &bytes)) == NULL) {
+		lx_tell("FUXI ATH12K: M7 no buffer for a message\n");
+		return (false);
+	}
+	(void)fa_data_frame(bytes, total, radio->vif->addr, radio->target.address, to, qos, type, body, length);
+	IEEE80211_SKB_CB(skb)->control.hw_key = radio->pairwise_key;
+	skb->protocol = cpu_to_be16(type);
+	skb->priority = 0;
+	radio->net_sent++;
+	frame_send(radio, skb);
+	return (true);
+}
+
+/* The next message kept for us, into `out` of FA_NET_MOST bytes. Its length, 0 when the time is up or the link is gone. */
+static unsigned
+net_next(struct fa_radio *radio, unsigned long long until, unsigned *type, uint8_t *from, uint8_t *out)
+{
+	while (lx_os_nanoseconds() < until && !fa_m4_trouble()) {
+		unsigned length = 0;
+		bool gone;
+
+		lx_os_lock();
+		gone = radio->answer == FA_ANSWER_GONE || radio->lost || radio->went_protected;
+		if (radio->inbox_count != 0) {
+			unsigned slot = radio->inbox_first;
+
+			*type = radio->inbox[slot].type;
+			length = radio->inbox[slot].length;
+			memcpy(from, radio->inbox[slot].from, 6);
+			memcpy(out, radio->inbox[slot].bytes, length);
+			radio->inbox_first = (slot + 1) % FA_INBOX;
+			radio->inbox_count--;
+		} else if (!gone) {
+			lx_os_sleep(&radio->answer, FA_NET_LOOK_NS);
+		}
+		lx_os_unlock();
+		if (length != 0) {
+			return (length);
+		}
+		if (gone) {
+			break;
+		}
+	}
+	return (0);
+}
+
+#define IP_SAID(a)	(a)[0], (a)[1], (a)[2], (a)[3]
+
+/* Tries of one DHCP message, until one of `wanted` (and always NAK) comes. The answer in *reply and who sent it in `from`. */
+static bool
+dhcp_ask(struct fa_radio *radio, unsigned kind, unsigned wanted, unsigned tries, const uint8_t *requested, const uint8_t *server, struct fa_dhcp_reply *reply,
+    uint8_t *from, unsigned *tried)
+{
+	static const uint8_t everybody[ETH_ALEN] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+	static uint8_t message[FA_DHCP_LENGTH], in[FA_NET_MOST];
+
+	for (*tried = 1; *tried <= tries && !fa_m4_trouble(); (*tried)++) {
+		/* Half of the tries ask for an answer to all: an answer that comes only then says which key works. */
+		unsigned length = fa_dhcp_build(message, sizeof(message), kind, radio->vif->addr, radio->xid, *tried > tries / 2, requested, server, NULL);
+		unsigned long long until = lx_os_nanoseconds() + FA_DHCP_ANSWER_NS;
+		unsigned got, type;
+
+		if (!net_send(radio, everybody, FA_TYPE_IP, message, length)) {
+			return (false);
+		}
+		while ((got = net_next(radio, until, &type, from, in)) != 0) {
+			if (type == FA_TYPE_IP && fa_dhcp_read(in, got, radio->vif->addr, radio->xid, reply) && (reply->kind == wanted || reply->kind == FA_DHCP_NAK)) {
+				return (true);
+			}
+		}
+		if (radio->answer == FA_ANSWER_GONE || radio->lost || radio->went_protected) {
+			return (false);
+		}
+	}
+	return (false);
+}
+
+/* One echo to `to`, through `hardware`, up to three times. */
+static void
+echo_ask(struct fa_radio *radio, const uint8_t *hardware, const uint8_t *to, const char *what)
+{
+	static uint8_t message[FA_ECHO_LENGTH], in[FA_NET_MOST];
+	unsigned long long began = lx_os_nanoseconds();
+	unsigned id = radio->xid & 0xffff;
+
+	for (unsigned sequence = 1; sequence <= FA_NET_TRIES && !fa_m4_trouble(); sequence++) {
+		unsigned long long until = lx_os_nanoseconds() + FA_ECHO_ANSWER_NS;
+		unsigned length = fa_echo_request(message, sizeof(message), radio->own_address, to, id, sequence), got, type;
+		uint8_t from[6];
+
+		if (!net_send(radio, hardware, FA_TYPE_IP, message, length)) {
+			return;
+		}
+		while ((got = net_next(radio, until, &type, from, in)) != 0) {
+			if (type == FA_TYPE_IP && fa_echo_read(in, got, to, radio->own_address, id, sequence)) {
+				lx_tell("FUXI ATH12K: M7 ping %s %u.%u.%u.%u ok, try %u, %llu ms\n", what, IP_SAID(to), sequence, (lx_os_nanoseconds() - began) / 1000000ull);
+				return;
+			}
+		}
+	}
+	lx_tell("FUXI ATH12K: M7 ping %s %u.%u.%u.%u no answer to %u tries\n", what, IP_SAID(to), FA_NET_TRIES);
+}
+
+/* What an address came to, and what the air said about it. */
+static void
+net_counts(struct fa_radio *radio, const char *when)
+{
+	lx_tell("FUXI ATH12K: M7 %s: sent %u; data done %u acked %u; rx ok %u dropped unprotected %u; kept lost %u\n", when, radio->net_sent, radio->data_done, radio->data_acked,
+	    radio->rx_ok, radio->rx_clear, radio->inbox_lost);
+}
+
+/* An address from the network, then the router and a host beyond it. Bounded by the clock, and whatever it comes to, the stay follows. */
+static void
+station_address(struct fa_radio *radio)
+{
+	static const uint8_t beyond[4] = { 1, 1, 1, 1 };
+	static const uint8_t everybody[ETH_ALEN] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+	static uint8_t message[FA_ARP_LENGTH], in[FA_NET_MOST];
+	unsigned long long began = lx_os_nanoseconds();
+	struct fa_dhcp_reply offer, ack;
+	uint8_t from[6], router[6];
+	bool found = false;
+	unsigned tried;
+
+	get_random_bytes(&radio->xid, sizeof(radio->xid));
+	lx_os_lock();
+	radio->rx_ok = radio->rx_clear = 0;
+	radio->net_on = true;
+	lx_os_unlock();
+	if (!dhcp_ask(radio, FA_DHCP_DISCOVER, FA_DHCP_OFFER, FA_DHCP_TRIES, NULL, NULL, &offer, from, &tried) || offer.kind != FA_DHCP_OFFER) {
+		lx_tell("FUXI ATH12K: M7 not proven: no DHCP offer after %u discovers\n", tried > FA_DHCP_TRIES ? FA_DHCP_TRIES : tried);
+		net_counts(radio, "no offer");
+		return;
+	}
+	lx_tell("FUXI ATH12K: M7 DHCP offer server %u.%u.%u.%u yiaddr %u.%u.%u.%u, try %u, %llu ms\n", IP_SAID(offer.server), IP_SAID(offer.address), tried,
+	    (lx_os_nanoseconds() - began) / 1000000ull);
+	if (!dhcp_ask(radio, FA_DHCP_REQUEST, FA_DHCP_ACK, FA_DHCP_TRIES, offer.address, offer.server, &ack, from, &tried) || ack.kind != FA_DHCP_ACK) {
+		lx_tell("FUXI ATH12K: M7 not proven: %s\n", ack.kind == FA_DHCP_NAK ? "the server said no to our request" : "no DHCP ack to our request");
+		net_counts(radio, "no ack");
+		return;
+	}
+	memcpy(radio->own_address, ack.address, 4);
+	memcpy(radio->server, ack.server, 4);
+	memcpy(radio->server_hardware, from, 6);
+	radio->leased = true;
+	lx_tell("FUXI ATH12K: M7 DHCP ack server %u.%u.%u.%u yiaddr %u.%u.%u.%u, lease %u s, %llu ms\n", IP_SAID(ack.server), IP_SAID(ack.address), ack.lease,
+	    (lx_os_nanoseconds() - began) / 1000000ull);
+	lx_tell("FUXI ATH12K: M7 network mask %u.%u.%u.%u router %u.%u.%u.%u name server %u.%u.%u.%u\n", IP_SAID(ack.mask), IP_SAID(ack.router), IP_SAID(ack.name_server));
+	net_counts(radio, "with the address");
+	if (!ack.has_router) {
+		lx_tell("FUXI ATH12K: M7 the network names no router\n");
+		return;
+	}
+	for (unsigned attempt = 0; attempt < FA_NET_TRIES && !found && !fa_m4_trouble(); attempt++) {
+		unsigned long long until = lx_os_nanoseconds() + FA_ARP_ANSWER_NS;
+		unsigned length = fa_arp_request(message, sizeof(message), radio->vif->addr, radio->own_address, ack.router), got, type;
+
+		if (!net_send(radio, everybody, FA_TYPE_ARP, message, length)) {
+			return;
+		}
+		while (!found && (got = net_next(radio, until, &type, from, in)) != 0) {
+			found = type == FA_TYPE_ARP && fa_arp_read(in, got, radio->own_address, ack.router, router);
+		}
+	}
+	if (!found) {
+		lx_tell("FUXI ATH12K: M7 not proven: the router does not answer ARP\n");
+		net_counts(radio, "no router");
+		return;
+	}
+	lx_tell("FUXI ATH12K: M7 router found\n");
+	echo_ask(radio, router, ack.router, "router");
+	echo_ask(radio, router, beyond, "beyond");
+	net_counts(radio, "after the echoes");
+}
+
+/* The address goes back: a lease on somebody's network is not left behind by a test. */
+static void
+station_address_back(struct fa_radio *radio)
+{
+	static uint8_t message[FA_DHCP_LENGTH];
+
+	radio->net_on = false;
+	if (radio->leased && radio->answer != FA_ANSWER_GONE && !radio->lost && !fa_m4_trouble()) {
+		unsigned length = fa_dhcp_build(message, sizeof(message), FA_DHCP_RELEASE, radio->vif->addr, radio->xid, false, NULL, radio->server, radio->own_address);
+
+		if (net_send(radio, radio->server_hardware, FA_TYPE_IP, message, length)) {
+			lx_tell("FUXI ATH12K: M7 the address given back\n");
+		}
+	}
+	radio->leased = false;
+}
+
 /* The handshake's beginning, from what the chosen access point offers. False, and said, when it is not to be joined. */
 static bool
 handshake_prepare(struct fa_radio *radio)
@@ -2053,7 +2306,11 @@ fa_m5_station(struct ieee80211_hw *hw, bool passive)
 			if (!radio->protect || handshake_prepare(radio)) {
 				error = station_join(radio, &joined);
 				if (joined) {
+					if (target_address) {
+						station_address(radio);
+					}
 					station_stay(radio);
+					station_address_back(radio);
 				}
 			}
 		}

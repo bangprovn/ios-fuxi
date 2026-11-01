@@ -543,7 +543,8 @@ enum { BSS_CHANGED_ASSOC = 1, BSS_CHANGED_ERP_PREAMBLE = 8, BSS_CHANGED_ERP_SLOT
        BSS_CHANGED_BSSID = 256, BSS_CHANGED_QOS = 512, BSS_CHANGED_BEACON_INFO = 1024 };
 enum { IEEE80211_TX_STAT_ACK = 2 };
 struct ieee80211_chanctx_conf { struct cfg80211_chan_def def, min_def; uint8_t rx_chains_dynamic, rx_chains_static; uint8_t drv_priv[0] __attribute__((aligned(64))); };
-struct ieee80211_tx_info { uint32_t flags; enum nl80211_band band; struct { struct ieee80211_vif *vif; } control; };
+struct ieee80211_key_conf;
+struct ieee80211_tx_info { uint32_t flags; enum nl80211_band band; struct { struct ieee80211_vif *vif; struct ieee80211_key_conf *hw_key; } control; };
 #define IEEE80211_SKB_CB(s) ((struct ieee80211_tx_info *)((s)->cb))
 struct ieee80211_tx_control { struct ieee80211_sta *sta; };
 struct ieee80211_tx_queue_params { uint16_t cw_min, cw_max, txop; uint8_t aifs; int acm; };
@@ -1127,8 +1128,72 @@ static void give_eapol(const uint8_t *body, unsigned length) {
     memcpy(f + at, body, length); at += length;
     deliver(f, at, 2412, -40, 0, true);
 }
+
+/* ---- the network's peer, stage 7 ---- */
+static const uint8_t V_ME[4] = {10, 0, 0, 9}, V_GW[4] = {10, 0, 0, 1}, V_BEYOND[4] = {1, 1, 1, 1};
+static struct { bool on, silent, unprotected, nak, no_router, broadcast_only, no_arp, no_beyond; unsigned discovers, requests, releases, arps, echoes, everybody_flags; uint32_t xid; } net;
+static void give_net(unsigned type, const uint8_t *body, unsigned length, bool to_all) {
+    uint8_t f[800] = {0}; unsigned at = 26;
+    f[0] = 0x88; f[1] = 0x02; memcpy(f + 4, to_all ? (const uint8_t *)"\xff\xff\xff\xff\xff\xff" : OWN, 6); memcpy(f + 10, AP, 6); memcpy(f + 16, OTHER, 6);
+    memcpy(f + at, "\xaa\xaa\x03\x00\x00\x00", 6); f[at + 6] = type >> 8; f[at + 7] = type; at += 8;
+    memcpy(f + at, body, length); at += length;
+    deliver(f, at, 2412, -40, net.unprotected ? 0 : RX_FLAG_DECRYPTED | RX_FLAG_IV_STRIPPED, true);
+}
+static void give_dhcp(unsigned kind, bool to_all) {
+    uint8_t m[400] = {0}, *udp = m + 20, *b = udp + 8, *o = b + 240;
+    b[0] = 2; b[1] = 1; b[2] = 6; b[4] = net.xid >> 24; b[5] = net.xid >> 16; b[6] = net.xid >> 8; b[7] = net.xid;
+    memcpy(b + 16, V_ME, 4); memcpy(b + 28, OWN, 6); b[236] = 99; b[237] = 130; b[238] = 83; b[239] = 99;
+    *o++ = 53; *o++ = 1; *o++ = kind; *o++ = 54; *o++ = 4; memcpy(o, V_GW, 4); o += 4;
+    *o++ = 1; *o++ = 4; *o++ = 255; *o++ = 255; *o++ = 255; *o++ = 0;
+    if (!net.no_router) { *o++ = 3; *o++ = 4; memcpy(o, V_GW, 4); o += 4; }
+    *o++ = 51; *o++ = 4; *o++ = 0; *o++ = 0; *o++ = 0x0e; *o++ = 0x10; *o++ = 255;
+    unsigned udp_length = (unsigned)(o - udp);
+    fa_ip_header(m, 17, V_GW, V_ME, 20 + udp_length, 9);
+    udp[1] = 67; udp[3] = 68; udp[4] = udp_length >> 8; udp[5] = udp_length;
+    give_net(FA_TYPE_IP, m, 20 + udp_length, to_all);
+}
+/* What the network hears from us: over the air, ciphered, after the keys. It answers from inside op_tx, as the fake's clock has no other time. */
+static void net_heard(const uint8_t *data, unsigned n, unsigned type) {
+    assert(net.on && radio_of(the_hw)->reached == IEEE80211_STA_AUTHORIZED);
+    if (type == FA_TYPE_ARP) {
+        net.arps++;
+        assert(n == 28 && data[7] == 1 && !memcmp(data + 14, V_ME, 4) && !memcmp(data + 24, V_GW, 4));
+        if (!net.no_arp) { uint8_t a[28]; memcpy(a, "\0\1\10\0\6\4\0\2", 8); memcpy(a + 8, OTHER, 6); memcpy(a + 14, V_GW, 4); memcpy(a + 18, OWN, 6); memcpy(a + 24, V_ME, 4); give_net(FA_TYPE_ARP, a, 28, false); }
+        return;
+    }
+    assert(type == FA_TYPE_IP && n >= 20 && fa_ip_sum(data, 20) == 0);
+    if (data[9] == 1) {
+        net.echoes++;
+        if (net.no_beyond && !memcmp(data + 16, V_BEYOND, 4)) return;
+        assert(!memcmp(data + 12, V_ME, 4));
+        uint8_t e[80]; memcpy(e, data, n); memcpy(e + 12, data + 16, 4); memcpy(e + 16, data + 12, 4); e[10] = e[11] = 0; fa_put16(e + 10, fa_ip_sum(e, 20));
+        e[20] = 0; e[22] = e[23] = 0; fa_put16(e + 22, fa_ip_sum(e + 20, n - 20));
+        give_net(FA_TYPE_IP, e, n, false);
+        return;
+    }
+    assert(data[9] == 17 && data[23] == 67 && n == FA_DHCP_LENGTH);
+    const uint8_t *b = data + 28; unsigned kind = b[242];
+    net.xid = fa_be32(b + 4);
+    assert(!memcmp(b + 28, OWN, 6));
+    bool all = (b[10] & 0x80) != 0;
+    net.everybody_flags += all;
+    if (kind == FA_DHCP_DISCOVER) { net.discovers++; if (net.silent || (net.broadcast_only && !all)) return; give_dhcp(FA_DHCP_OFFER, all); }
+    else if (kind == FA_DHCP_REQUEST) { net.requests++; assert(!memcmp(fa_element(b + 240, 60, 50) + 2, V_ME, 4) && !memcmp(fa_element(b + 240, 60, 54) + 2, V_GW, 4)); give_dhcp(net.nak ? FA_DHCP_NAK : FA_DHCP_ACK, all); }
+    else { assert(kind == FA_DHCP_RELEASE && !memcmp(data + 12, V_ME, 4) && !memcmp(data + 16, V_GW, 4) && !memcmp(b + 12, V_ME, 4)); net.releases++; }
+}
 static void eapol_sent(struct ieee80211_hw *hw, struct sk_buff *skb) {
     unsigned header = skb->data[0] == 0x88 ? 26 : 24;
+    if (skb->protocol != cpu_to_be16(0x888e)) {
+        unsigned type = fa_be16(skb->data + header + 6);
+        assert(skb->data[1] == 0x41 && IEEE80211_SKB_CB(skb)->control.hw_key == radio_of(hw)->pairwise_key && radio_of(hw)->pairwise_key != NULL && skb->priority == 0 && skb->protocol == cpu_to_be16(type));
+        assert(!memcmp(skb->data + header, "\xaa\xaa\x03\x00\x00\x00", 6));
+        uint8_t copy[1600]; unsigned n = skb->len - header - 8; memcpy(copy, skb->data + header + 8, n);
+        IEEE80211_SKB_CB(skb)->flags |= IEEE80211_TX_STAT_ACK;
+        struct ieee80211_tx_status s = { .skb = skb, .info = IEEE80211_SKB_CB(skb) };
+        linuxkpi_ieee80211_tx_status_ext(hw, &s);
+        net_heard(copy, n, type);
+        return;
+    }
     assert(skb->data[1] == 1 && skb->protocol == cpu_to_be16(0x888e) && skb->len > header + 8 && skb->priority == 7);
     const uint8_t *body = skb->data + header + 8; unsigned n = skb->len - header - 8;
     eapols++;
@@ -1231,8 +1296,9 @@ static void op_tx(struct ieee80211_hw *hw, struct ieee80211_tx_control *c, struc
     assert(!locks && !hw->wiphy->mtx.locked && c->sta == radio_of(hw)->sta);
     assert(IEEE80211_SKB_CB(skb)->control.vif == radio_of(hw)->vif && skb->len >= 24);
     uint8_t kind = skb->data[0];
-    assert(!memcmp(skb->data + 4, AP, 6) && !memcmp(skb->data + 10, OWN, 6) && !memcmp(skb->data + 16, AP, 6));
+    assert(!memcmp(skb->data + 4, AP, 6) && !memcmp(skb->data + 10, OWN, 6));
     if (kind == 0x88 || kind == 0x08) { eapol_sent(hw, skb); return; }
+    assert(!memcmp(skb->data + 16, AP, 6));
     if (kind == FA_KIND_AUTH) {
         NOTE("auth"); auth_tries++; assert(skb->len == FA_AUTH_LENGTH); memcpy(last_auth, skb->data, skb->len);
     } else if (kind == FA_KIND_ASSOC_REQUEST) {
@@ -1382,7 +1448,9 @@ static void fresh_wpa(const uint8_t *key) {
     fa_set_target_join((const unsigned char *)NAME, sizeof(NAME) - 1, key);
     ap.hear_elements = WPA_HEARD; ap.hear_length = sizeof(RSN_ELEMENT) + sizeof(OPEN_HT); ap.cap = FA_CAP_ESS | FA_CAP_SHORT_SLOT | FA_CAP_PRIVACY;
     tick = wpa_tick;
+    memset(&net, 0, sizeof(net));
 }
+static void fresh_net(void) { fresh_wpa(V_PMK); fa_m7_ask(); net.on = true; }
 static const uint8_t *find_in_request(unsigned number) { return fa_element(last_assoc + 28, last_assoc_length - 28, number); }
 /* What was said and done, when an assertion stops the run. */
 static void on_abort(int s) { fprintf(stderr, "calls: %s\nsaid:\n%s\n", calls, said); signal(SIGABRT, SIG_DFL); }
@@ -1703,6 +1771,50 @@ int main(void) {
     /* What is left of a key is never given to an open network's way: stage 5 asks for no bss. */
     fresh(); ticks = 0; tick = stay_frames;
     assert(fa_m5_station(the_hw, false) == 0 && !asked_bss_open);
+    done();
+
+    /* ---- stage 7 ---- */
+    /* The whole way: an address, the router, an echo to it and beyond it, the stay, the address given back, then goodbye. */
+    fresh_net();
+    assert(fa_m5_station(the_hw, false) == 0 && !rddm && !evidence_count);
+    assert(net.discovers == 1 && net.requests == 1 && net.arps == 1 && net.echoes == 2 && net.releases == 1 && !net.everybody_flags);
+    assert(SAID("M7 DHCP offer server 10.0.0.1 yiaddr 10.0.0.9") && SAID("M7 DHCP ack server 10.0.0.1 yiaddr 10.0.0.9, lease 3600 s") && SAID("M7 network mask 255.255.255.0 router 10.0.0.1"));
+    assert(SAID("M7 router found") && SAID("M7 ping router 10.0.0.1 ok, try 1") && SAID("M7 ping beyond 1.1.1.1 ok, try 1") && SAID("M7 the address given back") && SAID("kept lost 0"));
+    assert(strstr(said, "M6 4-way ok") < strstr(said, "M7 DHCP offer") && strstr(said, "M7 ping beyond") < strstr(said, "M5 stayed") && strstr(said, "M5 stayed") < strstr(said, "M7 the address given back"));
+    assert(strstr(said, "M7 the address given back") < strstr(said, "M5 deauthentication sent"));
+    log_is_clean();
+    done();
+    /* Stage 6 never asks: the same network with no fa_m7_ask(). */
+    fresh_wpa(V_PMK); net.on = false;
+    assert(fa_m5_station(the_hw, false) == 0 && !SAID("M7 ") && !net.discovers && SAID("M6 4-way ok"));
+    done();
+    /* No offer: four tries, the last two asking for an answer to all, bounded, nothing proven, the stay and the way down still follow. */
+    fresh_net(); net.silent = true;
+    {
+        unsigned long long began = now;
+        assert(fa_m5_station(the_hw, false) == 0 && now - began < FA_REGD_WAIT_NS + FA_DHCP_TRIES * FA_DHCP_ANSWER_NS + FA_JOIN_STAY_NS + 3000000000ull);
+    }
+    assert(net.discovers == 4 && net.everybody_flags == 2 && SAID("M7 not proven: no DHCP offer after 4 discovers") && !net.releases && deauths == 1 && SAID("M5 stayed"));
+    done();
+    /* An answer only to all, which is what the group's key alone would show. */
+    fresh_net(); net.broadcast_only = true;
+    assert(fa_m5_station(the_hw, false) == 0 && net.discovers == 3 && SAID("try 3") && SAID("M7 DHCP ack") && net.releases == 1);
+    done();
+    /* Design W3: what comes unciphered is counted, and never kept. */
+    fresh_net(); net.unprotected = true;
+    assert(fa_m5_station(the_hw, false) == 0 && SAID("M7 not proven: no DHCP offer") && strstr(said, "dropped unprotected 4") && !net.requests);
+    done();
+    fresh_net(); net.nak = true;
+    assert(fa_m5_station(the_hw, false) == 0 && SAID("M7 not proven: the server said no") && !net.arps && !net.releases);
+    done();
+    fresh_net(); net.no_router = true;
+    assert(fa_m5_station(the_hw, false) == 0 && SAID("M7 the network names no router") && !net.arps && net.releases == 1);
+    done();
+    fresh_net(); net.no_arp = true;
+    assert(fa_m5_station(the_hw, false) == 0 && SAID("M7 not proven: the router does not answer ARP") && net.arps == 3 && !net.echoes && net.releases == 1);
+    done();
+    fresh_net(); net.no_beyond = true;
+    assert(fa_m5_station(the_hw, false) == 0 && SAID("M7 ping router 10.0.0.1 ok") && SAID("M7 ping beyond 1.1.1.1 no answer to 3 tries") && net.releases == 1);
     done();
 
     /* The two iterators: only what exists. */
@@ -2164,7 +2276,7 @@ def the_key_stays_in_its_place(tmp):
         code = code_only(path.read_text()).lower()
         for word in ('passphrase', 'psk', 'pmk', 'ptk', 'gtk', 'set_key', 'wpa_', 'vnode', 'vn_open', 'kern_open', 'test-network'):
             assert word not in code, f'{path.name}: {word}'
-    for path in (own / 'fa_80211.c', own / 'fa_join.h', own / 'fa_wpa.c', own / 'fa_wpa.h'):
+    for path in (own / 'fa_80211.c', own / 'fa_join.h', own / 'fa_net.h', own / 'fa_wpa.c', own / 'fa_wpa.h'):
         code = code_only(path.read_text()).lower()
         for word in ('passphrase', 'vnode', 'vn_open', 'kern_open', 'test-network', 'lx_os_option', 'pe_parse'):
             assert word not in code, f'{path.name}: {word}'
@@ -2175,7 +2287,7 @@ def the_key_stays_in_its_place(tmp):
             assert word not in call, call
     block = wlan[wlan.index('static void\nwl_fa_join_configure(void)'):]
     block = block[:block.index('\n}\n')]
-    assert 'wl_fa_stage != 6' in block and 'PE_parse' not in block and 'fuxi-wifi-join' in block and block.count('printf(') == 3
+    assert 'wl_fa_stage != 6 && wl_fa_stage != 7' in block and 'PE_parse' not in block and 'fuxi-wifi-join' in block and block.count('printf(') == 3
     assert 'bytes + 1 + bytes[0]' not in ''.join(line for line in block.splitlines() if 'printf' in line)
     assert not re.search(r'PE_parse[a-z_]*\("fuxiwifi(key|pmk|pass|psk)', wlan)
     guarded = wlan[wlan.index('static void\nwl_fa_ssid_configure(void)'):]
@@ -2190,7 +2302,7 @@ def the_key_stays_in_its_place(tmp):
     assert text.count('ops->set_key') == 2 and text.index('ops->set_key') > block
     assert text.count('radio->say_names = true') == 1 and text.index('radio->say_names = true') > text.index('\nfa_m4_station(')
     hif = (own / 'fa_hif.c').read_text()
-    assert 'hif.stage == FA_STAGE_JOIN || hif.stage == FA_STAGE_WPA ? fa_m5_station(' in hif and hif.count('fa_m5_station(') == 1
+    assert 'hif.stage == FA_STAGE_JOIN || hif.stage == FA_STAGE_WPA || hif.stage == FA_STAGE_ADDRESS ? fa_m5_station(' in hif and hif.count('fa_m5_station(') == 1
     # 20 MHz and no EHT: the join sets one width, and no element 108 is built.
     join = (own / 'fa_join.h').read_text()
     assert 'NL80211_CHAN_WIDTH_20' in text and 'NL80211_CHAN_WIDTH_40' not in text and 'NL80211_CHAN_WIDTH_80' not in text
@@ -2317,6 +2429,117 @@ def wpa_against_an_independent_peer(tmp):
     program = tmp / 'wpa'
     subprocess.run([cc, '-std=gnu11', '-Wall', '-Wextra', '-g', '-O1', '-fsanitize=address,undefined', '-fno-sanitize-recover=all', f'-I{own}',
                     str(tmp / 'wpa.c'), str(own / 'fa_wpa.c'), '-o', str(program)], check=True)
+    subprocess.run([str(program)], check=True)
+
+
+FA_NET_HOST = r"""
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "fa_bss.h"
+#include "fa_join.h"
+#include "fa_net.h"
+static const uint8_t OWN[6] = {2, 0x46, 0x55, 0x58, 0x49, 1}, AP[6] = {0x02, 0xa1, 0xb2, 0xc3, 0xd4, 0x55}, SERVER[6] = {0x02, 0, 0, 0, 0, 9};
+static const uint8_t ME[4] = {10, 0, 0, 9}, THEM[4] = {10, 0, 0, 1};
+static uint32_t seed = 0x1234567;
+static uint32_t next(void) { seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5; return seed; }
+/* A server's answer, by the RFC's bytes. */
+static unsigned offer(uint8_t *out, unsigned kind, uint32_t xid, const uint8_t *chaddr) {
+    uint8_t *udp = out + 20, *b = udp + 8, *o = b + 240;
+    memset(out, 0, 400);
+    b[0] = 2; b[1] = 1; b[2] = 6; b[4] = xid >> 24; b[5] = xid >> 16; b[6] = xid >> 8; b[7] = xid;
+    memcpy(b + 16, ME, 4); memcpy(b + 28, chaddr, 6); b[236] = 99; b[237] = 130; b[238] = 83; b[239] = 99;
+    *o++ = 53; *o++ = 1; *o++ = kind; *o++ = 0; *o++ = 54; *o++ = 4; memcpy(o, THEM, 4); o += 4;
+    *o++ = 1; *o++ = 4; *o++ = 255; *o++ = 255; *o++ = 255; *o++ = 0;
+    *o++ = 3; *o++ = 8; memcpy(o, THEM, 4); memset(o + 4, 7, 4); o += 8;
+    *o++ = 6; *o++ = 4; *o++ = 8; *o++ = 8; *o++ = 8; *o++ = 8;
+    *o++ = 51; *o++ = 4; *o++ = 0; *o++ = 1; *o++ = 0; *o++ = 0; *o++ = 255;
+    unsigned udp_length = (unsigned)(o - udp), total = 20 + udp_length;
+    fa_ip_header(out, 17, THEM, ME, total, 7);
+    udp[1] = 67; udp[3] = 68; udp[4] = udp_length >> 8; udp[5] = udp_length;
+    return total;
+}
+int main(void) {
+    uint8_t m[2048], f[2048]; struct fa_dhcp_reply r; struct fa_data d; uint8_t hw[6];
+    /* What we send, by the RFC's bytes. */
+    unsigned n = fa_dhcp_build(m, sizeof(m), FA_DHCP_DISCOVER, OWN, 0x11223344, false, NULL, NULL, NULL);
+    assert(n == FA_DHCP_LENGTH && fa_dhcp_build(m, n - 1, FA_DHCP_DISCOVER, OWN, 1, false, NULL, NULL, NULL) == 0);
+    assert(fa_ip_sum(m, 20) == 0 && m[9] == 17 && !memcmp(m + 12, "\0\0\0\0", 4) && !memcmp(m + 16, "\xff\xff\xff\xff", 4));
+    assert(m[21] == 68 && m[23] == 67 && m[28] == 1 && m[28 + 4] == 0x11 && m[28 + 10] == 0 && !memcmp(m + 28 + 28, OWN, 6) && !memcmp(m + 28 + 236, "\x63\x82\x53\x63", 4));
+    assert(m[28 + 240] == 53 && m[28 + 242] == 1);
+    n = fa_dhcp_build(m, sizeof(m), FA_DHCP_REQUEST, OWN, 5, true, ME, THEM, NULL);
+    assert(m[28 + 10] == 0x80 && fa_element(m + 28 + 240, 60, 50) && !memcmp(fa_element(m + 28 + 240, 60, 50) + 2, ME, 4) && !memcmp(fa_element(m + 28 + 240, 60, 54) + 2, THEM, 4));
+    n = fa_dhcp_build(m, sizeof(m), FA_DHCP_RELEASE, OWN, 5, false, NULL, THEM, ME);
+    assert(!memcmp(m + 12, ME, 4) && !memcmp(m + 16, THEM, 4) && !memcmp(m + 28 + 12, ME, 4) && m[28 + 242] == 7 && fa_ip_sum(m, 20) == 0);
+    /* A good answer, then each way it is not one. */
+    n = offer(m, 2, 0xabcd, OWN);
+    assert(fa_dhcp_read(m, n, OWN, 0xabcd, &r) && r.kind == 2 && !memcmp(r.address, ME, 4) && !memcmp(r.server, THEM, 4) && !memcmp(r.router, THEM, 4) && r.mask[2] == 255 && r.name_server[0] == 8 && r.lease == 65536);
+    assert(!fa_dhcp_read(m, n, OWN, 0xabce, &r) && !fa_dhcp_read(m, n, SERVER, 0xabcd, &r));
+    n = offer(m, 6, 1, OWN); assert(fa_dhcp_read(m, n, OWN, 1, &r) && r.kind == 6);
+    n = offer(m, 9, 1, OWN); assert(!fa_dhcp_read(m, n, OWN, 1, &r));
+    n = offer(m, 2, 1, OWN); m[10] ^= 1; assert(!fa_dhcp_read(m, n, OWN, 1, &r));	/* a wrong header checksum */
+    n = offer(m, 2, 1, OWN); m[6] = 0x20; m[10] = m[11] = 0; fa_put16(m + 10, fa_ip_sum(m, 20)); assert(!fa_dhcp_read(m, n, OWN, 1, &r));	/* a fragment */
+    /* Every shorter length and random bytes, each in memory of exactly its size. */
+    n = offer(m, 2, 1, OWN);
+    for (unsigned i = 0; i < n; i++) {
+        uint8_t *x = malloc(i ? i : 1); memcpy(x, m, i);
+        (void)fa_dhcp_read(x, i, OWN, 1, &r); (void)fa_net_wanted(FA_TYPE_IP, x, i); (void)fa_echo_read(x, i, THEM, ME, 1, 1); (void)fa_arp_read(x, i, ME, THEM, hw); (void)fa_net_wanted(FA_TYPE_ARP, x, i);
+        free(x);
+    }
+    for (unsigned round = 0; round < 40000; round++) {
+        unsigned size = next() % 500; uint8_t *x = malloc(size ? size : 1);
+        memcpy(x, m, size < n ? size : n);
+        for (unsigned k = next() % 6; k > 0 && size > 0; k--) x[next() % size] = (uint8_t)next();
+        if (size > 20 && (next() & 1)) { x[10] = x[11] = 0; fa_put16(x + 10, fa_ip_sum(x, 20)); }
+        (void)fa_dhcp_read(x, size, OWN, 1, &r); (void)fa_net_wanted(FA_TYPE_IP, x, size); (void)fa_echo_read(x, size, THEM, ME, 1, 1);
+        (void)fa_data_read(x, size, next() & 1, next() & 1, OWN, AP, &d);
+        free(x);
+    }
+    /* ARP and the echo. */
+    assert(fa_arp_request(f, 27, OWN, ME, THEM) == 0 && fa_arp_request(f, 28, OWN, ME, THEM) == 28 && f[7] == 1 && !memcmp(f + 8, OWN, 6) && !memcmp(f + 14, ME, 4) && !memcmp(f + 24, THEM, 4));
+    { uint8_t a[28]; memcpy(a, "\0\1\10\0\6\4\0\2", 8); memcpy(a + 8, SERVER, 6); memcpy(a + 14, THEM, 4); memcpy(a + 18, OWN, 6); memcpy(a + 24, ME, 4);
+      assert(fa_net_wanted(FA_TYPE_ARP, a, 28) && fa_arp_read(a, 28, ME, THEM, hw) && !memcmp(hw, SERVER, 6) && !fa_arp_read(a, 28, THEM, THEM, hw) && !fa_arp_read(a, 27, ME, THEM, hw));
+      a[7] = 1; assert(!fa_net_wanted(FA_TYPE_ARP, a, 28) && !fa_arp_read(a, 28, ME, THEM, hw)); }
+    n = fa_echo_request(f, sizeof(f), ME, THEM, 77, 3);
+    assert(n == FA_ECHO_LENGTH && fa_ip_sum(f, 20) == 0 && fa_ip_sum(f + 20, n - 20) == 0 && f[20] == 8);
+    assert(!fa_net_wanted(FA_TYPE_IP, f, n));	/* a request is not kept */
+    /* The answer, as the other side turns it round. */
+    memcpy(f + 12, THEM, 4); memcpy(f + 16, ME, 4); f[20] = 0; f[22] = f[23] = 0; fa_put16(f + 22, fa_ip_sum(f + 20, n - 20));
+    assert(fa_net_wanted(FA_TYPE_IP, f, n) && fa_echo_read(f, n, THEM, ME, 77, 3) && !fa_echo_read(f, n, THEM, ME, 77, 4) && !fa_echo_read(f, n, ME, THEM, 77, 3));
+    f[30] ^= 1; assert(!fa_echo_read(f, n, THEM, ME, 77, 3));
+    /* Frames. */
+    n = fa_data_frame(f, sizeof(f), OWN, AP, SERVER, true, FA_TYPE_ARP, (const uint8_t *)"abcd", 4);
+    assert(n == 26 + 8 + 4 && f[0] == 0x88 && f[1] == 0x41 && !memcmp(f + 4, AP, 6) && !memcmp(f + 10, OWN, 6) && !memcmp(f + 16, SERVER, 6) && f[32] == 8 && f[33] == 6);
+    assert(fa_data_frame(f, n - 1, OWN, AP, SERVER, true, FA_TYPE_ARP, (const uint8_t *)"abcd", 4) == 0);
+    /* The same seen from the other side: a frame for us, for everybody, for another, our own heard back, from another access point. */
+    memcpy(f + 4, OWN, 6); memcpy(f + 10, AP, 6); memcpy(f + 16, SERVER, 6); f[1] = 0x42;
+    assert(fa_data_read(f, n, false, true, OWN, AP, &d) && d.type == FA_TYPE_ARP && d.length == 4 && !memcmp(d.from, SERVER, 6));
+    assert(!fa_data_read(f, n, false, false, OWN, AP, &d));	/* the cipher's bytes would be taken for the LLC */
+    f[4] = 0xff; assert(fa_data_read(f, n, false, true, OWN, AP, &d)); memcpy(f + 4, SERVER, 6); assert(!fa_data_read(f, n, false, true, OWN, AP, &d)); memcpy(f + 4, OWN, 6);
+    memcpy(f + 16, OWN, 6); assert(!fa_data_read(f, n, false, true, OWN, AP, &d)); memcpy(f + 16, SERVER, 6);
+    assert(!fa_data_read(f, n, false, true, OWN, SERVER, &d));
+    f[0] = 0xc8; assert(!fa_data_read(f, n, false, true, OWN, AP, &d));
+    /* Ethernet form. */
+    memcpy(f, OWN, 6); memcpy(f + 6, SERVER, 6); f[12] = 8; f[13] = 0; memcpy(f + 14, "abcd", 4);
+    assert(fa_data_read(f, 18, true, false, OWN, AP, &d) && d.type == FA_TYPE_IP && d.length == 4 && !fa_data_read(f, 13, true, false, OWN, AP, &d));
+    puts("fa_net: DHCP, ARP, echo and data frames, by the RFC's bytes and on malformed input");
+    return 0;
+}
+"""
+
+
+@check
+def net_frames_on_malformed_input(tmp):
+    """src/fa_net.h under the sanitizers: what stage 7 builds and reads. Design M7."""
+    own = ROOT / 'xnu/fuxi-ath12k/src'
+    (tmp / 'net.c').write_text(FA_NET_HOST)
+    cc = os.environ.get('CC', 'cc')
+    program = tmp / 'net'
+    subprocess.run([cc, '-std=gnu11', '-Wall', '-Wextra', '-Wno-unused-function', '-g', '-O1', '-fsanitize=address,undefined', '-fno-sanitize-recover=all', f'-I{own}',
+                    str(tmp / 'net.c'), '-o', str(program)], check=True)
     subprocess.run([str(program)], check=True)
 
 

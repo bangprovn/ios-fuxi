@@ -60,10 +60,11 @@ _Static_assert(ATH12K_MAX_SPT_ENTRIES * 8 == ATH12K_PAGE_SIZE, "fuxi-ath12k R2: 
 #define FA_IDLE_AFTER		100		/* quiet rounds before backing off */
 #define FA_WMI_EVENTS_SAID	64		/* of the first ones: which, and how long */
 
-#define FA_STAGE_SCAN		4		/* stages 4, 5 and 6 are the only ones that touch the radio's RF */
+#define FA_STAGE_SCAN		4		/* stages 4 to 7 are the only ones that touch the radio's RF */
 #define FA_STAGE_JOIN		5
 #define FA_STAGE_WPA		6
-#define FA_STAGE_USES_RF(stage)	((stage) == FA_STAGE_SCAN || (stage) == FA_STAGE_JOIN || (stage) == FA_STAGE_WPA)
+#define FA_STAGE_ADDRESS	7
+#define FA_STAGE_USES_RF(stage)	((stage) == FA_STAGE_SCAN || (stage) == FA_STAGE_JOIN || (stage) == FA_STAGE_WPA || (stage) == FA_STAGE_ADDRESS)
 
 /* fuxiath12kq=MASK, stages 4 and 5 only, each one idea for hunting a dying firmware (design section 6). */
 #define FA_KNOB_NO_IDLE_PS	0x01u		/* do not ask for idle power save in ops.start */
@@ -585,7 +586,10 @@ fa_stage_up(struct ath12k_base *ab)
 	fa_m4_rx_ring("before the scan");
 	srng = &ab->hal.srng_list[ath12k_ab_to_dp(ab)->rx_refill_buf_ring.refill_buf_ring.ring_id];
 	hif.rx_head_before = srng->u.src_ring.hp / srng->entry_size;
-	hif.stage_error = hif.stage == FA_STAGE_JOIN || hif.stage == FA_STAGE_WPA ? fa_m5_station(ath12k_ar_to_hw(ar), (hif.knobs & FA_KNOB_PASSIVE) != 0) :
+	if (hif.stage == FA_STAGE_ADDRESS) {
+		fa_m7_ask();
+	}
+	hif.stage_error = hif.stage == FA_STAGE_JOIN || hif.stage == FA_STAGE_WPA || hif.stage == FA_STAGE_ADDRESS ? fa_m5_station(ath12k_ar_to_hw(ar), (hif.knobs & FA_KNOB_PASSIVE) != 0) :
 	    fa_m4_station(ath12k_ar_to_hw(ar), (hif.knobs & FA_KNOB_PASSIVE) != 0);
 	lx_memory_say();
 	fa_hif_quiesce();
