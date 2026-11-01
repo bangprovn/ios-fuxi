@@ -116,8 +116,8 @@ void fuxi_wlan_init(void);
  *                 joining wins. The access point's deauthentication or the driver's loss is followed by another scan and join,
  *                 retried every 1 to 30 s, with the key kept until iOS's side leaves, joins or turns the radio off. With 2 the
  *                 same, except that the Apple80211 side gets no event of a join: wifid finds out only by asking.
- *   fuxiwifiwide=1  with fuxiath12k=8: the channel as wide as the access point's, up to 80 MHz, =2 up to 40, read by the driver domain. Off
- *                 by default. Stages 5 to 7 stay at 20 MHz with or without it.
+ *   fuxiwifiwide=1  with fuxiath12k=8: the channel as wide as the access point's, up to 80 MHz, as it is without this; =2 up to 40, =3 stays at
+ *                 20. Read by the driver domain. Stages 5 to 7 stay at 20 MHz with or without it.
  *   fuxiath12kq=MASK  with fuxiath12k=4 to 7: 0x1 no idle power save, 0x2 no hw mode command, 0x8 settle
  *                 after vdev create, 0x10 passive scan, 0x20 stage 7 answers ARP and echoes for 240 s, for a load from the
  *                 network. Read and logged by the driver domain.

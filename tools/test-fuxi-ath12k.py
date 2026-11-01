@@ -3539,7 +3539,7 @@ def the_key_stays_in_its_place(tmp):
     hif = (own / 'fa_hif.c').read_text()
     gate = hif[hif.index('if (stage == FA_STAGE_IOS) {\n\t\t\tfa_m8_tx_filter'):]
     gate = gate[:gate.index('\n\t\t}\n')]
-    assert hif.count('fa_m8_wide(') == 2 and 'if (lx_os_option("fuxiwifiwide") == 1) {' in gate and 'fa_m8_wide(80);' in gate and 'fa_m8_wide(40);' in gate
+    assert hif.count('fa_m8_wide(') == 1 and 'fa_m8_wide(lx_os_option("fuxiwifiwide") == 3 ? 20 : lx_os_option("fuxiwifiwide") == 2 ? 40 : 80);' in gate
     assert 'fuxiwifiwide' not in wlan.replace(' *   fuxiwifiwide=1  with fuxiath12k=8', '') and wlan.count('fuxiwifiwide') == 1
     assert 'eht' not in code_only(join).lower()
 
