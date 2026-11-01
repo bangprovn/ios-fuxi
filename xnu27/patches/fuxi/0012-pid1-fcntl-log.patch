@@ -1,0 +1,79 @@
+diff --git a/bsd/kern/kern_descrip.c b/bsd/kern/kern_descrip.c
+index 8adfaf2..e4702ca 100644
+--- a/bsd/kern/kern_descrip.c
++++ b/bsd/kern/kern_descrip.c
+@@ -78,6 +78,9 @@
+ #include <sys/kernel.h>
+ #include <sys/vnode_internal.h>
+ #include <sys/proc_internal.h>
++#if defined(FUXI)
++#include <kern/clock.h>
++#endif
+ #include <sys/kauth.h>
+ #include <sys/file_internal.h>
+ #include <sys/guarded.h>
+@@ -2876,8 +2879,45 @@ outdrop:
+ 	return sys_fcntl_outdrop(p, fd, fp, vp, error);
+ }
+ 
++#if defined(FUXI)
++static int sys_fcntl_nocancel_impl(proc_t p, struct fcntl_nocancel_args *uap, int32_t *retval);
++
++/* fuxi_proc_log=1: pid 1's fcntl calls (dyld's code-signature registration of the shared cache) with timing */
++int
++sys_fcntl_nocancel(proc_t p, struct fcntl_nocancel_args *uap, int32_t *retval)
++{
++	char *path;
++	vnode_t vp = NULLVP;
++	int len = MAXPATHLEN, error;
++	uint64_t t0, ns;
++
++	if (proc_getpid(p) != 1 || !fuxi_proc_log()) {
++		return sys_fcntl_nocancel_impl(p, uap, retval);
++	}
++	path = kalloc_data(MAXPATHLEN, Z_WAITOK | Z_ZERO);
++	if (path != NULL && file_vnode(uap->fd, &vp) == 0) {
++		if (vn_getpath(vp, path, &len) != 0) {
++			path[0] = '\0';
++		}
++		file_drop(uap->fd);
++	}
++	printf("fuxi: fcntl pid 1 fd %d cmd %d %s\n", uap->fd, uap->cmd, path != NULL ? path : "");
++	t0 = mach_absolute_time();
++	error = sys_fcntl_nocancel_impl(p, uap, retval);
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	printf("fuxi: fcntl pid 1 fd %d cmd %d -> %d (%llu ms)\n", uap->fd, uap->cmd, error, ns / 1000000ULL);
++	if (path != NULL) {
++		kfree_data(path, MAXPATHLEN);
++	}
++	return error;
++}
++
++static int
++sys_fcntl_nocancel_impl(proc_t p, struct fcntl_nocancel_args *uap, int32_t *retval)
++#else
+ int
+ sys_fcntl_nocancel(proc_t p, struct fcntl_nocancel_args *uap, int32_t *retval)
++#endif
+ {
+ 	int fd = uap->fd;
+ 	int cmd = uap->cmd;
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index 3859b95..7380c28 100644
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -10921,10 +10921,13 @@ fuxi_task_report(task_t task, int pid)
+ 				fp = (uint64_t)ptrauth_strip((void *)((uint64_t *)fp)[0], ptrauth_key_frame_pointer);
+ 			}
+ 		}
+-		printf("fuxi:  tid %llu state 0x%x pri %d wait 0x%llx upc 0x%llx ulr 0x%llx k %llx %llx %llx %llx %llx %llx %llx %llx\n",
++		printf("fuxi:  tid %llu state 0x%x pri %d wait 0x%llx upc 0x%llx ulr 0x%llx x16 0x%llx x0 0x%llx x1 0x%llx k %llx %llx %llx %llx %llx %llx %llx %llx\n",
+ 		    (unsigned long long)th->thread_id, th->state, th->sched_pri, (unsigned long long)th->wait_event,
+ 		    us != NULL ? (unsigned long long)get_saved_state_pc(us) : 0ULL,
+ 		    us != NULL ? (unsigned long long)get_saved_state_lr(us) : 0ULL,
++		    us != NULL ? (unsigned long long)get_saved_state_reg(us, 16) : 0ULL,
++		    us != NULL ? (unsigned long long)get_saved_state_reg(us, 0) : 0ULL,
++		    us != NULL ? (unsigned long long)get_saved_state_reg(us, 1) : 0ULL,
+ 		    k[0], k[1], k[2], k[3], k[4], k[5], k[6], k[7]);
+ 	}
+ 	task_unlock(task);
