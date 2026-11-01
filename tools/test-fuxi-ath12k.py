@@ -2371,7 +2371,7 @@ int main(void) {
         const uint8_t *name = (const uint8_t *)NAME; unsigned n = sizeof(NAME) - 1;
         struct fa_radio *radio;
 
-        target_wide = true;
+        target_most = 80;
         /* VHT80 and every part of it the same: channel, centre, the station's bandwidth, both sets of capabilities. HE goes, for its offer is 20 MHz. */
         for (unsigned he = 0; he < 2; he++) {
             radio = m8_fresh(); wide_radio(40, 80); wide_ap(5180, 4 | 1, 1, 42, he != 0);
@@ -2435,7 +2435,7 @@ int main(void) {
         assert(fa_ios_leave() == FA_IOS_DONE); station_down(radio); done();
 
         /* Off, the default: 20 MHz at 5 GHz. An access point that works at 80 and has no HE is not told VHT, or it would send 80 MHz at a radio tuned to 20. */
-        target_wide = false;
+        target_most = 20;
         radio = m8_fresh(); wide_radio(40, 80); wide_ap(5180, 4 | 1, 1, 42, false);
         assert(fa_m8_up(the_hw) == 0);
         m8_again(); assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_DONE && SAID("offering VHT 0 HE 1; fuxiwifiwide is off"));
@@ -2456,13 +2456,13 @@ int main(void) {
         assert(fa_ios_leave() == FA_IOS_DONE); station_down(radio); done();
 
         /* Stages 5 to 7 stay at 20 MHz even with it set, and offer what they always offered. */
-        target_wide = true;
+        target_most = 80;
         fresh_wpa(V_PMK); wide_radio(40, 80); wide_ap(5180, 4 | 1, 1, 42, true);
         assert(fa_m5_station(the_hw, false) == 0 && SAID("M5 channel 5180 MHz, 20 MHz wide") && !SAID("M8 width"));
         assert(last_def.width == NL80211_CHAN_WIDTH_20 && last_def.center_freq1 == 5180 && sta_seen.bandwidth == IEEE80211_STA_RX_BW_20 && (sta_seen.ht_cap & FA_HT_CAP_40) == 0 && sta_seen.vht && sta_seen.he);
         assert(asked_for(FA_EID_VHT) != NULL && (asked_for(FA_EID_HT)[2] & FA_HT_CAP_40) == 0);
         done();
-        target_wide = false;
+        target_most = 20;
     }
 
     /* ---- stage 8 ---- */
@@ -3219,6 +3219,40 @@ static void he_and_streams(void) {
     vht[6] = 0xea; vht[7] = 0xff; assert(fa_peer_streams(ht, vht, NULL) == 3);
     he.rx_mcs_80 = 0xff00; assert(fa_peer_streams(ht, vht, &he) == 4);
     he.rx_mcs_80 = 0xffff; assert(fa_peer_streams(NULL, NULL, &he) == 1);
+    {
+        /* A 4x4 access point to a 2x2 radio, as mac80211 cuts it. r-5: the firmware asserted when VHT said four streams. */
+        static const uint8_t own_mask[10] = {0xff, 0xff};
+        uint8_t h[2 + FA_HT_BODY] = {FA_EID_HT, FA_HT_BODY, 0xef, 0x19, 0x1b, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0, 0, 0xff};
+        fa_ht_limit(h, FA_HT_CAP_LDPC | FA_HT_CAP_40 | FA_HT_CAP_SGI_20 | FA_HT_CAP_TX_STBC | 0x0100, own_mask);
+        assert(h[5] == 0xff && h[6] == 0xff && h[7] == 0 && h[8] == 0 && h[14] == 0 && fa_peer_streams(h, NULL, NULL) == 2);
+        /* 0x19ef: green and SGI 40 go, ours lacking them; its rx STBC stays as we send it, its tx STBC is ours to receive and stays with the low bit. */
+        assert(((h[2] | h[3] << 8) & (FA_HT_CAP_GREEN | FA_HT_CAP_SGI_40)) == 0 && ((h[2] | h[3] << 8) & (FA_HT_CAP_LDPC | FA_HT_CAP_40 | FA_HT_CAP_SGI_20)) == 3 + 0x20);
+        assert(h[4] == 0x1b);
+        h[2] = 0xff; h[3] = 0xff;
+        fa_ht_limit(h, 0, own_mask);
+        assert(((h[2] | h[3] << 8) & (FA_HT_CAP_TX_STBC | FA_HT_CAP_RX_STBC | FA_HT_CAP_40 | FA_HT_CAP_LDPC)) == 0 && (h[2] | h[3] << 8) != 0);
+
+        assert(fa_vht_map_limit(0xffaa, 0xfffa) == 0xfffa);	/* streams 3 and 4 gone, stream 1 and 2 as they were */
+        assert(fa_vht_map_limit(0xff55, 0xfffa) == 0xfff5);			/* its lower MCS stands */
+        assert(fa_vht_map_limit(0xfffa, 0xff55) == 0xfff5);			/* ours lower */
+        assert(fa_vht_map_limit(0xffff, 0x0000) == 0xffff);			/* its none stays none */
+        uint8_t v[2 + FA_VHT_BODY] = {FA_EID_VHT, FA_VHT_BODY};
+        uint32_t c = FA_VHT_CAP_MPDU | FA_VHT_CAP_WIDTH | FA_VHT_CAP_SGI_80 | FA_VHT_CAP_SGI_160 | FA_VHT_CAP_SU_BFER | FA_VHT_CAP_SU_BFEE | FA_VHT_CAP_STS | FA_VHT_CAP_SOUNDING |
+            FA_VHT_CAP_MU_BFER | FA_VHT_CAP_MU_BFEE | 0x03800000u;
+        v[2] = (uint8_t)c; v[3] = (uint8_t)(c >> 8); v[4] = (uint8_t)(c >> 16); v[5] = (uint8_t)(c >> 24);
+        v[6] = 0xaa; v[7] = 0xaa; v[10] = 0xaa; v[11] = 0xaa;
+        assert(fa_peer_streams(NULL, v, NULL) == 8);
+        fa_vht_limit(v, 1u | FA_VHT_CAP_SGI_80 | FA_VHT_CAP_SU_BFEE | FA_VHT_CAP_MU_BFEE, 0xfffa, 0xfffa);
+        uint32_t got = (uint32_t)v[2] | (uint32_t)v[3] << 8 | (uint32_t)v[4] << 16 | (uint32_t)v[5] << 24;
+        assert(fa_peer_streams(NULL, v, NULL) == 2);
+        assert((v[6] | v[7] << 8) == 0xfffa && (v[10] | v[11] << 8) == 0xfffa);
+        assert((got & FA_VHT_CAP_MPDU) == 1);					/* the less of the two */
+        assert((got & FA_VHT_CAP_WIDTH) == 0 && (got & FA_VHT_CAP_SGI_160) == 0 && (got & FA_VHT_CAP_SGI_80) != 0);
+        assert((got & FA_VHT_CAP_SU_BFER) != 0 && (got & FA_VHT_CAP_SOUNDING) != 0);	/* it sounds us, we being a beamformee */
+        assert((got & FA_VHT_CAP_SU_BFEE) == 0 && (got & FA_VHT_CAP_STS) == 0);		/* we are no beamformer */
+        assert((got & FA_VHT_CAP_MU_BFER) != 0 && (got & FA_VHT_CAP_MU_BFEE) == 0);
+        assert((got & 0x03800000u) == 0x03800000u);				/* A-MPDU length is its own */
+    }
     static const uint16_t bits[] = {60, 90, 120, 180};
     static const uint8_t rates[] = {1, 2, 0x8c, 18, 50, 2, 0x98, 200, 7, 0};
     uint32_t basic;
@@ -3501,11 +3535,11 @@ def the_key_stays_in_its_place(tmp):
     assert chosen.index('fa_width_narrow(width, channel->center_freq);') < chosen.index('if (!radio->ios) {') < chosen.index('fa_width_choose(')
     assert code_only(text).count('fa_width_choose(') == 1 and text.count('station_width(radio, channel);') == 1
     assert 'radio->width.mhz = ' not in text and 'width->mhz = ' not in text and code_only(text).count('.center = ') == 0
-    assert 'target_wide = true;' in text and text.count('target_wide = true;') == 1 and text.index('target_wide = true;') > text.index('\nfa_m8_wide(void)')
+    assert text.count('target_most = most;') == 1 and text.index('target_most = most;') > text.index('\nfa_m8_wide(unsigned most)')
     hif = (own / 'fa_hif.c').read_text()
     gate = hif[hif.index('if (stage == FA_STAGE_IOS) {\n\t\t\tfa_m8_tx_filter'):]
     gate = gate[:gate.index('\n\t\t}\n')]
-    assert hif.count('fa_m8_wide()') == 1 and 'if (lx_os_option("fuxiwifiwide") == 1) {' in gate and 'fa_m8_wide();' in gate
+    assert hif.count('fa_m8_wide(') == 2 and 'if (lx_os_option("fuxiwifiwide") == 1) {' in gate and 'fa_m8_wide(80);' in gate and 'fa_m8_wide(40);' in gate
     assert 'fuxiwifiwide' not in wlan.replace(' *   fuxiwifiwide=1  with fuxiath12k=8', '') and wlan.count('fuxiwifiwide') == 1
     assert 'eht' not in code_only(join).lower()
 

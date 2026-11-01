@@ -49,10 +49,28 @@
 
 #define FA_HT_BODY		26
 #define FA_VHT_BODY		12
+#define FA_HT_CAP_LDPC		0x0001
 #define FA_HT_CAP_40		0x0002		/* supported channel width: 20 and 40 MHz */
+#define FA_HT_CAP_GREEN		0x0010
+#define FA_HT_CAP_SGI_20	0x0020
 #define FA_HT_CAP_SGI_40	0x0040
+#define FA_HT_CAP_TX_STBC	0x0080
+#define FA_HT_CAP_RX_STBC	0x0300
+#define FA_HT_CAP_DSSS_40	0x1000
+#define FA_VHT_CAP_MPDU		0x00000003u
 #define FA_VHT_CAP_WIDTH	0x0000000cu	/* 160 and 80+80 MHz */
+#define FA_VHT_CAP_LDPC		0x00000010u
+#define FA_VHT_CAP_SGI_80	0x00000020u
 #define FA_VHT_CAP_SGI_160	0x00000040u
+#define FA_VHT_CAP_TX_STBC	0x00000080u
+#define FA_VHT_CAP_RX_STBC	0x00000700u
+#define FA_VHT_CAP_SU_BFER	0x00000800u
+#define FA_VHT_CAP_SU_BFEE	0x00001000u
+#define FA_VHT_CAP_STS		0x0000e000u
+#define FA_VHT_CAP_SOUNDING	0x00070000u
+#define FA_VHT_CAP_MU_BFER	0x00080000u
+#define FA_VHT_CAP_MU_BFEE	0x00100000u
+#define FA_VHT_CAP_ANY_SIDE	0x3fe00000u	/* TXOP power save, +HTC, A-MPDU length, link adaptation, antenna patterns */
 #define FA_HE_MAC		6
 #define FA_HE_PHY		11
 #define FA_HE_PHY0_WIDTH	0xfe		/* the channel width set: nothing set is 20 MHz only */
@@ -813,6 +831,78 @@ fa_mcs_map_streams(unsigned map)
 		}
 	}
 	return (0);
+}
+
+/*
+ * An HT element of the access point's cut to what the radio has too, as ieee80211_ht_cap_ie_to_sta_ht_cap() does for ath12k under mac80211:
+ * a 4x4 access point said raw is a peer of four streams to a radio of two. `e` is a copy of at least FA_HT_BODY after its two bytes.
+ */
+static inline void
+fa_ht_limit(uint8_t *e, unsigned own_cap, const uint8_t own_mask[10])
+{
+	unsigned cap = (unsigned)e[2] | (unsigned)e[3] << 8;
+
+	cap &= own_cap | ~(unsigned)(FA_HT_CAP_LDPC | FA_HT_CAP_40 | FA_HT_CAP_GREEN | FA_HT_CAP_SGI_20 | FA_HT_CAP_SGI_40 | FA_HT_CAP_DSSS_40);
+	/* These two cross over: what it sends is what we must receive. */
+	if ((own_cap & FA_HT_CAP_TX_STBC) == 0) {
+		cap &= ~(unsigned)FA_HT_CAP_RX_STBC;
+	}
+	if ((own_cap & FA_HT_CAP_RX_STBC) == 0) {
+		cap &= ~(unsigned)FA_HT_CAP_TX_STBC;
+	}
+	e[2] = (uint8_t)cap;
+	e[3] = (uint8_t)(cap >> 8);
+	for (unsigned i = 0; i < 10; i++) {
+		e[5 + i] &= own_mask[i];
+	}
+}
+
+/* One side of a VHT MCS map: for each stream, no more than `own`, whose 3 means none. */
+static inline unsigned
+fa_vht_map_limit(unsigned map, unsigned own)
+{
+	unsigned out = 0;
+
+	for (unsigned i = 0; i < 8; i++) {
+		unsigned his = (map >> (2 * i)) & 3u, ours = (own >> (2 * i)) & 3u;
+
+		if (his != 3u && (ours == 3u || ours < his)) {
+			his = ours;
+		}
+		out |= his << (2 * i);
+	}
+	return (out);
+}
+
+/*
+ * A VHT element cut likewise, as ieee80211_vht_cap_ie_to_sta_vht_cap(). `own_cap` is what we offered, so without 160 MHz. The bits that
+ * pair up go by the other side's: its beamformee needs our beamformer. `e` is a copy of at least FA_VHT_BODY after its two bytes.
+ */
+static inline void
+fa_vht_limit(uint8_t *e, uint32_t own_cap, unsigned own_rx_map, unsigned own_tx_map)
+{
+	uint32_t his = (uint32_t)e[2] | (uint32_t)e[3] << 8 | (uint32_t)e[4] << 16 | (uint32_t)e[5] << 24;
+	uint32_t cap = his & FA_VHT_CAP_ANY_SIDE;
+	unsigned his_rx = (unsigned)e[6] | (unsigned)e[7] << 8, his_tx = (unsigned)e[10] | (unsigned)e[11] << 8;
+
+	cap |= (his & FA_VHT_CAP_MPDU) < (own_cap & FA_VHT_CAP_MPDU) ? his & FA_VHT_CAP_MPDU : own_cap & FA_VHT_CAP_MPDU;
+	cap |= his & own_cap & (FA_VHT_CAP_LDPC | FA_VHT_CAP_SGI_80 | FA_VHT_CAP_SGI_160);
+	cap |= (own_cap & FA_VHT_CAP_TX_STBC) != 0 ? his & FA_VHT_CAP_RX_STBC : 0;
+	cap |= (own_cap & FA_VHT_CAP_RX_STBC) != 0 ? his & FA_VHT_CAP_TX_STBC : 0;
+	cap |= (own_cap & FA_VHT_CAP_SU_BFER) != 0 ? his & (FA_VHT_CAP_SU_BFEE | FA_VHT_CAP_STS) : 0;
+	cap |= (own_cap & FA_VHT_CAP_SU_BFEE) != 0 ? his & (FA_VHT_CAP_SU_BFER | FA_VHT_CAP_SOUNDING) : 0;
+	cap |= (own_cap & FA_VHT_CAP_MU_BFER) != 0 ? his & FA_VHT_CAP_MU_BFEE : 0;
+	cap |= (own_cap & FA_VHT_CAP_MU_BFEE) != 0 ? his & FA_VHT_CAP_MU_BFER : 0;
+	e[2] = (uint8_t)cap;
+	e[3] = (uint8_t)(cap >> 8);
+	e[4] = (uint8_t)(cap >> 16);
+	e[5] = (uint8_t)(cap >> 24);
+	his_rx = fa_vht_map_limit(his_rx, own_tx_map);
+	his_tx = fa_vht_map_limit(his_tx, own_rx_map);
+	e[6] = (uint8_t)his_rx;
+	e[7] = (uint8_t)(his_rx >> 8);
+	e[10] = (uint8_t)his_tx;
+	e[11] = (uint8_t)(his_tx >> 8);
 }
 
 /*

@@ -761,7 +761,9 @@ fa_firmware_ready(const struct fa_caps *caps, unsigned stage)
 			    (hif.knobs & FA_KNOB_TX_NO_GROUP) != 0);
 			/* Off by default, for it is the riskiest of what iOS's radio does: a mismatch of width costs frames, not a refusal. */
 			if (lx_os_option("fuxiwifiwide") == 1) {
-				fa_m8_wide();
+				fa_m8_wide(80);
+			} else if (lx_os_option("fuxiwifiwide") == 2) {
+				fa_m8_wide(40);
 			}
 		}
 	}

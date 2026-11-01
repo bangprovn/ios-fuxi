@@ -260,7 +260,7 @@ static unsigned auto_name_length;
 /* The network the auto join has joined, for joining it again. Kept while that is so, under the gate, and never said. */
 static uint8_t rejoin_name[FA_SSID_MOST], rejoin_key[32];
 static unsigned rejoin_name_length;
-static bool target_wide;			/* stage 8, fuxiwifiwide=1 */
+static unsigned target_most = 20;		/* stage 8, MHz: fuxiwifiwide=1 is 80, =2 is 40 */
 
 /* find_sta has only the interface to go by, and there is one radio. */
 static struct fa_radio *the_radio;
@@ -329,12 +329,12 @@ fa_m8_tx_filter(bool ip6, bool tcp, bool udp, bool group)
 	lx_tell("FUXI ATH12K: M8 tx filter: ipv6 %d tcp %d udp %d multicast %d\n", ip6, tcp, udp, group);
 }
 
-/* From fa_hif.c on stage 8 alone, before the radio, fuxiwifiwide=1: the channel may be as wide as the access point's. */
+/* From fa_hif.c on stage 8 alone, before the radio, fuxiwifiwide: the channel may be as wide as the access point's, up to this. */
 void
-fa_m8_wide(void)
+fa_m8_wide(unsigned most)
 {
-	target_wide = true;
-	lx_tell("FUXI ATH12K: M8 wide channels are asked for\n");
+	target_most = most;
+	lx_tell("FUXI ATH12K: M8 wide channels are asked for, up to %u MHz\n", most);
 }
 
 /* tools/ath12k-edits.json, ath12k-mac-override. mac.c has no device-address fallback. */
@@ -1564,6 +1564,7 @@ station_abilities(struct fa_radio *radio, const uint8_t *elements, unsigned leng
 	const uint8_t *he_element = fa_ext_element(elements, length, FA_EXT_HE);
 	const uint8_t *e;
 	const struct ieee80211_sta_he_cap *own_he = station_he(band);
+	uint8_t ht_ours[2 + FA_HT_BODY], vht_ours[2 + FA_VHT_BODY], own_map[10];
 	struct fa_he he;
 	bool has_he = false;
 	uint16_t bitrates[32];
@@ -1586,6 +1587,10 @@ station_abilities(struct fa_radio *radio, const uint8_t *elements, unsigned leng
 	memset(&link->vht_cap, 0, sizeof(link->vht_cap));
 	memset(&link->he_cap, 0, sizeof(link->he_cap));
 	if (ht != NULL && ht[1] >= FA_HT_BODY && band->ht_cap.ht_supported) {
+		memcpy(ht_ours, ht, sizeof(ht_ours));
+		ht = ht_ours;
+		memcpy(own_map, &band->ht_cap.mcs, 10);		/* its rx_mask comes first */
+		fa_ht_limit(ht_ours, band->ht_cap.cap, own_map);
 		link->ht_cap.ht_supported = true;
 		link->ht_cap.cap = (uint16_t)((ht[2] | ht[3] << 8) & (radio->width.mhz > 20 ? 0xffffu : ~(unsigned)(FA_HT_CAP_40 | FA_HT_CAP_SGI_40)));
 		link->ht_cap.ampdu_factor = ht[4] & 3;
@@ -1595,6 +1600,10 @@ station_abilities(struct fa_radio *radio, const uint8_t *elements, unsigned leng
 		ht = NULL;
 	}
 	if (vht != NULL && vht[1] >= FA_VHT_BODY && band->vht_cap.vht_supported && radio->width.vht) {
+		memcpy(vht_ours, vht, sizeof(vht_ours));
+		vht = vht_ours;
+		memcpy(own_map, &band->vht_cap.vht_mcs, 8);	/* rx map, rx highest, tx map, tx highest */
+		fa_vht_limit(vht_ours, band->vht_cap.cap & ~(FA_VHT_CAP_WIDTH | FA_VHT_CAP_SGI_160), (unsigned)own_map[0] | (unsigned)own_map[1] << 8, (unsigned)own_map[4] | (unsigned)own_map[5] << 8);
 		link->vht_cap.vht_supported = true;
 		link->vht_cap.cap = (uint32_t)vht[2] | (uint32_t)vht[3] << 8 | (uint32_t)vht[4] << 16 | (uint32_t)vht[5] << 24;
 		memcpy(&link->vht_cap.vht_mcs, vht + 6, sizeof(link->vht_cap.vht_mcs));
@@ -2093,7 +2102,7 @@ station_width(struct fa_radio *radio, const struct linuxkpi_ieee80211_channel *c
 	const struct fa_target *target = &radio->target;
 	const struct ieee80211_supported_band *band = radio->wiphy->bands[channel->band];
 	struct fa_width *width = &radio->width;
-	unsigned most = target_wide ? 80 : 20;
+	unsigned most = target_most;
 
 	fa_width_narrow(width, channel->center_freq);
 	if (!radio->ios) {
@@ -2109,7 +2118,7 @@ station_width(struct fa_radio *radio, const struct linuxkpi_ieee80211_channel *c
 		most = width->mhz == 80 ? 40 : 20;
 	}
 	lx_tell("FUXI ATH12K: M8 width: %u MHz around %u, primary %u; the access point works at %u; offering VHT %d HE %d%s\n", width->mhz, width->center, channel->center_freq,
-	    width->said, width->vht, width->he, target_wide ? "" : "; fuxiwifiwide is off");
+	    width->said, width->vht, width->he, target_most > 20 ? "" : "; fuxiwifiwide is off");
 }
 
 /* The width as the driver's channel has it. Only station_width() at stage 8 makes it more than 20 MHz. */
