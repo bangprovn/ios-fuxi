@@ -3049,7 +3049,7 @@ def block_ack_is_stage_8_alone(tmp):
 
 @check
 def busy_watch_is_in_patch_0117_alone(tmp):
-    """The black screen's diagnostic: only kernel-metal4wifi has it, it looks and changes nothing, and says no name of a network."""
+    """The black screen's watch: only kernel-metal4wifi has it, it changes one count once, behind a check and an opt-out, and says no name of a network."""
     source = (ROOT / 'xnu/fuxi-wifi-ios/FuxiNetworkStack.cpp').read_text()
     assert 'M8 busy' not in source and 'fuxi_busy' not in source
     for patch in sorted((ROOT / 'xnu/patches').glob('*.patch')):
@@ -3059,7 +3059,11 @@ def busy_watch_is_in_patch_0117_alone(tmp):
     hunk = patch[patch.index('--- a/iokit/Kernel/arm/FuxiNetworkStack.cpp'):]
     added = '\n'.join(line[1:] for line in hunk.splitlines() if line.startswith('+') and not line.startswith('+++'))
     assert 'M8 busy: the root reached 0' in added and 'FUXI_BUSY_LINES_MOST    40' in added and 'seconds == 30' in added and 'fuxi_busy_watch();' in added
-    for word in ('adjustBusy', 'setProperty', 'terminate', 'waitQuiet', 'ssid', 'address', 'SSID'):
+    assert added.count('adjustBusy') == 1 and 'root->adjustBusy(-1);' in added
+    give_up = added[added.index('fuxi_busy_give_up(unsigned busy_under)'):added.index('root->adjustBusy(-1);')]
+    assert 'allowed == 0' in give_up and 'busy_under != 0 || root->getBusyState() != 1' in give_up
+    assert added.count('fuxi_busy_give_up(busy_under);') == 1 and 'if (seconds == 30) {' in added
+    for word in ('setProperty', 'terminate', 'waitQuiet', 'ssid', 'address', 'SSID'):
         assert word not in added, word
 
 
