@@ -3430,6 +3430,124 @@ def peer_id_zero_is_a_peer(tmp):
     assert 'said < 64' in body[:body.index('\n}\n')] and 'mac' not in body[:body.index('\n}\n')].lower()
 
 
+
+FUXI_REMOTE_HOST = r"""
+#include <assert.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include "fuxi_remote.h"
+static struct fuxi_remote_cmd make(uint32_t seq, uint32_t kind, int x0, int y0, int x1, int y1, uint32_t ms) {
+    struct fuxi_remote_cmd c = { seq, kind, x0, y0, x1, y1, ms, 0 };
+    c.check = fuxi_remote_check(&c);
+    return c;
+}
+int main(void) {
+    /* two cache lines, the monitor's beginning on the second */
+    assert(sizeof(struct fuxi_remote_cmd) == 32 && offsetof(struct fuxi_remote_box, cmd) == 64 && sizeof(struct fuxi_remote_box) == 128);
+    struct fuxi_remote_cmd c = make(1, FUXI_REMOTE_TAP, 0, 0, 0, 0, 0);
+    assert(fuxi_remote_valid(&c));
+    c = make(1, FUXI_REMOTE_TAP, 1079, 2399, 0, 0, 0); assert(fuxi_remote_valid(&c));
+    /* bounds */
+    c = make(1, FUXI_REMOTE_TAP, 1080, 0, 0, 0, 0); assert(!fuxi_remote_valid(&c));
+    c = make(1, FUXI_REMOTE_TAP, 0, 2400, 0, 0, 0); assert(!fuxi_remote_valid(&c));
+    c = make(1, FUXI_REMOTE_TAP, -1, 0, 0, 0, 0); assert(!fuxi_remote_valid(&c));
+    c = make(1, FUXI_REMOTE_TAP, 0, -1, 0, 0, 0); assert(!fuxi_remote_valid(&c));
+    c = make(2, FUXI_REMOTE_FLICK, 540, 2390, 540, 1100, 250); assert(fuxi_remote_valid(&c));
+    c = make(2, FUXI_REMOTE_FLICK, 540, 2390, 1080, 1100, 250); assert(!fuxi_remote_valid(&c));
+    c = make(2, FUXI_REMOTE_FLICK, 540, 2390, 540, 2400, 250); assert(!fuxi_remote_valid(&c));
+    c = make(2, FUXI_REMOTE_FLICK, 540, 2390, 540, 1100, 19); assert(!fuxi_remote_valid(&c));
+    c = make(2, FUXI_REMOTE_FLICK, 540, 2390, 540, 1100, 5001); assert(!fuxi_remote_valid(&c));
+    c = make(3, FUXI_REMOTE_KEY, 0, 0, 0, 0, 120); assert(fuxi_remote_valid(&c));
+    c = make(3, FUXI_REMOTE_KEY, 2, 0, 0, 0, 2000); assert(fuxi_remote_valid(&c));
+    c = make(3, FUXI_REMOTE_KEY, 3, 0, 0, 0, 120); assert(!fuxi_remote_valid(&c));
+    c = make(3, FUXI_REMOTE_KEY, -1, 0, 0, 0, 120); assert(!fuxi_remote_valid(&c));
+    c = make(3, FUXI_REMOTE_KEY, 0, 0, 0, 0, 2001); assert(!fuxi_remote_valid(&c));
+    /* nothing but the three kinds exists, seq 0 means nothing, and any changed field shows */
+    for (uint32_t kind = 0; kind < 256; kind++) {
+        c = make(1, kind, 1, 1, 1, 1, 100);
+        assert(fuxi_remote_valid(&c) == (kind >= 1 && kind <= 3));
+    }
+    c = make(0, FUXI_REMOTE_TAP, 1, 1, 0, 0, 0); assert(!fuxi_remote_valid(&c));
+    c = make(1, FUXI_REMOTE_TAP, 1, 1, 0, 0, 0); c.x0 = 2; assert(!fuxi_remote_valid(&c));
+    c = make(1, FUXI_REMOTE_TAP, 1, 1, 0, 0, 0); c.y0 = 2; assert(!fuxi_remote_valid(&c));
+    c = make(1, FUXI_REMOTE_FLICK, 1, 1, 2, 2, 100); c.ms = 101; assert(!fuxi_remote_valid(&c));
+    c = make(1, FUXI_REMOTE_FLICK, 1, 1, 2, 2, 100); c.x1 = 3; assert(!fuxi_remote_valid(&c));
+    c = make(1, FUXI_REMOTE_TAP, 1, 1, 0, 0, 0); c.kind = FUXI_REMOTE_KEY; assert(!fuxi_remote_valid(&c));
+    /* the monitor's question: off by default, one at a time, in order */
+    c = make(1, FUXI_REMOTE_TAP, 1, 1, 0, 0, 0);
+    assert(fuxi_remote_may_post(0, 0, 0, 0, &c) == FUXI_REMOTE_OFF);
+    assert(fuxi_remote_may_post(FUXI_REMOTE_MAGIC, 2, 0, 0, &c) == FUXI_REMOTE_OFF);
+    assert(fuxi_remote_may_post(FUXI_REMOTE_MAGIC, 1, 0, 0, &c) == FUXI_REMOTE_OK);
+    assert(fuxi_remote_may_post(FUXI_REMOTE_MAGIC, 1, 0, 1, &c) == FUXI_REMOTE_BUSY);
+    assert(fuxi_remote_may_post(FUXI_REMOTE_MAGIC, 1, 1, 1, &c) == FUXI_REMOTE_OUT_OF_ORDER);
+    c = make(2, FUXI_REMOTE_TAP, 1, 1, 0, 0, 0);
+    assert(fuxi_remote_may_post(FUXI_REMOTE_MAGIC, 1, 1, 1, &c) == FUXI_REMOTE_OK);
+    assert(fuxi_remote_may_post(FUXI_REMOTE_MAGIC, 1, 0, 0, &c) == FUXI_REMOTE_OUT_OF_ORDER);
+    c = make(2, FUXI_REMOTE_TAP, 1080, 1, 0, 0, 0);
+    assert(fuxi_remote_may_post(FUXI_REMOTE_MAGIC, 1, 1, 1, &c) == FUXI_REMOTE_BAD);
+    /* the number wraps with the done count */
+    c = make(0, FUXI_REMOTE_TAP, 1, 1, 0, 0, 0);
+    assert(fuxi_remote_may_post(FUXI_REMOTE_MAGIC, 1, 0xffffffffu, 0xffffffffu, &c) == FUXI_REMOTE_BAD);
+    c = make(7, FUXI_REMOTE_FLICK, 540, 2390, 12, 1100, 250); printf("check %u\n", c.check);
+    puts("fuxi_remote: fields, bounds, off by default, one at a time, in order");
+    return 0;
+}
+"""
+
+
+@check
+def remote_commands_are_bounded(tmp):
+    """include fuxi_remote.h under the sanitizers: what both ends check before acting."""
+    (tmp / 'remote.c').write_text(FUXI_REMOTE_HOST)
+    cc = os.environ.get('CC', 'cc')
+    program = tmp / 'remote'
+    subprocess.run([cc, '-std=gnu11', '-Wall', '-Wextra', '-g', '-O1', '-fsanitize=address,undefined', '-fno-sanitize-recover=all',
+                    f'-I{ROOT / "xnu/fuxi-ath12k/os"}', str(tmp / 'remote.c'), '-o', str(program)], check=True)
+    said = subprocess.run([str(program)], check=True, capture_output=True, text=True).stdout
+    # The monitor's own sum, read from its source, against the header's.
+    monitor = (ROOT / 'tools/fuxi-xnu-monitor.py').read_text()
+    formula = re.search(r'^\s*check = (.+)$', monitor, flags=re.M)[1]
+    values = dict(seq=7, kind=2, x0=540, y0=2390, x1=12, y1=1100, ms=250)
+    assert f'check {eval(formula, {}, values)}' in said
+
+
+@check
+def remote_control_stays_in_its_place(tmp):
+    """Only kernel-metal4wifi has it, it starts only with fuxiremote=1, and no way to send text exists on any side."""
+    keys = (ROOT / 'xnu/fuxi-h1/fuxi_keys.c').read_text()
+    assert 'fuxi_remote' not in keys and 'fuxiremote' not in keys
+    for patch in sorted((ROOT / 'xnu/patches').glob('*.patch')):
+        if patch.name != '0117-fuxi-ath12k.patch':
+            text = patch.read_text(errors='surrogateescape')
+            assert 'fuxiremote' not in text and 'fuxi_remote' not in text, patch.name
+    text = (ROOT / 'xnu/patches/0117-fuxi-ath12k.patch').read_text(errors='surrogateescape')
+    hunk = text[text.index('--- a/bsd/dev/fuxi_keys.c'):]
+    hunk = hunk[:hunk.index('\n--- a/', 10)]
+    added = '\n'.join(line[1:] for line in hunk.splitlines() if line.startswith('+') and not line.startswith('+++'))
+    assert 'PE_parse_boot_argn("fuxiremote", &remote, sizeof(remote)) && remote == 1' in added
+    start = added.index('unsigned remote = 0;')
+    assert added.count('kernel_thread_start(fk_remote') == 1 and added.index('kernel_thread_start(fk_remote') > start
+    assert 'fuxi_remote_valid(&cmd)' in added and 'FUXI REMOTE: tap %d %d seq %u' in added
+    # What the magic hangs on: the thread writes it, so that off leaves zero and the monitor refuses.
+    assert added.index('fuxi_remote_box.magic = FUXI_REMOTE_MAGIC') > added.index('fk_remote(void *arg')
+    # Delegate: only after the handoff, only the checked command, and the number last.
+    probe = (ROOT / 'shim/fuxi-probe/probe.c').read_text(errors='surrogateescape')
+    assert "req == 0x5c && length == sizeof(struct fuxi_remote_cmd) && monitor_report[MON_LAUNCH]" in probe
+    body = probe[probe.index('remote_post(uint64_t off'):]
+    body = body[:body.index('\n}\n')]
+    assert '(off & 63) != 0' in body and 'fuxi_remote_may_post(' in body and body.index('box->cmd.check') < body.index('box->cmd.seq = cmd.seq')
+    assert 'box->magic =' not in body and 'box->done =' not in body
+    # Nothing that could carry text, in the mailbox or the tools.
+    header = code_only((ROOT / 'xnu/fuxi-ath12k/os/fuxi_remote.h').read_text()).lower()
+    monitor = (ROOT / 'tools/fuxi-xnu-monitor.py').read_text()
+    for word in ('char ', 'text', 'string', 'keyboard', 'type_'):
+        assert word not in header, word
+    assert "'--remote'" in monitor and "if args.remote and status['stage'] >= 8:" in monitor
+    act = monitor[monitor.index('def remote_act(req):'):monitor.index('def remote_tick():')]
+    assert re.findall(r"op == '(\w+)'", act) == ['see', 'tap', 'flick', 'key']
+
 FA_BSS_DRIVER = r"""
 #include <assert.h>
 #include <stdbool.h>

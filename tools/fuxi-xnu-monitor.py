@@ -18,6 +18,7 @@ import usb.util
 
 MON_FIELDS = 'magic delegate active usb_mpidr launch stage boot_args entry deadline image end'.split()
 WANTED = {'_fuxi_early_status', '_sweet_log_ring', '_sweet_log_total'}
+OPTIONAL = {'_fuxi_remote_box'}		# only a kernel with patch 0117, and only --remote asks for it
 
 
 def symbols(path):
@@ -37,10 +38,10 @@ def symbols(path):
                     continue
                 name_start = strings + nameoff
                 name = b[name_start:b.find(b'\0', name_start)].decode(errors='replace')
-                if name in WANTED:
+                if name in WANTED or name in OPTIONAL:
                     result[name] = value
         offset += size
-    if result.keys() != WANTED:
+    if not WANTED <= result.keys():
         raise ValueError(f'missing XNU diagnostic symbols: {WANTED - result.keys()}')
     return result
 
@@ -147,6 +148,7 @@ def main():
     ap.add_argument('--out', type=Path, required=True)
     ap.add_argument('--seconds', type=float, default=65)
     ap.add_argument('--framebuffer',action='store_true',help='save the validated inherited framebuffer after collecting logs')
+    ap.add_argument('--remote',type=Path,metavar='DIR',help='act on boot/phone.py requests in DIR while the log runs: see, tap, flick, key. Only with fuxiremote=1; no text entry exists')
     ap.add_argument('--tour-shots',action='store_true',help='also save framebuffer-shotN-NAME.png at each "FUXI TOUR: shot N NAME" console line (fuxitour=S)')
     ap.add_argument('--skip-clocks',action='store_true',help='do not take the AHB-ungating clock snapshot before handoff')
     ap.add_argument('--reset-minutes',type=int,help='move the monitor PSCI reset deadline to now + N minutes (1-60)')
@@ -364,6 +366,60 @@ def main():
         png=b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',1080,2400,8,2,0,0,0))
         png+=chunk(b'IDAT',zlib.compress(b''.join(rows),6))+chunk(b'IEND',b'')
         (args.out/(name+'.png')).write_bytes(png)
+    # ---- boot/phone.py: one request file at a time, the answer beside it. A failed request never ends the log. ----
+    remote_seq = [None]
+    def remote_box():
+        raw = read_ram(offsets['_fuxi_remote_box'], 64)
+        magic, version, done, refused = struct.unpack_from('<QIII', raw)
+        return magic, version, done, refused
+    def remote_send(kind, x0=0, y0=0, x1=0, y1=0, ms=0):
+        if '_fuxi_remote_box' not in offsets:
+            return {'error': 'this kernel has no remote mailbox'}
+        magic, version, done, refused = remote_box()
+        if magic != 0x45544f4d45525846 or version != 1:
+            return {'error': 'the mailbox is not on: boot with fuxiremote=1, and wait for the kernel to start it'}
+        seq = (done + 1) & 0xffffffff
+        check = (seq ^ kind ^ (x0 & 0xffffffff) ^ ((y0 << 3) & 0xffffffff) ^ ((x1 << 7) & 0xffffffff) ^ ((y1 << 11) & 0xffffffff) ^ ((ms << 13) & 0xffffffff) ^ 0x46585243) & 0xffffffff
+        off = offsets['_fuxi_remote_box']
+        dev.ctrl_transfer(0x40, 0x5c, off & 0xffff, off >> 16, struct.pack('<II4iII', seq, kind, x0, y0, x1, y1, ms, check), timeout=3000)
+        result = struct.unpack('<I', request(0x5d, 4))[0]
+        if result != 0:
+            return {'error': 'refused by the monitor: ' + {1: 'no mailbox', 2: 'the last command is not finished', 3: 'out of order', 4: 'a field out of bounds'}.get(result, str(result))}
+        until = time.monotonic() + ms / 1000 + 4
+        while time.monotonic() < until:
+            _, _, done, later = remote_box()
+            if done == seq:
+                return {'done': seq, 'refused': later != refused}
+            time.sleep(.02)
+        return {'error': 'the kernel did not finish the command in time', 'seq': seq}
+    def remote_act(req):
+        op = req.get('op')
+        if op == 'see':
+            name = re.sub(r'[^a-z0-9-]', '', str(req.get('name', ''))) or 'see'
+            started = time.monotonic()
+            save_framebuffer(name)
+            return {'path': str(args.out / (name + '.png')), 'seconds': round(time.monotonic() - started, 1)}
+        if op == 'tap':
+            return remote_send(1, int(req['x']), int(req['y']))
+        if op == 'flick':
+            return remote_send(2, int(req['x0']), int(req['y0']), int(req['x1']), int(req['y1']), int(req['ms']))
+        if op == 'key':
+            return remote_send(3, int(req['key']), ms=int(req.get('ms', 120)))
+        return {'error': 'no such request'}
+    def remote_tick():
+        for path in sorted(args.remote.glob('req-*.json')):
+            try:
+                answer = remote_act(json.loads(path.read_text()))
+            except Exception as e:
+                answer = {'error': str(e)}
+            path.unlink()
+            temporary = path.with_name('tmp-' + path.name)
+            temporary.write_text(json.dumps(answer))
+            temporary.replace(path.with_name(path.name.replace('req-', 'res-')))
+            return True
+        return False
+    if args.remote:
+        args.remote.mkdir(parents=True, exist_ok=True)
     tour_tail, tour_done = b'', set()
     with (args.out / 'progress.jsonl').open('w') as progress, (args.out / 'boot.log').open('wb') as log:
         while time.monotonic() < until:
@@ -426,7 +482,9 @@ def main():
             if args.reset_minutes and time.monotonic() > renew:
                 request(0x54, 8, args.reset_minutes)
                 renew = time.monotonic() + 600
-            time.sleep(.25)
+            if args.remote and status['stage'] >= 8:
+                remote_tick()
+            time.sleep(.1 if args.remote else .25)
     (args.out/'display-after.bin').write_bytes(request(0x42,432))
     if args.framebuffer:
         save_framebuffer('framebuffer')

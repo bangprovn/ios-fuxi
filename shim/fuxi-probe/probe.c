@@ -8,6 +8,7 @@
 #include <stdbool.h>
 #include "../font.h"
 #include "monitor.h"
+#include "../../xnu/fuxi-ath12k/os/fuxi_remote.h"
 #define printf(...) ((void)0)
 #define rsr(r) ({ uint64_t v; __asm__ volatile("mrs %0, " r : "=r"(v)); v; })
 static void *memset(void *dst, int c, size_t n)
@@ -876,6 +877,8 @@ static struct {
 	enum { EP0_SETUP, EP0_DATA, EP0_WAIT_STATUS2, EP0_WAIT_STATUS3, EP0_STATUS } state;
 	bool        data_in;        /* data stage direction */
 	bool        audio_out;      /* OUT data stage carries an audio staging chunk */
+	bool        remote_out;     /* OUT data stage carries one remote command */
+	uint64_t    remote_off;     /* where in the XNU window the host says the kernel's mailbox is */
 	uint16_t    out_index, out_length;
 	uint32_t    events;
 } ud;
@@ -1121,6 +1124,44 @@ ud_string(unsigned idx, uint8_t *out)
 	return n;
 }
 
+/*
+ * Requests 0x5c and 0x5d (boot/phone.py through fuxi-xnu-monitor.py --remote). Not a memory write: what is written is one
+ * checked command, and only over a mailbox that the running kernel has marked as one, which it does with fuxiremote=1.
+ */
+static uint32_t remote_result = FUXI_REMOTE_OFF;
+
+static void
+remote_post(uint64_t off, const volatile uint8_t *data)
+{
+	const volatile struct fuxi_remote_box *seen;
+	volatile struct fuxi_remote_box *box;
+	struct fuxi_remote_cmd cmd;
+
+	if ((off & 63) != 0 || off > 0x13e000000ULL - sizeof(*box)) {
+		remote_result = FUXI_REMOTE_OFF;
+		return;
+	}
+	for (uint32_t i = 0; i < sizeof(cmd); i++) {
+		((uint8_t *)&cmd)[i] = data[i];
+	}
+	box = (volatile struct fuxi_remote_box *)(uintptr_t)(0x8c0000000ULL + off);
+	seen = box;
+	remote_result = fuxi_remote_may_post(seen->magic, seen->version, seen->done, seen->cmd.seq, &cmd);
+	if (remote_result != FUXI_REMOTE_OK) {
+		return;
+	}
+	box->cmd.kind = cmd.kind;
+	box->cmd.x0 = cmd.x0;
+	box->cmd.y0 = cmd.y0;
+	box->cmd.x1 = cmd.x1;
+	box->cmd.y1 = cmd.y1;
+	box->cmd.ms = cmd.ms;
+	box->cmd.check = cmd.check;
+	__asm__ volatile("dsb sy" ::: "memory");
+	box->cmd.seq = cmd.seq;		/* last: this is what the kernel looks at */
+	__asm__ volatile("dsb sy" ::: "memory");
+}
+
 static void
 ud_setup(void)
 {
@@ -1136,6 +1177,7 @@ ud_setup(void)
 		printf("SWEET USB: setup %02x %02x %04x len %u\n", type, req, value, length);
 	ud.data_in = (type & 0x80) != 0;
 	ud.audio_out = false;
+	ud.remote_out = false;
 	if (type == 0xc0 && (req == 0x40 || req == 0x41)) {
         uint32_t offset = (uint32_t)value | ((uint32_t)st[4] << 16) | ((uint32_t)st[5] << 24);
         const uint8_t *src = req == 0x40 ? (const uint8_t *)&probe_info : (const uint8_t *)probe_fdt;
@@ -1262,6 +1304,10 @@ ud_setup(void)
         /* audio lane: 'AS' snapshot, 'AU' staging status, 'AB' ADSP boot, 'AR' report */
     } else if (type == 0x40 && req == 0x5b && au_out_ok(value, (uint16_t)(st[4] | st[5] << 8), length)) {
         ud.audio_out = true; ud.out_index = (uint16_t)(st[4] | st[5] << 8); ud.out_length = length;
+    } else if (type == 0x40 && req == 0x5c && length == sizeof(struct fuxi_remote_cmd) && monitor_report[MON_LAUNCH]) {
+        ud.remote_out = true; ud.remote_off = (uint64_t)value | ((uint64_t)st[4] << 16) | ((uint64_t)st[5] << 24);
+    } else if (type == 0xc0 && req == 0x5d) {
+        memcpy(data, &remote_result, sizeof(remote_result)); n=sizeof(remote_result);
     } else if (type == 0xc0 && req == 0x48) {
         memcpy(data, monitor_error, sizeof(monitor_error)); n=sizeof(monitor_error);
 #if defined(FUXI_XNU_LOADER)
@@ -1361,6 +1407,14 @@ ud_event(uint32_t ev)
 				if (want - left == ud.out_length)
 					au_out_data(ud.out_index, (const volatile uint8_t *)(ud.dma + UD_DATA), ud.out_length);
 				ud.audio_out = false;
+			} else if (ud.remote_out) {
+				uint32_t left = *(volatile uint32_t *)(ud.dma + UD_TRB_OUT + 8) & 0xffffff;
+				ud_sync(UD_DATA, 64);
+				if (64 - left == sizeof(struct fuxi_remote_cmd))
+					remote_post(ud.remote_off, (const volatile uint8_t *)(ud.dma + UD_DATA));
+				else
+					remote_result = FUXI_REMOTE_BAD;
+				ud.remote_out = false;
 			}
 			ud.state = EP0_WAIT_STATUS3;
 			break;

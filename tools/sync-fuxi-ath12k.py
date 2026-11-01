@@ -18,6 +18,7 @@ PATCH_0117 = ROOT / 'xnu/patches/0117-fuxi-ath12k.patch'
 NEW_FILES = (('xnu/fuxi-ath12k/os/fuxi_ath12k_os.c', 'bsd/dev/fuxi_ath12k_os.c'),
              ('xnu/fuxi-ath12k/os/fuxi_ath12k_ios.c', 'bsd/dev/fuxi_ath12k_ios.c'),
              ('xnu/fuxi-ath12k/os/fuxi_aks_wrap.h', 'iokit/Kernel/arm/fuxi_aks_wrap.h'),
+             ('xnu/fuxi-ath12k/os/fuxi_remote.h', 'bsd/dev/fuxi_remote.h'),
              ('xnu/fuxi-ath12k/src/fa_xnu.h', 'bsd/dev/fa_xnu.h'),
              ('xnu/fuxi-ath12k/compat/include/lx_os.h', 'bsd/dev/fa_lx_os.h'))
 CONF = '''--- a/bsd/conf/files
@@ -325,13 +326,119 @@ def keystore():
     return ''.join(difflib.unified_diff(before.splitlines(True), after.splitlines(True), fromfile='a/' + KEYSTORE, tofile='b/' + KEYSTORE))
 
 
+# fuxiremote=1, as a change to the file 0092 adds: boot/phone.py's taps. Without 0117 the file and every other kernel's inputs stay as they are.
+KEYS_SOURCE = ROOT / 'xnu/fuxi-h1/fuxi_keys.c'
+KEYS_INCLUDE_FIND = """#include "fuxi_key_state.h"
+"""
+KEYS_INCLUDE = """#include "fuxi_key_state.h"
+#include "fuxi_remote.h"
+"""
+KEYS_HELPER_FIND = """void
+fuxi_keys_init(void)
+{
+"""
+KEYS_HELPER = """/*
+ * fuxiremote=1: touches and keys from the PC, one at a time, for looking at iOS with nobody there (boot/phone.py). The
+ * monitor writes the mailbox with its MMU off: see fuxi_remote.h for who cleans what. Without the argument the mailbox
+ * stays zero, so the monitor finds no magic and refuses, and this thread does not exist. No text comes this way.
+ */
+extern struct fuxi_remote_box fuxi_remote_box;
+struct fuxi_remote_box fuxi_remote_box __attribute__((aligned(64)));
+
+static void
+fk_remote_clean(void)
+{
+	__asm__ volatile("dc civac, %0; dsb sy" :: "r"(&fuxi_remote_box) : "memory");
+}
+
+static void
+fk_remote_act(const struct fuxi_remote_cmd *c)
+{
+	switch (c->kind) {
+	case FUXI_REMOTE_TAP:
+		printf("FUXI REMOTE: tap %d %d seq %u\\n", c->x0, c->y0, c->seq);
+		fk_tap(c->x0, c->y0);
+		break;
+	case FUXI_REMOTE_FLICK:
+		printf("FUXI REMOTE: flick %d %d %d %d %u ms seq %u\\n", c->x0, c->y0, c->x1, c->y1, c->ms, c->seq);
+		fk_flick(c->x0, c->y0, c->x1, c->y1, c->ms);
+		break;
+	default: {
+		struct fuxi_key_inject key = {(unsigned)c->x0, FUXI_KEY_INJECT_CLICK, c->ms};
+
+		printf("FUXI REMOTE: key %d %u ms seq %u\\n", c->x0, c->ms, c->seq);
+		(void)fk_inject(&key);
+		break;
+	}
+	}
+}
+
+static void
+fk_remote(void *arg, wait_result_t wr)
+{
+	(void)arg;
+	(void)wr;
+	fuxi_remote_box.version = FUXI_REMOTE_VERSION;
+	fuxi_remote_box.magic = FUXI_REMOTE_MAGIC;
+	fk_remote_clean();
+	printf("FUXI REMOTE: on\\n");
+	for (;;) {
+		volatile struct fuxi_remote_cmd *seen = &fuxi_remote_box.cmd;
+		struct fuxi_remote_cmd cmd;
+
+		__asm__ volatile("dc civac, %0; dsb sy" :: "r"(seen) : "memory");
+		cmd.seq = seen->seq;
+		if (cmd.seq != fuxi_remote_box.done) {
+			cmd.kind = seen->kind;
+			cmd.x0 = seen->x0;
+			cmd.y0 = seen->y0;
+			cmd.x1 = seen->x1;
+			cmd.y1 = seen->y1;
+			cmd.ms = seen->ms;
+			cmd.check = seen->check;
+			if (fuxi_remote_valid(&cmd)) {
+				fk_remote_act(&cmd);
+			} else {
+				fuxi_remote_box.refused++;
+				printf("FUXI REMOTE: refused seq %u\\n", cmd.seq);
+			}
+			fuxi_remote_box.done = cmd.seq;
+			fk_remote_clean();
+		}
+		fk_script_sleep(20);
+	}
+}
+
+"""
+KEYS_START_FIND = """	unsigned human = 0;
+"""
+KEYS_START = """	unsigned remote = 0;
+	if (PE_parse_boot_argn("fuxiremote", &remote, sizeof(remote)) && remote == 1) {
+		if (kernel_thread_start(fk_remote, NULL, &thread) == KERN_SUCCESS) {
+			thread_deallocate(thread);
+		} else {
+			printf("FUXI REMOTE: thread_start failed\\n");
+		}
+	}
+	unsigned human = 0;
+"""
+
+
+def remote_keys():
+    before = KEYS_SOURCE.read_text()
+    assert before.count(KEYS_INCLUDE_FIND) == 1 and before.count(KEYS_HELPER_FIND) == 1 and before.count(KEYS_START_FIND) == 1
+    after = before.replace(KEYS_INCLUDE_FIND, KEYS_INCLUDE).replace(KEYS_HELPER_FIND, KEYS_HELPER + KEYS_HELPER_FIND).replace(KEYS_START_FIND, KEYS_START)
+    return ''.join(difflib.unified_diff(before.splitlines(True), after.splitlines(True),
+                                        fromfile='a/bsd/dev/fuxi_keys.c', tofile='b/bsd/dev/fuxi_keys.c'))
+
+
 def new_file(source, dest):
     return ''.join(difflib.unified_diff([], (ROOT / source).read_text().splitlines(True),
                                         fromfile='/dev/null', tofile='b/' + dest))
 
 
 def expected_0117():
-    return CONF + MAKEINC + ''.join(new_file(*pair) for pair in NEW_FILES) + ios_selection() + stack_watch() + keystore()
+    return CONF + MAKEINC + ''.join(new_file(*pair) for pair in NEW_FILES) + remote_keys() + ios_selection() + stack_watch() + keystore()
 
 
 def expected_0099():
