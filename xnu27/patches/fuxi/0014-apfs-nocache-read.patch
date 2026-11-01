@@ -1,0 +1,21 @@
+diff --git a/bsd/miscfs/apfs/apfs_vnops.c b/bsd/miscfs/apfs/apfs_vnops.c
+index 26f8f8b..bd7ef4a 100644
+--- a/bsd/miscfs/apfs/apfs_vnops.c
++++ b/bsd/miscfs/apfs/apfs_vnops.c
+@@ -697,7 +697,16 @@ apfs_vnop_read(struct vnop_read_args *ap)
+ 	if (uio_offset(uio) < 0) {
+ 		return EINVAL;
+ 	}
++#if defined(FUXI)
++	/*
++	 * IO_NOCACHE (F_NOCACHE, and the native-4K rehash of a big signed file such as a dyld
++	 * shared cache subcache) past the page cache too: through it, launchd's 5 GB of subcache
++	 * reads filled all free memory and the boot froze.
++	 */
++	if (!am->am_ubc_read || !UBCINFOEXISTS(vp) || (ap->a_ioflag & IO_NOCACHE)) {
++#else
+ 	if (!am->am_ubc_read || !UBCINFOEXISTS(vp)) {
++#endif
+ 		return apfs_read_direct(ap);
+ 	}
+ 	ino = APFS_VP(vp)->an_ino;

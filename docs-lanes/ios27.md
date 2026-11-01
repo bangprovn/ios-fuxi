@@ -369,6 +369,26 @@ kernel do the graft right after devfs is mounted:
 
 Each mount logs `fuxi: cryptex WINDOW (diskN...) at PATH: ERR`.
 
+### Shared cache code signatures (K5c-K5g, OBSERVED)
+
+With the graft, launchd's dyld registers the signature of every subcache with `fcntl(F_ADDFILESIGS_RETURN)`.
+The cache's code directories use 16 KB pages and this kernel uses 4 KB pages, so UniXNU's native-4K hash cache
+(`cs_native4k_prepare`) reads each whole file once and keeps a 4 KB hash table (~1 s per 128 MB on the device).
+dada's apfs sent every `read(2)` through the page cache, `IO_NOCACHE` included. After ~5 GB of subcaches (the
+device had ~4.9 GB free at boot) the system froze during the 675 MB `.77.dyldlinkedit` (K5d-K5f). With
+`apfs_ubc_read=0` (direct reads) the whole cache registers (linkedit in 11 s) and dyld maps it system-wide (K5g).
+`fuxi/0014-apfs-nocache-read.patch` makes `IO_NOCACHE` reads take the direct path, so the page cache stays on
+for everything else.
+
+Diagnostics behind `fuxi_proc_log=1`: `0010` exec/exit lines, `0011` a pid-1 thread watchdog, `0012` pid-1 fcntl
+calls with timing, `0013` native-4K rehash progress, `0015` user PAC failures with the instruction's operands.
+
+K5g: launchd then dies with `EXC_BAD_ACCESS | EXC_PTRAUTH_BIT`, `EXC_ARM_PAC_FAIL`. The instruction is
+`autda x16, x17`, an authenticated GOT load. dyld logged `dyld cache mapped system-wide: customer, auth GOTs:
+unmapped`. The iOS 27 cache has a mapping flag that dyld-1378's headers do not define: `0x80`, on a 512 KB
+`AUTH | CONST_DATA` mapping in each data subcache. GUESS: the kernel (xnu-12377) does not handle it, so the GOT slot
+holds a value the slide never signed.
+
 Out of scope for K4a, next: the Data volume (writable, `/private/var`), the SystemOS/AppOS cryptex grafts (union with
 the OS volume), the sealed-volume root snapshot (`root-snapshot-name`/ APFS seal checks), launchd changes, and a
 writable path (extent-guarded WRITE(10) as on the 8796 lane).

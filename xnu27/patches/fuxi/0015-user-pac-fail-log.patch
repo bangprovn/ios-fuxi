@@ -1,0 +1,39 @@
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index ab492d8..c1d0314 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -119,6 +119,11 @@
+ 	assert(TEST_CONTEXT32_SANITY(context) || TEST_CONTEXT64_SANITY(context))
+ 
+ 
++#if defined(FUXI)
++extern bool fuxi_proc_log(void);
++extern int proc_selfpid(void);
++#endif
++
+ #define COPYIN(src, dst, size)                           \
+ 	(PSR64_IS_KERNEL(get_saved_state_cpsr(state))) ? \
+ 	copyin_kern(src, dst, size) :                    \
+@@ -2923,6 +2928,22 @@ handle_pac_fail(arm_saved_state_t *state, uint64_t esr)
+ 	}
+ 
+ 	codes[1] = instr;
++#if defined(FUXI)
++	/*
++	 * fuxi_proc_log=1: a user PAC failure with the operands of the instruction (for AUTxx Xd, Xn: the
++	 * pointer, the modifier and the 8 bytes the modifier points at, e.g. the auth GOT slot it was loaded from).
++	 */
++	if (fuxi_proc_log()) {
++		uint32_t rd = instr & 0x1f, rn = (instr >> 5) & 0x1f;
++		uint64_t vd = rd == 31 ? 0 : get_saved_state_reg(state, rd);
++		uint64_t vn = rn == 31 ? get_saved_state_sp(state) : get_saved_state_reg(state, rn);
++		uint64_t at = 0;
++		int err = copyin(vn, (char *)&at, sizeof(at));
++
++		printf("fuxi: pac fail pid %d pc 0x%llx lr 0x%llx instr 0x%08x x%u 0x%llx x%u 0x%llx [x%u] 0x%llx (%d) esr 0x%llx\n",
++		    proc_selfpid(), get_saved_state_pc(state), get_saved_state_lr(state), instr, rd, vd, rn, vn, rn, at, err, esr);
++	}
++#endif
+ 
+ 	exception_triage(exception, codes, numcodes);
+ 	__builtin_unreachable();
