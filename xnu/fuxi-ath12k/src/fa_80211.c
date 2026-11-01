@@ -207,7 +207,7 @@ enum { SCAN_NONE, SCAN_RUNNING, SCAN_OVER, SCAN_ABORTED };
 #define FA_ARP_ANSWER_NS	(500 * 1000000ull)
 #define FA_ECHO_ANSWER_NS	(1000 * 1000000ull)
 #define FA_NET_LOOK_NS		(20 * 1000000ull)
-#define FA_SERVE_NS		(240 * 1000000000ull)
+#define FA_SERVE_NS		(600 * 1000000000ull)
 #define FA_SERVE_SAY_NS		(10 * 1000000000ull)
 
 /* The address of the network an interface has joined while it has joined none: mac.c compares beacons with it. */

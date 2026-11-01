@@ -1889,13 +1889,13 @@ int main(void) {
         assert(now - began >= FA_SERVE_NS + FA_JOIN_STAY_NS && now - began < FA_SERVE_NS + FA_JOIN_STAY_NS + FA_REGD_WAIT_NS + 5000000000ull);
     }
     assert(serve.arps == 2 && serve.echoes == 2 && !serve.wrong);
-    assert(SAID("M7 serving for 240 s") && SAID("arp 2 echo 2") && SAID("inbox lost 2") && SAID("M7 served 240"));
+    assert(SAID("M7 serving for 600 s") && SAID("arp 2 echo 2") && SAID("inbox lost 2") && SAID("M7 served 600"));
     assert(strstr(said, "M7 ping beyond") < strstr(said, "M7 serving for") && strstr(said, "M7 served") < strstr(said, "M5 stayed") && strstr(said, "M5 stayed") < strstr(said, "M7 the address given back"));
     assert(net.releases == 1 && deauths == 1);
     {
         unsigned lines = 0; const char *at = said;
         while ((at = strstr(at, "M7 serving: rx ok")) != NULL) { lines++; at++; }
-        assert(lines >= 23 && lines <= 25);
+        assert(lines >= 59 && lines <= 61);
     }
     log_is_clean();
     assert(!SAID("02:") && !SAID("10.0.0.77"));
