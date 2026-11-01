@@ -131,12 +131,13 @@ fa_tx_is_dhcp(const uint8_t *body, unsigned length)
 static inline bool
 fa_tx_filtered(unsigned filter, const uint8_t *frame, unsigned length)
 {
-	const uint8_t *body = frame + 14;
+	const uint8_t *body;
 	unsigned type, size;
 
 	if (filter == 0 || length < 14) {
 		return (false);
 	}
+	body = frame + 14;
 	type = fa_be16(frame + 12);
 	size = length - 14;
 	if (type == FA_TYPE_ARP || type == 0x888e || (type == FA_TYPE_IP && fa_tx_is_dhcp(body, size))) {
