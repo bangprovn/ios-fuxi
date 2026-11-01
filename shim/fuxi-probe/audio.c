@@ -12,6 +12,9 @@
  *      with entry master-kernel before anything starts, bit 1 also rings LPASS's SMP2P doorbell, bits 15:8 are the
  *      seconds to wait for ready (0 is the usual 5, at most 45). 'AB' is what it always was.
  *  IN  0x5a 'AZ' (0x415a): PAS shutdown of the ADSP, after a stage 2 that reached ready. Nothing else.
+ *  IN  0x5a 'AG' (0x4147) wIndex: once, after a stage 2 that reached ready: GLINK over SMEM, polled, for bits 7:0 seconds
+ *      (at most 45), bit 8 also completes the opening of channels (au_glink.h). No data goes out. Returns its summary.
+ *  IN  0x5a 'AH' (0x4148) wIndex=page: its log, 128 words a page.
  *  OUT 0x5b wValue=chunk[15:0], wIndex[11:0]=chunk[27:16], wIndex bit15 =
  *      image (0 adsp_dtb, 1 adsp), bit14 = restart that image at chunk 0.
  *      Sequential 512-byte chunks of a squashed (single-file) MBN; a short
@@ -30,6 +33,7 @@
 #define AU_SMEM_SZ  0x00200000u
 #define AU_MUTEX    0x01f43000ULL  /* tcsr_mutex@1f40000, lock 3 is SMEM's, stride 0x1000 (Linux, sheng) */
 #define AU_IPCC_SMP2P ((3u << 16) | 2u) /* client LPASS, signal SMP2P (sm8550.dtsi) */
+#define AU_IPCC_GLINK ((3u << 16) | 0u) /* client LPASS, signal GLINK_QMP (sm8550.dtsi glink-edge) */
 #define AU_DTB_PA   0x9e980000ULL  /* q6_adsp_dtb_region, 0x80000, no-map */
 #define AU_DTB_SZ   0x00080000u
 #define AU_FW_PA    0x9ea00000ULL  /* adspslpi_region, 0x4680000, no-map */
@@ -562,6 +566,88 @@ static void au_boot_stage(void)
  au_boot[1] = au_boot_run(au_boot);
  au_boot[2] = au_faults;
 }
+/* ---- GLINK over SMEM with the DSP that came up (au_glink.h) ---- */
+#define AU_GL_RD(pa) au_rd(pa)
+#define AU_GL_WR(pa, v) au_wr((pa), (v))
+#define AU_GL_WMB() __asm__ volatile("dsb osh" ::: "memory")
+#define AU_GL_KICK() au_wr(AU_IPCC + 0xc, AU_IPCC_GLINK)
+#include "au_glink.h"
+#define AU_GL_RECORDS 96u
+#define AU_GL_LOG_WORDS (AU_GL_RECORDS * AU_GL_REC_WORDS)
+static uint32_t au_gl_rep[128], au_gl_log[AU_GL_LOG_WORDS];
+/* A cached private item, at the partition's far end (Linux qcom_smem_get_private()); the DSP may allocate its FIFO there. */
+static uint64_t au_smem_item_cached(const struct au_part *p, unsigned item, uint32_t *size)
+{
+ uint64_t pt = AU_SMEM + AU_SMEM_SZ - 0x1000;
+ uint32_t line = 0, n = au_rd(pt + 8);
+ for (unsigned i = 0; i < n && i < 64; i++) {
+  uint64_t e = pt + 0x20 + 0x30 * i;
+  if (AU_SMEM + au_rd(e) == p->pa) { line = au_rd(e + 16); break; }
+ }
+ if (!line || line > 0x1000 || (line & (line - 1))) return 0;
+ uint32_t step = (16 + line - 1) & ~(line - 1), free_cached = au_rd(p->pa + 16);
+ if (free_cached > p->size || free_cached < p->free_unc || p->size < step) return 0;
+ uint64_t e = p->pa + p->size - step, end = p->pa + free_cached;
+ for (unsigned i = 0; i < 512 && e >= end; i++) {
+  uint32_t w0 = au_rd(e), sz = au_rd(e + 4), w2 = au_rd(e + 8);
+  if ((w0 & 0xffff) != 0xa5a5 || sz > e - end) return 0;
+  if ((w0 >> 16) == item) { if (size) *size = sz - (w2 & 0xffff); return e - sz; }
+  if (sz + step > e - end) return 0;
+  e -= sz + step;
+ }
+ return 0;
+}
+static uint32_t au_glink_run(uint32_t *r, unsigned seconds, uint32_t options)
+{
+ static struct au_gl g;
+ struct au_part p;
+ uint32_t sz = 0, desc_sz = 0;
+ au_faults = 0;
+ if (!au_smem_part(0, 2, &p, 0)) return 0x201;
+ uint64_t desc = au_smem_item(&p, 478, &desc_sz), tx = au_smem_item(&p, 479, &sz);
+ r[8] = (uint32_t)desc; r[9] = desc_sz; r[10] = (uint32_t)tx; r[11] = sz;
+ /* Items 478 and 479 are the AP's to make, as Linux does. On this phone they have been there before anything starts. */
+ if (!desc || !tx) {
+  if (!au_smem_lock()) return 0x202;
+  if (!desc) { desc = au_smem_new(&p, 478, 32); desc_sz = 32; }
+  if (!tx) { tx = au_smem_new(&p, 479, 16384); sz = 16384; }
+  au_wr(AU_MUTEX, 0);
+  r[12] = 1;
+ }
+ if (!desc || desc_sz != 32 || !tx || sz < 1024 || sz > 0x100000 || (sz & 7)) return 0x203;
+ g.desc = desc; g.tx_fifo = tx; g.tx_len = sz; g.options = options;
+ g.log = au_gl_log; g.log_most = AU_GL_RECORDS;
+ uint64_t t0 = rsr("cntpct_el0"), hz = rsr("cntfrq_el0"), limit = seconds * hz;
+ if (!au_gl_start(&g)) return 0x204;
+ uint32_t bits = 0;
+ for (uint64_t now = 0; now < limit; now = rsr("cntpct_el0") - t0) {
+  g.ms = (uint32_t)(now * 1000 / hz);
+  if (!g.rx_fifo) {
+   uint32_t in = 0;
+   uint64_t rx = 0;
+   if (au_smem_part(0, 2, &p, 0)) {
+    rx = au_smem_item(&p, 480, &in);
+    if (!rx) { rx = au_smem_item_cached(&p, 480, &in); r[17] = rx != 0; }
+   }
+   if (rx && in >= 1024 && in <= 0x100000 && !(in & 7)) { g.rx_fifo = rx; g.rx_len = in; r[13] = (uint32_t)rx; r[14] = in; r[15] = g.ms; }
+  }
+  bits = au_ready_bits();
+  if (!(bits & 0xf0000000u) && (bits & 1)) { r[16] = bits; break; }   /* the DSP says it has fallen over */
+  if (!au_gl_step(&g)) delay(200);
+  if (g.stuck) break;
+ }
+ r[18] = g.rx_msgs; r[19] = g.tx_msgs; r[20] = g.tx_full; r[21] = g.stuck; r[22] = g.version_seen; r[23] = g.version_acked;
+ r[24] = g.features; r[25] = g.opened; r[26] = g.acked_by_dsp; r[27] = g.log_n; r[28] = g.log_lost; r[29] = g.ms;
+ for (unsigned i = 0; i < 4; i++) r[30 + i] = au_rd(desc + 4 * i);
+ r[34] = bits;
+ struct au_part gp;
+ if (au_smem_part(0xfffe, 0xfffe, &gp, 0)) {
+  uint32_t csz = 0; uint64_t cr = au_smem_item(&gp, 423, &csz);
+  r[35] = (uint32_t)cr; r[36] = csz;
+  for (unsigned i = 0; cr && i < 32 && i * 4 < csz; i++) r[40 + i] = au_rd(cr + 4 * i);
+ }
+ return g.stuck ? 0x210 + g.stuck : 1;
+}
 /* USB entry: returns bytes placed in out (0 = stall). */
 static uint32_t audio_request(uint16_t value, uint16_t index, uint8_t *out)
 {
@@ -586,6 +672,20 @@ static uint32_t audio_request(uint16_t value, uint16_t index, uint8_t *out)
   uint64_t x1, x0 = au_scm(AU_SMC(6), 1, AU_PAS_ADSP, 0, 0, &x1);
   uint32_t r[2] = {(uint32_t)x0, (uint32_t)x1};
   memcpy(out, r, sizeof(r)); return sizeof(r);
+ }
+ if (value == 0x4147 && !monitor_report[MON_LAUNCH] && au_boot[1] == 1) {
+  if (!au_gl_rep[0]) {
+   unsigned seconds = index & 0xff;
+   au_gl_rep[0] = 0xa0d10003;
+   au_gl_rep[2] = seconds = seconds == 0 ? 10 : seconds > 45 ? 45 : seconds;
+   au_gl_rep[3] = (index >> 8) & 1;
+   au_gl_rep[1] = au_glink_run(au_gl_rep, seconds, au_gl_rep[3] ? AU_GL_ANSWER : 0);
+   au_gl_rep[4] = au_faults;
+  }
+  memcpy(out, au_gl_rep, sizeof(au_gl_rep)); return sizeof(au_gl_rep);
+ }
+ if (value == 0x4148 && au_gl_rep[0] && index < AU_GL_LOG_WORDS / 128) {
+  memcpy(out, au_gl_log + 128u * index, 512); return 512;
  }
  return 0;
 }

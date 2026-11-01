@@ -6,6 +6,7 @@
   upload --dtb F --fw F        stage squashed adsp_dtb/adsp MBNs over control OUT
   boot                         stage 2: PAS-boot the ADSP once, then decode
   report                       re-read the frozen stage-2 report
+  glink [--seconds N] [--answer]  after a boot that reached ready: GLINK with the DSP, polled; no data is ever sent
   decode FILE                  decode a saved raw page offline
 Raw pages can be saved with --save. See docs-lanes/audio.md.
 """
@@ -139,6 +140,46 @@ def decode_boot(r):
     return '\n'.join(out)
 
 
+GLINK_CMDS = {0: 'VERSION', 1: 'VERSION_ACK', 2: 'OPEN', 3: 'CLOSE', 4: 'OPEN_ACK', 5: 'INTENT', 6: 'RX_DONE', 7: 'INTENT_REQ',
+              8: 'INTENT_REQ_ACK', 9: 'TX_DATA', 11: 'CLOSE_ACK', 12: 'TX_DATA_CONT', 13: 'READ_NOTIF', 14: 'RX_DONE_REUSE', 15: 'SIGNALS'}
+GLINK_RESULT = {1: 'listened to the end', 0x201: 'no AP-ADSP partition', 0x202: 'TCSR mutex 3 not taken', 0x203: 'no descriptor or FIFO of a usable size',
+                0x204: 'version could not be sent', 0x212: 'stuck: open with a bad name length', 0x213: 'stuck: intents beyond the ring',
+                0x214: 'stuck: data longer than the ring', 0x215: 'stuck: unknown command', 0x211: 'stuck: ring positions cannot be true'}
+
+
+def decode_glink(r):
+    out = [f'glink result={r[1]:#x} ({GLINK_RESULT.get(r[1], "?")}) seconds={r[2]} answer={r[3]} faults={r[4]}',
+           f'  descriptor @{r[8]:#x} size {r[9]}; tx 479 @{r[10]:#x} size {r[11]}, made by us {r[12]}',
+           f'  rx 480 @{r[13]:#x} size {r[14]} first seen at {r[15]} ms, in the cached end {r[17]}',
+           f'  rx messages {r[18]}, tx {r[19]}, tx full {r[20]}, stuck {r[21]}, its version seen {r[22]}, acked {r[23]}, features {r[24]:#x}',
+           f'  channels answered {r[25]}, their acks {r[26]}; log {r[27]} records, {r[28]} lost; last at {r[29]} ms',
+           f'  tx tail {r[30]:#x} head {r[31]:#x}, rx tail {r[32]:#x} head {r[33]:#x}; ready bits {ready_text(r[34])}, fatal bits {r[16]:#x}',
+           f'  crash reason 423 @{r[35]:#x} size {r[36]}: {cstr(r[40:72])!r}']
+    return out
+
+
+def decode_glink_log(words, count):
+    out = []
+    names = []
+    for i in range(count):
+        w = words[12 * i:12 * i + 12]
+        cmd, p1 = w[1] & 0xffff, w[1] >> 16
+        sent = cmd & 0x8000
+        name = GLINK_CMDS.get(cmd & 0x7fff, f'cmd {cmd & 0x7fff}')
+        raw = struct.pack('<8I', *w[4:12])
+        line = f'  {w[0]:6} ms {"AP ->" if sent else "   <-"} {name:14} p1={p1:<6} p2={w[2]:#x} extra={w[3]}'
+        if (cmd & 0x7fff) == 2:
+            text = raw.split(b'\0')[0].decode('ascii', 'replace')
+            line += f' name={text!r}'
+            if not sent:
+                names.append(text)
+        elif w[3]:
+            line += ' ' + raw[:min(32, w[3])].hex()
+        out.append(line)
+    out.append(f'  the DSP opened: {names}')
+    return out
+
+
 def squash(directory, name, dest):
     """pil-squasher: place every split .bNN segment at its p_offset."""
     mdt = (Path(directory) / f'{name}.mdt').read_bytes()
@@ -170,7 +211,9 @@ def fnv(data):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('cmd', choices=['snapshot', 'squash', 'upload', 'boot', 'report', 'decode', 'stop'])
+    ap.add_argument('cmd', choices=['snapshot', 'squash', 'upload', 'boot', 'report', 'decode', 'stop', 'glink'])
+    ap.add_argument('--seconds', type=int, default=30, help='glink: how long to listen, at most 45')
+    ap.add_argument('--answer', action='store_true', help='glink: complete the opening of channels; still sends no data')
     ap.add_argument('--outbound', action='store_true', help='boot: create the AP outbound SMP2P item 429 first')
     ap.add_argument('--doorbell', action='store_true', help='boot: with --outbound, also ring LPASS SMP2P')
     ap.add_argument('--wait', type=int, default=0, help='boot: seconds to wait for ready, at most 45')
@@ -249,6 +292,22 @@ def main():
     elif a.cmd == 'stop':
         x0, x1 = struct.unpack('<2I', req(0x415a, 0, 8))
         print(f'pas shutdown x0={x0:#x} x1={x1:#x}')
+    elif a.cmd == 'glink':
+        if not 1 <= a.seconds <= 45:
+            ap.error('--seconds is 1 to 45')
+        page = req(0x4147, a.seconds | int(a.answer) << 8)
+        r = struct.unpack('<128I', page)
+        if r[0] != 0xa0d10003:
+            raise SystemExit(f'no glink report: {r[0]:#x}')
+        print('\n'.join(decode_glink(r)))
+        count = min(r[27], 96)
+        words = []
+        for p in range((count * 12 + 127) // 128):
+            words += struct.unpack('<128I', req(0x4148, p))
+        print('\n'.join(decode_glink_log(words, count)))
+        if a.save:
+            with a.save.open('ab') as f:
+                f.write(page + struct.pack(f'<{len(words)}I', *words))
     elif a.cmd == 'report':
         show(req(0x4152))
     return 0
