@@ -1,0 +1,23 @@
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index c1d0314..aaabc30 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -2942,6 +2942,18 @@ handle_pac_fail(arm_saved_state_t *state, uint64_t esr)
+ 
+ 		printf("fuxi: pac fail pid %d pc 0x%llx lr 0x%llx instr 0x%08x x%u 0x%llx x%u 0x%llx [x%u] 0x%llx (%d) esr 0x%llx\n",
+ 		    proc_selfpid(), get_saved_state_pc(state), get_saved_state_lr(state), instr, rd, vd, rn, vn, rn, at, err, esr);
++		/* the modifier is usually blend(slot, discriminator): the slot is its low 48 bits */
++		uint64_t slot = vn & 0x0000ffffffffffffULL, words[4] = { 0 }, slide = 0, base = 0;
++		mach_vm_address_t infos = task_get_all_image_info_addr(current_task());
++		int werr = copyin((slot & ~0xfULL) - 16, (char *)words, sizeof(words));
++		/* user64_dyld_all_image_infos: sharedCacheSlide at 152, sharedCacheBaseAddress at 176 */
++		int ierr = infos ? copyin(infos + 152, (char *)&slide, sizeof(slide)) : -1;
++
++		if (ierr == 0) {
++			ierr = copyin(infos + 176, (char *)&base, sizeof(base));
++		}
++		printf("fuxi: pac fail slot 0x%llx: %d 0x%llx 0x%llx 0x%llx 0x%llx; cache slide 0x%llx base 0x%llx (%d)\n",
++		    slot, werr, words[0], words[1], words[2], words[3], slide, base, ierr);
+ 	}
+ #endif
+ 

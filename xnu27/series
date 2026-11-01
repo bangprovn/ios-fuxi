@@ -80,3 +80,4 @@ fuxi/0012-pid1-fcntl-log.patch
 fuxi/0013-native4k-progress.patch
 fuxi/0014-apfs-nocache-read.patch
 fuxi/0015-user-pac-fail-log.patch
+fuxi/0016-pac-fail-slot.patch
