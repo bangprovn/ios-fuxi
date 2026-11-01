@@ -1,0 +1,82 @@
+diff --git a/bsd/kern/kern_sig.c b/bsd/kern/kern_sig.c
+index c25ed3f..222be41 100644
+--- a/bsd/kern/kern_sig.c
++++ b/bsd/kern/kern_sig.c
+@@ -126,6 +126,11 @@
+ #include <security/mac_framework.h>
+ #endif
+ 
++#if defined(FUXI)
++extern bool fuxi_proc_log(void);
++extern void fuxi_user_backtrace(int signum);
++#endif
++
+ /*
+  * Missing prototypes that Mach should export
+  *
+@@ -3190,6 +3195,11 @@ postsig_locked(int signum)
+ 		KERNEL_DEBUG_CONSTANT(BSDDBG_CODE(DBG_BSD_PROC, BSD_PROC_FRCEXIT) | DBG_FUNC_NONE,
+ 		    proc_getpid(p), W_EXITCODE(0, signum), 3, 0, 0);
+ 
++#if defined(FUXI)
++		if (proc_getpid(p) == 1 && fuxi_proc_log()) {
++			fuxi_user_backtrace(signum & ~WCOREFLAG);
++		}
++#endif
+ 		exit_with_reason(p, W_EXITCODE(0, signum), (int *)NULL, TRUE, TRUE, 0, ut_exit_reason);
+ 
+ 		proc_lock(p);
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index aaabc30..33f5ba7 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -3465,3 +3465,49 @@ sleh_panic_lockdown_should_initiate_el1_sp0_sync(uint64_t esr, uint64_t elr,
+ }
+ __SECURITY_STACK_DISALLOWED_POP
+ #endif /* CONFIG_SPTM */
++
++#if defined(FUXI)
++/*
++ * fuxi_proc_log=1: the user stack of the current thread when pid 1 dies of a signal (launchd's abort),
++ * by its frame pointer chain. Return addresses are printed unslid against the shared cache
++ * (raw value minus sharedCacheSlide), so they can be looked up in the cache's image list offline.
++ */
++void
++fuxi_user_backtrace(int signum)
++{
++	arm_saved_state_t *state = get_user_regs(current_thread());
++	uint64_t slide = 0, frame[2], ret[24];
++	mach_vm_address_t infos = task_get_all_image_info_addr(current_task());
++	int n = 0;
++
++	if (state == NULL) {
++		return;
++	}
++	if (infos == 0 || copyin(infos + 152, (char *)&slide, sizeof(slide)) != 0) {
++		slide = 0;
++	}
++	printf("fuxi: sig %d pid %d pc 0x%llx lr 0x%llx fp 0x%llx x0 0x%llx x1 0x%llx x2 0x%llx slide 0x%llx\n",
++	    signum, proc_selfpid(), get_saved_state_pc(state), get_saved_state_lr(state), get_saved_state_fp(state),
++	    get_saved_state_reg(state, 0), get_saved_state_reg(state, 1), get_saved_state_reg(state, 2), slide);
++	ret[n++] = get_saved_state_pc(state);
++	ret[n++] = get_saved_state_lr(state);
++	for (uint64_t fp = get_saved_state_fp(state); fp != 0 && (fp & 0xf) == 0 && n < 24;) {
++		if (copyin(fp, (char *)frame, sizeof(frame)) != 0 || frame[1] == 0) {
++			break;
++		}
++		ret[n++] = frame[1];
++		if (frame[0] <= fp) {
++			break;
++		}
++		fp = frame[0];
++	}
++	for (int i = 0; i < n; i += 4) {
++		uint64_t v[4] = { 0 };
++		for (int j = 0; j < 4 && i + j < n; j++) {
++			/* strip the PAC signature (user VAs are below 2^39 here) and unslide */
++			v[j] = (ret[i + j] & 0x0000007fffffffffULL) - slide;
++		}
++		printf("fuxi: bt %d: 0x%llx 0x%llx 0x%llx 0x%llx\n", i, v[0], v[1], v[2], v[3]);
++	}
++}
++#endif
