@@ -44,6 +44,7 @@ FA_PUBLIC int	fa_firmware_ready(const struct fa_caps *caps, unsigned stage);	/* 
 FA_PUBLIC void	fa_stop(void);			/* rings and registers left alone from now on; repeatable */
 FA_PUBLIC void	fa_set_radio_mac(const unsigned char *mac);	/* before fa_firmware_ready(): station.address */
 FA_PUBLIC void	fa_set_target_ssid(const unsigned char *name, unsigned length);	/* before it, stage 5: the open network, 1-32 bytes */
+FA_PUBLIC void	fa_set_target_join(const unsigned char *name, unsigned length, const unsigned char *key);	/* before it, stage 6: the network and its 32-byte key */
 
 /* fuxi_wlan.c (FUXI_ATH12K) owes these. */
 void	*fuxi_ath12k_bar(unsigned long *length);	/* BAR0 mapped contiguously for 0x100000 */

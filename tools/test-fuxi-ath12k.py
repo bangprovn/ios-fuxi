@@ -7,6 +7,7 @@ assertion is shown to fire, and with --full the whole build runs clean.
 """
 import argparse
 import hashlib
+import hmac
 import importlib.util
 import json
 import os
@@ -426,8 +427,14 @@ static inline void list_del_init(struct list_head *n) { n->prev->next = n->next;
 #define ETH_ALEN 6
 static inline bool is_zero_ether_addr(const u8 *a) { return !(a[0] | a[1] | a[2] | a[3] | a[4] | a[5]); }
 """,
+    'linux/random.h': r"""#pragma once
+static inline void get_random_bytes(void *p, int n) { for (int i = 0; i < n; i++) ((uint8_t *)p)[i] = (uint8_t)i; }
+""",
     'linux/skbuff.h': r"""#pragma once
-struct sk_buff { uint8_t cb[48]; uint8_t *data; unsigned len; uint8_t *head; };
+#ifndef cpu_to_be16
+#define cpu_to_be16(x) ((uint16_t)__builtin_bswap16(x))
+#endif
+struct sk_buff { uint8_t cb[48]; uint8_t *data; unsigned len; uint8_t *head; uint16_t protocol; uint32_t priority; };
 extern int fail_skb;
 static inline void dev_kfree_skb_any(struct sk_buff *s) { free(s->head); free(s); }
 static inline struct sk_buff *dev_alloc_skb(unsigned n) {
@@ -514,7 +521,8 @@ struct wiphy_work { struct list_head entry; void (*fn)(struct wiphy *, struct wi
 static inline void wiphy_lock(struct wiphy *w) { assert(!w->mtx.locked); w->mtx.locked = 1; }
 static inline void wiphy_unlock(struct wiphy *w) { assert(w->mtx.locked); w->mtx.locked = 0; }
 enum ieee80211_bss_type { IEEE80211_BSS_TYPE_ANY }; enum ieee80211_privacy { IEEE80211_PRIVACY_ANY };
-struct cfg80211_bss;
+struct cfg80211_bss_ies { uint8_t *data; size_t len; };
+struct cfg80211_bss { struct cfg80211_bss_ies *ies, *beacon_ies; int32_t signal; };
 struct cfg80211_scan_info { bool aborted; };
 struct cfg80211_ssid { int ssid_len; uint8_t ssid[32]; };
 struct cfg80211_scan_request {
@@ -550,7 +558,11 @@ struct ieee80211_sta {
 enum { IEEE80211_HW_SUPPORTS_TX_ENCAP_OFFLOAD = 1, IEEE80211_HW_SUPPORTS_RX_DECAP_OFFLOAD = 2 };
 #define ieee80211_hw_check(hw, flag) (((hw)->flags & IEEE80211_HW_ ## flag) != 0)
 enum { IEEE80211_OFFLOAD_ENCAP_ENABLED = 1, IEEE80211_OFFLOAD_DECAP_ENABLED = 2 };
-enum { RX_FLAG_NO_SIGNAL_VAL = 1 << 19, RX_FLAG_8023 = 1 << 27 };
+enum { RX_FLAG_NO_SIGNAL_VAL = 1 << 19, RX_FLAG_8023 = 1 << 27, RX_FLAG_DECRYPTED = 1 << 1, RX_FLAG_IV_STRIPPED = 1 << 4 };
+enum set_key_cmd { SET_KEY, DISABLE_KEY };
+enum { IEEE80211_KEY_FLAG_PAIRWISE = 1 };
+#define WLAN_CIPHER_SUITE_CCMP 0x000fac04
+struct ieee80211_key_conf { uint32_t cipher; uint8_t icv_len, iv_len, hw_key_idx, keyidx; uint16_t flags; int8_t link_id; uint8_t keylen; uint8_t key[0]; };
 struct ieee80211_rx_status { uint32_t flag; uint16_t freq; int8_t signal; };
 #define IEEE80211_SKB_RXCB(s) ((struct ieee80211_rx_status *)((s)->cb))
 struct ieee80211_bss_conf {
@@ -577,8 +589,9 @@ struct ieee80211_ops {
     int (*conf_tx)(struct ieee80211_hw *, struct ieee80211_vif *, u32, u16, const struct ieee80211_tx_queue_params *);
     void (*flush)(struct ieee80211_hw *, struct ieee80211_vif *, u32, bool);
     void (*tx)(struct ieee80211_hw *, struct ieee80211_tx_control *, struct sk_buff *);
+    int (*set_key)(struct ieee80211_hw *, enum set_key_cmd, struct ieee80211_vif *, struct ieee80211_sta *, struct ieee80211_key_conf *);
 };
-struct ieee80211_tx_status { struct sk_buff *skb; };
+struct ieee80211_tx_status { struct sk_buff *skb; struct ieee80211_tx_info *info; };
 enum ieee80211_iface_iter { IEEE80211_IFACE_ITER_NORMAL };
 """,
 }
@@ -713,7 +726,7 @@ def fa_80211_runs_on_fake_headers(tmp):
     (tmp / 'driver.c').write_text('#include <stdarg.h>\n#include <linux/kernel.h>\n' + FA_80211_DRIVER)
     program = tmp / 'driver'
     cc = os.environ.get('CC', 'cc')
-    subprocess.run([cc, '-std=gnu11', '-w', '-g', f'-I{tmp / "fake"}', f'-I{own / "src"}', str(tmp / 'driver.c'), '-o', str(program)], check=True)
+    subprocess.run([cc, '-std=gnu11', '-w', '-g', f'-I{tmp / "fake"}', f'-I{own / "src"}', str(tmp / 'driver.c'), str(own / 'src/fa_wpa.c'), '-o', str(program)], check=True)
     subprocess.run([str(program)], check=True)
 
 
@@ -1004,7 +1017,7 @@ def station_runs_on_fake_headers(tmp):
     program = tmp / 'driver'
     cc = os.environ.get('CC', 'cc')
     subprocess.run([cc, '-std=gnu11', '-w', '-g', '-fsanitize=address,undefined', '-fno-sanitize-recover=all',
-                    f'-I{tmp / "fake"}', f'-I{own / "src"}', str(tmp / 'driver.c'), '-o', str(program)], check=True)
+                    f'-I{tmp / "fake"}', f'-I{own / "src"}', str(tmp / 'driver.c'), str(own / 'src/fa_wpa.c'), '-o', str(program)], check=True)
     subprocess.run([str(program)], check=True)
 
 
@@ -1102,6 +1115,40 @@ static const uint8_t OPEN_HT[] = { 1, 8, 0x82, 0x84, 0x8b, 0x96, 12, 18, 24, 36,
     221, 7, 0x00, 0x50, 0xf2, 2, 0, 1, 0 };
 static const uint8_t WMM_PARAM[] = { 221, 24, 0x00, 0x50, 0xf2, 2, 1, 1, 0, 0, 3, 0xa4, 0, 0, 0x27, 0xa4, 0, 0, 0x42, 0x43, 94, 0, 0x62, 0x32, 47, 0 };
 
+/* ---- the handshake's peer, stage 6 ---- */
+static struct { bool forged_first, any_reply, silent, no_m3, door, die_at_m3, goes_open; int fail_key; bool m1_given, m3_given, forged_given, stayed; } wpa;
+static unsigned eapols, key_calls;
+static bool asked_bss, bss_had_rsn, asked_bss_open;
+static uint8_t WPA_HEARD[sizeof((uint8_t[]){ 0 }) * 22 + 128];
+static void give_eapol(const uint8_t *body, unsigned length) {
+    uint8_t f[800] = {0}; unsigned at = 26;
+    f[0] = 0x88; f[1] = 0x02; memcpy(f + 4, OWN, 6); memcpy(f + 10, AP, 6); memcpy(f + 16, AP, 6);
+    memcpy(f + at, "\xaa\xaa\x03\x00\x00\x00\x88\x8e", 8); at += 8;
+    memcpy(f + at, body, length); at += length;
+    deliver(f, at, 2412, -40, 0, true);
+}
+static void eapol_sent(struct ieee80211_hw *hw, struct sk_buff *skb) {
+    unsigned header = skb->data[0] == 0x88 ? 26 : 24;
+    assert(skb->data[1] == 1 && skb->protocol == cpu_to_be16(0x888e) && skb->len > header + 8 && skb->priority == 7);
+    const uint8_t *body = skb->data + header + 8; unsigned n = skb->len - header - 8;
+    eapols++;
+    if (!wpa.any_reply) {
+        if (eapols == 1) assert(n == sizeof(V_M2) && !memcmp(body, V_M2, n));
+        else assert(n == sizeof(V_M4) && !memcmp(body, V_M4, n));
+    }
+    IEEE80211_SKB_CB(skb)->flags |= IEEE80211_TX_STAT_ACK;
+    struct ieee80211_tx_status s = { .skb = skb, .info = IEEE80211_SKB_CB(skb) };
+    linuxkpi_ieee80211_tx_status_ext(hw, &s);
+}
+static int op_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd, struct ieee80211_vif *v, struct ieee80211_sta *s, struct ieee80211_key_conf *k) {
+    bool pairwise = (k->flags & IEEE80211_KEY_FLAG_PAIRWISE) != 0;
+    assert(hw->wiphy->mtx.locked && k->cipher == WLAN_CIPHER_SUITE_CCMP && k->keylen == 16 && k->iv_len == 8 && k->link_id == -1 && (cmd == DISABLE_KEY ? radio_of(hw)->reached >= IEEE80211_STA_ASSOC : radio_of(hw)->reached == IEEE80211_STA_ASSOC));
+    if (pairwise) assert(s == radio_of(hw)->sta && k->keyidx == 0 && (cmd != SET_KEY || !memcmp(k->key, V_TK, 16)));
+    else assert(s == NULL && k->keyidx == 1 && (cmd != SET_KEY || !memcmp(k->key, V_GTK, 16)));
+    NOTE(cmd == SET_KEY ? (pairwise ? "key_p" : "key_g") : (pairwise ? "off_p" : "off_g"));
+    if (cmd == SET_KEY && (int)++key_calls == wpa.fail_key) return -5;
+    return 0;
+}
 static struct {
     const uint8_t *hear_elements; unsigned hear_length, cap;
     const char *heard_name;
@@ -1157,6 +1204,13 @@ static int op_sta_state(struct ieee80211_hw *hw, struct ieee80211_vif *v, struct
     /* The way it finds its station: every state it is in, as the driver asks (mac.c, ath12k_bss_assoc()). */
     assert(linuxkpi_ieee80211_find_sta(v, AP) == s && linuxkpi_ieee80211_find_sta(v, OTHER) == NULL);
     snprintf(what, sizeof(what), "sta%d%d", from, to); NOTE(what);
+    /* What ath12k asks in the peer's association (mac.c), and what it reads out of the answer. */
+    if (to == IEEE80211_STA_ASSOC && from < to) {
+        struct cfg80211_bss *b = linuxkpi_cfg80211_get_bss(hw->wiphy, NULL, AP, NULL, 0, IEEE80211_BSS_TYPE_ANY, IEEE80211_PRIVACY_ANY);
+        assert(linuxkpi_cfg80211_get_bss(hw->wiphy, NULL, OTHER, NULL, 0, IEEE80211_BSS_TYPE_ANY, IEEE80211_PRIVACY_ANY) == NULL);
+        if (radio_of(hw)->protect) { asked_bss = b != NULL; bss_had_rsn = b != NULL && fa_element(b->ies->data, b->ies->len, FA_EID_RSN) != NULL; linuxkpi_cfg80211_put_bss(hw->wiphy, b); }
+        else asked_bss_open = b != NULL;
+    }
     return ap.fail_sta_to != 0 && ap.fail_sta_to == (int)to && from < to ? -110 : 0;
 }
 static uint32_t he_params_seen;
@@ -1178,6 +1232,7 @@ static void op_tx(struct ieee80211_hw *hw, struct ieee80211_tx_control *c, struc
     assert(IEEE80211_SKB_CB(skb)->control.vif == radio_of(hw)->vif && skb->len >= 24);
     uint8_t kind = skb->data[0];
     assert(!memcmp(skb->data + 4, AP, 6) && !memcmp(skb->data + 10, OWN, 6) && !memcmp(skb->data + 16, AP, 6));
+    if (kind == 0x88 || kind == 0x08) { eapol_sent(hw, skb); return; }
     if (kind == FA_KIND_AUTH) {
         NOTE("auth"); auth_tries++; assert(skb->len == FA_AUTH_LENGTH); memcpy(last_auth, skb->data, skb->len);
     } else if (kind == FA_KIND_ASSOC_REQUEST) {
@@ -1223,7 +1278,7 @@ static void op_tx(struct ieee80211_hw *hw, struct ieee80211_tx_control *c, struc
 static const struct ieee80211_ops ops = { .start = op_start, .stop = op_stop, .add_interface = op_add, .remove_interface = op_remove,
     .hw_scan = op_scan, .cancel_hw_scan = op_cancel, .add_chanctx = op_add_chanctx, .remove_chanctx = op_remove_chanctx,
     .assign_vif_chanctx = op_assign, .unassign_vif_chanctx = op_unassign, .sta_state = op_sta_state, .link_info_changed = op_link,
-    .vif_cfg_changed = op_vif, .conf_tx = op_conf_tx, .flush = op_flush, .tx = op_tx };
+    .vif_cfg_changed = op_vif, .conf_tx = op_conf_tx, .flush = op_flush, .tx = op_tx, .set_key = op_set_key };
 
 static struct linuxkpi_ieee80211_channel two[3], five[3];
 static struct ieee80211_rate rates[12];
@@ -1297,6 +1352,37 @@ static const uint8_t RSN_ELEMENT[] = { 48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 
 static void rsn_in_the_stay(void) { stay_frames(); if (ticks == 5) { ticks = 200; hear(FA_KIND_BEACON, AP, NAME, ap.cap, RSN_ELEMENT, sizeof(RSN_ELEMENT), 2437, -41); } }
 static void rsn_sibling(void) { hear(FA_KIND_BEACON, OTHER, NAME, 0, RSN_ELEMENT, sizeof(RSN_ELEMENT), 2412, -90); }
 
+static void wpa_tick(void) {
+    struct fa_radio *r = radio_of(the_hw);
+    if (r->vif == NULL || !r->vif->cfg.assoc || r->eapol_length != 0 || wpa.silent) return;
+    if (!wpa.m1_given) { wpa.m1_given = true; give_eapol(V_M1, sizeof(V_M1)); return; }
+    if (eapols == 1 && !wpa.m3_given) {
+        if (wpa.no_m3) return;
+        if (wpa.door) { wpa.door = false; give_door(FA_KIND_DEAUTH, 15); return; }
+        if (wpa.die_at_m3) { wpa.die_at_m3 = false; fa_m4_evidence("died"); return; }
+        if (wpa.forged_first && !wpa.forged_given) { wpa.forged_given = true; give_eapol(V_M3_FORGED, sizeof(V_M3_FORGED)); return; }
+        wpa.m3_given = true; give_eapol(V_M3, sizeof(V_M3)); return;
+    }
+    if (r->reached == IEEE80211_STA_AUTHORIZED && !wpa.stayed && r->rx_ok + r->rx_clear == 0 && lx_os_nanoseconds() > 0) {
+        static unsigned count;
+        if (++count < 3) return;	/* after the stay has begun and counted from nothing */
+        count = 0; wpa.stayed = true;
+        uint8_t f[64] = {0};
+        f[0] = 0x88; f[1] = 2; memset(f + 4, 0xff, 6); memcpy(f + 10, AP, 6); memcpy(f + 16, AP, 6);
+        deliver(f, 40, 2412, 0, RX_FLAG_NO_SIGNAL_VAL | RX_FLAG_DECRYPTED, true);
+        deliver(f, 40, 2412, 0, RX_FLAG_NO_SIGNAL_VAL | RX_FLAG_8023, true);
+        deliver(f, 40, 2412, 0, RX_FLAG_NO_SIGNAL_VAL, true);
+        hear(FA_KIND_BEACON, AP, NAME, ap.cap, WPA_HEARD, sizeof(RSN_ELEMENT) + sizeof(OPEN_HT), 2437, -41);
+        if (wpa.goes_open) hear(FA_KIND_BEACON, AP, NAME, FA_CAP_ESS, OPEN_HT, sizeof(OPEN_HT), 2437, -41);
+    }
+}
+static void fresh_wpa(const uint8_t *key) {
+    fresh();
+    memset(&wpa, 0, sizeof(wpa)); eapols = key_calls = 0; asked_bss = bss_had_rsn = false;
+    fa_set_target_join((const unsigned char *)NAME, sizeof(NAME) - 1, key);
+    ap.hear_elements = WPA_HEARD; ap.hear_length = sizeof(RSN_ELEMENT) + sizeof(OPEN_HT); ap.cap = FA_CAP_ESS | FA_CAP_SHORT_SLOT | FA_CAP_PRIVACY;
+    tick = wpa_tick;
+}
 static const uint8_t *find_in_request(unsigned number) { return fa_element(last_assoc + 28, last_assoc_length - 28, number); }
 /* What was said and done, when an assertion stops the run. */
 static void on_abort(int s) { fprintf(stderr, "calls: %s\nsaid:\n%s\n", calls, said); signal(SIGABRT, SIG_DFL); }
@@ -1521,6 +1607,102 @@ int main(void) {
     fresh(); fail_skb = 1;
     assert(fa_m5_station(the_hw, false) == 0 && SAID("M5 no buffer for the authentication frame") && !auth_tries);
     fail_skb = 0;
+    done();
+
+    /* ---- stage 6 ---- */
+    memcpy(WPA_HEARD, RSN_ELEMENT, sizeof(RSN_ELEMENT)); memcpy(WPA_HEARD + sizeof(RSN_ELEMENT), OPEN_HT, sizeof(OPEN_HT));
+    /* The whole way: mac80211's order, the association told before the handshake, the keys, then authorized, and the way down. */
+    fresh_wpa(V_PMK);
+    assert(fa_m5_station(the_hw, false) == 0);
+    assert(!strcmp(calls, "start,add,scan,add_chanctx,assign,link,sta01,auth,sta12,assoc,sta23,assoc_told,conf_tx,conf_tx,conf_tx,conf_tx,link,key_p,key_g,sta34,"
+                          "deauth,flush,off_g,off_p,sta43,sta32,sta21,sta10,disassoc_told,unassign,remove_chanctx,remove,stop,"));
+    assert(eapols == 2 && asked_bss && bss_had_rsn);
+    assert(SAID("M6 target offers group 4 pairwise 0x10 akm 0x4") && SAID("message 1, answered") && SAID("message 3, good, answered"));
+    assert(SAID("M6 message 4 after 0 ms: data done 2 acked 2") && SAID("M6 keys to the driver: 0, group number 1") && SAID("M6 4-way ok pairwise group installed"));
+    assert(SAID("M6 rx ok 2 dropped unprotected 1\n") && SAID("M5 auth ok assoc ok aid 7") && !rddm && !evidence_count);
+    assert(strstr(said, "M6 4-way ok") < strstr(said, "M5 auth ok") && strstr(said, "M5 auth ok") < strstr(said, "M6 rx ok"));
+    {
+        const uint8_t *e = find_in_request(FA_EID_RSN);
+        assert(e && e[1] == 20 && !memcmp(e, FA_RSN_OURS, FA_RSN_LENGTH) && (last_assoc[24] & FA_CAP_PRIVACY) != 0);
+        assert(e > find_in_request(FA_EID_RATES) && e < find_in_request(FA_EID_HT));	/* Table 9-35 */
+    }
+    /* Nothing of the key is left, here or in the log. */
+    {
+        struct fa_radio *radio = radio_of(the_hw);
+        static const struct fa_wpa zero;
+        assert(!memcmp(&radio->wpa, &zero, sizeof(zero)) && !memcmp(target_key, zero.pmk, sizeof(target_key)));
+        for (unsigned i = 0; i < 2; i++) { assert(!memcmp(((struct ieee80211_key_conf *)radio->key_memory[i])->key, zero.pmk, 16)); }
+    }
+    log_is_clean();
+    done();
+    /* Fresh after it: a later open network is not taken as protected. */
+    fresh(); assert(!target_protected); done();
+
+    /* Forged first: a message that fails its check does not end the wait, and the genuine one still counts. */
+    fresh_wpa(V_PMK); wpa.forged_first = true;
+    assert(fa_m5_station(the_hw, false) == 0 && SAID("not good: its signature is not right") && SAID("M6 4-way ok") && eapols == 2);
+    done();
+
+    /* The wrong key: its message 3 fails, bounded, no key given, and we say goodbye. Never authorized. */
+    {
+        static uint8_t wrong[32]; memset(wrong, 0x5a, 32);
+        fresh_wpa(wrong); wpa.any_reply = true;
+        unsigned long long began = now;
+        assert(fa_m5_station(the_hw, false) == 0 && now - began < FA_HANDSHAKE_NS + FA_REGD_WAIT_NS + 2000000000ull);
+        assert(SAID("M6 not proven: the handshake did not come through") && SAID("a message was not good: its signature") && !strstr(calls, "key_") && !strstr(calls, "sta34"));
+        assert(deauths == 1 && !SAID("M5 auth ok") && !rddm && !evidence_count);
+        log_is_clean();
+        done();
+    }
+    /* It never begins, or never answers message 2: bounded, and which of them is said. */
+    fresh_wpa(V_PMK); wpa.silent = true;
+    assert(fa_m5_station(the_hw, false) == 0 && SAID("the access point did not begin it") && !eapols && deauths == 1);
+    done();
+    fresh_wpa(V_PMK); wpa.no_m3 = true;
+    assert(fa_m5_station(the_hw, false) == 0 && SAID("our message 2 was not answered") && eapols == 1 && deauths == 1);
+    done();
+    /* It shows us the door in the middle: at once, and no goodbye after that. */
+    fresh_wpa(V_PMK); wpa.door = true;
+    {
+        unsigned long long began = now;
+        assert(fa_m5_station(the_hw, false) == 0 && now - began < FA_REGD_WAIT_NS + 2000000000ull && SAID("shown us the door (a wrong passphrase gives this)") && !deauths);
+    }
+    done();
+    /* The firmware says no to a key: its account, and the one it took comes back. */
+    fresh_wpa(V_PMK); wpa.fail_key = 2;
+    assert(fa_m5_station(the_hw, false) == -5 && !strcmp(first_evidence, "keys refused or peer not authorized") && strstr(calls, "key_p,key_g,rddm,off_p,") && !strstr(calls, "off_g"));
+    done();
+    fresh_wpa(V_PMK); wpa.fail_key = 1;
+    assert(fa_m5_station(the_hw, false) == -5 && !strstr(calls, "key_g") && !strstr(calls, "off_"));
+    done();
+    /* The firmware dies during the handshake. */
+    fresh_wpa(V_PMK); wpa.die_at_m3 = true;
+    assert(fa_m5_station(the_hw, false) == -EIO && rddm && !strstr(calls, "key_") && !deauths);
+    done();
+    /* The beacon loses its RSN element during the stay: that is no network of ours any more. */
+    fresh_wpa(V_PMK); wpa.goes_open = true;
+    assert(fa_m5_station(the_hw, false) == 0 && SAID("now asks for something else: leaving") && deauths == 1);
+    done();
+
+    /* Refused before any frame: an open network of the name, or an offer we do not make. */
+    fresh_wpa(V_PMK); ap.hear_elements = OPEN_HT; ap.hear_length = sizeof(OPEN_HT); ap.cap = FA_CAP_ESS;
+    assert(fa_m5_station(the_hw, false) == 0 && !strcmp(calls, "start,add,scan,remove,stop,") && SAID("M6 refused: the target has nothing (1 frames)") && !auth_tries);
+    done();
+    {
+        static const struct { unsigned at; uint8_t value; const char *text; } offers[] = {
+            { 7, 2, "M6 refused: its group cipher is not CCMP" }, { 19, 8, "M6 refused: it does not take a WPA2 passphrase's key" }, { 20, 0x40, "M6 refused: it requires protected management frames" },
+        };
+        for (unsigned i = 0; i < 3; i++) {
+            static uint8_t e[sizeof(RSN_ELEMENT)];
+            memcpy(e, RSN_ELEMENT, sizeof(e)); e[offers[i].at] = offers[i].value;
+            fresh_wpa(V_PMK); ap.hear_elements = e; ap.hear_length = sizeof(e);
+            assert(fa_m5_station(the_hw, false) == 0 && !strcmp(calls, "start,add,scan,remove,stop,") && SAID(offers[i].text) && !auth_tries);
+            done();
+        }
+    }
+    /* What is left of a key is never given to an open network's way: stage 5 asks for no bss. */
+    fresh(); ticks = 0; tick = stay_frames;
+    assert(fa_m5_station(the_hw, false) == 0 && !asked_bss_open);
     done();
 
     /* The two iterators: only what exists. */
@@ -1815,6 +1997,65 @@ static void he_and_streams(void) {
 static void kinds(void) {
     uint8_t f[40] = {0};
     memcpy(f + 10, AP, 6); memcpy(f + 16, AP, 6);
+    /* Stage 6's frames: the wanted protection, what an RSN element offers, the handshake's frames. */
+    {
+        static const uint8_t GOOD[] = { 48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 2, 0, 0 };
+        struct fa_rsn rsn;
+        assert(sizeof(FA_RSN_OURS) == FA_RSN_LENGTH && !memcmp(FA_RSN_OURS, GOOD, sizeof(GOOD)));
+        assert(fa_rsn_read(GOOD, sizeof(GOOD), &rsn) == NULL && rsn.group == 4 && rsn.pairwise == 1u << 4 && rsn.akm == 1u << 2);
+        assert(fa_rsn_read(GOOD, 0, &rsn) != NULL);
+        for (unsigned length = 0; length < sizeof(GOOD); length++) {	/* every length the element could say */
+            uint8_t *e = malloc(length + 2); memcpy(e, GOOD, length + 2 > sizeof(GOOD) ? sizeof(GOOD) : length + 2); e[1] = (uint8_t)length;
+            const char *why = fa_rsn_read(e, length + 2, &rsn);
+            assert(length >= 18 ? why == NULL : why != NULL);
+            free(e);
+        }
+        const struct { unsigned at; uint8_t value; const char *text; } changes[] = {
+            { 7, 2, "group cipher" }, { 13, 2, "CCMP" }, { 19, 8, "WPA2 passphrase" }, { 19, 1, "WPA2 passphrase" }, { 20, 0x40, "protected management" }, { 2, 2, "not one this reads" },
+        };
+        for (unsigned i = 0; i < sizeof(changes) / sizeof(changes[0]); i++) {
+            uint8_t e[sizeof(GOOD)]; memcpy(e, GOOD, sizeof(e)); e[changes[i].at] = changes[i].value;
+            assert(strstr(fa_rsn_read(e, sizeof(e), &rsn), changes[i].text));
+        }
+        /* a list that says it is longer than the element */
+        { uint8_t e[sizeof(GOOD)]; memcpy(e, GOOD, sizeof(e)); e[8] = 200; assert(strstr(fa_rsn_read(e, sizeof(e), &rsn), "ciphers")); }
+        { uint8_t e[sizeof(GOOD)]; memcpy(e, GOOD, sizeof(e)); e[14] = 200; assert(strstr(fa_rsn_read(e, sizeof(e), &rsn), "key management")); }
+        /* mixed: both suites offered, it is still joined */
+        { uint8_t e[] = { 48, 24, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 2, 0, 0, 0x0f, 0xac, 8, 0, 0x0f, 0xac, 2, 0x80, 0 };
+          assert(fa_rsn_read(e, sizeof(e), &rsn) == NULL && rsn.akm == ((1u << 8) | (1u << 2)) && rsn.capabilities == 0x80); }
+
+        const uint8_t body[5] = { 2, 3, 0, 1, 9 };
+        uint8_t f[64]; const uint8_t *out; unsigned out_length, n;
+        assert(fa_eapol_frame(f, 10, OWN, AP, true, body, 5) == 0);
+        n = fa_eapol_frame(f, sizeof(f), OWN, AP, true, body, 5);
+        assert(n == 26 + 8 + 5 && f[0] == 0x88 && f[1] == 1 && f[24] == 7 && !memcmp(f + 4, AP, 6) && !memcmp(f + 10, OWN, 6) && !memcmp(f + 16, AP, 6));
+        assert(f[32] == 0x88 && f[33] == 0x8e && !memcmp(f + 34, body, 5));
+        n = fa_eapol_frame(f, sizeof(f), OWN, AP, false, body, 5);
+        assert(n == 24 + 8 + 5 && f[0] == 0x08);
+        /* What we build, seen from the other side: the same but from the access point. */
+        memcpy(f + 4, OWN, 6); memcpy(f + 10, AP, 6); f[1] = 2;
+        assert(fa_eapol_read(f, n, false, false, OWN, AP, &out, &out_length) && out_length == 5 && !memcmp(out, body, 5));
+        for (unsigned i = 0; i < n; i++) {
+            uint8_t *exact = malloc(i ? i : 1); memcpy(exact, f, i);
+            assert(!fa_eapol_read(exact, i, false, false, OWN, AP, &out, &out_length) || i > 32);
+            free(exact);
+        }
+        assert(!fa_eapol_read(f, n, false, false, OTHER, AP, &out, &out_length));	/* for another */
+        assert(!fa_eapol_read(f, n, false, false, OWN, OTHER, &out, &out_length));	/* from another */
+        f[1] = 1; assert(!fa_eapol_read(f, n, false, false, OWN, AP, &out, &out_length)); f[1] = 2;	/* to the system, not from it */
+        f[0] = 0x48; assert(!fa_eapol_read(f, n, false, false, OWN, AP, &out, &out_length)); f[0] = 0x08;	/* null data */
+        f[31] = 0x00; assert(!fa_eapol_read(f, n, false, false, OWN, AP, &out, &out_length)); f[31] = 0x8e;	/* another type */
+        memcpy(f + 16, OTHER, 6); assert(!fa_eapol_read(f, n, false, false, OWN, AP, &out, &out_length)); memcpy(f + 16, AP, 6);	/* relayed from another */
+        /* Protected: the cipher's 8 bytes are skipped only if they are there. */
+        memmove(f + 32, f + 24, n - 24); memset(f + 24, 0, 8); f[1] = 0x42;
+        assert(fa_eapol_read(f, n + 8, false, false, OWN, AP, &out, &out_length) && out_length == 5);
+        assert(!fa_eapol_read(f, n + 8, false, true, OWN, AP, &out, &out_length));
+        /* Ethernet form. */
+        memset(f, 0, sizeof(f)); memcpy(f, OWN, 6); memcpy(f + 6, AP, 6); f[12] = 0x88; f[13] = 0x8e; memcpy(f + 14, body, 5);
+        assert(fa_eapol_read(f, 19, true, false, OWN, AP, &out, &out_length) && out_length == 5 && out == f + 14);
+        assert(!fa_eapol_read(f, 14, true, false, OWN, AP, &out, &out_length) && !fa_eapol_read(f, 19, true, false, OWN, OTHER, &out, &out_length));
+        f[13] = 0; assert(!fa_eapol_read(f, 19, true, false, OWN, AP, &out, &out_length));
+    }
     f[0] = FA_KIND_BEACON; assert(fa_rx_kind(f, 24, AP) == FA_RX_BEACON); assert(fa_rx_kind(f, 24, OTHER) == FA_RX_ELSE); assert(fa_rx_kind(f, 23, AP) == FA_RX_ELSE);
     f[0] = FA_KIND_AUTH; assert(fa_rx_kind(f, 24, AP) == FA_RX_MANAGEMENT);
     f[0] = 0x88; assert(fa_rx_kind(f, 24, AP) == FA_RX_DATA); assert(fa_rx_kind(f, 24, OTHER) == FA_RX_ELSE);
@@ -1888,11 +2129,12 @@ def join_runs_on_fake_headers(tmp):
     own = ROOT / 'xnu/fuxi-ath12k'
     (tmp / 'fake/lx.h').write_bytes((own / 'compat/lx.h').read_bytes())
     (tmp / 'fake/lx_os.h').write_bytes((own / 'compat/include/lx_os.h').read_bytes())
-    (tmp / 'driver.c').write_text('#include <stdarg.h>\n#include <linux/kernel.h>\n' + JOIN_DRIVER)
+    vectors = wpa_vectors(b'fuxi-test-net', bytes.fromhex('024655584901'), bytes.fromhex('02a1b2c3d455'))
+    (tmp / 'driver.c').write_text('#include <stdarg.h>\n#include <linux/kernel.h>\n' + vectors + JOIN_DRIVER)
     program = tmp / 'driver'
     cc = os.environ.get('CC', 'cc')
     subprocess.run([cc, '-std=gnu11', '-w', '-g', '-fsanitize=address,undefined', '-fno-sanitize-recover=all',
-                    f'-I{tmp / "fake"}', f'-I{own / "src"}', str(tmp / 'driver.c'), '-o', str(program)], check=True)
+                    f'-I{tmp / "fake"}', f'-I{own / "src"}', str(tmp / 'driver.c'), str(own / 'src/fa_wpa.c'), '-o', str(program)], check=True)
     subprocess.run([str(program)], check=True)
 
 
@@ -1914,14 +2156,28 @@ def code_only(text):
 
 
 @check
-def stage_5_holds_no_secret_and_stays_in_its_place(tmp):
-    """Design change of section 6: the name comes from a boot argument and no secret path exists. No network file either."""
+def the_key_stays_in_its_place(tmp):
+    """Stage 5 knows no key, and stage 6's comes from the device tree alone: never a boot argument or a file, never in a line of the log."""
     own = ROOT / 'xnu/fuxi-ath12k/src'
     wlan = (ROOT / 'xnu/fuxi-wlan/fuxi_wlan.c').read_text()
-    for path in (own / 'fa_80211.c', own / 'fa_join.h', own / 'fa_hif.c', own / 'fa_qmi.c', ROOT / 'xnu/fuxi-ath12k/os/fuxi_ath12k_os.c'):
+    for path in (own / 'fa_hif.c', own / 'fa_qmi.c', ROOT / 'xnu/fuxi-ath12k/os/fuxi_ath12k_os.c'):
         code = code_only(path.read_text()).lower()
         for word in ('passphrase', 'psk', 'pmk', 'ptk', 'gtk', 'set_key', 'wpa_', 'vnode', 'vn_open', 'kern_open', 'test-network'):
             assert word not in code, f'{path.name}: {word}'
+    for path in (own / 'fa_80211.c', own / 'fa_join.h', own / 'fa_wpa.c', own / 'fa_wpa.h'):
+        code = code_only(path.read_text()).lower()
+        for word in ('passphrase', 'vnode', 'vn_open', 'kern_open', 'test-network', 'lx_os_option', 'pe_parse'):
+            assert word not in code, f'{path.name}: {word}'
+    assert 'printf' not in code_only((own / 'fa_wpa.c').read_text()) and 'lx_tell' not in (own / 'fa_wpa.c').read_text()
+    # No line of the log is given anything of a key.
+    for call in re.findall(r'lx_tell\(.*?\);', (own / 'fa_80211.c').read_text(), flags=re.S):
+        for word in ('target_key', '.pmk', 'wpa.pairwise', 'wpa.group,', 'wpa.group)', '.kck', '.kek', 'nonce', 'radio->eapol,', '->key', 'target_name,', 'target_name)'):
+            assert word not in call, call
+    block = wlan[wlan.index('static void\nwl_fa_join_configure(void)'):]
+    block = block[:block.index('\n}\n')]
+    assert 'wl_fa_stage != 6' in block and 'PE_parse' not in block and 'fuxi-wifi-join' in block and block.count('printf(') == 3
+    assert 'bytes + 1 + bytes[0]' not in ''.join(line for line in block.splitlines() if 'printf' in line)
+    assert not re.search(r'PE_parse[a-z_]*\("fuxiwifi(key|pmk|pass|psk)', wlan)
     guarded = wlan[wlan.index('static void\nwl_fa_ssid_configure(void)'):]
     guarded = guarded[:guarded.index('\n}\n')]
     assert 'wl_fa_stage != 5' in guarded and 'text);' not in guarded.replace('strlen(text);', '').replace('(const unsigned char *)text', '')
@@ -1931,14 +2187,137 @@ def stage_5_holds_no_secret_and_stays_in_its_place(tmp):
     block = text.index('/* ---- stage 5: one open network')
     for word in ('ops->tx(', 'ops->sta_state', 'ops->assign_vif_chanctx', 'ops->add_chanctx', 'ops->vif_cfg_changed', 'ops->link_info_changed', 'dev_alloc_skb'):
         assert text.index(word) > block, word
-    assert 'ops->set_key' not in text
+    assert text.count('ops->set_key') == 2 and text.index('ops->set_key') > block
     assert text.count('radio->say_names = true') == 1 and text.index('radio->say_names = true') > text.index('\nfa_m4_station(')
     hif = (own / 'fa_hif.c').read_text()
-    assert 'hif.stage == FA_STAGE_JOIN ? fa_m5_station(' in hif and hif.count('fa_m5_station(') == 1
+    assert 'hif.stage == FA_STAGE_JOIN || hif.stage == FA_STAGE_WPA ? fa_m5_station(' in hif and hif.count('fa_m5_station(') == 1
     # 20 MHz and no EHT: the join sets one width, and no element 108 is built.
     join = (own / 'fa_join.h').read_text()
     assert 'NL80211_CHAN_WIDTH_20' in text and 'NL80211_CHAN_WIDTH_40' not in text and 'NL80211_CHAN_WIDTH_80' not in text
     assert 'eht' not in code_only(join).lower()
+
+
+
+def wpa_vectors(name, own, ap, wrong=False):
+    """A peer of the handshake made from the standard, no code of the kernel's: what it sends and what it must hear. C arrays."""
+    from cryptography.hazmat.primitives.keywrap import aes_key_wrap
+    ours = bytes.fromhex('30140100000fac040100000fac040100000fac020000')
+    pmk = hashlib.pbkdf2_hmac('sha1', b'not a real passphrase', name, 4096, 32)
+    snonce, anonce = bytes(range(32)), bytes(range(32, 64))
+    data = min(own, ap) + max(own, ap) + min(snonce, anonce) + max(snonce, anonce)
+    ptk = b''.join(hmac.digest(pmk, b'Pairwise key expansion\0' + data + bytes([i]), 'sha1') for i in range(3))[:48]
+    gtk = bytes(range(100, 116))
+
+    def message(info, counter, nonce, payload=b'', signed=True):
+        out = bytearray(99 + len(payload))
+        out[:4] = bytes([2, 3]) + (len(out) - 4).to_bytes(2, 'big')
+        out[4] = 2
+        out[5:7] = info.to_bytes(2, 'big')
+        out[9:17] = counter.to_bytes(8, 'big')
+        out[17:49] = nonce
+        out[97:99] = len(payload).to_bytes(2, 'big')
+        out[99:] = payload
+        if signed:
+            out[81:97] = hmac.digest(ptk[:16], out, 'sha1')[:16]
+        return bytes(out)
+
+    def wrapped(rsn=ours, kde=b'\xdd\x16\x00\x0f\xac\x01\x01\x00' + gtk):
+        plain = rsn + kde
+        plain += b'\xdd\x00' + bytes(-(len(plain) + 2) % 8)
+        return aes_key_wrap(ptk[16:32], plain)
+
+    def array(label, value):
+        return f'static const unsigned char {label}[]={{' + ','.join(map(str, value)) + '};\n'
+
+    m3 = message(0x13ca, 2, anonce, wrapped())
+    forged = bytearray(m3)
+    forged[81] ^= 1
+    return ''.join(array(k, v) for k, v in [
+        ('V_RSN', ours), ('V_PMK', pmk), ('V_TK', ptk[32:]), ('V_GTK', gtk),
+        ('V_M1', message(0x8a, 1, anonce, signed=False)),
+        ('V_M2', message(0x010a, 1, snonce, ours)),
+        ('V_M3', m3), ('V_M3_FORGED', forged),
+        ('V_M3_SHORT_GTK', message(0x13ca, 2, anonce, wrapped(kde=b'\xdd\x0e\x00\x0f\xac\x01\x01\x00' + gtk[:8]))),
+        ('V_M3_INDEX_0', message(0x13ca, 2, anonce, wrapped(kde=b'\xdd\x16\x00\x0f\xac\x01\x00\x00' + gtk))),
+        ('V_M3_OTHER_RSN', message(0x13ca, 2, anonce, wrapped(rsn=ours[:18] + b'\x08' + ours[19:]))),
+        ('V_M3_NO_RSN', message(0x13ca, 2, anonce, wrapped(rsn=b''))),
+        ('V_G1', message(0x1382, 3, anonce, wrapped(rsn=b''))),
+        ('V_M4', message(0x030a, 2, bytes(32))),
+    ])
+
+
+FA_WPA_DRIVER = r"""
+#include <assert.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include "fa_wpa.h"
+static const unsigned char OWN[6] = {2, 0x46, 0x55, 0x58, 0x49, 1}, AP[6] = {0x02, 0xa1, 0xb2, 0xc3, 0xd4, 0x55};
+static void begin(struct fa_wpa *w) {
+    memset(w, 0, sizeof(*w)); memcpy(w->pmk, V_PMK, 32); memcpy(w->own, OWN, 6); memcpy(w->peer, AP, 6);
+    for (int i = 0; i < 32; i++) w->own_nonce[i] = (unsigned char)i;
+    w->rsn = V_RSN; w->rsn_length = sizeof(V_RSN); w->peer_rsn = V_RSN; w->peer_rsn_length = sizeof(V_RSN);
+}
+/* In memory of exactly its size. */
+static int say(struct fa_wpa *w, const unsigned char *m, unsigned n, unsigned char *reply, unsigned *length, const char **why) {
+    unsigned char *exact = malloc(n ? n : 1); memcpy(exact, m, n);
+    int r = fa_wpa_message(w, exact, n, reply, length, why);
+    free(exact);
+    return r;
+}
+int main(void) {
+    struct fa_wpa w; unsigned char reply[FA_WPA_REPLY_MOST]; unsigned n; const char *why;
+    begin(&w);
+    assert(say(&w, V_M3, sizeof(V_M3), reply, &n, &why) == FA_WPA_BAD);		/* no message 1 yet */
+    assert(say(&w, V_M1, sizeof(V_M1), reply, &n, &why) == FA_WPA_ANSWER && n == sizeof(V_M2) && !memcmp(reply, V_M2, n));
+    assert(!memcmp(w.pairwise, V_TK, 16));
+    assert(say(&w, V_M1, sizeof(V_M1), reply, &n, &why) == FA_WPA_ANSWER && !memcmp(reply, V_M2, n));	/* sent again */
+    assert(say(&w, V_M3_FORGED, sizeof(V_M3_FORGED), reply, &n, &why) == FA_WPA_BAD && strstr(why, "signature"));
+    assert(say(&w, V_M3, sizeof(V_M3), reply, &n, &why) == FA_WPA_KEYS && n == sizeof(V_M4) && !memcmp(reply, V_M4, n));
+    assert(w.group_length == 16 && w.group_index == 1 && !memcmp(w.group, V_GTK, 16));
+    assert(say(&w, V_M3, sizeof(V_M3), reply, &n, &why) == FA_WPA_BAD);		/* played again */
+    /* W1: no message moves the keys once message 3 was good. */
+    assert(say(&w, V_M1, sizeof(V_M1), reply, &n, &why) == FA_WPA_BAD && strstr(why, "over") && !memcmp(w.pairwise, V_TK, 16));
+    assert(say(&w, V_G1, sizeof(V_G1), reply, &n, &why) == FA_WPA_GROUP);
+    /* W7: the group key is 16 bytes with a number a group key may have, and message 3 says what the beacon said. */
+    const struct { const unsigned char *m; unsigned n; const char *text; } bad[] = {
+        { V_M3_SHORT_GTK, sizeof(V_M3_SHORT_GTK), "no group key" }, { V_M3_INDEX_0, sizeof(V_M3_INDEX_0), "no group key" },
+        { V_M3_OTHER_RSN, sizeof(V_M3_OTHER_RSN), "RSN" }, { V_M3_NO_RSN, sizeof(V_M3_NO_RSN), "RSN" },
+    };
+    for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        begin(&w);
+        assert(say(&w, V_M1, sizeof(V_M1), reply, &n, &why) == FA_WPA_ANSWER);
+        assert(say(&w, bad[i].m, bad[i].n, reply, &n, &why) == FA_WPA_BAD && strstr(why, bad[i].text) && !w.replay_known);
+    }
+    /* Every shorter length, and every byte changed, under the sanitizers. */
+    for (unsigned i = 0; i < sizeof(V_M3); i++) {
+        begin(&w);
+        assert(say(&w, V_M1, sizeof(V_M1), reply, &n, &why) == FA_WPA_ANSWER);
+        assert(say(&w, V_M3, i, reply, &n, &why) != FA_WPA_KEYS);
+        unsigned char *changed = malloc(sizeof(V_M3)); memcpy(changed, V_M3, sizeof(V_M3)); changed[i] ^= 0x41;
+        begin(&w);
+        (void)say(&w, V_M1, sizeof(V_M1), reply, &n, &why);
+        assert(say(&w, changed, sizeof(V_M3), reply, &n, &why) != FA_WPA_KEYS || i == 0);	/* (the version byte is signed but free) */
+        free(changed);
+    }
+    puts("fa_wpa: independent peer, messages 2 and 4 byte for byte, W1, W7, lengths and changed bytes");
+    return 0;
+}
+"""
+
+
+@check
+def wpa_against_an_independent_peer(tmp):
+    """src/fa_wpa.c: the keys and every byte we answer with, against a peer made from the standard in Python. Design M6."""
+    own = ROOT / 'xnu/fuxi-ath12k/src'
+    vectors = wpa_vectors(b'fuxi-test-net', bytes.fromhex('024655584901'), bytes.fromhex('02a1b2c3d455'))
+    (tmp / 'wpa.c').write_text(vectors + FA_WPA_DRIVER)
+    cc = os.environ.get('CC', 'cc')
+    program = tmp / 'wpa'
+    subprocess.run([cc, '-std=gnu11', '-Wall', '-Wextra', '-g', '-O1', '-fsanitize=address,undefined', '-fno-sanitize-recover=all', f'-I{own}',
+                    str(tmp / 'wpa.c'), str(own / 'fa_wpa.c'), '-o', str(program)], check=True)
+    subprocess.run([str(program)], check=True)
 
 
 FA_BSS_DRIVER = r"""

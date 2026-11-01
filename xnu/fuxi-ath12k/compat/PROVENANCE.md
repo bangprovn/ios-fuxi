@@ -6,6 +6,7 @@ notice are kept in `LICENSE.hackios` and apply to the adapted files and to the c
 
 | Here | From `wifi/lx/` | Change |
 |---|---|---|
+| `../src/fa_wpa.c`, `../src/fa_wpa.h` | through `xnu/fuxi-wifi-ios/fuxi_wifi_wpa.c`, from `src/lx_wpa.c`; its notice says APSL-2.0, and that is kept | No passphrase, gaps W1 and W7 closed |
 | `lx_base.c` | `src/lx_base.c` | 80 MiB pool, free list for rings, 4 KiB alignment for pieces of a page or more (R2), waiting `timer_delete_sync`, `lx_vlog`, firmware answers ENOENT, device-tree answers, no `_ioremap_attr` |
 | `lx.h` | `src/lx.h` | Only the base functions |
 | `include/lx_prelude.h` | `include/lx_prelude.h` | PAGE_SIZE assertion (R2) |

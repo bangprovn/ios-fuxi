@@ -1,7 +1,8 @@
 /*
- * The frames of joining an open network, and how the answers are read off the air. Stage 5 only, and open
- * networks only: an element that asks for protection ends the join before anything is sent to the access
- * point, and nothing here knows of a key or a passphrase. Nothing in a received frame is trusted: every length
+ * The frames of joining a network, and how the answers are read off the air. Stage 5 joins open networks only: an
+ * element that asks for protection ends the join before anything is sent to the access point. Stage 6 joins WPA2 with
+ * a key only, and the absence of its RSN element ends the join the same way; what is here reads and builds frames and
+ * holds no key. Nothing in a received frame is trusted: every length
  * is checked against the frame. Like fa_bss.h this needs only <stdint.h>, <stdbool.h> and memcpy(), and
  * tools/test-fuxi-ath12k.py runs it on malformed frames under the sanitizers.
  * Frame layout: IEEE 802.11-2020, 9.3.3 and 9.4.1; elements: 9.4.2.
@@ -157,17 +158,98 @@ fa_protection_name(enum fa_protection protection)
 	}
 }
 
+/* What stage 6 asks in its association request: RSN version 1, CCMP for the group and for us, a key from a passphrase, no PMF. */
+#define FA_RSN_LENGTH		22
+static const uint8_t FA_RSN_OURS[FA_RSN_LENGTH] = { FA_EID_RSN, 20, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 2, 0, 0 };
+
+/* What an RSN element offers: a bit for each suite of the standard's own OUI, numbered as the standard numbers them. */
+struct fa_rsn {
+	unsigned	group;
+	uint32_t	pairwise, akm;
+	unsigned	capabilities;
+};
+
+#define FA_RSN_CCMP		4
+#define FA_RSN_AKM_PSK		2
+#define FA_RSN_MFP_REQUIRED	0x0040
+
+static inline uint32_t
+fa_rsn_suites(const uint8_t *at, unsigned count)
+{
+	uint32_t bits = 0;
+
+	for (unsigned i = 0; i < count; i++, at += 4) {
+		if (at[0] == 0x00 && at[1] == 0x0f && at[2] == 0xac && at[3] < 32) {
+			bits |= 1u << at[3];
+		}
+	}
+	return (bits);
+}
+
+/*
+ * Whether we can join what this network's RSN element offers. NULL if so; else what stands in the way. Whatever could
+ * be read is in *rsn, for the log: when a network is refused its offer is the first thing to know.
+ */
+static inline const char *
+fa_rsn_read(const uint8_t *elements, unsigned length, struct fa_rsn *rsn)
+{
+	const uint8_t *e = fa_element(elements, length, FA_EID_RSN);
+	unsigned at, end, count;
+
+	memset(rsn, 0, sizeof(*rsn));
+	if (e == NULL) {
+		return ("it has no RSN element");
+	}
+	at = 2;
+	end = 2u + e[1];
+	if (end < at + 8 || e[2] != 1 || e[3] != 0 || e[4] != 0x00 || e[5] != 0x0f || e[6] != 0xac) {
+		return ("its RSN element is not one this reads");
+	}
+	rsn->group = e[7];
+	count = e[8] | (unsigned)e[9] << 8;
+	at += 8;
+	if (end - at < 4 * count + 2) {
+		return ("its list of ciphers does not fit its RSN element");
+	}
+	rsn->pairwise = fa_rsn_suites(e + at, count);
+	at += 4 * count;
+	count = e[at] | (unsigned)e[at + 1] << 8;
+	at += 2;
+	if (end - at < 4 * count) {
+		return ("its list of key management does not fit its RSN element");
+	}
+	rsn->akm = fa_rsn_suites(e + at, count);
+	at += 4 * count;
+	if (end - at >= 2) {
+		rsn->capabilities = e[at] | (unsigned)e[at + 1] << 8;
+	}
+	if (rsn->group != FA_RSN_CCMP) {
+		return ("its group cipher is not CCMP");
+	}
+	if ((rsn->pairwise & 1u << FA_RSN_CCMP) == 0) {
+		return ("it does not offer CCMP");
+	}
+	if ((rsn->akm & 1u << FA_RSN_AKM_PSK) == 0) {
+		return ("it does not take a WPA2 passphrase's key (WPA3 only, or an enterprise network)");
+	}
+	if ((rsn->capabilities & FA_RSN_MFP_REQUIRED) != 0) {
+		return ("it requires protected management frames");
+	}
+	return (NULL);
+}
+
 /* ---- the network that is wanted, from what a scan hears ------------------------------------------------- */
 
 struct fa_target {
 	bool		found;
 	bool		fixed;			/* the join has chosen: only this access point's frames count now */
+	enum fa_protection wanted;		/* FA_OPEN (stage 5), or FA_PROTECT_RSN (stage 6) */
 	uint8_t		address[6];		/* BSSID, never said in the log */
 	uint16_t	frequency;		/* MHz, where it was heard at its strongest */
 	uint16_t	capability, interval;
 	int8_t		rssi;
 	unsigned	heard;
-	unsigned	protected_frames;	/* frames of this name that asked for protection: any one refuses the join */
+	unsigned	protected_frames;	/* frames of this name that asked for other than `wanted`: any one refuses the join */
 	enum fa_protection why;			/* the first of them */
 	unsigned	elements_length;
 	uint8_t		elements[FA_TARGET_ELEMENTS_MOST];
@@ -220,7 +302,7 @@ fa_target_take(struct fa_target *t, const uint8_t *frame, unsigned length, unsig
 		if (memcmp(bssid, t->address, 6) != 0) {
 			return (FA_TARGET_ELSEWHERE);
 		}
-		if (protection == FA_OPEN) {
+		if (protection == t->wanted) {
 			return (FA_TARGET_TAKEN);
 		}
 	} else {
@@ -233,7 +315,7 @@ fa_target_take(struct fa_target *t, const uint8_t *frame, unsigned length, unsig
 			return (FA_TARGET_ELSEWHERE);
 		}
 	}
-	if (protection != FA_OPEN) {
+	if (protection != t->wanted) {
 		t->why = t->protected_frames == 0 ? protection : t->why;
 		t->protected_frames++;
 		return (FA_TARGET_PROTECTED);
@@ -300,6 +382,8 @@ struct fa_offer {
 	bool		spectrum;		/* the access point uses 802.11h: power and channels are said */
 	uint8_t		power_most, channel;
 	bool		has_ht, has_vht, wmm;
+	const uint8_t	*rsn;			/* a whole element, stage 6 only */
+	unsigned	rsn_length;
 	uint8_t		ht[FA_HT_BODY];
 	uint8_t		vht[FA_VHT_BODY];
 	uint8_t		he[FA_HE_OFFER_MOST];	/* a whole element from fa_he_offer() */
@@ -307,8 +391,8 @@ struct fa_offer {
 };
 
 /*
- * The association request. Elements in the order of Table 9-35, vendor elements last. No RSN element ever: an open
- * network is all that is built. No EHT element either (design section 9). The number of bytes, 0 when they do not
+ * The association request. Elements in the order of Table 9-35, vendor elements last. An RSN element only when one is
+ * offered. No EHT element (design section 9). The number of bytes, 0 when they do not
  * fit or when what is offered is not something a station may ask with.
  */
 static inline unsigned
@@ -318,7 +402,7 @@ fa_assoc_request(uint8_t *out, unsigned size, const uint8_t *own, const uint8_t 
 	unsigned in_one = offer->rate_count < FA_RATES_IN_ONE ? offer->rate_count : FA_RATES_IN_ONE;
 	unsigned more = offer->rate_count - in_one;
 	unsigned need = FA_FRAME_HEADER + 4u + 2 + offer->ssid_length + 2 + in_one + (more != 0 ? 2 + more : 0) +
-	    (offer->spectrum ? 8 : 0) + (offer->has_ht ? 2 + FA_HT_BODY : 0) + (offer->has_vht ? 2 + FA_VHT_BODY : 0) +
+	    (offer->spectrum ? 8 : 0) + offer->rsn_length + (offer->has_ht ? 2 + FA_HT_BODY : 0) + (offer->has_vht ? 2 + FA_VHT_BODY : 0) +
 	    offer->he_length + (offer->wmm ? sizeof(wmm) : 0);
 	unsigned at = FA_FRAME_HEADER;
 
@@ -354,6 +438,10 @@ fa_assoc_request(uint8_t *out, unsigned size, const uint8_t *own, const uint8_t 
 		out[at++] = 2;
 		out[at++] = offer->channel;
 		out[at++] = 1;
+	}
+	if (offer->rsn_length != 0) {
+		memcpy(out + at, offer->rsn, offer->rsn_length);
+		at += offer->rsn_length;
 	}
 	if (offer->has_ht) {
 		out[at++] = FA_EID_HT;
@@ -532,7 +620,7 @@ struct fa_reply {
 /*
  * A management frame, if it is the access point's answer to this station: both addresses are checked, so that nobody
  * else's frame moves the join. FA_ANSWER_NONE for anything else, including an answer that cannot be read, an
- * association number the standard does not have, and a protected frame: an open network has none.
+ * association number the standard does not have, and a protected frame: PMF is not built, so there are none.
  */
 static inline void
 fa_reply_read(struct fa_reply *reply, const uint8_t *frame, unsigned length, const uint8_t *own, const uint8_t *bssid)
@@ -589,6 +677,76 @@ fa_reply_read(struct fa_reply *reply, const uint8_t *frame, unsigned length, con
 	default:
 		return;
 	}
+}
+
+/* ---- the handshake's frames ------------------------------------------------------------------------------- */
+
+#define FA_LLC_LENGTH		8
+#define FA_EAPOL_MOST		640		/* what fa_wpa.c reads at most */
+#define FA_QOS_HEADER		26
+#define FA_TID_CONTROL		7		/* mac80211 sends the control port's frames at the highest priority */
+
+/*
+ * The EAPOL frame in what the driver received, if this is one from the access point to this station: in Ethernet form
+ * (`ethernet`) or 802.11, with the cipher's 8 bytes when the frame is protected and they were left there. False for
+ * anything else: every address is checked, and every length against the frame.
+ */
+static inline bool
+fa_eapol_read(const uint8_t *frame, unsigned length, bool ethernet, bool cipher_header_gone, const uint8_t *own, const uint8_t *bssid,
+    const uint8_t **body, unsigned *body_length)
+{
+	static const uint8_t llc[FA_LLC_LENGTH] = { 0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x88, 0x8e };
+	unsigned header = FA_FRAME_HEADER;
+
+	if (ethernet) {
+		if (length <= 14 || memcmp(frame, own, 6) != 0 || memcmp(frame + 6, bssid, 6) != 0 || frame[12] != 0x88 || frame[13] != 0x8e) {
+			return (false);
+		}
+		*body = frame + 14;
+		*body_length = length - 14;
+		return (true);
+	}
+	/* data with a payload, from the distribution system and not to it */
+	if (length < FA_FRAME_HEADER || (frame[0] & 0x0f) != 0x08 || (frame[0] & 0x40) != 0 || (frame[1] & 0x03) != 0x02) {
+		return (false);
+	}
+	if (memcmp(frame + 4, own, 6) != 0 || memcmp(frame + 10, bssid, 6) != 0 || memcmp(frame + 16, bssid, 6) != 0) {
+		return (false);
+	}
+	if ((frame[0] & 0x80) != 0) {
+		header += 2 + ((frame[1] & 0x80) != 0 ? FA_FRAME_HT_CONTROL : 0);
+	}
+	header += (frame[1] & 0x40) != 0 && !cipher_header_gone ? 8 : 0;
+	if (length <= header + FA_LLC_LENGTH || memcmp(frame + header, llc, FA_LLC_LENGTH) != 0) {
+		return (false);
+	}
+	*body = frame + header + FA_LLC_LENGTH;
+	*body_length = length - header - FA_LLC_LENGTH;
+	return (true);
+}
+
+/* An EAPOL frame as 802.11 data for the access point, QoS data when it does QoS. The number of bytes, 0 when they do not fit. */
+static inline unsigned
+fa_eapol_frame(uint8_t *out, unsigned size, const uint8_t *own, const uint8_t *bssid, bool qos, const uint8_t *body, unsigned body_length)
+{
+	static const uint8_t llc[FA_LLC_LENGTH] = { 0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x88, 0x8e };
+	unsigned header = qos ? FA_QOS_HEADER : FA_FRAME_HEADER;
+
+	if (size < header + FA_LLC_LENGTH + body_length) {
+		return (0);
+	}
+	memset(out, 0, header);
+	out[0] = qos ? 0x88 : 0x08;
+	out[1] = 0x01;				/* to the distribution system */
+	memcpy(out + 4, bssid, 6);
+	memcpy(out + 10, own, 6);
+	memcpy(out + 16, bssid, 6);
+	if (qos) {
+		out[FA_FRAME_HEADER] = FA_TID_CONTROL;
+	}
+	memcpy(out + header, llc, FA_LLC_LENGTH);
+	memcpy(out + header + FA_LLC_LENGTH, body, body_length);
+	return (header + FA_LLC_LENGTH + body_length);
 }
 
 enum fa_rx_kind { FA_RX_ELSE, FA_RX_BEACON, FA_RX_MANAGEMENT, FA_RX_DATA };

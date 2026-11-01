@@ -101,17 +101,22 @@ void fuxi_wlan_init(void);
  *   fuxiath12k=N  kernel-metal4wifi only: hand the chip to Linux ath12k at FW_READY. N>0 alone
  *                 implies the working recipe as defaults, each still overridable. Stage 1 stops
  *                 after HTC ready, stage 2 after WMI ready, hw_mode and mac registration, stage 4
- *                 after one scan, stage 5 after joining one open network for 20 s, each then contains.
- *                 Stages 4 and 5 are the only ones that use the radio's RF, and only N exactly 4 or 5
+ *                 after one scan, stage 5 after joining one open network for 20 s, stage 6 after the same
+ *                 with WPA2, each then contains.
+ *                 Stages 4, 5 and 6 are the only ones that use the radio's RF, and only N exactly 4, 5 or 6
  *                 runs them: any other N runs stage 2 at most, and says so. Stage 4 alone logs SSIDs.
  *   fuxiwifissid=NAME  with fuxiath12k=5: the open network to join, 1 to 32 bytes, and it cannot hold a
  *                 space. Logged by length only. Without it stage 5 does no radio work.
- *   fuxiath12kq=MASK  with fuxiath12k=4 or 5: 0x1 no idle power save, 0x2 no hw mode command, 0x8 settle
+ *   /chosen fuxi-wifi-join  with fuxiath12k=6: what boot/add-wifi-adt.py put in the device tree, a length, the
+ *                 network's name, its 32-byte key. Not a boot argument: those reach the logs. Without it stage 6
+ *                 does no radio work.
+ *   fuxiath12kq=MASK  with fuxiath12k=4, 5 or 6: 0x1 no idle power save, 0x2 no hw mode command, 0x8 settle
  *                 after vdev create, 0x10 passive scan. Read and logged by the driver domain.
  *   fuxiwifimac=aa:bb:cc:dd:ee:ff  with fuxiath12k: the radio's address, instead of the locally
  *                 administered default. Malformed, all-zero or group addresses are refused, and say so.
  */
 #include "fa_xnu.h"
+#include <pexpert/device_tree.h>
 #include "fa_lx_os.h" /* lx_os_radio_memory is defined below */
 #endif /* FUXI_ATH12K */
 
@@ -973,8 +978,8 @@ wl_fa_configure(void)
 {
 	int stage = 0;
 	if (PE_parse_boot_argn("fuxiath12k", &stage, sizeof(stage)) && stage > 0) {
-		wl_fa_stage = stage == 1 || stage == 4 || stage == 5 ? (unsigned)stage : 2;
-		printf("FUXI ATH12K: fuxiath12k=%d, recipe defaults on, running stage %u; stages built are 1, 2, 4 and 5\n",
+		wl_fa_stage = stage == 1 || stage == 4 || stage == 5 || stage == 6 ? (unsigned)stage : 2;
+		printf("FUXI ATH12K: fuxiath12k=%d, recipe defaults on, running stage %u; stages built are 1, 2, 4, 5 and 6\n",
 		    stage, wl_fa_stage);
 	}
 }
@@ -1058,6 +1063,29 @@ wl_fa_ssid_configure(void)
 	}
 	printf("FUXI ATH12K: fuxiwifissid length %u\n", (unsigned)length);
 	fa_set_target_ssid((const unsigned char *)text, (unsigned)length);
+}
+
+/* Stage 6 only: the network and its key, from the device tree. Its name is said by its length alone, and the key never. */
+static void
+wl_fa_join_configure(void)
+{
+	DTEntry chosen;
+	void const *value = NULL;
+	unsigned int size = 0;
+	const unsigned char *bytes;
+	if (wl_fa_stage != 6) { return; }
+	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
+	    SecureDTGetProperty(chosen, "fuxi-wifi-join", &value, &size) != kSuccess) {
+		printf("FUXI ATH12K: no network in the device tree, so no radio work\n");
+		return;
+	}
+	bytes = value;
+	if (size < 1 || bytes[0] < 1 || bytes[0] > 32 || size != 1u + bytes[0] + 32) {
+		printf("FUXI ATH12K: the network in the device tree is malformed: %u bytes\n", size);
+		return;
+	}
+	printf("FUXI ATH12K: network name length %u, key given\n", bytes[0]);
+	fa_set_target_join(bytes + 1, bytes[0], bytes + 1 + bytes[0]);
 }
 #endif /* FUXI_ATH12K */
 static unsigned
@@ -4945,6 +4973,7 @@ wl_fa_handoff(void)
 	wl_fa_started = true;
 	wl_fa_mac_configure();
 	wl_fa_ssid_configure();
+	wl_fa_join_configure();
 	int e = fa_firmware_ready(&wl_fa_caps, wl_fa_stage);
 	/* Poll thread and ath12k's register access end here, before this thread's own MHI work. */
 	fa_stop();

@@ -6,7 +6,9 @@
  * brings them up: ops.start, add_interface, hw_scan, then remove_interface, ops.stop. Stage 5 goes on to join
  * one open network named by fuxiwifissid, as mac80211 joins it: channel context, link configuration, the access
  * point as a station from none to authorized, its authentication and association frames, some seconds of
- * listening, and away again. Nothing here knows of a key or a passphrase. What stands in for mac80211 without
+ * listening, and away again. Stage 6 joins one WPA2 network the same way, with its key from fuxi_wlan.c: between the
+ * association and the authorized state comes the four-way handshake, then the two keys. The key itself and what is made
+ * from it are never said, and are wiped on the way out. What stands in for mac80211 without
  * doing its work logs its name at runtime through STUB(). The probe request offers legacy rates only.
  *
  * What the scan hears comes here by both of ath12k's routes: linuxkpi_ieee80211_rx() below. wmi.c says
@@ -23,6 +25,7 @@
  */
 #include <linux/kernel.h>
 #include <linux/etherdevice.h>
+#include <linux/random.h>
 #include <linux/skbuff.h>
 #include <linux/slab.h>
 #include <linux/workqueue.h>
@@ -34,6 +37,7 @@
 #include "fa_xnu.h"
 #include "fa_bss.h"
 #include "fa_join.h"
+#include "fa_wpa.h"
 
 /* Says the name a few times and keeps going; each caller then gives its own documented answer. */
 #define STUB()	lx_stub(__func__)
@@ -86,6 +90,19 @@ struct fa_radio {
 	unsigned tx_sent_before, tx_done_before;	/* when the exchange that is going on began */
 	unsigned link_data, link_beacons, link_others;	/* frames from the access point while joined */
 	int rssi;				/* of the access point's last frame that had a value */
+	/* the handshake of stage 6 */
+	bool protect;
+	struct fa_wpa wpa;
+	struct cfg80211_bss bss;		/* what ath12k asks of the access point (mac.c, peer assoc) */
+	struct cfg80211_bss_ies bss_elements;
+	uint8_t eapol[FA_EAPOL_MOST];		/* one message on its way from the poll thread to the join */
+	volatile unsigned eapol_length;
+	unsigned eapol_heard, eapol_lost;
+	unsigned eapol_sent;			/* our messages, and what the data path has finished */
+	unsigned data_done, data_acked;
+	struct ieee80211_key_conf *pairwise_key, *group_key;	/* set for as long as the driver has them */
+	void *key_memory[2];			/* kept until the wiphy goes, wiped: the driver's peer may still name them */
+	unsigned rx_ok, rx_clear;		/* with the keys in: data the radio deciphered, and data it did not */
 };
 
 enum { SCAN_NONE, SCAN_RUNNING, SCAN_OVER, SCAN_ABORTED };
@@ -113,6 +130,10 @@ enum { SCAN_NONE, SCAN_RUNNING, SCAN_OVER, SCAN_ABORTED };
 #define FA_JOIN_LOOK_STAY_NS	(100 * 1000000ull)
 #define FA_JOIN_SAY_EVERY_NS	(5 * 1000000000ull)
 #define FA_FRAME_MOST		768		/* what the association request can come to */
+/* Bounds of stage 6. The access point begins within a second or so, and resends a message it hears no answer to. */
+#define FA_HANDSHAKE_NS		(8 * 1000000000ull)
+#define FA_HANDSHAKE_LOOK_NS	(20 * 1000000ull)
+#define FA_LAST_MESSAGE_NS	(300 * 1000000ull)	/* message 4 on its way, unciphered, before there is a key to cipher it with */
 
 /* The address of the network an interface has joined while it has joined none: mac.c compares beacons with it. */
 static const uint8_t no_network[ETH_ALEN];
@@ -122,6 +143,8 @@ static unsigned char radio_mac[ETH_ALEN];
 /* The name of the network stage 5 joins, from fuxi_wlan.c. It is said by its length alone. */
 static uint8_t target_name[FA_SSID_MOST];
 static unsigned target_name_length;
+static uint8_t target_key[32];			/* stage 6: wiped when the join is over */
+static bool target_protected;
 
 /* find_sta has only the interface to go by, and there is one radio. */
 static struct fa_radio *the_radio;
@@ -148,9 +171,21 @@ fa_set_radio_mac(const unsigned char *mac)
 void
 fa_set_target_ssid(const unsigned char *name, unsigned length)
 {
+	target_protected = false;
 	target_name_length = length >= 1 && length <= FA_SSID_MOST ? length : 0;
 	if (target_name_length != 0) {
 		memcpy(target_name, name, target_name_length);
+	}
+}
+
+/* Before fa_firmware_ready(), stage 6 only. The name is said by its length alone, and the key never. */
+void
+fa_set_target_join(const unsigned char *name, unsigned length, const unsigned char *key)
+{
+	fa_set_target_ssid(name, length);
+	if (target_name_length != 0) {
+		memcpy(target_key, key, sizeof(target_key));
+		target_protected = true;
 	}
 }
 
@@ -322,6 +357,8 @@ linuxkpi_wiphy_free(struct wiphy *wiphy)
 
 	kfree(radio->regd);
 	kfree(radio->vif_memory);
+	kfree(radio->key_memory[0]);
+	kfree(radio->key_memory[1]);
 	kfree(radio->sta_memory);
 	if (the_radio == radio) {
 		the_radio = NULL;
@@ -585,6 +622,12 @@ linuxkpi_ieee80211_tx_status(struct ieee80211_hw *hw, struct sk_buff *skb)
 void
 linuxkpi_ieee80211_tx_status_ext(struct ieee80211_hw *hw, struct ieee80211_tx_status *status)
 {
+	struct fa_radio *radio = radio_of(hw);
+
+	lx_os_lock();
+	radio->data_done++;
+	radio->data_acked += status->info != NULL && (status->info->flags & IEEE80211_TX_STAT_ACK) != 0;
+	lx_os_unlock();
 	if (status->skb != NULL) {
 		dev_kfree_skb_any(status->skb);
 	}
@@ -651,22 +694,28 @@ linuxkpi_ieee80211_find_sta(struct ieee80211_vif *vif, const u8 *address)
 }
 
 /*
- * BEHAVIOUR STUB: no scan results are kept here, so ath12k sees an access point without RSN or WPA (mac.c, peer assoc).
- * As of M5 that is the truth of what it gets to ask about: a network with either is refused before any of this.
- * M6 must keep the elements and answer properly, or the firmware will not expect the handshake.
+ * What ath12k asks in the peer's association (mac.c): only of the access point stage 6 has chosen, with the elements it
+ * heard, or the firmware will not expect the handshake. An open network stays without any: there is nothing to expect.
  */
 struct cfg80211_bss *
 linuxkpi_cfg80211_get_bss(struct wiphy *wiphy, struct linuxkpi_ieee80211_channel *channel, const uint8_t *bssid,
     const uint8_t *ssid, size_t ssid_length, enum ieee80211_bss_type type, enum ieee80211_privacy privacy)
 {
-	STUB();
-	return (NULL);
+	struct fa_radio *radio = the_radio;
+
+	if (radio == NULL || !radio->protect || !radio->target.fixed || bssid == NULL || memcmp(bssid, radio->target.address, ETH_ALEN) != 0) {
+		return (NULL);
+	}
+	radio->bss_elements.data = radio->target.elements;
+	radio->bss_elements.len = radio->target.elements_length;
+	radio->bss.ies = radio->bss.beacon_ies = &radio->bss_elements;
+	radio->bss.signal = radio->target.rssi * 100;
+	return (&radio->bss);
 }
 
 void
 linuxkpi_cfg80211_put_bss(struct wiphy *wiphy, struct cfg80211_bss *bss)
 {
-	STUB();
 }
 
 /* BEHAVIOUR STUB: nothing is queued above the driver, so nothing is pulled. Stage 5 sends management frames only. */
@@ -690,6 +739,43 @@ linuxkpi_ieee80211_scan_completed(struct ieee80211_hw *hw, struct cfg80211_scan_
 	lx_os_unlock();
 }
 
+/*
+ * A message of the handshake is copied for the join to answer, on its own thread: no ciphering and no sending on the poll
+ * thread. There is room for one, and the access point sends again what it hears no answer to. Under the layer's lock.
+ */
+static bool
+join_eapol(struct fa_radio *radio, const struct sk_buff *skb, const struct ieee80211_rx_status *status)
+{
+	const uint8_t *body;
+	unsigned length;
+
+	if (!radio->protect || !fa_eapol_read(skb->data, skb->len, (status->flag & RX_FLAG_8023) != 0, (status->flag & RX_FLAG_IV_STRIPPED) != 0,
+	    radio->vif->addr, radio->target.address, &body, &length)) {
+		return (false);
+	}
+	radio->eapol_heard++;
+	if (radio->eapol_length != 0 || length > sizeof(radio->eapol)) {
+		radio->eapol_lost++;
+	} else {
+		memcpy(radio->eapol, body, length);
+		radio->eapol_length = length;
+		lx_os_wakeup(&radio->answer);
+	}
+	return (true);
+}
+
+/* Design W3: nothing goes up from here yet, but what came unciphered once there are keys is counted as what it is. */
+static void
+join_data_count(struct fa_radio *radio, const struct ieee80211_rx_status *status)
+{
+	radio->link_data++;
+	if ((status->flag & (RX_FLAG_8023 | RX_FLAG_DECRYPTED)) != 0) {
+		radio->rx_ok++;
+	} else {
+		radio->rx_clear++;
+	}
+}
+
 /* What the join reads of a frame from the air: under the layer's lock, on the poll thread. */
 static void
 join_rx(struct fa_radio *radio, const struct sk_buff *skb, const struct ieee80211_rx_status *status)
@@ -697,14 +783,18 @@ join_rx(struct fa_radio *radio, const struct sk_buff *skb, const struct ieee8021
 	struct fa_reply reply;
 
 	lx_os_lock();
+	if (join_eapol(radio, skb, status)) {
+		lx_os_unlock();
+		return;
+	}
 	if ((status->flag & RX_FLAG_8023) != 0) {
-		radio->link_data++;
+		join_data_count(radio, status);
 		lx_os_unlock();
 		return;
 	}
 	switch (fa_rx_kind(skb->data, skb->len, radio->target.address)) {
 	case FA_RX_DATA:
-		radio->link_data++;
+		join_data_count(radio, status);
 		break;
 	case FA_RX_BEACON:
 		radio->link_beacons++;
@@ -1256,6 +1346,11 @@ request_build(struct fa_radio *radio, uint8_t *frame, unsigned size)
 
 	memset(&offer, 0, sizeof(offer));
 	offer.capability = (uint16_t)(FA_CAP_ESS | (target->capability & (FA_CAP_SHORT_PREAMBLE | FA_CAP_SHORT_SLOT | FA_CAP_SPECTRUM)));
+	if (radio->protect) {
+		offer.capability |= FA_CAP_PRIVACY;
+		offer.rsn = FA_RSN_OURS;
+		offer.rsn_length = sizeof(FA_RSN_OURS);
+	}
 	offer.ssid = target_name;
 	offer.ssid_length = target_name_length;
 	for (int i = 0; i < band->n_bitrates && offer.rate_count < FA_RATES_MOST; i++) {
@@ -1359,6 +1454,158 @@ build_auth(struct fa_radio *radio, uint8_t *frame, unsigned size)
 	return (fa_auth_request(frame, size, radio->vif->addr, radio->target.address));
 }
 
+/* A key for the driver to give the firmware: CCMP, for frames between us and the access point or for the group's. 0, or what it said. */
+static int
+key_give(struct fa_radio *radio, const uint8_t *key, unsigned index, bool pairwise, struct ieee80211_key_conf **given)
+{
+	struct ieee80211_key_conf *conf = kzalloc(sizeof(*conf) + 16, GFP_KERNEL);
+	int error;
+
+	*given = NULL;
+	if (conf == NULL) {
+		return (-ENOMEM);
+	}
+	radio->key_memory[pairwise ? 0 : 1] = conf;
+	conf->cipher = WLAN_CIPHER_SUITE_CCMP;
+	conf->keyidx = (uint8_t)index;
+	conf->keylen = 16;
+	conf->iv_len = 8;
+	conf->icv_len = 8;
+	conf->flags = pairwise ? IEEE80211_KEY_FLAG_PAIRWISE : 0;
+	conf->link_id = -1;
+	memcpy(conf->key, key, 16);
+	wiphy_lock(radio->wiphy);
+	error = radio->ops->set_key(&radio->hw, SET_KEY, radio->vif, pairwise ? radio->sta : NULL, conf);
+	wiphy_unlock(radio->wiphy);
+	if (error != 0) {
+		fa_wipe(conf->key, 16);
+		return (error);
+	}
+	*given = conf;
+	return (0);
+}
+
+static void
+key_take_back(struct fa_radio *radio, struct ieee80211_key_conf **given, bool pairwise)
+{
+	if (*given != NULL) {
+		int error;
+
+		wiphy_lock(radio->wiphy);
+		error = radio->ops->set_key(&radio->hw, DISABLE_KEY, radio->vif, pairwise ? radio->sta : NULL, *given);
+		wiphy_unlock(radio->wiphy);
+		lx_tell("FUXI ATH12K: M6 %s key taken back %d\n", pairwise ? "pairwise" : "group", error);
+		fa_wipe((*given)->key, 16);
+		*given = NULL;
+	}
+}
+
+/* Our answer to a message of the handshake: 802.11 data, which the driver takes to the firmware unciphered until there are keys. */
+static bool
+eapol_send(struct fa_radio *radio, const uint8_t *body, unsigned length)
+{
+	bool qos = radio->sta->wme;
+	struct sk_buff *skb;
+	uint8_t *bytes;
+	unsigned total = (qos ? FA_QOS_HEADER : FA_FRAME_HEADER) + FA_LLC_LENGTH + length;
+
+	if ((skb = frame_new(radio, total, &bytes)) == NULL) {
+		lx_tell("FUXI ATH12K: M6 no buffer for our message\n");
+		return (false);
+	}
+	(void)fa_eapol_frame(bytes, total, radio->vif->addr, radio->target.address, qos, body, length);
+	skb->protocol = cpu_to_be16(0x888e);
+	skb->priority = FA_TID_CONTROL;
+	radio->eapol_sent++;
+	frame_send(radio, skb);
+	return (true);
+}
+
+/*
+ * The four-way handshake: the access point begins it, its messages come through join_eapol(), and each is answered here.
+ * A message that is not good does not end the wait: anyone in range can send one, and the genuine one can still come.
+ * True when message 3 was good and message 4 went. Bounded by the clock alone. The result is said, and never a key.
+ */
+static bool
+station_handshake(struct fa_radio *radio)
+{
+	unsigned long long began = lx_os_nanoseconds();
+	uint8_t reply[FA_WPA_REPLY_MOST];
+	static uint8_t message[FA_EAPOL_MOST];
+	const char *last_why = "";
+	int last = FA_WPA_NOTHING;
+	bool keys = false;
+
+	while (!keys && lx_os_nanoseconds() - began < FA_HANDSHAKE_NS && !fa_m4_trouble()) {
+		unsigned length, reply_length = 0;
+		const char *why = "";
+		bool gone;
+		int said;
+
+		lx_os_lock();
+		length = radio->eapol_length;
+		gone = radio->answer == FA_ANSWER_GONE;
+		if (length != 0) {
+			memcpy(message, radio->eapol, length);
+			radio->eapol_length = 0;
+		} else if (!gone) {
+			lx_os_sleep(&radio->answer, FA_HANDSHAKE_LOOK_NS);
+		}
+		lx_os_unlock();
+		if (gone) {
+			break;
+		}
+		if (length == 0) {
+			continue;
+		}
+		said = fa_wpa_message(&radio->wpa, message, length, reply, &reply_length, &why);
+		lx_tell("FUXI ATH12K: M6 handshake: %u bytes from the access point after %llu ms: %s%s\n", length,
+		    (lx_os_nanoseconds() - began) / 1000000ull, said == FA_WPA_ANSWER ? "message 1, answered" : said == FA_WPA_KEYS ? "message 3, good, answered" :
+		    said == FA_WPA_GROUP ? "a new group key, left unanswered at this stage" : said == FA_WPA_BAD ? "not good: " : "not one to answer", why);
+		if (said == FA_WPA_ANSWER || said == FA_WPA_KEYS) {
+			if (!eapol_send(radio, reply, reply_length)) {
+				break;
+			}
+		}
+		if (said != FA_WPA_NOTHING) {
+			last = said;
+			last_why = why;
+		}
+		keys = said == FA_WPA_KEYS;
+	}
+	fa_wipe(message, sizeof(message));
+	fa_wipe(reply, sizeof(reply));
+	if (!keys) {
+		lx_tell("FUXI ATH12K: M6 not proven: the handshake did not come through in %llu ms: %s%s; messages heard %u lost %u; data sent %u done %u acked %u\n",
+		    (lx_os_nanoseconds() - began) / 1000000ull, radio->answer == FA_ANSWER_GONE ? "the access point has shown us the door (a wrong passphrase gives this)" :
+		    last == FA_WPA_BAD ? "a message was not good: " : last == FA_WPA_ANSWER ? "our message 2 was not answered (a wrong passphrase gives this)" :
+		    "the access point did not begin it", last == FA_WPA_BAD ? last_why : "", radio->eapol_heard, radio->eapol_lost, radio->eapol_sent,
+		    radio->data_done, radio->data_acked);
+	}
+	return (keys);
+}
+
+/* After message 3: message 4 given time to leave unciphered, the two keys to the driver. 0, or what it said. */
+static int
+station_keys(struct fa_radio *radio)
+{
+	unsigned long long began = lx_os_nanoseconds();
+	int error;
+
+	while (radio->data_done < radio->eapol_sent && lx_os_nanoseconds() - began < FA_LAST_MESSAGE_NS && !fa_m4_trouble()) {
+		lx_os_lock();
+		lx_os_sleep(&radio->answer, FA_HANDSHAKE_LOOK_NS);
+		lx_os_unlock();
+	}
+	lx_tell("FUXI ATH12K: M6 message 4 after %llu ms: data done %u acked %u\n", (lx_os_nanoseconds() - began) / 1000000ull, radio->data_done, radio->data_acked);
+	error = key_give(radio, radio->wpa.pairwise, 0, true, &radio->pairwise_key);
+	if (error == 0) {
+		error = key_give(radio, radio->wpa.group, radio->wpa.group_index, false, &radio->group_key);
+	}
+	lx_tell("FUXI ATH12K: M6 keys to the driver: %d, group number %u\n", error, radio->wpa.group_index);
+	return (error);
+}
+
 /*
  * No answer is either the air's doing or the firmware's. When frames went to the firmware and none of them came back, it is
  * the firmware's: that goes the way of any other death. Otherwise it is only a join that did not happen.
@@ -1399,6 +1646,10 @@ station_leave(struct fa_radio *radio)
 			lx_tell("FUXI ATH12K: M5 deauthentication sent; frames sent %u done %u acked %u dropped %u\n", radio->tx_sent, radio->tx_done,
 			    radio->tx_acked, radio->tx_dropped);
 		}
+	}
+	if (radio->sta != NULL) {
+		key_take_back(radio, &radio->group_key, false);
+		key_take_back(radio, &radio->pairwise_key, true);
 	}
 	for (; radio->sta != NULL && state > IEEE80211_STA_NOTEXIST; state--) {
 		int error = station_state(radio, state, state - 1);
@@ -1492,7 +1743,8 @@ join_refused(struct fa_radio *radio, enum fa_answer answer, const char *what)
  * authentication and association): the channel taken, the link told of the access point, the access point made a station
  * of the driver's, which creates the peer and starts the vdev (vdev_start_delay), then the frames. A network without
  * control-port protection is authorized before the association is told, which is when ath12k brings the vdev up and sets
- * the peer authorized on the firmware (mac.c, ath12k_bss_assoc()). 0 with *joined when it stands; 0 without when the air
+ * the peer authorized on the firmware (mac.c, ath12k_bss_assoc()). With protection the association is told first, the
+ * handshake and the keys follow, and only then authorized. 0 with *joined when it stands; 0 without when the air
  * or the access point stopped it; -errno when the driver or the firmware did.
  */
 static int
@@ -1612,7 +1864,7 @@ station_join(struct fa_radio *radio, bool *joined)
 	station_abilities(radio, radio->answer_elements, radio->answer_length);
 	radio->sta->aid = (uint16_t)radio->aid;
 	error = station_state(radio, IEEE80211_STA_AUTH, IEEE80211_STA_ASSOC);
-	if (error == 0) {
+	if (error == 0 && !radio->protect) {
 		error = station_state(radio, IEEE80211_STA_ASSOC, IEEE80211_STA_AUTHORIZED);
 	}
 	if (error != 0) {
@@ -1627,6 +1879,24 @@ station_join(struct fa_radio *radio, bool *joined)
 	fa_m4_credits("after the association was told");
 	if (fa_m4_trouble()) {
 		return (-EIO);
+	}
+	if (radio->protect) {
+		if (!station_handshake(radio)) {
+			return (fa_m4_trouble() ? -EIO : 0);
+		}
+		error = station_keys(radio);
+		if (error == 0) {
+			error = station_state(radio, IEEE80211_STA_ASSOC, IEEE80211_STA_AUTHORIZED);
+		}
+		if (error != 0) {
+			fa_m4_evidence("keys refused or peer not authorized");
+			return (error);
+		}
+		lx_tell("FUXI ATH12K: M6 4-way ok pairwise group installed\n");
+		fa_m4_credits("after the keys");
+		if (fa_m4_trouble()) {
+			return (-EIO);
+		}
 	}
 	lx_tell("FUXI ATH12K: M5 peer rates %#x, HT %d VHT %d HE %d, %u streams, QoS %d\n", radio->sta->deflink.supp_rates[channel->band],
 	    radio->sta->deflink.ht_cap.ht_supported, radio->sta->deflink.vht_cap.vht_supported, radio->sta->deflink.he_cap.has_he,
@@ -1644,6 +1914,7 @@ station_stay(struct fa_radio *radio)
 
 	lx_os_lock();
 	radio->link_data = radio->link_beacons = radio->link_others = 0;
+	radio->rx_ok = radio->rx_clear = 0;
 	radio->rssi = radio->target.rssi;
 	lx_os_unlock();
 	fa_m5_rx_ring("after the association");
@@ -1671,13 +1942,50 @@ station_stay(struct fa_radio *radio)
 		lx_tell("FUXI ATH12K: M5 the access point has shown us the door, reason %u\n", radio->reason);
 	}
 	if (radio->went_protected) {
-		lx_tell("FUXI ATH12K: M5 the access point now asks for protection: leaving\n");
+		lx_tell("FUXI ATH12K: M5 the access point now asks for %s: leaving\n", radio->protect ? "something else" : "protection");
 	}
 	lx_tell("FUXI ATH12K: M5 stayed %llu ms\n", (lx_os_nanoseconds() - began) / 1000000ull);
 	lx_tell("FUXI ATH12K: M5 rx data %u beacons %u rssi %d\n", radio->link_data, radio->link_beacons, radio->rssi);
 	lx_tell("FUXI ATH12K: M5 beacon losses %u others %u\n", radio->beacon_losses, radio->link_others);
+	if (radio->protect) {
+		lx_tell("FUXI ATH12K: M6 rx ok %u dropped unprotected %u\n", radio->rx_ok, radio->rx_clear);
+	}
 	fa_m4_credits("after the stay");
 	fa_m5_rx_ring("after the stay");
+}
+
+/* The handshake's beginning, from what the chosen access point offers. False, and said, when it is not to be joined. */
+static bool
+handshake_prepare(struct fa_radio *radio)
+{
+	const struct fa_target *target = &radio->target;
+	struct fa_rsn rsn;
+	const char *why = fa_rsn_read(target->elements, target->elements_length, &rsn);
+	const uint8_t *element = fa_element(target->elements, target->elements_length, FA_EID_RSN);
+	uint8_t any = 0;
+
+	lx_tell("FUXI ATH12K: M6 target offers group %u pairwise %#x akm %#x capabilities %#x\n", rsn.group, rsn.pairwise, rsn.akm, rsn.capabilities);
+	if (why != NULL) {
+		lx_tell("FUXI ATH12K: M6 refused: %s\n", why);
+		return (false);
+	}
+	memset(&radio->wpa, 0, sizeof(radio->wpa));
+	memcpy(radio->wpa.pmk, target_key, sizeof(radio->wpa.pmk));
+	memcpy(radio->wpa.own, radio->vif->addr, ETH_ALEN);
+	memcpy(radio->wpa.peer, target->address, ETH_ALEN);
+	get_random_bytes(radio->wpa.own_nonce, sizeof(radio->wpa.own_nonce));
+	for (unsigned i = 0; i < sizeof(radio->wpa.own_nonce); i++) {
+		any |= radio->wpa.own_nonce[i];
+	}
+	if (any == 0) {
+		lx_tell("FUXI ATH12K: M6 refused: the random source gave only zeros\n");
+		return (false);
+	}
+	radio->wpa.rsn = FA_RSN_OURS;
+	radio->wpa.rsn_length = sizeof(FA_RSN_OURS);
+	radio->wpa.peer_rsn = element;
+	radio->wpa.peer_rsn_length = 2u + element[1];
+	return (true);
 }
 
 /* Scans until the network is heard or refused, at most FA_JOIN_SCANS. 0, or what a scan came to. */
@@ -1712,6 +2020,8 @@ fa_m5_station(struct ieee80211_hw *hw, bool passive)
 		return (0);
 	}
 	lx_tell("FUXI ATH12K: M5 target ssid length %u\n", target_name_length);
+	radio->protect = target_protected;
+	target->wanted = target_protected ? FA_PROTECT_RSN : FA_OPEN;
 	radio->asked.ssid_len = (uint8_t)target_name_length;
 	memcpy(radio->asked.ssid, target_name, target_name_length);
 	error = station_up(radio);
@@ -1725,7 +2035,10 @@ fa_m5_station(struct ieee80211_hw *hw, bool passive)
 		}
 	}
 	if (error == 0 && !fa_m4_trouble()) {
-		if (target->protected_frames != 0) {
+		if (target->protected_frames != 0 && radio->protect) {
+			lx_tell("FUXI ATH12K: M6 refused: the target has %s (%u frames), only WPA2 with a key is built\n",
+			    fa_protection_name(target->why), target->protected_frames);
+		} else if (target->protected_frames != 0) {
 			lx_tell("FUXI ATH12K: M5 refused: the target has %s (%u frames), only open networks are allowed at this stage\n",
 			    fa_protection_name(target->why), target->protected_frames);
 		} else if (!target->found) {
@@ -1737,9 +2050,11 @@ fa_m5_station(struct ieee80211_hw *hw, bool passive)
 			    fa_element(target->elements, target->elements_length, FA_EID_VHT) != NULL,
 			    fa_ext_element(target->elements, target->elements_length, FA_EXT_HE) != NULL,
 			    fa_wmm_element(target->elements, target->elements_length) != NULL);
-			error = station_join(radio, &joined);
-			if (joined) {
-				station_stay(radio);
+			if (!radio->protect || handshake_prepare(radio)) {
+				error = station_join(radio, &joined);
+				if (joined) {
+					station_stay(radio);
+				}
 			}
 		}
 	}
@@ -1750,6 +2065,9 @@ fa_m5_station(struct ieee80211_hw *hw, bool passive)
 		station_leave(radio);
 	}
 	station_down(radio);
+	fa_wipe(&radio->wpa, sizeof(radio->wpa));
+	fa_wipe(radio->eapol, sizeof(radio->eapol));
+	fa_wipe(target_key, sizeof(target_key));
 	if (fa_m4_trouble()) {
 		fa_m4_firmware_dead();
 		return (error != 0 ? error : -EIO);

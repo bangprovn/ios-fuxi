@@ -20,6 +20,17 @@ PREAMBLE_HEAD = f'''#define FUXI_ATH12K 1
 #include "{ROOT / 'xnu/fuxi-ath12k/src/fa_xnu.h'}"
 '''
 PREAMBLE_TAIL = r'''
+typedef const void *DTEntry;
+enum { kSuccess = 0, kError = -1 };
+static const unsigned char *dt_join;
+static unsigned dt_join_size;
+static int SecureDTLookupEntry(DTEntry from, const char *path, DTEntry *found) { assert(!from && !strcmp(path, "/chosen")); *found = path; return kSuccess; }
+static int SecureDTGetProperty(DTEntry entry, const char *name, void const **value, unsigned int *size) {
+    assert(!strcmp(name, "fuxi-wifi-join"));
+    if (!dt_join) return kError;
+    *value = dt_join; *size = dt_join_size;
+    return kSuccess;
+}
 static uint8_t fake_bar[0x100000];
 static uintptr_t fw_bar_window(void) { return (uintptr_t)fake_bar; }
 static unsigned mhi_locks, mhi_depth, fa_stops, fa_entries;
@@ -116,6 +127,8 @@ int fa_firmware_ready(const struct fa_caps *caps, unsigned stage) {
 }
 void fa_stop(void) { fa_stops++; assert(!mhi_depth); }
 void fa_set_radio_mac(const unsigned char *mac) { memcpy(seen_mac,mac,6); macs_set++; }
+static unsigned joins_set, seen_join_length; static unsigned char seen_join_name[32], seen_join_key[32];
+void fa_set_target_join(const unsigned char *name, unsigned length, const unsigned char *key) { assert(length<=32);memcpy(seen_join_name,name,length);memcpy(seen_join_key,key,32);seen_join_length=length;joins_set++; }
 void fa_set_target_ssid(const unsigned char *name, unsigned length) { assert(length<=sizeof(seen_ssid));memcpy(seen_ssid,name,length);seen_ssid_length=length;ssids_set++; }
 
 static void boot_fa(unsigned c,bool keep) {
@@ -147,19 +160,31 @@ int main(void) {
 
     /* fuxiath12k>0 alone is the recipe of design section 5, argument by argument. */
     ath12k_arg=1;wl_fa_configure();assert(wl_fa_stage==1);
-    assert(strstr(logbuf,"fuxiath12k=1, recipe defaults on, running stage 1; stages built are 1, 2, 4 and 5"));
+    assert(strstr(logbuf,"fuxiath12k=1, recipe defaults on, running stage 1; stages built are 1, 2, 4, 5 and 6"));
     ath12k_arg=2;wl_fa_configure();assert(wl_fa_stage==2);
-    assert(strstr(logbuf,"fuxiath12k=2, recipe defaults on, running stage 2; stages built are 1, 2, 4 and 5"));
+    assert(strstr(logbuf,"fuxiath12k=2, recipe defaults on, running stage 2; stages built are 1, 2, 4, 5 and 6"));
     ath12k_arg=4;wl_fa_configure();assert(wl_fa_stage==4);
-    assert(strstr(logbuf,"fuxiath12k=4, recipe defaults on, running stage 4; stages built are 1, 2, 4 and 5"));
+    assert(strstr(logbuf,"fuxiath12k=4, recipe defaults on, running stage 4; stages built are 1, 2, 4, 5 and 6"));
     ath12k_arg=5;wl_fa_configure();assert(wl_fa_stage==5);
-    assert(strstr(logbuf,"fuxiath12k=5, recipe defaults on, running stage 5; stages built are 1, 2, 4 and 5"));
+    assert(strstr(logbuf,"fuxiath12k=5, recipe defaults on, running stage 5; stages built are 1, 2, 4, 5 and 6"));
     /* All RF needs exactly 4 or 5. Anything else not built runs stage 2, and says so. */
     ath12k_arg=3;wl_fa_configure();assert(wl_fa_stage==2);
-    assert(strstr(logbuf,"fuxiath12k=3, recipe defaults on, running stage 2; stages built are 1, 2, 4 and 5"));
-    ath12k_arg=6;wl_fa_configure();assert(wl_fa_stage==2);
+    assert(strstr(logbuf,"fuxiath12k=3, recipe defaults on, running stage 2; stages built are 1, 2, 4, 5 and 6"));
+    ath12k_arg=6;wl_fa_configure();assert(wl_fa_stage==6);
+    /* Stage 6's network: from the device tree alone, its length said, its key never. */
+    {
+        static const unsigned char good[1+8+32] = {8,'M','i','2',' ','t','e','s','t',
+            0xa5,0xa5,0xa5,0xa5,0xa5,0xa5,0xa5,0xa5,0xa5,0xa5,0xa5,0xa5,0xa5,0xa5,0xa5,0xa5,0xa5,0xa5,0xa5,0xa5,0xa5,0xa5,0xa5,0xa5,0xa5,0xa5,0xa5,0xa5,0xa5,0xa5,0xa5,0xa5};
+        dt_join=NULL;wl_fa_join_configure();assert(!joins_set && strstr(logbuf,"no network in the device tree"));
+        dt_join=good;dt_join_size=sizeof(good)-1;wl_fa_join_configure();assert(!joins_set && strstr(logbuf,"malformed: 40 bytes"));
+        dt_join_size=sizeof(good);wl_fa_join_configure();
+        assert(joins_set==1 && seen_join_length==8 && !memcmp(seen_join_name,"Mi2 test",8) && seen_join_key[0]==0xa5 && seen_join_key[31]==0xa5);
+        assert(strstr(logbuf,"network name length 8, key given") && !strstr(logbuf,"Mi2 test"));
+        wl_fa_stage=5;wl_fa_join_configure();assert(joins_set==1);	/* no other stage reads it */
+        wl_fa_stage=6;dt_join=NULL;joins_set=0;
+    }
     ath12k_arg=7;wl_fa_configure();assert(wl_fa_stage==2);
-    assert(strstr(logbuf,"fuxiath12k=7, recipe defaults on, running stage 2; stages built are 1, 2, 4 and 5"));
+    assert(strstr(logbuf,"fuxiath12k=7, recipe defaults on, running stage 2; stages built are 1, 2, 4, 5 and 6"));
     const struct {const char *name;int v;} numbers[]={{"fuxiwlan",1},{"fuxiwlanclk",1},{"fuxiwlanqrtr",5},
         {"fuxiwlanmlo",0x1c1},{"fuxiwlanp18",6},{"fuxiwlankeep",1}};
     for(unsigned i=0;i<6;i++){assert(wl_fa_recipe_arg(numbers[i].name,&number,sizeof(number)) && number==numbers[i].v);}
