@@ -83,3 +83,4 @@ fuxi/0015-user-pac-fail-log.patch
 fuxi/0016-pac-fail-slot.patch
 fuxi/0017-native-pac-default-jop-pid.patch
 fuxi/0018-launchd-ramdisk-bootargs.patch
+fuxi/0019-spawn-nosys-log.patch

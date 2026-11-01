@@ -61,14 +61,15 @@ def layout():
     listed = series()
     files = sorted(p.relative_to(X27 / 'patches').as_posix() for p in (X27 / 'patches').rglob('*.patch'))
     assert sorted(listed) == files and len(set(listed)) == len(listed), 'series and patches/ differ'
-    assert listed[-18:] == ['fuxi/0001-machine-config.patch', 'fuxi/0002-builtin-crypto.patch',
+    assert listed[-19:] == ['fuxi/0001-machine-config.patch', 'fuxi/0002-builtin-crypto.patch',
                            'fuxi/0003-console.patch', 'fuxi/0004-components.patch', 'fuxi/0005-crypto-kext-handoff.patch',
                            'fuxi/0006-log-ring-fileset.patch', 'fuxi/0007-root27-storage.patch',
                            'fuxi/0008-dada-apfs.patch', 'fuxi/0009-cryptex-graft.patch', 'fuxi/0010-proc-log.patch',
                            'fuxi/0011-pid1-watch.patch', 'fuxi/0012-pid1-fcntl-log.patch',
                            'fuxi/0013-native4k-progress.patch', 'fuxi/0014-apfs-nocache-read.patch',
                            'fuxi/0015-user-pac-fail-log.patch', 'fuxi/0016-pac-fail-slot.patch',
-                           'fuxi/0017-native-pac-default-jop-pid.patch', 'fuxi/0018-launchd-ramdisk-bootargs.patch']
+                           'fuxi/0017-native-pac-default-jop-pid.patch', 'fuxi/0018-launchd-ramdisk-bootargs.patch',
+                           'fuxi/0019-spawn-nosys-log.patch']
     plog = (X27 / 'patches/fuxi/0010-proc-log.patch').read_text()
     assert plog.count('+#if defined(FUXI)') == 4 and 'PE_parse_boot_argn("fuxi_proc_log"' in plog
     watch = (X27 / 'patches/fuxi/0011-pid1-watch.patch').read_text()
@@ -87,6 +88,8 @@ def layout():
     assert '+#elif HAS_NATIVE_PAC' in jop and '+\treturn 1;' in jop
     rd = (X27 / 'patches/fuxi/0018-launchd-ramdisk-bootargs.patch').read_text()
     assert 'PE_parse_boot_argn("fuxi_launchd_ramdisk"' in rd and 'strlcat(buf, " rd=md0", BOOT_LINE_LENGTH);' in rd
+    spawn = (X27 / 'patches/fuxi/0019-spawn-nosys-log.patch').read_text()
+    assert '+posix_spawn_impl(proc_t ap, struct posix_spawn_args *uap, int32_t *retval)' in spawn and 'fuxi: nosys pid %d' in spawn
     # 0009: the kernel grafts the SystemOS/AppOS cryptexes and the dyld cache directory when ignition is skipped.
     graft = (X27 / 'patches/fuxi/0009-cryptex-graft.patch').read_text()
     for need in ('+fuxi_root27_graft(void)', 'PE_parse_boot_argn("fuxi_root27_cryptex"', '"/private/preboot/Cryptexes/OS"',

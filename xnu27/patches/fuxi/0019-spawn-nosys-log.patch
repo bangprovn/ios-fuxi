@@ -1,0 +1,69 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index b503cb4..dc7c54e 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -4334,8 +4334,36 @@ spawn_posix_cred_adopt(proc_t p,
+  *		Handle posix_spawnattr_t
+  *		Handle posix_spawn_file_actions_t
+  */
++#if defined(FUXI)
++static int posix_spawn_impl(proc_t ap, struct posix_spawn_args *uap, int32_t *retval);
++
++/* fuxi_proc_log=1: what pid 1 spawns and how it ends (launchd's daemons) */
+ int
+ posix_spawn(proc_t ap, struct posix_spawn_args *uap, int32_t *retval)
++{
++	char path[128] = "";
++	size_t len = 0;
++	pid_t child = 0;
++	int error;
++
++	if (proc_getpid(ap) != 1 || !fuxi_proc_log()) {
++		return posix_spawn_impl(ap, uap, retval);
++	}
++	(void)copyinstr(uap->path, path, sizeof(path), &len);
++	error = posix_spawn_impl(ap, uap, retval);
++	if (uap->pid != USER_ADDR_NULL) {
++		(void)copyin(uap->pid, &child, sizeof(child));
++	}
++	printf("fuxi: spawn by pid 1 %s: %d (pid %d)\n", path, error, error == 0 ? child : -1);
++	return error;
++}
++
++static int
++posix_spawn_impl(proc_t ap, struct posix_spawn_args *uap, int32_t *retval)
++#else
++int
++posix_spawn(proc_t ap, struct posix_spawn_args *uap, int32_t *retval)
++#endif
+ {
+ 	proc_t p = ap;
+ 	user_addr_t pid = uap->pid;
+diff --git a/bsd/kern/subr_xxx.c b/bsd/kern/subr_xxx.c
+index e62c6a4..95805eb 100644
+--- a/bsd/kern/subr_xxx.c
++++ b/bsd/kern/subr_xxx.c
+@@ -69,6 +69,9 @@
+ #include <sys/vnode.h>
+ #include <sys/uio.h>
+ #include <sys/sysproto.h>
++#if defined(FUXI)
++#include <sys/user.h>
++#endif
+ 
+ #include <sys/signalvar.h>              /* for psignal() */
+ #include <kern/debug.h>
+@@ -180,6 +183,13 @@ nullsys(void)
+ int
+ nosys(__unused struct proc *p, __unused struct nosys_args *args, __unused int32_t *retval)
+ {
++#if defined(FUXI)
++	/* fuxi_proc_log=1: system calls this kernel does not have (a newer user space's) */
++	if (fuxi_proc_log()) {
++		printf("fuxi: nosys pid %d %s syscall %u\n", proc_getpid(current_proc()), proc_best_name(current_proc()),
++		    current_uthread()->syscall_code);
++	}
++#endif
+ 	if (send_sigsys) {
+ 		psignal_uthread(current_thread(), SIGSYS);
+ 	}
