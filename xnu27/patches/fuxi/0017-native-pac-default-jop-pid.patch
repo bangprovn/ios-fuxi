@@ -1,0 +1,19 @@
+diff --git a/osfmk/arm/machine_routines_apple.c b/osfmk/arm/machine_routines_apple.c
+index 144dab5..e3171f4 100644
+--- a/osfmk/arm/machine_routines_apple.c
++++ b/osfmk/arm/machine_routines_apple.c
+@@ -249,6 +249,14 @@ ml_default_jop_pid(void)
+ #if HAS_PARAVIRTUALIZED_PAC
+ 	vmapple_pac_get_default_keys();
+ 	return vmapple_default_jop_pid;
++#elif HAS_NATIVE_PAC
++	/*
++	 * One key set for the kernel and every process, so the value does not select a key; it only
++	 * has to be nonzero. With 0 the shared region slides the cache's authenticated pointers
++	 * without signing them (vm_shared_region_slide_page_v5: jop_key != 0), and the first
++	 * autda of an auth GOT entry in launchd takes a PAC exception.
++	 */
++	return 1;
+ #else
+ 	return 0;
+ #endif /* HAS_PARAVIRTUALIZED_PAC */

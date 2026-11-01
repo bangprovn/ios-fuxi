@@ -389,6 +389,13 @@ unmapped`. The iOS 27 cache has a mapping flag that dyld-1378's headers do not d
 `AUTH | CONST_DATA` mapping in each data subcache. GUESS: the kernel (xnu-12377) does not handle it, so the GOT slot
 holds a value the slide never signed.
 
+K5i (with `0016`): the slot is at unslid 0x1e8d13778 in `.25.dylddata`'s `AUTH | CONST_DATA` mapping (flags 0x5,
+not the 0x80 one). On disk it holds an auth chained pointer (DA key, diversity 0x9abf, address diversity). In memory
+it is slid but unsigned. Cause: `shared_region_find_key` gives the system shared region `ml_default_jop_pid()`, which
+is 0 without paravirtualized PAC, and the slide code signs only when `jop_key != 0`.
+`fuxi/0017-native-pac-default-jop-pid.patch` returns 1 under `HAS_NATIVE_PAC`. The kernel and every process share
+one key set there, so the value selects nothing. It only has to be nonzero.
+
 Out of scope for K4a, next: the Data volume (writable, `/private/var`), the SystemOS/AppOS cryptex grafts (union with
 the OS volume), the sealed-volume root snapshot (`root-snapshot-name`/ APFS seal checks), launchd changes, and a
 writable path (extent-guarded WRITE(10) as on the 8796 lane).
