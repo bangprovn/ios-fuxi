@@ -12,6 +12,7 @@
 Raw pages can be saved with --save. See docs-lanes/audio.md.
 """
 import argparse
+import math
 import struct
 import sys
 from pathlib import Path
@@ -328,6 +329,7 @@ def decode_mic(r):
 
 
 MIC_PHASES = ('muted at the TX macro', 'gain 8, bias on', 'gain 16, bias on', 'gain 16, BIAS OFF', 'gain 16, bias on again')
+MIC_LOOP_PHASES = ('muted at the TX macro', 'before the tone, gain 16', 'during the tone', 'after the tone')
 
 
 def decode_mic_capture(q, status):
@@ -340,9 +342,19 @@ def decode_mic_capture(q, status):
 
     def signed(x):
         return x - (1 << 32) if x >> 31 else x
-    for p, name in enumerate(MIC_PHASES):
+    loop = q[90:126] != (0,) * 36
+    for p, name in enumerate(MIC_LOOP_PHASES if loop else MIC_PHASES):
         s = q[40 + 10 * p:50 + 10 * p]
         out.append(f'  {name:24}: periods {s[0]:3} samples {s[1]:6} least {signed(s[2]):6} most {signed(s[3]):6} mean {signed(s[4]):6} mean abs {s[5]:6} not zero {s[6]:6} change {s[7]:6} still pattern {s[8]:6} from {s[9]} ms')
+    if loop:
+        out.append('  tone list up: ' + ' '.join('-' if x == 0xffffffff else hex(x) for x in q[16:26]) + f'; failed {q[26]}; down: ' + ' '.join('-' if x == 0xffffffff else hex(x) for x in q[27:32]))
+        for p, name in enumerate(('before', 'during', 'after')):
+            samples = q[40 + 10 * (p + 1) + 1] or 1
+            levels = []
+            for b, hz in enumerate((2000, 4000, 6000)):
+                c = [struct.unpack('<q', struct.pack('<2I', q[90 + 4 * (3 * p + b) + 2 * k], q[90 + 4 * (3 * p + b) + 2 * k + 1]))[0] for k in (0, 1)]
+                levels.append(f'{hz} Hz {2 * math.hypot(*c) / samples / 52428.8:8.3f}')
+            out.append(f'  amplitude {name:6}: ' + ' '.join(levels) + ' (LSB)')
     return '\n'.join(out)
 
 
@@ -377,7 +389,7 @@ def fnv(data):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('cmd', choices=['mic-cap', 'mic-cap2', 'snapshot', 'squash', 'upload', 'boot', 'report', 'decode', 'stop', 'glink', 'smmu', 'poke', 'amp', 'tone', 'mic'])
+    ap.add_argument('cmd', choices=['mic-cap', 'mic-cap2', 'mic-loop', 'mic-loop-no-bias', 'snapshot', 'squash', 'upload', 'boot', 'report', 'decode', 'stop', 'glink', 'smmu', 'poke', 'amp', 'tone', 'mic'])
     ap.add_argument('--monitors', action='store_true', help="tone: also bring the amplifier's voltage and current back, and look for the tone in them")
     ap.add_argument('--owner-agreed', action='store_true', help='tone: the owner has agreed to writes to the amplifier: bottom speaker, lowest level, a second')
     ap.add_argument('--which', type=int, default=3, help='amp: 1 B at 0x40, 2 T at 0x42, 3 both; read only')
@@ -501,8 +513,10 @@ def main():
         if a.save:
             with a.save.open('ab') as f:
                 f.write(page + struct.pack('<128I', *q))
-    elif a.cmd in ('mic', 'mic-cap', 'mic-cap2'):
-        page = req(0x4143, {'mic': 0x4d31, 'mic-cap': 0x4d32, 'mic-cap2': 0x4d33}[a.cmd])
+    elif a.cmd in ('mic', 'mic-cap', 'mic-cap2', 'mic-loop', 'mic-loop-no-bias'):
+        if a.cmd.startswith('mic-loop') and not a.owner_agreed:
+            ap.error('mic-loop writes to an amplifier: --owner-agreed')
+        page = req(0x4143, {'mic': 0x4d31, 'mic-cap': 0x4d32, 'mic-cap2': 0x4d33, 'mic-loop': 0x4d34, 'mic-loop-no-bias': 0x4d35}[a.cmd])
         r = struct.unpack('<128I', page)
         if r[0] != 0xa0d10003:
             raise SystemExit(f'no report: {r[0]:#x}')
@@ -515,6 +529,8 @@ def main():
             print(f'  the clock let go: {status}, heard at {q[51]} ms (the list sent {r[126]} steps: 4 means it was asked)')
         else:
             print(decode_mic_capture(struct.unpack('<128I', req(0x4146)), q))
+            if a.cmd.startswith('mic-loop'):
+                print('\n'.join(decode_tone(struct.unpack('<128I', req(0x414a)))))
             print(f'  the clock let go: {"no answer" if q[17] == 0xffffffff else hex(q[17])}, heard at {q[48 + 17]} ms (the list sent {r[126]} steps: 18 means it was asked)')
         count = min(r[27], 96)
         words = []

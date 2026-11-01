@@ -528,7 +528,14 @@ def main():
     cap_hook = audio[audio.index("if (value == 0x4143 && (index == 0x4d32"):audio.index("if (value == 0x4149")]
     assert "au_boot[1] == 1" in cap_hook and '!monitor_report[MON_LAUNCH]' in cap_hook and '!au_gl_rep[0]' in cap_hook and 'AU_GL_PLAY | AU_GL_MIC' in cap_hook and 'AU_GL_TONE' not in cap_hook
     stage = audio[audio.index('static void au_mic_scan'):audio.index('static uint32_t audio_request')]
-    for bad in ('au_on', 'AU_AMP', 'au_pin', 'au_tone', 'AU_TLMM', 'AU_SE0', 'memcpy', 'au_mic_rep'):
+    # 0x4d34 alone adds the tone, by au_tone_stage() unchanged: the only sound here, and the tool wants --owner-agreed for it.
+    loop = stage[stage.index('static void au_mic_tone_edge'):stage.index('static uint32_t au_mic_cap_stage')]
+    stage = stage.replace(loop, '')
+    assert loop.count('= au_tone_stage(g, au_gl_rep3, t0, hz)') == 1 and re.findall(r'au_mic_codec_update\(mic, ([^,]+),', loop) == ['0x300eu', 'AU_MIC_MICB1'] and 'AU_MIC_MICB1, 0xc0u, 0u' in loop and 'au_on_' not in loop and 'AU_AMP' not in loop and 'au_pin' not in loop
+    assert audio.count('au_mic_loop = ') == 1 and 'au_mic_loop = index == 0x4d34 || index == 0x4d35;' in cap_hook and audio.count('au_mic_loop_stage(') == 2 and 'if (au_mic_loop) au_mic_loop_stage(g, q, t0, hz);' in stage
+    probe = (ROOT / 'tools/fuxi-audio-probe.py').read_text()
+    assert "if a.cmd.startswith('mic-loop') and not a.owner_agreed:" in probe and probe.count('0x4d34') == 1 and probe.count('0x4d35') == 1
+    for bad in ('au_on', 'AU_AMP', 'au_pin', 'AU_TLMM', 'AU_SE0', 'memcpy', 'au_mic_rep', 'au_tone_'):
         assert bad not in stage, bad
     assert re.findall(r'au_mic_codec_update\(m, ([^,]+),', stage) == ['0x300eu', 'AU_MIC_MICB1'] and '{{8, 0x40}, {16, 0x40}, {16, 0}, {16, 0x40}}' in stage
     # Run inside the list, between the votes (prm_sent == 2): the clock let go after it by the list's last step, the votes then by au_gl_prm_step()'s last two.
