@@ -3,6 +3,8 @@
  * it, started on a second of zeros, and taken down again. What a-play2 did before iOS, here beside iOS.
  * fuxiaudio=2: instead /dev/fuxiaudio, which takes 48 kHz stereo 16 bit from tools/fuxi-audio's HAL plug-in in mediaserverd and never blocks it. The graph starts at the first
  * samples and comes down after two seconds without any. Whichever: no pin is muxed, no amplifier reached, nothing is heard; what this proves is iOS's samples reaching the DSP.
+ * fuxiaudioamp=1, with fuxiaudio=2: the bottom amplifier as well, its pins and up while there are samples, at the lowest level the owner has agreed to in the loader. **Not yet run: the
+ * owner has agreed to a second of tone there (a-tone5), not to iOS's sound.** Off without it, and then the two functions it calls do nothing at all.
  * The loader has put apps_smmu's streams 0x1001/0x80 and 0x1061 into context bank 4 (poke 2 and 18); this does not touch the SMMU. The buffer is outside the bank XNU owns. */
 #ifdef FUXI
 #include <stdint.h>
@@ -23,6 +25,7 @@
 #include "fuxi_audioreach.h"
 
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+extern void delay_for_interval(uint32_t, uint32_t);
 extern kern_return_t thread_terminate(thread_t);
 void fuxi_audio_dsp_init(void);
 
@@ -32,9 +35,10 @@ void fuxi_audio_dsp_init(void);
 #define FA_IPCC_SIZE    0x00001000u
 #define FA_IPCC_GLINK   ((3u << 16) | 0u)    /* client LPASS, signal GLINK_QMP */
 #define FA_BUFFER       0xd0000000ull
-#define FA_BUFFER_BYTES (4u * 7680u)
+#define FA_BUFFER_BYTES (4u * 15360u)
 #define FA_BUFFER_SID   1ull            /* 0x1001 & 0xf, as Linux q6apm_dai */
-#define FA_PERIOD_BYTES 7680u           /* 20 ms of 48 kHz, 2 channels of 32 bits */
+#define FA_PERIOD_BYTES 15360u          /* 20 ms of 48 kHz, 4 slots of 32 bits: the same on all four, as a-tone5 proved */
+#define FA_TDM_CLOCK    0x202u          /* LPASS_CLK_ID_SEC_TDM_IBIT, as the PRM numbers it */
 #define FA_PERIODS      50u
 #define FA_PERIOD_FRAMES 960u
 #define FA_RING_FRAMES  16384u          /* a power of two: about 340 ms */
@@ -227,8 +231,8 @@ fa_step(uint32_t bytes)
 	if (status != 0) { bad++; } \
 } while (0)
 
-static const FuxiArFormat fa_format = {48000, 32, 2};
-static const FuxiArTdm fa_tdm = {.intf = 1, .slot_mask = 5, .slots = 4, .slot_width = 32, .sync_mode = 1, .invert_sync = 0, .sync_data_delay = 1, .lane = 1, .clock_attribute = 4};
+static const FuxiArFormat fa_format = {48000, 32, 4};
+static const FuxiArTdm fa_tdm = {.intf = 1, .slot_mask = 0xf, .slots = 4, .slot_width = 32, .sync_mode = 1, .invert_sync = 0, .sync_data_delay = 1, .lane = 1, .clock_attribute = 4};
 
 /* The mappings, GLINK and the APM's answer. */
 static bool
@@ -268,7 +272,7 @@ fa_bring_up(void)
 	fa_g.options = AU_GL_ANSWER | AU_GL_GPR | AU_GL_PRM | AU_GL_GRAPH | AU_GL_PLAY;
 	fa_g.log = fa_log;
 	fa_g.log_most = 8;
-	fa_g.graph_steps = 15;
+	fa_g.graph_steps = 17;
 	if (!au_gl_start(&fa_g)) {
 		printf("FUXI AUDIO: GLINK did not start\n");
 		return false;
@@ -298,6 +302,14 @@ fa_bring_up(void)
 	return fa_g.gpr_ready != 0;
 }
 
+/* The TDM's bit clock, from the PRM: Linux's card asks it before anything opens. 6.144 MHz, inverted. The same shape as the others for FA_STEP; 0 lets it go. */
+static uint32_t
+fa_prm_clock(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, uint32_t hz)
+{
+#pragma unused(port)
+	return fuxi_ar_prm_clock_attr(out, capacity, 2, token, FA_TDM_CLOCK, hz, 4);
+}
+
 /* LPASS's votes on, and the list to the graph's start. How many failed. */
 static uint32_t
 fa_graph_up(void)
@@ -322,6 +334,7 @@ fa_graph_up(void)
 		((volatile uint32_t *)fa_buffer)[i] = 0;
 	}
 	__asm__ volatile ("dsb osh" ::: "memory");
+	FA_STEP("TDM clock", fa_prm_clock, 6144000u);
 	FA_STEP("open device", fuxi_ar_open_speaker_tdm);
 	FA_STEP("configure device", fuxi_ar_config_speaker_tdm, &fa_format, &fa_tdm);
 	FA_STEP("open stream", fuxi_ar_open_playback_stream_tdm);
@@ -342,12 +355,13 @@ fa_graph_down(void)
 	uint32_t bad = 0;
 
 	/* In step with au_gl_graph_send(): the list's place is its token. */
-	fa_g.graph_sent = 10;
+	fa_g.graph_sent = 11;
 	FA_STEP("stop stream", fuxi_ar_graph_command, FUXI_AR_OP_GRAPH_STOP, FUXI_AR_SG_PLAY);
 	FA_STEP("stop device", fuxi_ar_graph_command, FUXI_AR_OP_GRAPH_STOP, FUXI_AR_SG_SPEAKER);
 	FA_STEP("close stream", fuxi_ar_graph_command, FUXI_AR_OP_GRAPH_CLOSE, FUXI_AR_SG_PLAY);
 	FA_STEP("close device", fuxi_ar_graph_command, FUXI_AR_OP_GRAPH_CLOSE, FUXI_AR_SG_SPEAKER);
 	FA_STEP("unmap", fuxi_ar_unmap, fa_g.map_handle);
+	FA_STEP("TDM clock off", fa_prm_clock, 0u);
 	fa_g.prm_sent = 2;
 	for (unsigned i = 2; i < 4; i++) {
 		(void)au_gl_prm_step(&fa_g);
@@ -419,6 +433,156 @@ static const struct cdevsw fa_cdevsw = {
 	.d_type       = 0,
 };
 
+/* ---- the bottom amplifier, fuxiaudioamp=1: au_amp_on.h's sequence, as the loader's au_tone_stage() ran it ---- */
+#define FA_SE0  0x00880000ull
+#define FA_GCC  0x00100000ull
+#define FA_TLMM 0x0f100000ull
+static vm_offset_t fa_se0, fa_gcc, fa_tlmm;
+static bool fa_amp_wanted, fa_amp_up_now, fa_amp_gave_up;
+
+static vm_offset_t
+fa_amp_va(uint64_t pa)
+{
+	if (pa >= FA_SE0 && pa < FA_SE0 + 0x4000) {
+		return fa_se0 + (vm_offset_t)(pa - FA_SE0);
+	}
+	if (pa >= FA_GCC && pa < FA_GCC + 0x80000) {
+		return fa_gcc + (vm_offset_t)(pa - FA_GCC);
+	}
+	if (pa >= FA_TLMM && pa < FA_TLMM + 0x100000 + 0x4000) {
+		return fa_tlmm + (vm_offset_t)(pa - FA_TLMM);
+	}
+	panic("FUXI AUDIO: no window for %#llx", (unsigned long long)pa);
+}
+static uint32_t fa_amp_rd(uint64_t pa) { return *(volatile uint32_t *)fa_amp_va(pa); }
+static int
+fa_amp_wr(uint64_t pa, uint32_t v)
+{
+	__asm__ volatile ("dmb oshst" ::: "memory");
+	*(volatile uint32_t *)fa_amp_va(pa) = v;
+	__asm__ volatile ("dsb osh" ::: "memory");
+	return 0;
+}
+#define AU_AMP_RD(pa) fa_amp_rd(pa)
+#define AU_AMP_WR(pa, v) fa_amp_wr((pa), (v))
+#define AU_AMP_DELAY_US(us) delay_for_interval((us), 1000u)
+#include "fuxi_au_amp.h"
+#include "fuxi_au_amp_on.h"
+
+static const uint8_t fa_amp_pins[8] = {0, 1, 182, 183, 121, 122, 123, 124};
+static uint32_t fa_amp_saved[8][2];
+static struct au_on fa_amp;
+
+/* As the loader's au_pin(): the pin's control, claimed from LPASS where it can be, and its level before the output turns on. */
+static void
+fa_amp_pin(unsigned n, uint32_t ctl, uint32_t out)
+{
+	uint64_t c = FA_TLMM + 0x1000u * n;
+	uint32_t was = fa_amp_rd(c);
+
+	ctl |= was & (1u << 11);
+	if ((was & (1u << 11)) != 0) {
+		ctl |= 1u << 12;
+	}
+	if ((ctl & (1u << 9)) != 0) {
+		(void)fa_amp_wr(c + 4, out << 1);
+	}
+	(void)fa_amp_wr(c, ctl);
+}
+
+static void
+fa_amp_pins_back(void)
+{
+	fa_amp_pin(183, 1u | 1u << 9, 0);
+	delay_for_interval(3000, 1000);
+	for (unsigned i = 0; i < 8; i++) {
+		(void)fa_amp_wr(FA_TLMM + 0x1000u * fa_amp_pins[i] + 4, fa_amp_saved[i][1] & 2u);
+		(void)fa_amp_wr(FA_TLMM + 0x1000u * fa_amp_pins[i], fa_amp_saved[i][0]);
+	}
+}
+
+/* With the graph started, zeros going. Any trouble: it goes down and stays down until the next boot. Nothing is retried. */
+static void
+fa_amp_up(void)
+{
+	int r;
+
+	if (!fa_amp_wanted || fa_amp_gave_up || fa_amp_up_now) {
+		return;
+	}
+	(void)fa_amp_wr(FA_GCC + 0x52010, fa_amp_rd(FA_GCC + 0x52010) | 0x1fu);
+	for (unsigned i = 0; i < 10000 && (fa_amp_rd(FA_GCC + 0x233cc) >> 31) != 0; i++) {
+		delay_for_interval(10, 1000);
+	}
+	if ((fa_amp_rd(FA_GCC + 0x233cc) >> 31) != 0 || !au_amp_engine(FA_SE0)) {
+		printf("FUXI AUDIO: amp: no bus\n");
+		fa_amp_gave_up = true;
+		return;
+	}
+	for (unsigned i = 0; i < 10000 && (fa_amp_rd(FA_GCC + 0x1e004) >> 31) != 0; i++) {
+		delay_for_interval(10, 1000);
+	}
+	for (unsigned i = 0; i < 8; i++) {
+		fa_amp_saved[i][0] = fa_amp_rd(FA_TLMM + 0x1000u * fa_amp_pins[i]);
+		fa_amp_saved[i][1] = fa_amp_rd(FA_TLMM + 0x1000u * fa_amp_pins[i] + 4);
+	}
+	/* The top one in reset all along; gpio68, its earpiece switch, not touched. */
+	fa_amp_pin(182, 1u | 1u << 9, 0);
+	fa_amp_pin(183, 1u | 1u << 9, 0);
+	fa_amp_pin(0, 3u | 2u << 2, 0);
+	fa_amp_pin(1, 3u | 2u << 2, 0);
+	fa_amp_pin(121, 1u << 2 | 3u << 6, 0);
+	fa_amp_pin(123, 1u << 2 | 3u << 6, 0);
+	fa_amp_pin(124, 1u << 2 | 3u << 6, 0);
+	delay_for_interval(3000, 1000);
+	fa_amp_pin(183, 1u | 1u << 9, 1);
+	delay_for_interval(3000, 1000);
+	memset(&fa_amp, 0, sizeof(fa_amp));
+	fa_amp.se = FA_SE0;
+	fa_amp.address = 0x40;
+	r = au_on_prepare(&fa_amp, true, false);
+	if (r == AU_ON_OK) {
+		r = au_on_power_up(&fa_amp);
+	}
+	if (r == AU_ON_OK) {
+		r = au_on_check(&fa_amp);
+	}
+	if (r == AU_ON_OK) {
+		r = au_on_unmute(&fa_amp, 0);
+	}
+	printf("FUXI AUDIO: amp up: %#x at step %u, reg %#x want %#x got %#x, status %#x %#x\n", r, fa_amp.step, fa_amp.failed_reg, fa_amp.failed_want, fa_amp.failed_got, fa_amp.status[0], fa_amp.status[2]);
+	if (r != AU_ON_OK) {
+		fa_amp_gave_up = true;
+		au_on_down(&fa_amp);
+		fa_amp_pins_back();
+		return;
+	}
+	fa_amp_up_now = true;
+}
+
+static void
+fa_amp_down(void)
+{
+	if (!fa_amp_up_now) {
+		return;
+	}
+	au_on_down(&fa_amp);
+	fa_amp_pins_back();
+	fa_amp_up_now = false;
+	printf("FUXI AUDIO: amp down\n");
+}
+
+/* Once in a while as it plays: a flag and it comes down for good. */
+static void
+fa_amp_watch(void)
+{
+	if (fa_amp_up_now && au_on_check(&fa_amp) != AU_ON_OK) {
+		printf("FUXI AUDIO: amp flag: status %#x %#x %#x %#x\n", fa_amp.status[0], fa_amp.status[1], fa_amp.status[2], fa_amp.status[3]);
+		fa_amp_gave_up = true;
+		fa_amp_down();
+	}
+}
+
 /* What has come, or silence, into the next of the DSP's periods. The frames taken. */
 static uint32_t
 fa_fill_period(uint32_t index, uint32_t *peak)
@@ -428,13 +592,13 @@ fa_fill_period(uint32_t index, uint32_t *peak)
 
 	for (uint32_t i = 0; i < FA_PERIOD_FRAMES; i++) {
 		uint32_t frame = i < taken ? fa_ring[tail++ & (FA_RING_FRAMES - 1)] : 0;
-		int32_t left = (int16_t)(frame & 0xffff), right = (int16_t)(frame >> 16);
-		uint32_t a = (uint32_t)(left < 0 ? -left : left), b = (uint32_t)(right < 0 ? -right : right);
+		int32_t left = (int16_t)(frame & 0xffff), right = (int16_t)(frame >> 16), mono = (left + right) / 2;
+		uint32_t a = (uint32_t)(mono < 0 ? -mono : mono);
 
 		*peak = a > *peak ? a : *peak;
-		*peak = b > *peak ? b : *peak;
-		out[2 * i] = (uint32_t)(left * 65536);
-		out[2 * i + 1] = (uint32_t)(right * 65536);
+		for (uint32_t c = 0; c < 4; c++) {
+			out[4 * i + c] = (uint32_t)(mono * 65536);
+		}
 	}
 	__atomic_store_n(&fa_ring_tail, tail, __ATOMIC_RELEASE);
 	__asm__ volatile ("dsb osh" ::: "memory");
@@ -460,6 +624,7 @@ fa_stream(void)
 			fa_graph_down();
 			return;
 		}
+		fa_amp_up();
 		while (idle < FA_IDLE_PERIODS) {
 			if (fa_g.write_sent < fa_g.write_done + FA_AHEAD) {
 				uint32_t index = fa_g.write_sent % 4, have = fa_ring_count();
@@ -484,6 +649,7 @@ fa_stream(void)
 			}
 			if (fa_g.write_sent - sent_at_last >= 250) {
 				sent_at_last = fa_g.write_sent;
+				fa_amp_watch();
 				if (last_said != fa_g.write_sent) {
 					printf("FUXI AUDIO: playing: %u periods sent, %u played, %u bad, %u s of samples, peak %u, %u periods short, %u frames dropped\n", fa_g.write_sent, fa_g.write_done, fa_g.write_bad,
 					    (uint32_t)(frames / 48000), peak, short_periods, fa_dropped);
@@ -492,6 +658,7 @@ fa_stream(void)
 				}
 			}
 		}
+		fa_amp_down();
 		printf("FUXI AUDIO: quiet: %u periods sent, %u played, %u bad, %u s of samples, %u frames dropped\n", fa_g.write_sent, fa_g.write_done, fa_g.write_bad, (uint32_t)(frames / 48000), fa_dropped);
 		fa_graph_down();
 	}
@@ -551,7 +718,15 @@ fuxi_audio_dsp_init(void)
 		return;
 	}
 	if (on == 2) {
-		int major = cdevsw_add(-1, &fa_cdevsw);
+		int major = cdevsw_add(-1, &fa_cdevsw), amp = 0;
+
+		if (PE_parse_boot_argn("fuxiaudioamp", &amp, sizeof(amp)) && amp == 1) {
+			fa_se0 = ml_io_map((vm_offset_t)FA_SE0, 0x4000);
+			fa_gcc = ml_io_map((vm_offset_t)FA_GCC, 0x80000);
+			fa_tlmm = ml_io_map((vm_offset_t)FA_TLMM, 0x104000);
+			fa_amp_wanted = fa_se0 != 0 && fa_gcc != 0 && fa_tlmm != 0;
+			printf("FUXI AUDIO: the amplifier was asked for: %d\n", fa_amp_wanted);
+		}
 
 		if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "fuxiaudio") == NULL) {
 			printf("FUXI AUDIO: no /dev/fuxiaudio\n");

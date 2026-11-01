@@ -29,6 +29,7 @@ thread_t current_thread(void);
 void thread_deallocate(thread_t);
 kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
 int PE_parse_boot_argn(const char *, void *, int);
+void panic(const char *, ...);
 typedef int dev_t;
 typedef void *proc_t;
 typedef char *caddr_t;
@@ -53,14 +54,21 @@ def main():
             (stubs / header).parent.mkdir(parents=True, exist_ok=True)
             (stubs / header).write_text('#include "stub.h"\n')
         (stubs / 'stub.h').write_text('#pragma once\n' + STUB)
-        (stubs / 'fuxi_au_glink.h').write_text((ROOT / 'shim/fuxi-probe/au_glink.h').read_text())
+        for name, source in (('fuxi_au_glink.h', 'au_glink.h'), ('fuxi_au_amp.h', 'au_amp.h'), ('fuxi_au_amp_on.h', 'au_amp_on.h')):
+            (stubs / name).write_text((ROOT / 'shim/fuxi-probe' / source).read_text())
         subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-Wno-unknown-pragmas', '-Wno-unused-function', '-Wno-unused-parameter', '-Wno-incompatible-pointer-types', '-DFUXI=1', '-fsyntax-only',
                         f'-I{stubs}', f'-I{ROOT / "xnu/fuxi-audio"}', str(ROOT / 'xnu/fuxi-audio/fuxi_audio_dsp.c')], check=True)
     text = (ROOT / 'xnu/fuxi-audio/fuxi_audio_dsp.c').read_text()
     lower = text.lower()
-    for word in ('i2s1', '0xf100000', 'tlmm', 'geni', 'cs35l41', '0x880000', '0x15000000', 'smmu_'):
-        assert word not in lower, word
-    assert text.count('ml_io_map(') == 4 and 'PE_parse_boot_argn("fuxiaudio"' in text
+    # Nothing reaches a pin or an amplifier but the section behind fuxiaudioamp=1, and that keeps to what the loader's tone did: the bottom one, the lowest level.
+    amp = text[text.index('/* ---- the bottom amplifier'):text.index("/* What has come, or silence, into the next")]
+    rest = (text.replace(amp, '')).lower()
+    for word in ('i2s1', 'geni', 'cs35l41', '0x15000000', 'smmu_', 'au_on_'):
+        assert word not in rest, word
+    assert amp.count('au_on_unmute(') == 1 and 'au_on_unmute(&fa_amp, 0)' in amp and 'fa_amp.address = 0x40;' in amp and '0x42' not in amp
+    assert 'fa_amp_pin(182, 1u | 1u << 9, 0);' in amp and 'fa_amp_pin(182, 1u | 1u << 9, 1)' not in amp and ', 68' not in amp and 'fa_amp_pin(68' not in amp
+    assert 'if (!fa_amp_wanted ||' in amp and 'PE_parse_boot_argn("fuxiaudioamp", &amp, sizeof(amp)) && amp == 1' in text
+    assert text.count('ml_io_map(') == 7 and 'PE_parse_boot_argn("fuxiaudio"' in text
     subprocess.run(['python3', str(ROOT / 'tools/sync-fuxi-audio.py'), '--check'], check=True, capture_output=True)
     hook = (ROOT / 'xnu/patches/0118-fuxi-audio-dsp.patch').read_text()
     assert 'fuxi_audio_dsp_init();' in hook and 'bsd/dev/fuxi_audio_dsp.c' in hook and 'bsd/dev/fuxi_audioreach.c' in hook

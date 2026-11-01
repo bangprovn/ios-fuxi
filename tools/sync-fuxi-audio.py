@@ -12,12 +12,12 @@ import re
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / 'xnu/fuxi-audio'
 PATCH = ROOT / 'xnu/patches/0113-fuxi-audio.patch'
-FILES = ('fuxi_gpr.h', 'fuxi_gpr.c', 'fuxi_audioreach.h', 'fuxi_audioreach.c', 'fuxi_rpmh_arb.h', 'fuxi_audio_dsp.c', 'fuxi_au_glink.h')
-GLINK = ROOT / 'shim/fuxi-probe/au_glink.h'
+FILES = ('fuxi_gpr.h', 'fuxi_gpr.c', 'fuxi_audioreach.h', 'fuxi_audioreach.c', 'fuxi_rpmh_arb.h', 'fuxi_audio_dsp.c', 'fuxi_au_glink.h', 'fuxi_au_amp.h', 'fuxi_au_amp_on.h')
+SHARED = {'fuxi_au_glink.h': 'au_glink.h', 'fuxi_au_amp.h': 'au_amp.h', 'fuxi_au_amp_on.h': 'au_amp_on.h'}
 
 
 def expected():
-    return ''.join(''.join(difflib.unified_diff([], (GLINK if name == 'fuxi_au_glink.h' else SRC / name).read_text().splitlines(True),
+    return ''.join(''.join(difflib.unified_diff([], (ROOT / 'shim/fuxi-probe' / SHARED[name] if name in SHARED else SRC / name).read_text().splitlines(True),
                                                fromfile='/dev/null', tofile='b/bsd/dev/' + name)) for name in FILES)
 
 
