@@ -86,6 +86,7 @@ STACK_HELPER = """/*
 #include <IOKit/IORegistryEntry.h>
 #include <kern/clock.h>
 #include <kern/thread_call.h>
+#include <pexpert/pexpert.h>
 #include <libkern/OSAtomic.h>
 
 #define FUXI_BUSY_LINES_MOST    40
@@ -96,7 +97,30 @@ static volatile UInt32 fuxi_busy_started;
 static unsigned fuxi_busy_seconds;
 static bool fuxi_busy_quiet;
 
+/*
+ * w-ios2: the root stayed at 1 for all of the 300 s watched, with no service under it busy, so what holds it is nothing
+ * anyone can finish, and configd's InterfaceNamer waits five minutes for a quiet that does not come. With nothing busy
+ * under it 30 s after the open, that count is taken away once. fuxiwifiquiet=0 leaves it, to compare.
+ */
 static void
+fuxi_busy_give_up(unsigned busy_under)
+{
+	IOService * root = IOService::getServiceRoot();
+	int allowed = 1;
+
+	if (PE_parse_boot_argn("fuxiwifiquiet", &allowed, sizeof(allowed)) && allowed == 0) {
+		IOLog("FUXI ATH12K: M8 busy: left as it is, fuxiwifiquiet=0\\n");
+		return;
+	}
+	if (busy_under != 0 || root->getBusyState() != 1) {
+		IOLog("FUXI ATH12K: M8 busy: nothing given up: %u busy under the root, its state %u\\n", busy_under, (unsigned) root->getBusyState());
+		return;
+	}
+	root->adjustBusy(-1);
+	IOLog("FUXI ATH12K: M8 busy: the root's stuck count given up, state now %u\\n", (unsigned) root->getBusyState());
+}
+
+static unsigned
 fuxi_busy_round(unsigned seconds)
 {
 	IOService * root = IOService::getServiceRoot();
@@ -108,7 +132,7 @@ fuxi_busy_round(unsigned seconds)
 	walk = IORegistryIterator::iterateOver(root, gIOServicePlane, kIORegistryIterateRecursively);
 	if (walk == NULL) {
 		IOLog("FUXI ATH12K: M8 busy: no walk\\n");
-		return;
+		return (1);
 	}
 	while ((entry = walk->getNextObject()) != NULL) {
 		IOService * service = OSDynamicCast(IOService, entry);
@@ -129,7 +153,11 @@ fuxi_busy_round(unsigned seconds)
 	if (more != 0) {
 		IOLog("FUXI ATH12K: M8 busy: %u more\\n", more);
 	}
+	if (!walk->isValid()) {
+		said++;				/* (what is not seen is not known to be idle) */
+	}
 	walk->release();
+	return (said + more);
 }
 
 static void
@@ -142,7 +170,11 @@ fuxi_busy_tick(thread_call_param_t, thread_call_param_t)
 		IOLog("FUXI ATH12K: M8 busy: the root reached 0, %u s after the open\\n", seconds);
 	}
 	if (seconds == 0 || seconds == 30 || seconds == 60 || seconds == 120 || seconds == FUXI_BUSY_SECONDS_MOST) {
-		fuxi_busy_round(seconds);
+		unsigned busy_under = fuxi_busy_round(seconds);
+
+		if (seconds == 30) {
+			fuxi_busy_give_up(busy_under);
+		}
 	}
 	if (seconds < FUXI_BUSY_SECONDS_MOST) {
 		uint64_t deadline;
