@@ -23,13 +23,14 @@ static unsigned kicks, wmbs;
 #include "au_glink.h"
 #include "fuxi_audioreach.h"
 
-#define FIFO 256u
+#define FIFO 1024u
 static uint32_t desc[8], tx[FIFO / 4], rx[FIFO / 4], logs[AU_GL_REC_WORDS * 32];
 static uint32_t far_head;	/* what the DSP has written to */
 static uint32_t far_tail;	/* what the DSP has read of ours */
 static bool may_send;		/* heard() fails on data otherwise */
 static bool may_vote;		/* and on a vote */
-static uint32_t asks, votes;
+static bool may_graph;		/* and on a graph's packet */
+static uint32_t asks, votes, graphs;
 
 static void fresh(struct au_gl *g, uint32_t options)
 {
@@ -75,11 +76,18 @@ static bool heard(uint32_t *cmd, uint32_t *p1, uint32_t *p2, char *name)
 			static const uint8_t block[4] = {FUXI_AR_HW_MACRO, FUXI_AR_HW_DCODEC, FUXI_AR_HW_DCODEC, FUXI_AR_HW_MACRO};
 			uint8_t want[128];
 			uint32_t step = word[6] - AU_GL_PRM_TOKEN, n;
-			assert(may_vote && word[0] == 60 && step == votes);
-			n = fuxi_ar_prm_vote(want, sizeof(want), 2, word[6], block[step], step < 2);
-			assert(n == 60 && !memcmp(want, word + 2, 60));
-			votes++;
-			total += (8 + 60 + 7) & ~7u;
+			if (word[6] >= AU_GL_GRAPH_TOKEN) {
+				/* a graph's packet: checked by its size and order, its bytes by tools/fuxi-audio-host */
+				assert(may_graph && word[6] == AU_GL_GRAPH_TOKEN + graphs && word[0] <= AU_GL_GPR_BUFFER);
+				graphs++;
+				total += (8 + word[0] + 7) & ~7u;
+			} else {
+				assert(may_vote && word[0] == 60 && step == votes);
+				n = fuxi_ar_prm_vote(want, sizeof(want), 2, word[6], block[step], step < 2);
+				assert(n == 60 && !memcmp(want, word + 2, 60));
+				votes++;
+				total += (8 + 60 + 7) & ~7u;
+			}
 		}
 	} else if (*cmd == AU_GL_INTENT) {
 		total += 8 * *p2;
@@ -330,6 +338,60 @@ int main(void)
 		assert(au_gl_step(&g) && g.prm_status[3] == 7 && heard(&cmd, &p1, &p2, 0));
 		may_vote = false;
 	}
+	/* --graph. A long buffer is asked for once, a refusal counted; packets go only into it, then only when it is back, and only three. */
+	{
+		static uint32_t m[2 + AU_GL_GPR_BUFFER / 4 + 2];
+		uint32_t big[2] = {4096, 77}, small[2] = {128, 14};
+		uint32_t answer[11] = {32, 0, 0x2060, 0x0203, 1, 1, AU_GL_GRAPH_TOKEN, AU_GL_OP_BASIC_RESULT, 0x01001000, 3, 0};
+
+		fresh(&g, AU_GL_ANSWER | AU_GL_GPR | AU_GL_PRM); may_send = may_graph = true; graphs = 0;
+		assert(au_gl_start(&g)); assert(heard(&cmd, &p1, &p2, 0));
+		g.gpr_lcid = 1; g.gpr_rcid = 9; g.gpr_acked = 1; g.gpr_ready = 1; g.big_have = 1; g.big_size = 4096;
+		assert(!au_gl_big_ask(&g) && !au_gl_graph_send(&g, m, 64));	/* no option */
+		/* The long buffer is kept out of the small ones without the option as well. */
+		say(AU_GL_INTENT, 9, 1, big, 8);
+		assert(au_gl_step(&g) && g.gpr_riid_n == 0);
+		g.big_have = 0; g.big_size = 0;
+		g.options |= AU_GL_GRAPH; g.gpr_acked = 0;
+		assert(!au_gl_big_ask(&g));
+		g.gpr_acked = 1;
+		assert(au_gl_big_ask(&g) && heard(&cmd, &p1, &p2, 0) && cmd == AU_GL_INTENT_REQ && p1 == 1 && p2 == AU_GL_GPR_BUFFER);
+		assert(!au_gl_big_ask(&g) && !heard(&cmd, &p1, &p2, 0));
+		say(AU_GL_INTENT_REQ_ACK, 9, 0, 0, 0);
+		assert(au_gl_step(&g) && g.big_refused == 1);
+		say(AU_GL_INTENT, 9, 1, small, 8);
+		assert(au_gl_step(&g) && !g.big_have && g.gpr_riid_n == 1);
+		assert(!au_gl_graph_send(&g, m, 64));				/* its small one is not for this */
+		say(AU_GL_INTENT_REQ_ACK, 9, 1, 0, 0);
+		assert(au_gl_step(&g) && g.big_refused == 1);
+		say(AU_GL_INTENT, 9, 1, big, 8);
+		assert(au_gl_step(&g) && g.big_have && g.big_riid == 77 && !g.big_asked);
+		assert(!au_gl_graph_send(&g, m, AU_GL_GPR_BUFFER + 4));		/* too long */
+		for (uint32_t i = 0; i < AU_GL_GRAPH_STEPS; i++) {
+			memset(m, 0x77, sizeof(m));
+			m[6] = AU_GL_GRAPH_TOKEN + i;				/* GPR's token, word 4, after GLINK's two */
+			assert(au_gl_graph_send(&g, m, i == 0 ? 500 : 60 + 4));
+			assert(heard(&cmd, &p1, &p2, 0) && cmd == AU_GL_TX_DATA && p1 == 1 && p2 == 77 && graphs == i + 1);
+			assert(!g.big_have && !au_gl_graph_send(&g, m, 64));	/* one to a buffer */
+			if (i == 1) {
+				/* An answer: its status kept by its token. */
+				answer[6] = AU_GL_GRAPH_TOKEN; g.ms = 55;
+				say(AU_GL_TX_DATA, 9, 1, answer, 40);
+				assert(au_gl_step(&g) && g.graph_status[0] == 3 && g.graph_heard_ms[0] == 55 && g.graph_status[1] == AU_GL_PRM_NO_ANSWER && heard(&cmd, &p1, &p2, 0));
+				/* Of a step not sent yet: nothing. */
+				answer[6] = AU_GL_GRAPH_TOKEN + 2;
+				say(AU_GL_TX_DATA, 9, 1, answer, 40);
+				assert(au_gl_step(&g) && g.graph_status[2] == 0 && heard(&cmd, &p1, &p2, 0));
+			}
+			/* Another buffer's return changes nothing, its own does. */
+			say(AU_GL_RX_DONE_REUSE, 9, 14, 0, 0);
+			assert(au_gl_step(&g) && !g.big_have);
+			say(AU_GL_RX_DONE_REUSE, 9, 77, 0, 0);
+			assert(au_gl_step(&g) && g.big_have);
+		}
+		assert(!au_gl_graph_send(&g, m, 64) && g.graph_sent == AU_GL_GRAPH_STEPS);
+		may_graph = false;
+	}
 	may_send = false;
 
 	/* The log is bounded and says how much it lost. */
@@ -342,8 +404,8 @@ int main(void)
 		uint32_t seed = 0x51ed2701;
 		for (unsigned round = 0; round < 40000; round++) {
 			/* (round & 3) == 3 is --gpr, with the channel up from the start for the rings that would never open it. */
-			fresh(&g, (round & 1) | ((round & 3) == 3 ? AU_GL_GPR | AU_GL_PRM : 0)); (void)au_gl_start(&g);
-			if ((round & 3) == 3) { g.gpr_lcid = 1; g.gpr_rcid = round & 15; g.gpr_acked = round & 4; g.prm_sent = (round >> 4) & 7; }
+			fresh(&g, (round & 1) | ((round & 3) == 3 ? AU_GL_GPR | AU_GL_PRM | AU_GL_GRAPH : 0)); (void)au_gl_start(&g);
+			if ((round & 3) == 3) { g.gpr_lcid = 1; g.gpr_rcid = round & 15; g.gpr_acked = round & 4; g.prm_sent = (round >> 4) & 7; g.graph_sent = (round >> 7) & 3; }
 			for (unsigned i = 0; i < FIFO / 4; i++) { seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5; rx[i] = (i & 1) && (seed & 8) ? seed >> 24 : seed & 0x000f000f; }
 			seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
 			desc[3] = (seed & 0xf8) % FIFO;
@@ -367,10 +429,10 @@ def main():
                         '-fsanitize=address,undefined', '-fno-sanitize-recover=all', f'-I{ROOT / "shim/fuxi-probe"}', f'-I{ROOT / "xnu/fuxi-audio"}', str(source),
                         str(ROOT / 'xnu/fuxi-audio/fuxi_audioreach.c'), str(ROOT / 'xnu/fuxi-audio/fuxi_gpr.c'), '-o', str(program)], check=True)
         subprocess.run([str(program)], check=True)
-    # What could put any other audio command on the wire is simply not there: two TX_DATA, each in the function with its fixed packet.
+    # What could put any other audio command on the wire is simply not there: three TX_DATA, each in its own function, and no starting.
     text = (ROOT / 'shim/fuxi-probe/au_glink.h').read_text()
     code = text[text.index('#define AU_GL_FEATURE_REUSE'):]
-    assert code.count('AU_GL_TX_DATA,') == 2 and code.count('au_gl_tx(g, AU_GL_TX_DATA,') == 2
+    assert code.count('AU_GL_TX_DATA,') == 3 and code.count('au_gl_tx(g, AU_GL_TX_DATA,') == 3
     ask = code[code.index('static inline bool au_gl_gpr_ask'):code.index('static inline void au_gl_gpr_take')]
     assert 'au_gl_tx(g, AU_GL_TX_DATA,' in ask and 'AU_GL_OP_GET_SPF_STATE' in ask
     assert 'AU_GL_TX_DATA_CONT,' not in code
@@ -378,6 +440,7 @@ def main():
     assert 'au_gl_tx(g, AU_GL_TX_DATA,' in vote and 'gpr_ready' in vote and '0x08001032u' in vote
     audio = (ROOT / 'shim/fuxi-probe/audio.c').read_text()
     assert 'au_gl_tx(' not in audio.replace('au_gl_tx_', '')
+    assert 'GRAPH_START' not in audio and 'GRAPH_PREPARE' not in audio and 'fuxi_ar_write' not in audio and 'fuxi_ar_map' not in audio
     print('PASS: au_glink')
 
 

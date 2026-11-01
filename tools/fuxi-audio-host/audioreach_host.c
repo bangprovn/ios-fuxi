@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Host tests of the graph manager commands (xnu/fuxi-audio/fuxi_audioreach.c): packet sizes, parameter block layout and the fields the DSP
 // reads, checked against the layout the DSP's reference client produces.
+#include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -71,6 +72,28 @@ int main(void)
           le32(b + off[4] + 4 + 44) == 2);
 
     /* I2S configuration: LPAIF secondary, SD1, internal word select, 48 kHz 16-bit stereo, frame size factor 1. */
+    {
+        static const FuxiArTdm tdm = {.intf = 1, .slot_mask = 5, .slots = 4, .slot_width = 32, .sync_mode = 1, .invert_sync = 0, .sync_data_delay = 1, .lane = 1, .clock_attribute = 4};
+        const FuxiArFormat s32 = {48000, 32, 2};
+        uint8_t t[FUXI_GPR_MAX_PACKET];
+        uint32_t m = fuxi_ar_open_speaker_tdm(t, sizeof t, 1, 11), at;
+        assert(m != 0 && m <= FUXI_GPR_MAX_PACKET);
+        m = fuxi_ar_config_speaker_tdm(t, sizeof t, 1, 12, &s32, &tdm);
+        /* GPR 24, command 16; then each parameter: header 16, body padded to 8. */
+        assert(m == 24 + 16 + (16 + 32) + (16 + 16) + (16 + 8) + (16 + 8) + 16 + 16);
+#define WORD(at) ((uint32_t)t[at] | (uint32_t)t[(at) + 1] << 8 | (uint32_t)t[(at) + 2] << 16 | (uint32_t)t[(at) + 3] << 24)
+        assert(WORD(20) == FUXI_AR_OP_SET_CFG && WORD(24 + 12) == m - 40);
+        at = 40;
+        assert(WORD(at) == FUXI_AR_IID_SPEAKER_TDM && WORD(at + 4) == 0x0800101Bu && WORD(at + 8) == 28);
+        assert(WORD(at + 16) == 0 && WORD(at + 20) == 1 && WORD(at + 24) == (1u | 1u << 16) && WORD(at + 28) == 5 && WORD(at + 32) == (4u | 32u << 16));
+        assert(WORD(at + 36) == 1 && WORD(at + 40) == 1 && WORD(at + 44) == 0);
+        at += 48 + 32 + 24;
+        assert(WORD(at + 4) == 0x0800106Au && WORD(at + 8) == 4 && WORD(at + 16) == 2);
+        at += 24;
+        assert(WORD(at + 4) == 0x0800113Cu && WORD(at + 8) == 16 && WORD(at + 16) == 0 && WORD(at + 24) == 4 && at + 32 == m);
+#undef WORD
+        assert(fuxi_ar_config_speaker_tdm(t, 40, 1, 12, &s32, &tdm) == 0);
+    }
     n = fuxi_ar_config_speaker_device(b, sizeof b, 1, 9, &stereo);
     CHECK(n && blocks(b, n, iid, id, off, 8) == 3);
     CHECK(iid[0] == FUXI_AR_IID_SPEAKER_I2S && id[0] == 0x08001019 && le32(b + off[0] - 8) == 16);

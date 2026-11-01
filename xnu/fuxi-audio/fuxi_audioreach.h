@@ -37,6 +37,7 @@ extern "C" {
 #define FUXI_AR_MOD_PCM_ENC 0x07001004u
 #define FUXI_AR_MOD_PCM_DEC 0x07001005u
 #define FUXI_AR_MOD_I2S_SINK 0x0700100Au
+#define FUXI_AR_MOD_TDM_SINK 0x0700100Eu             /* in fuxi's ACDB too */
 #define FUXI_AR_MOD_CODEC_DMA_SOURCE 0x07001024u
 
 #define FUXI_AR_SG_PLAY 0x4001u
@@ -47,6 +48,7 @@ extern "C" {
 #define FUXI_AR_IID_PLAY_DEC 0x6002u
 #define FUXI_AR_IID_PLAY_CNV 0x6003u
 #define FUXI_AR_IID_SPEAKER_I2S 0x6051u
+#define FUXI_AR_IID_SPEAKER_TDM 0x6052u              /* our own: a client names its graph's parts */
 #define FUXI_AR_IID_MIC_DMA 0x6070u
 #define FUXI_AR_IID_CAP_CNV 0x6022u
 #define FUXI_AR_IID_CAP_ENC 0x6023u
@@ -58,10 +60,22 @@ typedef struct {
     uint16_t channels;       /* 1 or 2 */
 } FuxiArFormat;
 
+/* A TDM endpoint. Fuxi's speakers are on the secondary one, the SoC its clock master. */
+typedef struct {
+    uint32_t intf;           /* 1 secondary */
+    uint32_t slot_mask;
+    uint16_t slots, slot_width;
+    uint16_t sync_mode, invert_sync, sync_data_delay;
+    uint16_t lane;           /* sd line: gpio124, i2s1_data1, is 1 */
+    uint32_t clock_attribute;/* 1 couple no, 4 the same with the bit clock inverted */
+} FuxiArTdm;
+
 /* Each builder writes one complete GPR packet into out (capacity bytes) and returns its size, or 0 when it does not fit.
  * port: the GPR port the answers come back to; token: echoed in the answer. */
 uint32_t fuxi_ar_open_speaker_device(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token);
 uint32_t fuxi_ar_config_speaker_device(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const FuxiArFormat *f);
+uint32_t fuxi_ar_open_speaker_tdm(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token);
+uint32_t fuxi_ar_config_speaker_tdm(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const FuxiArFormat *f, const FuxiArTdm *t);
 uint32_t fuxi_ar_open_playback_stream(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token);
 uint32_t fuxi_ar_config_playback_stream(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const FuxiArFormat *f);
 uint32_t fuxi_ar_config_playback_shmem(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const FuxiArFormat *f);

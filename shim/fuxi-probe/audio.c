@@ -15,7 +15,8 @@
  *  IN  0x5a 'AG' (0x4147) wIndex: once, after a stage 2 that reached ready: GLINK over SMEM, polled, for bits 7:0 seconds
  *      (at most 45), bit 8 also completes the opening of channels (au_glink.h), bit 9 with it also asks the APM whether it is
  *      up: APM_CMD_GET_SPF_STATE on adsp_apps, the only data that goes out, every 3 s until it says ready; bit 10 with both then
- *      also votes LPASS's macro and dcodec on and off again, a step each 1.5 s. Returns its summary.
+ *      also votes LPASS's macro and dcodec on and off again, a step each 1.5 s; bit 11 with all three, between the votes, opens the
+ *      secondary TDM endpoint's graph, configures it and closes it, never starting it. Returns its summary.
  *  IN  0x5a 'AH' (0x4148) wIndex=page: its log, 128 words a page.
  *  OUT 0x5b wValue=chunk[15:0], wIndex[11:0]=chunk[27:16], wIndex bit15 =
  *      image (0 adsp_dtb, 1 adsp), bit14 = restart that image at chunk 0.
@@ -574,6 +575,17 @@ static void au_boot_stage(void)
 #define AU_GL_WMB() __asm__ volatile("dsb osh" ::: "memory")
 #define AU_GL_KICK() au_wr(AU_IPCC + 0xc, AU_IPCC_GLINK)
 #include "au_glink.h"
+#include "../../xnu/fuxi-audio/fuxi_audioreach.h"
+/* What --graph sends, in order. Values of the Xiaomi 14's port, which shares these pins: unproven here, and with no start nothing depends on them yet. */
+static uint32_t au_graph_build(uint32_t step, uint32_t *m, uint32_t capacity)
+{
+ static const FuxiArFormat format = {48000, 32, 2};
+ static const FuxiArTdm tdm = {.intf = 1, .slot_mask = 5, .slots = 4, .slot_width = 32, .sync_mode = 1, .invert_sync = 0, .sync_data_delay = 1, .lane = 1, .clock_attribute = 4};
+ uint8_t *out = (uint8_t *)(m + 2);
+ if (step == 0) return fuxi_ar_open_speaker_tdm(out, capacity, 1, AU_GL_GRAPH_TOKEN);
+ if (step == 1) return fuxi_ar_config_speaker_tdm(out, capacity, 1, AU_GL_GRAPH_TOKEN + 1, &format, &tdm);
+ return fuxi_ar_graph_command(out, capacity, 1, AU_GL_GRAPH_TOKEN + 2, FUXI_AR_OP_GRAPH_CLOSE, FUXI_AR_SG_SPEAKER);
+}
 #define AU_GL_RECORDS 96u
 #define AU_GL_LOG_WORDS (AU_GL_RECORDS * AU_GL_REC_WORDS)
 static uint32_t au_gl_rep[128], au_gl_log[AU_GL_LOG_WORDS];
@@ -621,7 +633,7 @@ static uint32_t au_glink_run(uint32_t *r, unsigned seconds, uint32_t options)
  g.log = au_gl_log; g.log_most = AU_GL_RECORDS;
  uint64_t t0 = rsr("cntpct_el0"), hz = rsr("cntfrq_el0"), limit = seconds * hz;
  if (!au_gl_start(&g)) return 0x204;
- uint32_t bits = 0, next_ask = 2000;
+ uint32_t bits = 0, next_ask = 2000, graph_until = 0;
  for (uint64_t now = 0; now < limit; now = rsr("cntpct_el0") - t0) {
   g.ms = (uint32_t)(now * 1000 / hz);
   if (!g.rx_fifo) {
@@ -639,7 +651,17 @@ static uint32_t au_glink_run(uint32_t *r, unsigned seconds, uint32_t options)
   if (g.stuck) break;
   if (g.ms >= next_ask) {
    if (!g.gpr_ready) { if (au_gl_gpr_ask(&g)) next_ask = g.ms + 3000; }
-   else if (au_gl_prm_step(&g)) next_ask = g.ms + 1500;
+   else if ((options & AU_GL_GRAPH) != 0 && g.prm_sent == 2 && g.graph_sent < AU_GL_GRAPH_STEPS && g.ms < graph_until) {
+    /* Each packet into the long buffer; if the DSP gives none, on to the votes coming off. */
+    static uint32_t m[2 + AU_GL_GPR_BUFFER / 4 + 2];
+    if (!g.big_have) { (void)au_gl_big_ask(&g); next_ask = g.ms + 100; }
+    else {
+     uint32_t bytes = au_graph_build(g.graph_sent, m, AU_GL_GPR_BUFFER);
+     if (bytes != 0 && au_gl_graph_send(&g, m, bytes)) next_ask = g.ms + 1500;
+     else if (bytes == 0) graph_until = 0;
+    }
+   }
+   else if (au_gl_prm_step(&g)) { next_ask = g.ms + 1500; graph_until = g.ms + 8000; }
   }
  }
  r[18] = g.rx_msgs; r[19] = g.tx_msgs; r[20] = g.tx_full; r[21] = g.stuck; r[22] = g.version_seen; r[23] = g.version_acked;
@@ -654,7 +676,10 @@ static uint32_t au_glink_run(uint32_t *r, unsigned seconds, uint32_t options)
  }
  r[72] = g.gpr_asked; r[73] = g.gpr_heard; r[74] = g.gpr_other; r[75] = g.gpr_ready; r[76] = g.gpr_asked_ms; r[77] = g.gpr_first_ms; r[78] = g.gpr_last_ms;
  r[79] = g.gpr_lcid | g.gpr_rcid << 16; r[80] = g.gpr_acked | g.gpr_offers << 8; r[81] = g.gpr_riid_n; r[82] = g.gpr_first_bytes; r[83] = g.gpr_last_bytes;
- for (unsigned i = 0; i < AU_GL_GPR_WORDS; i++) { r[84 + i] = g.gpr_first[i]; r[100 + i] = g.gpr_last[i]; }
+ for (unsigned i = 0; i < AU_GL_GPR_WORDS; i++) r[84 + i] = g.gpr_first[i];
+ for (unsigned i = 0; i < 8; i++) r[100 + i] = g.gpr_last[i];
+ for (unsigned i = 0; i < AU_GL_GRAPH_STEPS; i++) { r[108 + i] = g.graph_status[i]; r[111 + i] = g.graph_heard_ms[i]; }
+ r[114] = g.big_size; r[115] = g.big_refused; r[126] = g.graph_sent; r[127] = g.big_have | g.big_asked << 8;
  for (unsigned i = 0; i < AU_GL_PRM_STEPS; i++) { r[116 + i] = g.prm_status[i]; r[120 + i] = g.prm_heard_ms[i]; }
  r[124] = g.prm_sent; r[125] = g.prm_sent_ms[0];
  return g.stuck ? 0x210 + g.stuck : 1;
@@ -689,9 +714,9 @@ static uint32_t audio_request(uint16_t value, uint16_t index, uint8_t *out)
    unsigned seconds = index & 0xff;
    au_gl_rep[0] = 0xa0d10003;
    au_gl_rep[2] = seconds = seconds == 0 ? 10 : seconds > 45 ? 45 : seconds;
-   au_gl_rep[3] = (index >> 8) & 7;
-   au_gl_rep[1] = au_glink_run(au_gl_rep, seconds, au_gl_rep[3] == 7 ? AU_GL_ANSWER | AU_GL_GPR | AU_GL_PRM : au_gl_rep[3] == 3 ? AU_GL_ANSWER | AU_GL_GPR :
-                               au_gl_rep[3] & 1 ? AU_GL_ANSWER : 0);
+   au_gl_rep[3] = (index >> 8) & 15;
+   au_gl_rep[1] = au_glink_run(au_gl_rep, seconds, au_gl_rep[3] == 15 ? AU_GL_ANSWER | AU_GL_GPR | AU_GL_PRM | AU_GL_GRAPH : au_gl_rep[3] == 7 ? AU_GL_ANSWER | AU_GL_GPR | AU_GL_PRM :
+                               au_gl_rep[3] == 3 ? AU_GL_ANSWER | AU_GL_GPR : au_gl_rep[3] & 1 ? AU_GL_ANSWER : 0);
    au_gl_rep[4] = au_faults;
   }
   memcpy(out, au_gl_rep, sizeof(au_gl_rep)); return sizeof(au_gl_rep);

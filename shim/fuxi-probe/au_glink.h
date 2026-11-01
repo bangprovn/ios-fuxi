@@ -3,8 +3,9 @@
  * The wire format follows Linux qcom_glink_native.c and qcom_glink_smem.c. It negotiates the version, answers CLOSE and an
  * intent request, and with AU_GL_ANSWER also completes the opening of a channel. Only with AU_GL_GPR does any data leave, and
  * then APM_CMD_GET_SPF_STATE alone on adsp_apps, by au_gl_gpr_ask(), which reads a state and sets up nothing. With AU_GL_PRM,
- * once that says ready, au_gl_prm_step() also votes LPASS's macro and dcodec on and off again: no graph, no amplifier, no register.
- * Define AU_GL_RD, AU_GL_WR, AU_GL_WMB and AU_GL_KICK.
+ * once that says ready, au_gl_prm_step() also votes LPASS's macro and dcodec on and off again. With AU_GL_GRAPH, au_gl_graph_send()
+ * sends what audio.c builds, a packet too long for the DSP's own buffers: it opens, configures and closes a graph and never starts it,
+ * so no clock reaches a pin. No amplifier and no register either way. Define AU_GL_RD, AU_GL_WR, AU_GL_WMB and AU_GL_KICK.
  */
 #ifndef AU_GLINK_H
 #define AU_GLINK_H
@@ -37,6 +38,9 @@ enum { AU_GL_VERSION = 0, AU_GL_VERSION_ACK = 1, AU_GL_OPEN = 2, AU_GL_CLOSE = 3
 #define AU_GL_OP_PRM_REQUEST_DONE 0x02001002u
 #define AU_GL_OP_PRM_RELEASE_DONE 0x02001003u
 #define AU_GL_PRM_TOKEN 0x100u
+#define AU_GL_GRAPH 8u         /* options: with AU_GL_PRM, between the votes, the packets of au_gl_graph_send() */
+#define AU_GL_GRAPH_STEPS 3u   /* open, configure, close */
+#define AU_GL_GRAPH_TOKEN 0x200u
 
 struct au_gl {
 	uint64_t desc, tx_fifo, rx_fifo;
@@ -49,6 +53,7 @@ struct au_gl {
 	uint32_t gpr_asked_ms, gpr_first_ms, gpr_last_ms, gpr_first_bytes, gpr_last_bytes, gpr_riid_n;
 	uint32_t gpr_riid[AU_GL_GPR_INTENTS], gpr_first[AU_GL_GPR_WORDS], gpr_last[AU_GL_GPR_WORDS];
 	uint32_t prm_sent, prm_status[AU_GL_PRM_STEPS], prm_opcode[AU_GL_PRM_STEPS], prm_sent_ms[AU_GL_PRM_STEPS], prm_heard_ms[AU_GL_PRM_STEPS];
+	uint32_t big_riid, big_have, big_asked, big_refused, big_size, graph_sent, graph_status[AU_GL_GRAPH_STEPS], graph_heard_ms[AU_GL_GRAPH_STEPS];
 };
 
 static inline uint32_t au_gl_align8(uint32_t n) { return (n + 7u) & ~7u; }
@@ -160,6 +165,30 @@ static inline bool au_gl_prm_step(struct au_gl *g)
 	return true;
 }
 
+/* A buffer of the DSP's long enough for a graph's packet, as Linux qcom_glink_request_intent(). Once, until it has been used. */
+static inline bool au_gl_big_ask(struct au_gl *g)
+{
+	if ((g->options & AU_GL_GRAPH) == 0 || !g->gpr_acked || g->big_have || g->big_asked) return false;
+	if (!au_gl_tx(g, AU_GL_INTENT_REQ, g->gpr_lcid, AU_GL_GPR_BUFFER, 0, 0)) return false;
+	g->big_asked = 1;
+	return true;
+}
+
+/*
+ * The next packet of audio.c's list, `bytes` long, in `m` after two words kept for GLINK's own sizes, and with room to reach 8 bytes.
+ * True when it went: only into the long buffer, and only that many times.
+ */
+static inline bool au_gl_graph_send(struct au_gl *g, uint32_t *m, uint32_t bytes)
+{
+	if ((g->options & AU_GL_GRAPH) == 0 || !g->gpr_ready || !g->big_have || g->graph_sent >= AU_GL_GRAPH_STEPS || bytes > AU_GL_GPR_BUFFER || bytes > g->big_size) return false;
+	m[0] = bytes; m[1] = 0;
+	if (((8u + bytes) & 7u) != 0) m[(8u + bytes) / 4u] = 0;
+	if (!au_gl_tx(g, AU_GL_TX_DATA, g->gpr_lcid, g->big_riid, m, 8u + bytes)) return false;
+	g->big_have = 0;
+	g->graph_status[g->graph_sent++] = AU_GL_PRM_NO_ANSWER;
+	return true;
+}
+
 /* An answer on adsp_apps, while it is still in the ring. `tail` is at its header, so its bytes begin 16 past. */
 static inline void au_gl_gpr_take(struct au_gl *g, uint32_t tail, uint32_t bytes)
 {
@@ -177,6 +206,10 @@ static inline void au_gl_gpr_take(struct au_gl *g, uint32_t tail, uint32_t bytes
 		g->prm_status[step] = bytes >= 32u ? keep[7] : keep[6];
 		g->prm_opcode[step] = keep[5];
 		g->prm_heard_ms[step] = g->ms;
+	}
+	if (keep[4] >= AU_GL_GRAPH_TOKEN && keep[4] - AU_GL_GRAPH_TOKEN < g->graph_sent && keep[4] - AU_GL_GRAPH_TOKEN < AU_GL_GRAPH_STEPS && bytes >= 32u && keep[5] == AU_GL_OP_BASIC_RESULT) {
+		g->graph_status[keep[4] - AU_GL_GRAPH_TOKEN] = keep[7];
+		g->graph_heard_ms[keep[4] - AU_GL_GRAPH_TOKEN] = g->ms;
 	}
 	g->gpr_heard++;
 }
@@ -278,9 +311,25 @@ static inline bool au_gl_step(struct au_gl *g)
 	case AU_GL_INTENT:
 		if (gpr_channel) {
 			for (uint32_t i = 0; i < p2 && i < 4u; i++) {
-				if (words[2u * i] >= 24u && g->gpr_riid_n < AU_GL_GPR_INTENTS) g->gpr_riid[g->gpr_riid_n++] = words[2u * i + 1u];
+				if (words[2u * i] >= AU_GL_GPR_BUFFER) {
+					if ((g->options & AU_GL_GRAPH) != 0) {
+						g->big_riid = words[2u * i + 1u];
+						g->big_size = words[2u * i];
+						g->big_have = 1;
+						g->big_asked = 0;
+					}
+				} else if (words[2u * i] >= 24u && g->gpr_riid_n < AU_GL_GPR_INTENTS) {
+					g->gpr_riid[g->gpr_riid_n++] = words[2u * i + 1u];
+				}
 			}
 		}
+		break;
+	case AU_GL_INTENT_REQ_ACK:
+		if (gpr_channel && p2 == 0u) g->big_refused++;
+		break;
+	case AU_GL_RX_DONE_REUSE:
+		/* Our long buffer back to use again. */
+		if (gpr_channel && g->big_size != 0u && p2 == g->big_riid) g->big_have = 1;
 		break;
 	case AU_GL_TX_DATA: case AU_GL_TX_DATA_CONT:
 		if (!gpr_channel) { g->gpr_other++; break; }

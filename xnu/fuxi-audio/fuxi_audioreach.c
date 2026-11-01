@@ -21,6 +21,9 @@
 #define PROP_CONT_DOMAIN 0x08001014u
 #define PROP_PORT_INFO 0x08001015u
 #define PARAM_I2S_INTF 0x08001019u
+#define PARAM_TDM_INTF 0x0800101Bu
+#define PARAM_TDM_LANE 0x0800106Au
+#define PARAM_HW_INTF_CLOCK 0x0800113Cu
 #define PARAM_HW_EP_MF 0x08001017u
 #define PARAM_FRAME_SIZE_FACTOR 0x08001018u
 #define PARAM_PCM_OUTPUT 0x08001008u
@@ -79,6 +82,9 @@ static void cmd_payload_end(W *w, uint32_t at) {set32(w, at + 12, w->n - at - CM
 static uint32_t param_begin(W *w, uint32_t iid, uint32_t id) {uint32_t at = w->n; put32(w, iid); put32(w, id); put32(w, 0); put32(w, 0); return at;}
 static void param_end(W *w, uint32_t at) {pad_to(w, at + align8(w->n - at)); set32(w, at + 8, w->n - at - PARAM_HEADER);}
 
+/* The same, with param_size the body's alone, for the ones whose size the DSP checks exactly. */
+static void param_end_exact(W *w, uint32_t at) {set32(w, at + 8, w->n - at - PARAM_HEADER); pad_to(w, at + align8(w->n - at));}
+
 typedef struct {uint32_t id, perf, direction, scenario;} Sg;
 typedef struct {uint32_t id, position;} Container;
 typedef struct {uint32_t module, iid, inputs, outputs;} Module;
@@ -130,6 +136,14 @@ uint32_t fuxi_ar_open_speaker_device(uint8_t *out, uint32_t capacity, uint32_t p
     static const Sg sg = {FUXI_AR_SG_SPEAKER, PERF_LOW_LATENCY, DIR_TX, SCENARIO_PLAYBACK};
     static const Container c = {FUXI_AR_SG_SPEAKER, POS_STREAM};
     static const Module m[] = {{FUXI_AR_MOD_I2S_SINK, FUXI_AR_IID_SPEAKER_I2S, 1, 0}};
+    return graph_open(out, capacity, port, token, &sg, &c, m, 1, 0, 0);
+}
+
+uint32_t fuxi_ar_open_speaker_tdm(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token)
+{
+    static const Sg sg = {FUXI_AR_SG_SPEAKER, PERF_LOW_LATENCY, DIR_TX, SCENARIO_PLAYBACK};
+    static const Container c = {FUXI_AR_SG_SPEAKER, POS_STREAM};
+    static const Module m[] = {{FUXI_AR_MOD_TDM_SINK, FUXI_AR_IID_SPEAKER_TDM, 1, 0}};
     return graph_open(out, capacity, port, token, &sg, &c, m, 1, 0, 0);
 }
 
@@ -185,6 +199,29 @@ uint32_t fuxi_ar_config_speaker_device(uint8_t *out, uint32_t capacity, uint32_t
     param_end(&w, at);
     hw_ep_mf(&w, FUXI_AR_IID_SPEAKER_I2S, f);
     frame_size_factor(&w, FUXI_AR_IID_SPEAKER_I2S);
+    cmd_payload_end(&w, cmd);
+    return finish(&w);
+}
+
+/* Layouts as pcm_tdm_api.h says them, read from the Xiaomi 14's Linux port (research_notes/audio-next.md). No start here: this reaches no pin. */
+uint32_t fuxi_ar_config_speaker_tdm(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const FuxiArFormat *f, const FuxiArTdm *t)
+{
+    W w;
+    begin(&w, out, capacity, port, FUXI_AR_APM_IID, token, FUXI_AR_OP_SET_CFG);
+    const uint32_t cmd = cmd_payload_start(&w);
+    uint32_t at = param_begin(&w, FUXI_AR_IID_SPEAKER_TDM, PARAM_TDM_INTF);
+    put32(&w, LPAIF); put32(&w, t->intf); put16(&w, WS_INTERNAL); put16(&w, 1);    /* the SoC's sync, data going out */
+    put32(&w, t->slot_mask); put16(&w, t->slots); put16(&w, t->slot_width);
+    put16(&w, t->sync_mode); put16(&w, t->invert_sync); put16(&w, t->sync_data_delay); put16(&w, 0);
+    param_end_exact(&w, at);
+    hw_ep_mf(&w, FUXI_AR_IID_SPEAKER_TDM, f);
+    frame_size_factor(&w, FUXI_AR_IID_SPEAKER_TDM);
+    at = param_begin(&w, FUXI_AR_IID_SPEAKER_TDM, PARAM_TDM_LANE);
+    put16(&w, 1u << t->lane); put16(&w, 0);
+    param_end_exact(&w, at);
+    at = param_begin(&w, FUXI_AR_IID_SPEAKER_TDM, PARAM_HW_INTF_CLOCK);
+    put32(&w, 0); put32(&w, 0); put32(&w, t->clock_attribute); put32(&w, 0);       /* id, frequency and root left to the interface */
+    param_end_exact(&w, at);
     cmd_payload_end(&w, cmd);
     return finish(&w);
 }
