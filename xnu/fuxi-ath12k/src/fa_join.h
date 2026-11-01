@@ -754,6 +754,112 @@ fa_eapol_frame(uint8_t *out, unsigned size, const uint8_t *own, const uint8_t *b
 	return (header + FA_LLC_LENGTH + body_length);
 }
 
+/* ---- block ack: the access point asks to send aggregates (IEEE 802.11-2020, 9.6.4). Stage 8 only ---------------- */
+
+#define FA_KIND_ACTION		0xd0
+#define FA_ACTION_BLOCK_ACK	3
+enum { FA_BA_ADDBA_REQUEST = 0, FA_BA_ADDBA_RESPONSE = 1, FA_BA_DELBA = 2 };
+#define FA_BA_TIDS		8
+#define FA_ADDBA_RESPONSE_LENGTH (FA_FRAME_HEADER + 9)
+#define FA_STATUS_DECLINED	37
+#define FA_BA_SIZE_HT		64
+#define FA_BA_SIZE_HE		256
+
+struct fa_ba_ask {
+	bool		start;			/* ADDBA request, else DELBA */
+	bool		amsdu, immediate;
+	uint8_t		token, tid;
+	uint16_t	size, timeout, ssn;
+};
+
+/*
+ * A block ack request of the access point's to this station, read from a management frame. False for anything else: both
+ * addresses are checked, a protected frame is not one (PMF is not built), a traffic class above 7 is not ours, and a DELBA
+ * from the recipient's side is about what we send, which the firmware keeps.
+ */
+static inline bool
+fa_ba_read(const uint8_t *frame, unsigned length, const uint8_t *own, const uint8_t *bssid, struct fa_ba_ask *ask)
+{
+	unsigned header = FA_FRAME_HEADER, left, params;
+	const uint8_t *at;
+
+	memset(ask, 0, sizeof(*ask));
+	if (length < FA_FRAME_HEADER || frame[0] != FA_KIND_ACTION || (frame[1] & 0x40) != 0) {
+		return (false);
+	}
+	header += (frame[1] & 0x80) != 0 ? FA_FRAME_HT_CONTROL : 0;
+	if (length < header + 2 || memcmp(frame + 4, own, 6) != 0 || memcmp(frame + 10, bssid, 6) != 0 || memcmp(frame + 16, bssid, 6) != 0) {
+		return (false);
+	}
+	at = frame + header;
+	left = length - header;
+	if (at[0] != FA_ACTION_BLOCK_ACK) {
+		return (false);
+	}
+	if (at[1] == FA_BA_ADDBA_REQUEST) {
+		if (left < 9) {
+			return (false);
+		}
+		params = at[3] | (unsigned)at[4] << 8;
+		if (((params >> 2) & 0x0f) >= FA_BA_TIDS) {
+			return (false);
+		}
+		ask->start = true;
+		ask->token = at[2];
+		ask->amsdu = (params & 1) != 0;
+		ask->immediate = (params & 2) != 0;
+		ask->tid = (uint8_t)((params >> 2) & 0x0f);
+		ask->size = (uint16_t)(params >> 6);
+		ask->timeout = (uint16_t)(at[5] | at[6] << 8);
+		ask->ssn = (uint16_t)((at[7] | at[8] << 8) >> 4);
+		return (true);
+	}
+	if (at[1] == FA_BA_DELBA) {
+		if (left < 6) {
+			return (false);
+		}
+		params = at[2] | (unsigned)at[3] << 8;
+		if ((params & 0x0800) == 0 || (params >> 12) >= FA_BA_TIDS) {
+			return (false);
+		}
+		ask->tid = (uint8_t)(params >> 12);
+		return (true);
+	}
+	return (false);
+}
+
+/* The window we take: what was asked for (0: leaves it to us), never above what the link's kind and the radio can have. */
+static inline unsigned
+fa_ba_size(unsigned asked, unsigned link_most, unsigned radio_most)
+{
+	unsigned size = asked == 0 || asked > link_most ? link_most : asked;
+
+	return (radio_most != 0 && size > radio_most ? radio_most : size);
+}
+
+/* Our answer to an ADDBA request. The number of bytes, 0 when they do not fit. */
+static inline unsigned
+fa_addba_response(uint8_t *out, unsigned size, const uint8_t *own, const uint8_t *bssid, const struct fa_ba_ask *ask, unsigned status, unsigned window)
+{
+	unsigned params = (ask->amsdu ? 1u : 0u) | (ask->immediate ? 2u : 0u) | (unsigned)ask->tid << 2 | window << 6;
+
+	if (size < FA_ADDBA_RESPONSE_LENGTH) {
+		return (0);
+	}
+	fa_frame_header(out, FA_KIND_ACTION, own, bssid);
+	out += FA_FRAME_HEADER;
+	out[0] = FA_ACTION_BLOCK_ACK;
+	out[1] = FA_BA_ADDBA_RESPONSE;
+	out[2] = ask->token;
+	out[3] = (uint8_t)status;
+	out[4] = (uint8_t)(status >> 8);
+	out[5] = (uint8_t)params;
+	out[6] = (uint8_t)(params >> 8);
+	out[7] = (uint8_t)ask->timeout;
+	out[8] = (uint8_t)(ask->timeout >> 8);
+	return (FA_ADDBA_RESPONSE_LENGTH);
+}
+
 enum fa_rx_kind { FA_RX_ELSE, FA_RX_BEACON, FA_RX_MANAGEMENT, FA_RX_DATA };
 
 /*

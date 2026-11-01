@@ -344,6 +344,62 @@
       "file": "wmi.c",
       "find": "\tif (ret == -EAGAIN)\n\t\tath12k_warn(wmi_ab->ab, \"wmi command %d timeout\\n\", cmd_id);\n",
       "replace": "\tif (ret == -EAGAIN)\n\t\tath12k_warn(wmi_ab->ab, \"wmi command %d timeout\\n\", cmd_id);\n\tfa_wmi_command(wmi_ab->ab, cmd_id, ret);\n"
+    },
+    {
+      "id": "ath12k-dst-ring-barrier-always",
+      "why": "w-ios1 panicked under load after msdu_done failures: a stale destination descriptor is the theory. dst_num_free() with sync updates cached_hp, and try_again then sees hp == cached_hp and skips this barrier: rx_process starts with done = false, so an empty poll goes that way. Always order the head pointer before the descriptor.",
+      "tree": "ath12k",
+      "file": "hal.c",
+      "find": "\t\tif (hp != srng->u.dst_ring.cached_hp) {\n\t\t\tsrng->u.dst_ring.cached_hp = hp;\n\t\t\t/* Make sure descriptor is read after the head\n\t\t\t * pointer.\n\t\t\t */\n\t\t\tdma_rmb();\n\t\t}\n",
+      "replace": "\t\tsrng->u.dst_ring.cached_hp = hp;\n\t\t/* Make sure descriptor is read after the head\n\t\t * pointer, whoever read it last.\n\t\t */\n\t\tdma_rmb();\n"
+    },
+    {
+      "id": "ath12k-dst-ring-barrier-sync",
+      "why": "The same order for the other reader of a destination ring head pointer.",
+      "tree": "ath12k",
+      "file": "hal.c",
+      "find": "\t\thp = *srng->u.dst_ring.hp_addr;\n\t\tsrng->u.dst_ring.cached_hp = hp;\n",
+      "replace": "\t\thp = *srng->u.dst_ring.hp_addr;\n\t\tsrng->u.dst_ring.cached_hp = hp;\n\t\tdma_rmb();\n"
+    },
+    {
+      "id": "ath12k-rx-stale-reo",
+      "why": "A descriptor whose buffer was already reaped has no skb, and rxcb would be read from NULL. Counted and said, so a run shows whether descriptors are seen twice.",
+      "tree": "ath12k",
+      "file": "wifi7/dp_rx.c",
+      "find": "\t\tmsdu = desc_info->skb;\n\t\tdesc_info->skb = NULL;\n\n\t\tlist_add_tail(&desc_info->list, &rx_desc_used_list[device_id]);\n",
+      "replace": "\t\tmsdu = desc_info->skb;\n\t\tif (unlikely(!msdu)) {\n\t\t\tfa_rx_stale(\"reo\", ring_id, srng->u.dst_ring.tp);\n\t\t\tcontinue;\n\t\t}\n\t\tdesc_info->skb = NULL;\n\n\t\tlist_add_tail(&desc_info->list, &rx_desc_used_list[device_id]);\n"
+    },
+    {
+      "id": "ath12k-rx-stale-err-buf",
+      "why": "The same dereference on the REO exception path.",
+      "tree": "ath12k",
+      "file": "wifi7/dp_rx.c",
+      "find": "\tmsdu = desc_info->skb;\n\tdesc_info->skb = NULL;\n\n\tlist_add_tail(&desc_info->list, used_list);\n",
+      "replace": "\tmsdu = desc_info->skb;\n\tif (unlikely(!msdu)) {\n\t\tfa_rx_stale(\"exception\", -1, 0);\n\t\treturn -EINVAL;\n\t}\n\tdesc_info->skb = NULL;\n\n\tlist_add_tail(&desc_info->list, used_list);\n"
+    },
+    {
+      "id": "ath12k-rx-stale-err-drop",
+      "why": "The same dereference where an exception buffer is dropped.",
+      "tree": "ath12k",
+      "file": "wifi7/dp_rx.c",
+      "find": "\tmsdu = desc_info->skb;\n\tdesc_info->skb = NULL;\n\tlist_add_tail(&desc_info->list, list);\n",
+      "replace": "\tmsdu = desc_info->skb;\n\tif (unlikely(!msdu)) {\n\t\tfa_rx_stale(\"exception drop\", -1, 0);\n\t\treturn -EINVAL;\n\t}\n\tdesc_info->skb = NULL;\n\tlist_add_tail(&desc_info->list, list);\n"
+    },
+    {
+      "id": "ath12k-rx-stale-wbm",
+      "why": "The same dereference on the WBM error path.",
+      "tree": "ath12k",
+      "file": "wifi7/dp_rx.c",
+      "find": "\t\tmsdu = desc_info->skb;\n\t\tdesc_info->skb = NULL;\n\n\t\tdevice_id = desc_info->device_id;\n",
+      "replace": "\t\tmsdu = desc_info->skb;\n\t\tif (unlikely(!msdu)) {\n\t\t\tfa_rx_stale(\"wbm\", -1, 0);\n\t\t\tcontinue;\n\t\t}\n\t\tdesc_info->skb = NULL;\n\n\t\tdevice_id = desc_info->device_id;\n"
+    },
+    {
+      "id": "ath12k-rx-msdu-not-done-count",
+      "why": "w-ios1 said this about nine times before the panic. Counted beside the stale count, so the next run shows whether they go together. The warning stays.",
+      "tree": "ath12k",
+      "file": "wifi7/dp_rx.c",
+      "find": "\t\tath12k_warn(dp->ab, \"msdu_done bit in msdu_end is not set\\n\");\n",
+      "replace": "\t\tfa_rx_msdu_not_done();\n\t\tath12k_warn(dp->ab, \"msdu_done bit in msdu_end is not set\\n\");\n"
     }
   ]
 }

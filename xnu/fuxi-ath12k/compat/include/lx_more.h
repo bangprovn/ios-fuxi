@@ -121,6 +121,8 @@ void fa_radio_mac(u8 *mac);		/* src/fa_80211.c: design section 4, station.addres
 struct ath12k_base;
 bool fa_stage_htc_ready(struct ath12k_base *ab);	/* src/fa_hif.c: stops ath12k_core_start at stage 1 */
 bool fa_stage_registered(struct ath12k_base *ab);	/* src/fa_hif.c: stops the hardware group's start at stage 2 */
+void fa_rx_stale(const char *where, int ring, u32 tp);	/* src/fa_80211.c: a descriptor with no buffer behind it, counted */
+void fa_rx_msdu_not_done(void);				/* src/fa_80211.c: counted, the warning stays */
 void fa_wmi_event(u32 id, u32 length);			/* src/fa_hif.c: the order firmware's WMI events come in */
 bool fa_stage_up(struct ath12k_base *ab);		/* src/fa_hif.c: stage 4's scan, and the stop of the group's start after it */
 void fa_wmi_command(struct ath12k_base *ab, u32 id, int result);	/* src/fa_hif.c: stage 4, what was sent; a timeout is evidence */

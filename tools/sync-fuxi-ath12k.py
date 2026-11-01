@@ -75,13 +75,122 @@ def ios_selection():
                                         fromfile='a/bsd/dev/fuxi_wifi_ios.c', tofile='b/bsd/dev/fuxi_wifi_ios.c'))
 
 
+# The black screen of w-ios1: who holds the registry busy while configd's namer waits. Logs only, in the file 0104 adds.
+STACK_SOURCE = ROOT / 'xnu/fuxi-wifi-ios/FuxiNetworkStack.cpp'
+STACK_HELPER_FIND = """class IONetworkStackUserClient : public IOUserClient
+"""
+STACK_HELPER = """/*
+ * Patch 0117, kernel-metal4wifi only. The theory of w-ios1's five minutes of black screen: configd's namer waits for the
+ * registry to go quiet. This says who keeps it busy, at the open and later, and when the root gets there. It only looks.
+ */
+#include <IOKit/IORegistryEntry.h>
+#include <kern/clock.h>
+#include <kern/thread_call.h>
+#include <libkern/OSAtomic.h>
+
+#define FUXI_BUSY_LINES_MOST    40
+#define FUXI_BUSY_SECONDS_MOST  300
+
+static thread_call_t fuxi_busy_call;
+static volatile UInt32 fuxi_busy_started;
+static unsigned fuxi_busy_seconds;
+static bool fuxi_busy_quiet;
+
+static void
+fuxi_busy_round(unsigned seconds)
+{
+	IOService * root = IOService::getServiceRoot();
+	IORegistryIterator * walk;
+	IORegistryEntry * entry;
+	unsigned said = 0, more = 0;
+
+	IOLog("FUXI ATH12K: M8 busy: %u s after the open, the root's state is %u\\n", seconds, (unsigned) root->getBusyState());
+	walk = IORegistryIterator::iterateOver(root, gIOServicePlane, kIORegistryIterateRecursively);
+	if (walk == NULL) {
+		IOLog("FUXI ATH12K: M8 busy: no walk\\n");
+		return;
+	}
+	while ((entry = walk->getNextObject()) != NULL) {
+		IOService * service = OSDynamicCast(IOService, entry);
+
+		if (service == NULL || service->getBusyState() == 0) {
+			continue;
+		}
+		if (said < FUXI_BUSY_LINES_MOST) {
+			IOLog("FUXI ATH12K: M8 busy: %s \\"%s\\" %u\\n", entry->getMetaClass()->getClassName(), entry->getName(), (unsigned) service->getBusyState());
+			said++;
+		} else {
+			more++;
+		}
+	}
+	if (!walk->isValid()) {
+		IOLog("FUXI ATH12K: M8 busy: the registry changed, this walk is cut\\n");
+	}
+	if (more != 0) {
+		IOLog("FUXI ATH12K: M8 busy: %u more\\n", more);
+	}
+	walk->release();
+}
+
+static void
+fuxi_busy_tick(thread_call_param_t, thread_call_param_t)
+{
+	unsigned seconds = fuxi_busy_seconds++;
+
+	if (!fuxi_busy_quiet && IOService::getServiceRoot()->getBusyState() == 0) {
+		fuxi_busy_quiet = true;
+		IOLog("FUXI ATH12K: M8 busy: the root reached 0, %u s after the open\\n", seconds);
+	}
+	if (seconds == 0 || seconds == 30 || seconds == 60 || seconds == 120 || seconds == FUXI_BUSY_SECONDS_MOST) {
+		fuxi_busy_round(seconds);
+	}
+	if (seconds < FUXI_BUSY_SECONDS_MOST) {
+		uint64_t deadline;
+
+		clock_interval_to_deadline(1, kSecondScale, &deadline);
+		thread_call_enter_delayed(fuxi_busy_call, deadline);
+	}
+}
+
+static void
+fuxi_busy_watch(void)
+{
+	if (!OSCompareAndSwap(0, 1, &fuxi_busy_started)) {
+		return;
+	}
+	fuxi_busy_call = thread_call_allocate(fuxi_busy_tick, NULL);
+	if (fuxi_busy_call == NULL) {
+		IOLog("FUXI ATH12K: M8 busy: no thread call\\n");
+		return;
+	}
+	thread_call_enter(fuxi_busy_call);
+}
+
+"""
+STACK_START_FIND = """	    (unsigned) IOService::getServiceRoot()->getBusyState());
+	return true;
+"""
+STACK_START = """	    (unsigned) IOService::getServiceRoot()->getBusyState());
+	fuxi_busy_watch();
+	return true;
+"""
+
+
+def stack_watch():
+    before = STACK_SOURCE.read_text()
+    assert before.count(STACK_HELPER_FIND) == 1 and before.count(STACK_START_FIND) == 1
+    after = before.replace(STACK_HELPER_FIND, STACK_HELPER + STACK_HELPER_FIND).replace(STACK_START_FIND, STACK_START)
+    return ''.join(difflib.unified_diff(before.splitlines(True), after.splitlines(True),
+                                        fromfile='a/iokit/Kernel/arm/FuxiNetworkStack.cpp', tofile='b/iokit/Kernel/arm/FuxiNetworkStack.cpp'))
+
+
 def new_file(source, dest):
     return ''.join(difflib.unified_diff([], (ROOT / source).read_text().splitlines(True),
                                         fromfile='/dev/null', tofile='b/' + dest))
 
 
 def expected_0117():
-    return CONF + MAKEINC + ''.join(new_file(*pair) for pair in NEW_FILES) + ios_selection()
+    return CONF + MAKEINC + ''.join(new_file(*pair) for pair in NEW_FILES) + ios_selection() + stack_watch()
 
 
 def expected_0099():

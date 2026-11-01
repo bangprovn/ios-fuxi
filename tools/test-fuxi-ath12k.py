@@ -535,7 +535,7 @@ struct cfg80211_scan_request {
 #include <linux/workqueue.h>
 #define D80211_TODO 1
 struct ieee80211_vif; struct ieee80211_sta; struct ieee80211_txq; struct ieee80211_chanctx_conf; struct napi_struct;
-struct ieee80211_hw { struct wiphy *wiphy; void *priv; size_t vif_data_size, sta_data_size, chanctx_data_size; unsigned long flags; struct { uint32_t listen_interval; } conf; };
+struct ieee80211_hw { struct wiphy *wiphy; void *priv; size_t vif_data_size, sta_data_size, chanctx_data_size; unsigned long flags; uint16_t max_rx_aggregation_subframes; struct { uint32_t listen_interval; } conf; };
 enum ieee80211_sta_state { IEEE80211_STA_NOTEXIST, IEEE80211_STA_NONE, IEEE80211_STA_AUTH, IEEE80211_STA_ASSOC, IEEE80211_STA_AUTHORIZED };
 enum { IEEE80211_STA_RX_BW_20 = 1 }; enum { IEEE80211_SMPS_OFF = 1 };
 enum { IEEE80211_AC_VO, IEEE80211_AC_VI, IEEE80211_AC_BE, IEEE80211_AC_BK };
@@ -577,6 +577,8 @@ struct ieee80211_vif {
     uint8_t drv_priv[0] __attribute__((aligned(64)));
 };
 struct ieee80211_scan_request { struct { int x; } ies; struct cfg80211_scan_request req; };
+enum ieee80211_ampdu_mlme_action { IEEE80211_AMPDU_RX_START, IEEE80211_AMPDU_RX_STOP };
+struct ieee80211_ampdu_params { struct ieee80211_sta *sta; enum ieee80211_ampdu_mlme_action action; uint16_t buf_size, timeout, ssn; uint8_t tid; bool amsdu; };
 struct ieee80211_ops {
     int (*start)(struct ieee80211_hw *); void (*stop)(struct ieee80211_hw *, bool);
     int (*add_interface)(struct ieee80211_hw *, struct ieee80211_vif *); void (*remove_interface)(struct ieee80211_hw *, struct ieee80211_vif *);
@@ -591,6 +593,7 @@ struct ieee80211_ops {
     void (*flush)(struct ieee80211_hw *, struct ieee80211_vif *, u32, bool);
     void (*tx)(struct ieee80211_hw *, struct ieee80211_tx_control *, struct sk_buff *);
     int (*set_key)(struct ieee80211_hw *, enum set_key_cmd, struct ieee80211_vif *, struct ieee80211_sta *, struct ieee80211_key_conf *);
+    int (*ampdu_action)(struct ieee80211_hw *, struct ieee80211_vif *, struct ieee80211_ampdu_params *);
 };
 struct ieee80211_tx_status { struct sk_buff *skb; struct ieee80211_tx_info *info; };
 enum ieee80211_iface_iter { IEEE80211_IFACE_ITER_NORMAL };
@@ -1235,6 +1238,19 @@ static void eapol_sent(struct ieee80211_hw *hw, struct sk_buff *skb) {
     struct ieee80211_tx_status s = { .skb = skb, .info = IEEE80211_SKB_CB(skb) };
     linuxkpi_ieee80211_tx_status_ext(hw, &s);
 }
+/* Only stage 8 may come here, never from the poll thread (give_action asserts it). */
+static unsigned ba_calls, action_sent, action_length; static int ba_fail; static struct ieee80211_ampdu_params ba_last; static uint8_t action[64]; static bool on_poll;
+static int op_ampdu(struct ieee80211_hw *hw, struct ieee80211_vif *v, struct ieee80211_ampdu_params *p) {
+    assert(hw->wiphy->mtx.locked && radio_of(hw)->ios && !on_poll && !locks && p->sta == radio_of(hw)->sta && p->sta != NULL);
+    ba_calls++; ba_last = *p;
+    NOTE(p->action == IEEE80211_AMPDU_RX_START ? "ba_start" : "ba_stop");
+    return p->action == IEEE80211_AMPDU_RX_START ? ba_fail : 0;
+}
+static void give_action(const uint8_t *from, const uint8_t *body, unsigned length) {
+    uint8_t f[80] = {0};
+    f[0] = FA_KIND_ACTION; memcpy(f + 4, OWN, 6); memcpy(f + 10, from, 6); memcpy(f + 16, from, 6); memcpy(f + 24, body, length);
+    on_poll = true; deliver(f, 24 + length, 2412, -40, 0, false); on_poll = false;
+}
 static int op_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd, struct ieee80211_vif *v, struct ieee80211_sta *s, struct ieee80211_key_conf *k) {
     bool pairwise = (k->flags & IEEE80211_KEY_FLAG_PAIRWISE) != 0;
     assert(hw->wiphy->mtx.locked && k->cipher == WLAN_CIPHER_SUITE_CCMP && k->keylen == 16 && k->iv_len == 8 && k->link_id == -1 && (cmd == DISABLE_KEY || radio_of(hw)->ios ? radio_of(hw)->reached >= IEEE80211_STA_ASSOC : radio_of(hw)->reached == IEEE80211_STA_ASSOC));
@@ -1336,6 +1352,8 @@ static void op_tx(struct ieee80211_hw *hw, struct ieee80211_tx_control *c, struc
         NOTE("auth"); auth_tries++; assert(skb->len == FA_AUTH_LENGTH); memcpy(last_auth, skb->data, skb->len);
     } else if (kind == FA_KIND_ASSOC_REQUEST) {
         NOTE("assoc"); assoc_tries++; memcpy(last_assoc, skb->data, skb->len); last_assoc_length = skb->len;
+    } else if (kind == FA_KIND_ACTION) {
+        NOTE("action"); action_sent++; action_length = skb->len; assert(skb->len <= sizeof(action)); memcpy(action, skb->data, skb->len);
     } else if (kind == FA_KIND_DEAUTH) {
         NOTE("deauth"); deauths++; assert(skb->len == FA_DEAUTH_LENGTH); memcpy(last_deauth, skb->data, skb->len);
     } else {
@@ -1377,7 +1395,7 @@ static void op_tx(struct ieee80211_hw *hw, struct ieee80211_tx_control *c, struc
 static const struct ieee80211_ops ops = { .start = op_start, .stop = op_stop, .add_interface = op_add, .remove_interface = op_remove,
     .hw_scan = op_scan, .cancel_hw_scan = op_cancel, .add_chanctx = op_add_chanctx, .remove_chanctx = op_remove_chanctx,
     .assign_vif_chanctx = op_assign, .unassign_vif_chanctx = op_unassign, .sta_state = op_sta_state, .link_info_changed = op_link,
-    .vif_cfg_changed = op_vif, .conf_tx = op_conf_tx, .flush = op_flush, .tx = op_tx, .set_key = op_set_key };
+    .vif_cfg_changed = op_vif, .conf_tx = op_conf_tx, .flush = op_flush, .tx = op_tx, .set_key = op_set_key, .ampdu_action = op_ampdu };
 
 static struct linuxkpi_ieee80211_channel two[3], five[3];
 static struct ieee80211_rate rates[12];
@@ -1393,7 +1411,7 @@ static void fresh(void) {
     auth_tries = assoc_tries = deauths = scans = link_changes = 0; first_link_change = second_link_change = 0;
     memset(last_deauth, 0, sizeof(last_deauth)); tick = NULL; seen_ssid_length = -2;
     the_hw = linuxkpi_ieee80211_alloc_hw(256, &ops);
-    the_hw->vif_data_size = 512; the_hw->sta_data_size = 256; the_hw->chanctx_data_size = 128;
+    the_hw->vif_data_size = 512; the_hw->sta_data_size = 256; the_hw->chanctx_data_size = 128; the_hw->max_rx_aggregation_subframes = 1024;
     struct wiphy *w = the_hw->wiphy;
     memcpy(w->perm_addr, OWN, 6);
     memset(two, 0, sizeof(two)); memset(five, 0, sizeof(five));
@@ -1442,6 +1460,7 @@ static void stay_frames(void) {
     if (ticks == 5) hear(FA_KIND_BEACON, AP, NAME, ap.cap, OPEN_HT, sizeof(OPEN_HT), 2437, -41);
     if (ticks == 6) hear(FA_KIND_BEACON, OTHER, "other", 0, OPEN_HT, 0, 2437, -11);
     if (ticks == 7) hear(FA_KIND_BEACON, AP, NULL, ap.cap, OPEN_HT, sizeof(OPEN_HT), 2437, -42);	/* it hides its name now: the same access point */
+    if (ticks == 8) { static const uint8_t ASK[9] = { 3, 0, 1, 0x03, 0x10, 0, 0, 0, 0 }; give_action(AP, ASK, 9); }	/* stages 5 to 7 do not answer this: op_ampdu and op_tx would say */
 }
 static void trouble_in_the_stay(void) { stay_frames(); if (ticks == 5) fa_m4_evidence("died"); }
 static void door_in_the_stay(void) { stay_frames(); if (ticks == 5) { ticks = 200; give_door(FA_KIND_DEAUTH, 8); } }
@@ -1910,6 +1929,53 @@ int main(void) {
         eth[12] = 0x88; eth[13] = 0x8e; assert(!fa_ios_tx(eth, 60)); eth[12] = 0; eth[13] = 60; assert(!fa_ios_tx(eth, 60)); eth[12] = 8; eth[13] = 0;
         eth[6] ^= 2; assert(!fa_ios_tx(eth, 60)); eth[6] ^= 2;
         radio->ios_said = 0; ios_step(radio); assert(SAID("M8 joined: rx ok 0 dropped unprotected 0"));
+        /* Block ack: heard on the poll thread, done on the stage's own, answered in the standard's bytes. */
+        {
+            static const uint8_t ADDBA[9] = { 3, 0, 0x5a, 0x17, 0x08, 0xe8, 0x03, 0x30, 0x12 }, WANT[9] = { 3, 1, 0x5a, 0, 0, 0x17, 0x08, 0xe8, 0x03 };
+            static const uint8_t DELBA[6] = { 3, 2, 0x00, 0x58, 37, 0 }, DELBA_OURS[6] = { 3, 2, 0x00, 0x50, 37, 0 };
+            uint8_t b[9];
+            calls[0] = 0; ba_calls = 0; action_sent = 0;
+            give_action(AP, ADDBA, 9);
+            assert(!ba_calls && (radio->ios_pending & IOS_BA) && radio->ba_want == 1u << 5);
+            ios_step(radio);
+            assert(!strcmp(calls, "ba_start,action,") && ba_last.tid == 5 && ba_last.buf_size == 32 && ba_last.ssn == 0x123 && ba_last.timeout == 1000 && ba_last.amsdu && ba_last.sta == radio->sta);
+            assert(SAID("M8 block-ack tid 5: size 32, result 0") && radio->ba_live == 1u << 5 && action_sent == 1 && action_length == 33 && !memcmp(action + 24, WANT, 9));
+            /* Again for a live class: it restarts. */
+            calls[0] = 0; give_action(AP, ADDBA, 9); ios_step(radio); assert(!strcmp(calls, "ba_stop,ba_start,action,") && radio->ba_live == 1u << 5);
+            /* No size says ours; too large is cut to what HT has. */
+            memcpy(b, ADDBA, 9); b[3] = 0x03; b[4] = 0; give_action(AP, b, 9); ios_step(radio); assert(ba_last.tid == 0 && ba_last.buf_size == 64 && radio->ba_live == (1u << 5 | 1u));
+            assert((action[29] | action[30] << 8) >> 6 == 64);
+            memcpy(b, ADDBA, 9); b[3] = 0x07; b[4] = 0xfa; give_action(AP, b, 9); ios_step(radio); assert(ba_last.tid == 1 && ba_last.buf_size == 64);
+            /* Refused by the driver or for its policy: status 37, the class not live, frames still pass. */
+            calls[0] = 0; ba_fail = -5; memcpy(b, ADDBA, 9); b[3] = 0x0b; b[4] = 0x08; give_action(AP, b, 9); ios_step(radio); ba_fail = 0;
+            assert(!strcmp(calls, "ba_start,action,") && action[27] == 37 && !(radio->ba_live & 1u << 2) && SAID("M8 block-ack tid 2: size 32, result -5"));
+            calls[0] = 0; memcpy(b, ADDBA, 9); b[3] = 0x0d; b[4] = 0x08; give_action(AP, b, 9); ios_step(radio);
+            assert(!strcmp(calls, "action,") && action[27] == 37 && SAID("M8 block-ack tid 3: size 0, result -"));
+            assert(fa_ios_tx(eth, 60) == 1);
+            /* DELBA: the class stops, nothing is sent. The recipient's own, another's and a broken one move nothing. */
+            calls[0] = 0; give_action(AP, DELBA, 6); ios_step(radio); assert(!strcmp(calls, "ba_stop,") && !(radio->ba_live & 1u << 5));
+            calls[0] = 0; give_action(AP, DELBA_OURS, 6); give_action(OTHER, ADDBA, 9); give_action(AP, ADDBA, 8);
+            assert(!(radio->ios_pending & IOS_BA)); ios_step(radio); assert(!calls[0]);
+            /* What the run reads: the counts in the joined line, and a limit on the stale lines. */
+            radio->ios_said = 0; fa_rx_stale("reo", 3, 64); fa_rx_msdu_not_done(); ios_step(radio);
+            assert(SAID("rx descriptor with no buffer, reo, ring 3 tp 64, number 1") && SAID("block-ack 4 refused 2 stopped 2") && SAID("stale 1, msdu not done 1\n"));
+            for (int i = 0; i < 40; i++) fa_rx_stale("wbm", -1, 0);
+            { unsigned lines = 0; for (const char *at = said; (at = strstr(at, "rx descriptor with no buffer")) != NULL; at++) lines++; assert(lines == FA_RX_STALE_SAID); }
+            /* What is live goes back before the keys and the peer, without a word to the access point. */
+            give_action(AP, ADDBA, 9); ios_step(radio); assert(radio->ba_live != 0);
+            calls[0] = 0; deauths = 0;
+            assert(fa_ios_leave() == FA_IOS_DONE && strstr(calls, "deauth,flush,ba_stop,ba_stop,ba_stop,off_g,off_p,sta43,") && !radio->ba_live && !radio->ba_want);
+            m8_again();
+            assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_DONE && !radio->ba_live);
+            /* Loss: no goodbye, and live classes back. */
+            give_action(AP, ADDBA, 9); ios_step(radio); assert(radio->ba_live == 1u << 5);
+            calls[0] = 0; deauths = 0; m8.losts = 0; m8.downs = 0; give_door(FA_KIND_DEAUTH, 7); ios_step(radio);
+            assert(strstr(calls, "ba_stop,off_g,off_p,") && !strstr(calls, "action") && !deauths && m8.losts == 1 && !radio->ba_live);
+            m8_again();
+            assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_DONE);
+            m8.ups = 1; m8.downs = 0; m8.losts = 0; calls[0] = 0;
+        }
+
 
         /* RX: deciphered data as Ethernet, outside the lock (m8_rx asserts it). Design W3: unciphered is dropped. */
         m8.rx = 0;
@@ -2329,6 +2395,39 @@ static void he_and_streams(void) {
 static void kinds(void) {
     uint8_t f[40] = {0};
     memcpy(f + 10, AP, 6); memcpy(f + 16, AP, 6);
+    /* Block ack: the requests of the access point, and our answer, by the standard's bytes. */
+    {
+        uint8_t f[80] = {0}; struct fa_ba_ask ask;
+        static const uint8_t ADDBA[9] = { 3, 0, 0x5a, 0x17, 0x08, 0xe8, 0x03, 0x30, 0x12 };	/* A-MSDU, immediate, tid 5, 32; 1000 TU; SSN 0x123 */
+        f[0] = FA_KIND_ACTION; memcpy(f + 4, OWN, 6); memcpy(f + 10, AP, 6); memcpy(f + 16, AP, 6); memcpy(f + 24, ADDBA, 9);
+        assert(fa_ba_read(f, 33, OWN, AP, &ask) && ask.start && ask.amsdu && ask.immediate && ask.token == 0x5a && ask.tid == 5 && ask.size == 32 && ask.timeout == 1000 && ask.ssn == 0x123);
+        for (unsigned i = 0; i < 33; i++) {
+            uint8_t *exact = malloc(i ? i : 1); memcpy(exact, f, i);
+            assert(!fa_ba_read(exact, i, OWN, AP, &ask));
+            free(exact);
+        }
+        assert(!fa_ba_read(f, 33, OTHER, AP, &ask) && !fa_ba_read(f, 33, OWN, OTHER, &ask));
+        f[1] = 0x40; assert(!fa_ba_read(f, 33, OWN, AP, &ask)); f[1] = 0;
+        memcpy(f + 16, OTHER, 6); assert(!fa_ba_read(f, 33, OWN, AP, &ask)); memcpy(f + 16, AP, 6);
+        f[0] = FA_KIND_AUTH; assert(!fa_ba_read(f, 33, OWN, AP, &ask)); f[0] = FA_KIND_ACTION;
+        f[24] = 4; assert(!fa_ba_read(f, 33, OWN, AP, &ask)); f[24] = 3;
+        f[25] = 1; assert(!fa_ba_read(f, 33, OWN, AP, &ask)); f[25] = 7; assert(!fa_ba_read(f, 33, OWN, AP, &ask)); f[25] = 0;
+        f[27] = (uint8_t)(f[27] | 0x20); assert(!fa_ba_read(f, 33, OWN, AP, &ask)); f[27] &= (uint8_t)~0x20;	/* traffic class 13 */
+        /* With an HT control field in the header. */
+        memmove(f + 28, f + 24, 9); memset(f + 24, 0, 4); f[1] = 0x80;
+        assert(fa_ba_read(f, 37, OWN, AP, &ask) && ask.tid == 5); assert(!fa_ba_read(f, 36, OWN, AP, &ask));
+        memmove(f + 24, f + 28, 9); f[1] = 0;
+        /* DELBA: the originator's stops the class; the recipient's is about what we send. */
+        { static const uint8_t D[6] = { 3, 2, 0x00, 0x58, 37, 0 }; memcpy(f + 24, D, 6);
+          assert(fa_ba_read(f, 30, OWN, AP, &ask) && !ask.start && ask.tid == 5); assert(!fa_ba_read(f, 29, OWN, AP, &ask));
+          f[27] = 0x50; assert(!fa_ba_read(f, 30, OWN, AP, &ask)); f[27] = 0xd8; assert(!fa_ba_read(f, 30, OWN, AP, &ask)); }
+        assert(fa_ba_size(32, FA_BA_SIZE_HT, 1024) == 32 && fa_ba_size(0, FA_BA_SIZE_HT, 1024) == 64 && fa_ba_size(1000, FA_BA_SIZE_HE, 1024) == 256 && fa_ba_size(0, 64, 16) == 16 && fa_ba_size(8, 64, 0) == 8);
+        { struct fa_ba_ask a = { .start = true, .amsdu = true, .immediate = true, .token = 0x5a, .tid = 5, .size = 32, .timeout = 1000 };
+          static const uint8_t WANT[9] = { 3, 1, 0x5a, 0, 0, 0x17, 0x08, 0xe8, 0x03 };
+          assert(fa_addba_response(f, FA_ADDBA_RESPONSE_LENGTH - 1, OWN, AP, &a, 0, 32) == 0);
+          assert(fa_addba_response(f, sizeof(f), OWN, AP, &a, 0, 32) == 33 && f[0] == FA_KIND_ACTION && !memcmp(f + 4, AP, 6) && !memcmp(f + 10, OWN, 6) && !memcmp(f + 16, AP, 6) && !memcmp(f + 24, WANT, 9));
+          assert(fa_addba_response(f, sizeof(f), OWN, AP, &a, 37, 32) == 33 && f[27] == 37 && f[28] == 0); }
+    }
     /* Stage 6's frames: the wanted protection, what an RSN element offers, the handshake's frames. */
     {
         static const uint8_t GOOD[] = { 48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 2, 0, 0 };
@@ -2920,6 +3019,49 @@ def stage_8_is_reached_from_stage_8_alone(tmp):
     # A passphrase never reaches the driver domain.
     for path in (own / 'fa_80211.c', own / 'fa_ios.h', own / 'fa_xnu.h'):
         assert 'passphrase' not in code_only(path.read_text()).lower(), path.name
+
+@check
+def rx_ring_order_and_stale_buffers_are_edited_in(tmp):
+    """w-ios1's panic: the edits that order every destination ring's head pointer, count what is stale and keep the warning."""
+    edits = {e['id']: e for e in json.loads((ROOT / 'tools/ath12k-edits.json').read_text())['edits']}
+    always = edits['ath12k-dst-ring-barrier-always']['replace']
+    assert 'if (' not in always and always.index('cached_hp = hp') < always.index('dma_rmb()')
+    assert edits['ath12k-dst-ring-barrier-sync']['replace'].endswith('dma_rmb();\n')
+    for name in ('reo', 'err-buf', 'err-drop', 'wbm'):
+        edit = edits['ath12k-rx-stale-' + name]
+        assert edit['file'] == 'wifi7/dp_rx.c' and edit['replace'].index('fa_rx_stale(') < edit['replace'].index('desc_info->skb = NULL')
+    done = edits['ath12k-rx-msdu-not-done-count']
+    assert 'fa_rx_msdu_not_done();' in done['replace'] and done['find'].strip() in done['replace']
+    # No retry and nothing that hides the cause.
+    for edit in edits.values():
+        if edit['id'].startswith('ath12k-rx-'):
+            assert 'goto try_again' not in edit['replace'] and 'udelay' not in edit['replace']
+
+
+@check
+def block_ack_is_stage_8_alone(tmp):
+    """Stages 4 to 7 do not answer: the frame goes on as it did, and only the stage's own thread calls the driver."""
+    text = (ROOT / 'xnu/fuxi-ath12k/src/fa_80211.c').read_text()
+    assert "radio->ios && skb->data[0] == FA_KIND_ACTION" in text
+    assert text.count('ops->ampdu_action') == 3
+    assert text.index('ba_stop_all(radio);') < text.index('key_take_back(radio, &radio->group_key, false);')
+
+
+@check
+def busy_watch_is_in_patch_0117_alone(tmp):
+    """The black screen's diagnostic: only kernel-metal4wifi has it, it looks and changes nothing, and says no name of a network."""
+    source = (ROOT / 'xnu/fuxi-wifi-ios/FuxiNetworkStack.cpp').read_text()
+    assert 'M8 busy' not in source and 'fuxi_busy' not in source
+    for patch in sorted((ROOT / 'xnu/patches').glob('*.patch')):
+        if patch.name != '0117-fuxi-ath12k.patch':
+            assert 'M8 busy' not in patch.read_text(errors='surrogateescape'), patch.name
+    patch = (ROOT / 'xnu/patches/0117-fuxi-ath12k.patch').read_text()
+    hunk = patch[patch.index('--- a/iokit/Kernel/arm/FuxiNetworkStack.cpp'):]
+    added = '\n'.join(line[1:] for line in hunk.splitlines() if line.startswith('+') and not line.startswith('+++'))
+    assert 'M8 busy: the root reached 0' in added and 'FUXI_BUSY_LINES_MOST    40' in added and 'seconds == 30' in added and 'fuxi_busy_watch();' in added
+    for word in ('adjustBusy', 'setProperty', 'terminate', 'waitQuiet', 'ssid', 'address', 'SSID'):
+        assert word not in added, word
+
 
 
 FA_BSS_DRIVER = r"""

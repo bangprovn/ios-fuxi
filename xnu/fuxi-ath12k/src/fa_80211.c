@@ -136,9 +136,33 @@ struct fa_radio {
 	unsigned group_slot;
 	unsigned rx_replay, rx_no_key, rx_long;
 	unsigned long long ios_said;
+	/* block ack: the requests of each traffic class, from the poll thread to the stage's own */
+	struct fa_ba_ask ba_asked[FA_BA_TIDS];
+	unsigned char ba_want, ba_live;
+	unsigned ba_started, ba_refused, ba_stopped;
 };
 
-enum { IOS_EAPOL = 1, IOS_LOSS = 2, IOS_DEAD = 4 };
+enum { IOS_EAPOL = 1, IOS_LOSS = 2, IOS_DEAD = 4, IOS_BA = 8 };
+
+/* What wifi7/dp_rx.c saw (tools/ath12k-edits.json): a descriptor with no buffer behind it, and a buffer that is not done. */
+static volatile unsigned rx_stale, rx_not_done;
+#define FA_RX_STALE_SAID	16
+
+void
+fa_rx_stale(const char *where, int ring, u32 tp)
+{
+	unsigned count = __sync_add_and_fetch(&rx_stale, 1);
+
+	if (count <= FA_RX_STALE_SAID) {
+		lx_tell("FUXI ATH12K: rx descriptor with no buffer, %s, ring %d tp %u, number %u\n", where, ring, tp, count);
+	}
+}
+
+void
+fa_rx_msdu_not_done(void)
+{
+	__sync_add_and_fetch(&rx_not_done, 1);
+}
 
 enum { SCAN_NONE, SCAN_RUNNING, SCAN_OVER, SCAN_ABORTED };
 
@@ -948,6 +972,19 @@ join_rx(struct fa_radio *radio, struct sk_buff *skb, const struct ieee80211_rx_s
 		}
 		break;
 	case FA_RX_MANAGEMENT:
+		if (radio->ios && skb->data[0] == FA_KIND_ACTION) {
+			struct fa_ba_ask ask;
+
+			if (radio->sta != NULL && fa_ba_read(skb->data, skb->len, radio->vif->addr, radio->target.address, &ask)) {
+				radio->ba_asked[ask.tid] = ask;
+				radio->ba_want |= (unsigned char)(1u << ask.tid);
+				radio->ios_pending |= IOS_BA;
+				lx_os_wakeup(&radio->ios_pending);
+			} else {
+				radio->link_others++;
+			}
+			break;
+		}
 		fa_reply_read(&reply, skb->data, skb->len, radio->vif->addr, radio->target.address);
 		if (reply.answer == FA_ANSWER_NONE) {
 			radio->link_others++;
@@ -1654,6 +1691,26 @@ key_give(struct fa_radio *radio, const uint8_t *key, unsigned index, bool pairwi
 	return (0);
 }
 
+/* What is live goes before the peer does, without a DELBA: the deauthentication has said it all (mac80211, sta_info.c). */
+static void
+ba_stop_all(struct fa_radio *radio)
+{
+	if (radio->ba_live == 0) {
+		return;
+	}
+	wiphy_lock(radio->wiphy);
+	for (unsigned tid = 0; tid < FA_BA_TIDS; tid++) {
+		if ((radio->ba_live & (1u << tid)) != 0) {
+			struct ieee80211_ampdu_params params = { .sta = radio->sta, .action = IEEE80211_AMPDU_RX_STOP, .tid = (uint8_t)tid };
+
+			(void)radio->ops->ampdu_action(&radio->hw, radio->vif, &params);
+			radio->ba_stopped++;
+		}
+	}
+	wiphy_unlock(radio->wiphy);
+	radio->ba_live = 0;
+}
+
 static void
 key_take_back(struct fa_radio *radio, struct ieee80211_key_conf **given, bool pairwise)
 {
@@ -1822,6 +1879,7 @@ station_leave(struct fa_radio *radio)
 		}
 	}
 	if (radio->sta != NULL) {
+		ba_stop_all(radio);
 		key_take_back(radio, &radio->group_key, false);
 		key_take_back(radio, &radio->pairwise_key, true);
 	}
@@ -2551,6 +2609,8 @@ ios_clean(struct fa_radio *radio)
 	}
 	lx_os_lock();
 	radio->eapol_length = 0;
+	radio->ba_want = 0;
+	radio->ba_live = 0;
 	radio->ios_pending &= IOS_DEAD;
 	memset(&radio->group_pn, 0, sizeof(radio->group_pn));
 	lx_os_unlock();
@@ -2630,6 +2690,66 @@ ios_eapol(struct fa_radio *radio)
 	}
 }
 
+/*
+ * The access point's block ack requests, on this thread: the driver's call sends WMI commands, whose answers the poll thread
+ * must be free to see (mac80211: agg-rx.c). One for a live class stops that first. A delayed policy is declined.
+ */
+static void
+ios_ba(struct fa_radio *radio)
+{
+	for (unsigned tid = 0; tid < FA_BA_TIDS; tid++) {
+		struct ieee80211_ampdu_params params = { .sta = radio->sta, .tid = (uint8_t)tid };
+		struct sk_buff *skb;
+		struct fa_ba_ask ask;
+		uint8_t *bytes;
+		unsigned window = 0;
+		bool wanted;
+		int result = -EOPNOTSUPP;
+
+		lx_os_lock();
+		wanted = (radio->ba_want & (1u << tid)) != 0;
+		ask = radio->ba_asked[tid];
+		radio->ba_want &= (unsigned char)~(1u << tid);
+		lx_os_unlock();
+		if (!wanted || radio->sta == NULL) {
+			continue;
+		}
+		wiphy_lock(radio->wiphy);
+		if ((radio->ba_live & (1u << tid)) != 0) {
+			params.action = IEEE80211_AMPDU_RX_STOP;
+			(void)radio->ops->ampdu_action(&radio->hw, radio->vif, &params);
+			radio->ba_live &= (unsigned char)~(1u << tid);
+			radio->ba_stopped++;
+		}
+		if (ask.start && ask.immediate) {
+			window = fa_ba_size(ask.size, radio->sta->deflink.he_cap.has_he ? FA_BA_SIZE_HE : FA_BA_SIZE_HT, radio->hw.max_rx_aggregation_subframes);
+			params.action = IEEE80211_AMPDU_RX_START;
+			params.buf_size = (uint16_t)window;
+			params.timeout = ask.timeout;
+			params.ssn = ask.ssn;
+			params.amsdu = ask.amsdu;
+			result = radio->ops->ampdu_action(&radio->hw, radio->vif, &params);
+			if (result == 0) {
+				radio->ba_live |= (unsigned char)(1u << tid);
+			}
+		}
+		wiphy_unlock(radio->wiphy);
+		if (!ask.start) {
+			lx_tell("FUXI ATH12K: M8 block-ack tid %u: stopped by the access point\n", tid);
+			continue;
+		}
+		radio->ba_started += result == 0;
+		radio->ba_refused += result != 0;
+		lx_tell("FUXI ATH12K: M8 block-ack tid %u: size %u, result %d\n", tid, window, result);
+		if ((skb = frame_new(radio, FA_ADDBA_RESPONSE_LENGTH, &bytes)) == NULL) {
+			lx_tell("FUXI ATH12K: M8 no buffer for the answer to block-ack tid %u\n", tid);
+			continue;
+		}
+		(void)fa_addba_response(bytes, FA_ADDBA_RESPONSE_LENGTH, radio->vif->addr, radio->target.address, &ask, result == 0 ? 0 : FA_STATUS_DECLINED, result == 0 ? window : ask.size);
+		frame_send(radio, skb);
+	}
+}
+
 /* What the thread does each time it wakes. Apart from the thread itself so that the host test can run it. */
 static void
 ios_step(struct fa_radio *radio)
@@ -2654,11 +2774,14 @@ ios_step(struct fa_radio *radio)
 	} else if ((pending & IOS_EAPOL) != 0 && radio->ios_joined) {
 		ios_eapol(radio);
 	}
+	if ((pending & IOS_BA) != 0 && radio->ios_joined) {
+		ios_ba(radio);
+	}
 	if (radio->ios_joined && lx_os_nanoseconds() - radio->ios_said >= FA_IOS_SAY_EVERY_NS) {
 		radio->ios_said = lx_os_nanoseconds();
-		lx_tell("FUXI ATH12K: M8 joined: rx ok %u dropped unprotected %u, played again %u, no key %u, too long %u; sent %u, done %u acked %u dropped %u; beacons %u losses %u\n",
+		lx_tell("FUXI ATH12K: M8 joined: rx ok %u dropped unprotected %u, played again %u, no key %u, too long %u; sent %u, done %u acked %u dropped %u; beacons %u losses %u; block-ack %u refused %u stopped %u; stale %u, msdu not done %u\n",
 		    radio->rx_ok, radio->rx_clear, radio->rx_replay, radio->rx_no_key, radio->rx_long, radio->net_sent, radio->data_done, radio->data_acked, radio->tx_dropped,
-		    radio->link_beacons, radio->beacon_losses);
+		    radio->link_beacons, radio->beacon_losses, radio->ba_started, radio->ba_refused, radio->ba_stopped, rx_stale, rx_not_done);
 		fa_m5_rx_ring("while joined");
 	}
 	ios_gate_out(radio);
