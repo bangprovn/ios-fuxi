@@ -29,7 +29,7 @@ thread_t current_thread(void);
 void thread_deallocate(thread_t);
 kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
 int PE_parse_boot_argn(const char *, void *, int);
-void panic(const char *, ...);
+__attribute__((noreturn)) void panic(const char *, ...);
 typedef int dev_t;
 typedef void *proc_t;
 typedef char *caddr_t;
