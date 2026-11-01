@@ -127,6 +127,8 @@ int fa_firmware_ready(const struct fa_caps *caps, unsigned stage) {
 }
 void fa_stop(void) { fa_stops++; assert(!mhi_depth); }
 void fa_set_radio_mac(const unsigned char *mac) { memcpy(seen_mac,mac,6); macs_set++; }
+static unsigned autos_set, seen_auto_length;
+void fa_set_auto_join(const unsigned char *name, unsigned length, const unsigned char *key) { assert(length<=32 && key!=NULL); seen_auto_length=length; autos_set++; }
 static unsigned joins_set, seen_join_length; static unsigned char seen_join_name[32], seen_join_key[32];
 void fa_set_target_join(const unsigned char *name, unsigned length, const unsigned char *key) { assert(length<=32);memcpy(seen_join_name,name,length);memcpy(seen_join_key,key,32);seen_join_length=length;joins_set++; }
 void fa_set_target_ssid(const unsigned char *name, unsigned length) { assert(length<=sizeof(seen_ssid));memcpy(seen_ssid,name,length);seen_ssid_length=length;ssids_set++; }
@@ -182,6 +184,12 @@ int main(void) {
         assert(strstr(logbuf,"network name length 8, key given") && !strstr(logbuf,"Mi2 test"));
         wl_fa_stage=7;wl_fa_join_configure();assert(joins_set==2);
         wl_fa_stage=5;wl_fa_join_configure();assert(joins_set==2);	/* no other stage reads it */
+        /* Stage 8 does not look at it, unless it is told to with exactly 1; and then it is the auto join's, not a target. */
+        wl_fa_stage=8;dt_join=good;dt_join_size=sizeof(good);auto_arg=0;wl_fa_join_configure();assert(!autos_set && joins_set==2);
+        auto_arg=2;wl_fa_join_configure();assert(!autos_set && joins_set==2);
+        auto_arg=1;wl_fa_join_configure();assert(autos_set==1 && seen_auto_length==8 && joins_set==2);
+        dt_join=NULL;wl_fa_join_configure();assert(autos_set==1);
+        auto_arg=0;
         wl_fa_stage=6;dt_join=NULL;joins_set=0;
     }
     ath12k_arg=7;wl_fa_configure();assert(wl_fa_stage==7);
@@ -356,9 +364,10 @@ def main():
     preamble = preamble.replace('return 0x12345; }', 'return (uint64_t)sleeps*1000000ull; }')
     assert 'static bool PE_parse_boot_argn(const char *name, void *out, int size) {' in preamble
     preamble = preamble.replace('static bool PE_parse_boot_argn(const char *name, void *out, int size) {',
-                                'static int ath12k_arg;\nstatic const char *mac_arg;\nstatic const char *ssid_arg;\nstatic bool PE_parse_boot_argn(const char *name, void *out, int size) {\n'
+                                'static int ath12k_arg;\nstatic int auto_arg;\nstatic const char *mac_arg;\nstatic const char *ssid_arg;\nstatic bool PE_parse_boot_argn(const char *name, void *out, int size) {\n'
                                 '    if(!strcmp(name,"fuxiwifimac")){if(!mac_arg)return false;strlcpy(out,mac_arg,size);return true;}\n'
                                 '    if(!strcmp(name,"fuxiwifissid")){if(!ssid_arg)return false;strlcpy(out,ssid_arg,size);return true;}\n'
+                                '    if(!strcmp(name,"fuxiwifiauto")){if(!auto_arg)return false;memcpy(out,&auto_arg,size);return true;}\n'
                                 '    if(!strcmp(name,"fuxiath12k")){if(!ath12k_arg)return false;memcpy(out,&ath12k_arg,size);return true;}')
     m6.PREAMBLE = PREAMBLE_HEAD + preamble + PREAMBLE_TAIL
     w15.w14.TESTS = TESTS

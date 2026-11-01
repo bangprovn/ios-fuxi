@@ -111,8 +111,12 @@ void fuxi_wlan_init(void);
  *   /chosen fuxi-wifi-join  with fuxiath12k=6 or 7: what boot/add-wifi-adt.py put in the device tree, a length, the
  *                 network's name, its 32-byte key. Not a boot argument: those reach the logs. Without it stages 6, 7
  *                 does no radio work.
+ *   fuxiwifiauto=1  with fuxiath12k=8: also read /chosen fuxi-wifi-join, and join that network once when the radio is up,
+ *                 with nobody on iOS's side asking. Without it stage 8 does not look at that property. iOS's side leaving or
+ *                 joining wins, and a loss is not followed by another join.
  *   fuxiath12kq=MASK  with fuxiath12k=4 to 7: 0x1 no idle power save, 0x2 no hw mode command, 0x8 settle
- *                 after vdev create, 0x10 passive scan. Read and logged by the driver domain.
+ *                 after vdev create, 0x10 passive scan, 0x20 stage 7 answers ARP and echoes for 240 s, for a load from the
+ *                 network. Read and logged by the driver domain.
  *   fuxiwifimac=aa:bb:cc:dd:ee:ff  with fuxiath12k: the radio's address, instead of the locally
  *                 administered default. Malformed, all-zero or group addresses are refused, and say so.
  */
@@ -1087,7 +1091,10 @@ wl_fa_join_configure(void)
 	void const *value = NULL;
 	unsigned int size = 0;
 	const unsigned char *bytes;
-	if (wl_fa_stage != 6 && wl_fa_stage != 7) { return; }
+	int wants_auto = 0;
+	if (wl_fa_stage == 8) {
+		if (!PE_parse_boot_argn("fuxiwifiauto", &wants_auto, sizeof(wants_auto)) || wants_auto != 1) { return; }
+	} else if (wl_fa_stage != 6 && wl_fa_stage != 7) { return; }
 	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
 	    SecureDTGetProperty(chosen, "fuxi-wifi-join", &value, &size) != kSuccess) {
 		printf("FUXI ATH12K: no network in the device tree, so no radio work\n");
@@ -1099,6 +1106,10 @@ wl_fa_join_configure(void)
 		return;
 	}
 	printf("FUXI ATH12K: network name length %u, key given\n", bytes[0]);
+	if (wl_fa_stage == 8) {
+		fa_set_auto_join(bytes + 1, bytes[0], bytes + 1 + bytes[0]);
+		return;
+	}
 	fa_set_target_join(bytes + 1, bytes[0], bytes + 1 + bytes[0]);
 }
 #endif /* FUXI_ATH12K */

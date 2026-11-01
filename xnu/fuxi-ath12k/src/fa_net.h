@@ -411,6 +411,77 @@ fa_echo_read(const uint8_t *datagram, unsigned size, const uint8_t *from, const 
 	    fa_be16(icmp + 4) == id && fa_be16(icmp + 6) == sequence && fa_ip_sum(icmp, length) == 0);
 }
 
+/* ---- answering, for stage 7's load test ------------------------------------------------------------------- */
+
+/* Whether this is an ARP request for `own_address`. */
+static inline bool
+fa_arp_asks_for(const uint8_t *body, unsigned length, const uint8_t *own_address)
+{
+	static const uint8_t head[8] = { 0, 1, 8, 0, 6, 4, 0, 1 };
+
+	return (length >= FA_ARP_LENGTH && memcmp(body, head, sizeof(head)) == 0 && memcmp(body + 24, own_address, 4) == 0);
+}
+
+/* The answer to such a request, for the hardware address at body + 8. The number of bytes, 0 when it is not one or does not fit. */
+static inline unsigned
+fa_arp_reply(uint8_t *out, unsigned size, const uint8_t *own, const uint8_t *own_address, const uint8_t *body, unsigned length)
+{
+	static const uint8_t head[8] = { 0, 1, 8, 0, 6, 4, 0, 2 };
+
+	if (size < FA_ARP_LENGTH || !fa_arp_asks_for(body, length, own_address)) {
+		return (0);
+	}
+	memcpy(out, head, sizeof(head));
+	memcpy(out + 8, own, 6);
+	memcpy(out + 14, own_address, 4);
+	memcpy(out + 18, body + 8, 6);
+	memcpy(out + 24, body + 14, 4);
+	return (FA_ARP_LENGTH);
+}
+
+/* The ICMP message of an echo request to `own_address` with a right checksum, or NULL. *length is its size. */
+static inline const uint8_t *
+fa_echo_asks(const uint8_t *datagram, unsigned size, const uint8_t *own_address, unsigned *length)
+{
+	const uint8_t *icmp = fa_ip_read(datagram, size, FA_PROTO_ICMP, length);
+
+	if (icmp == NULL || *length < 8 || memcmp(datagram + 16, own_address, 4) != 0 || icmp[0] != 8 || icmp[1] != 0 || fa_ip_sum(icmp, *length) != 0) {
+		return (NULL);
+	}
+	return (icmp);
+}
+
+/* The answer to such a request, with its identifier, number and data. The number of bytes, 0 when it is not one or does not fit. */
+static inline unsigned
+fa_echo_reply(uint8_t *out, unsigned size, const uint8_t *own_address, const uint8_t *datagram, unsigned length)
+{
+	unsigned message;
+	const uint8_t *icmp = fa_echo_asks(datagram, length, own_address, &message);
+
+	if (icmp == NULL || message > size || size - message < FA_IP_HEADER) {
+		return (0);
+	}
+	fa_ip_header(out, FA_PROTO_ICMP, own_address, datagram + 12, FA_IP_HEADER + message, fa_be16(datagram + 4));
+	memcpy(out + FA_IP_HEADER, icmp, message);
+	out[FA_IP_HEADER] = 0;
+	out[FA_IP_HEADER + 2] = out[FA_IP_HEADER + 3] = 0;
+	fa_put16(out + FA_IP_HEADER + 2, fa_ip_sum(out + FA_IP_HEADER, message));
+	return (FA_IP_HEADER + message);
+}
+
+/* Whether the poll thread should keep this while stage 7 answers: a request that is for us. */
+static inline bool
+fa_net_served(unsigned type, const uint8_t *body, unsigned length, const uint8_t *own_address)
+{
+	unsigned message;
+
+	if (length > FA_NET_MOST) {
+		return (false);
+	}
+	return ((type == FA_TYPE_ARP && fa_arp_asks_for(body, length, own_address)) ||
+	    (type == FA_TYPE_IP && fa_echo_asks(body, length, own_address, &message) != NULL));
+}
+
 /* Whether the poll thread should keep this for the join: an ARP answer, an echo answer, or something for the DHCP client port. */
 static inline bool
 fa_net_wanted(unsigned type, const uint8_t *body, unsigned length)

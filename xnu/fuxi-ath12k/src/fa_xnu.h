@@ -44,6 +44,7 @@ FA_PUBLIC int	fa_firmware_ready(const struct fa_caps *caps, unsigned stage);	/* 
 FA_PUBLIC void	fa_stop(void);			/* rings and registers left alone from now on; repeatable */
 FA_PUBLIC void	fa_set_radio_mac(const unsigned char *mac);	/* before fa_firmware_ready(): station.address */
 FA_PUBLIC void	fa_set_target_ssid(const unsigned char *name, unsigned length);	/* before it, stage 5: the open network, 1-32 bytes */
+FA_PUBLIC void	fa_set_auto_join(const unsigned char *name, unsigned length, const unsigned char *key);	/* before it, stage 8, fuxiwifiauto=1: join this once it is up */
 FA_PUBLIC void	fa_set_target_join(const unsigned char *name, unsigned length, const unsigned char *key);	/* before it, stage 6: the network and its 32-byte key */
 
 /* ---- stage 8: the radio for iOS. bsd/dev/fuxi_ath12k_ios.c is the other side. Plain answers: the domains' errno differ. ---- */
@@ -78,6 +79,7 @@ struct fa_ios_input {
 	void	(*rx)(const unsigned char *frame, unsigned long length);
 	void	(*link)(int up);
 	void	(*lost)(int answer);
+	void	(*joined_alone)(int answer);	/* an auto join that nobody on iOS's side asked for came to this */
 };
 
 FA_PUBLIC void	fa_ios_start(const struct fa_ios_input *input);	/* once, before the radio is up; sends nothing yet */

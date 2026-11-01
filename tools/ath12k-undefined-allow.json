@@ -10,6 +10,7 @@
     "fa_ios_start",
     "fa_ios_state",
     "fa_ios_tx",
+    "fa_set_auto_join",
     "fa_set_radio_mac",
     "fa_set_target_join",
     "fa_set_target_ssid",

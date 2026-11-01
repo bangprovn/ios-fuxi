@@ -74,6 +74,7 @@ _Static_assert(ATH12K_MAX_SPT_ENTRIES * 8 == ATH12K_PAGE_SIZE, "fuxi-ath12k R2: 
 #define FA_KNOB_ONE_CREDIT	0x04u		/* the design's "one credit": not built, its bit kept */
 #define FA_KNOB_SETTLE		0x08u		/* wait after the vdev create command, before its first set_param */
 #define FA_KNOB_PASSIVE		0x10u		/* passive scan: nothing is sent over the air */
+#define FA_KNOB_SERVE		0x20u		/* stage 7: answer ARP and echoes for a while, for a load from the network */
 #define FA_SETTLE_MS		1000u
 
 #define FA_CREDIT_STALL_NS	(10 * 1000000000ull)	/* of no WMI credit at all, while a scan runs and nothing else is asked */
@@ -601,6 +602,9 @@ fa_stage_up(struct ath12k_base *ab)
 	}
 	if (hif.stage == FA_STAGE_ADDRESS) {
 		fa_m7_ask();
+		if ((hif.knobs & FA_KNOB_SERVE) != 0) {
+			fa_m7_serve();
+		}
 	}
 	hif.stage_error = hif.stage == FA_STAGE_JOIN || hif.stage == FA_STAGE_WPA || hif.stage == FA_STAGE_ADDRESS ? fa_m5_station(ath12k_ar_to_hw(ar), (hif.knobs & FA_KNOB_PASSIVE) != 0) :
 	    fa_m4_station(ath12k_ar_to_hw(ar), (hif.knobs & FA_KNOB_PASSIVE) != 0);
@@ -707,9 +711,9 @@ fa_firmware_ready(const struct fa_caps *caps, unsigned stage)
 			ath12k_debug_mask |= ATH12K_DBG_MAC;
 		}
 		hif.knobs = lx_os_option("fuxiath12kq");
-		lx_tell("FUXI ATH12K: M4 knobs %#x: no idle ps %d no hw mode %d settle %d passive %d%s\n", hif.knobs,
+		lx_tell("FUXI ATH12K: M4 knobs %#x: no idle ps %d no hw mode %d settle %d passive %d serve %d%s\n", hif.knobs,
 		    (hif.knobs & FA_KNOB_NO_IDLE_PS) != 0, (hif.knobs & FA_KNOB_NO_HW_MODE) != 0, (hif.knobs & FA_KNOB_SETTLE) != 0,
-		    (hif.knobs & FA_KNOB_PASSIVE) != 0, (hif.knobs & FA_KNOB_ONE_CREDIT) != 0 ? "; one credit is not built" : "");
+		    (hif.knobs & FA_KNOB_PASSIVE) != 0, (hif.knobs & FA_KNOB_SERVE) != 0, (hif.knobs & FA_KNOB_ONE_CREDIT) != 0 ? "; one credit is not built" : "");
 	}
 
 	ab = ath12k_core_alloc(&device, 0, ATH12K_BUS_PCI);

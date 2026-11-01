@@ -67,10 +67,19 @@ ios_lost(int answer)
 	fuxi_wifi_sta_lost(ios_errno(answer));
 }
 
+/* The Apple80211 side hears of it as of any other link: it did not ask, and what it then does is for a run to show. */
+static void
+ios_joined_alone(int answer)
+{
+	if (answer == FA_IOS_DONE) {
+		fuxi_wifi_apple80211_event(FUXI_WIFI_STA_LINK, 1);
+	}
+}
+
 static void
 ios_start(const struct fuxi_wifi_input *input)
 {
-	static const struct fa_ios_input driver = { .rx = ios_rx, .link = ios_link, .lost = ios_lost };
+	static const struct fa_ios_input driver = { .rx = ios_rx, .link = ios_link, .lost = ios_lost, .joined_alone = ios_joined_alone };
 
 	ios_input = input;
 	fa_ios_start(&driver);

@@ -9,7 +9,8 @@
  * listening, and away again. Stage 6 joins one WPA2 network the same way, with its key from fuxi_wlan.c: between the
  * association and the authorized state comes the four-way handshake, then the two keys. The key itself and what is made
  * from it are never said, and are wiped on the way out. Stage 7 then asks for an address by DHCP, finds the router, sends
- * it and a host beyond it one echo, and gives the address back: all from here, nothing above this layer. Stage 8 does not
+ * it and a host beyond it one echo, and gives the address back: all from here, nothing above this layer. With fuxiath12kq=0x20 it also
+ * answers ARP and echoes for four minutes, so that a host on the network can load the receive path. Stage 8 does not
  * stop: it is the radio for iOS, whose side says what to scan and join and takes the frames. What stands in for mac80211 without
  * doing its work logs its name at runtime through STUB(). The probe request offers legacy rates only.
  *
@@ -111,6 +112,8 @@ struct fa_radio {
 	unsigned rx_ok, rx_clear;		/* with the keys in: data the radio deciphered, and data it did not */
 	/* the address of stage 7 */
 	volatile bool net_on;			/* the poll thread keeps what fa_net_wanted() wants, once it was deciphered */
+	volatile bool serving;			/* ... and what fa_net_served() wants: stage 7's load test */
+	unsigned served_arp, served_echo;
 	struct { unsigned type, length; uint8_t from[6]; uint8_t bytes[FA_NET_MOST]; } inbox[FA_INBOX];
 	unsigned inbox_first, inbox_count, inbox_lost;
 	bool leased;
@@ -121,6 +124,10 @@ struct fa_radio {
 	bool ios;
 	volatile bool ios_joined;		/* frames pass, under the layer's lock */
 	volatile unsigned ios_pending;		/* what the thread is to do: below */
+	volatile bool ios_powered;		/* iOS's side has asked for the radio */
+	volatile bool ios_wifid_asked;		/* it has left or joined: an auto join gives way for good */
+	bool ios_auto_joined;			/* the network now joined is the auto join's */
+	unsigned long long ios_up_at;
 	volatile bool ios_gate;			/* one of station thread and ios_step() at a time */
 	volatile unsigned ios_tx_busy;
 	bool ios_dead;
@@ -200,6 +207,8 @@ enum { SCAN_NONE, SCAN_RUNNING, SCAN_OVER, SCAN_ABORTED };
 #define FA_ARP_ANSWER_NS	(500 * 1000000ull)
 #define FA_ECHO_ANSWER_NS	(1000 * 1000000ull)
 #define FA_NET_LOOK_NS		(20 * 1000000ull)
+#define FA_SERVE_NS		(240 * 1000000000ull)
+#define FA_SERVE_SAY_NS		(10 * 1000000000ull)
 
 /* The address of the network an interface has joined while it has joined none: mac.c compares beacons with it. */
 static const uint8_t no_network[ETH_ALEN];
@@ -216,6 +225,10 @@ static unsigned target_name_length;
 static uint8_t target_key[32];			/* stage 6: wiped when the join is over */
 static bool target_protected;
 static bool target_address;			/* stage 7 */
+static bool target_serve;			/* stage 7, fuxiath12kq=0x20 */
+/* Stage 8, fuxiwifiauto=1: a network to join with nobody asking, once. The key is wiped when it is used or given up. */
+static uint8_t auto_name[FA_SSID_MOST], auto_key[32];
+static unsigned auto_name_length;
 
 /* find_sta has only the interface to go by, and there is one radio. */
 static struct fa_radio *the_radio;
@@ -244,6 +257,7 @@ fa_set_target_ssid(const unsigned char *name, unsigned length)
 {
 	target_protected = false;
 	target_address = false;
+	target_serve = false;
 	target_name_length = length >= 1 && length <= FA_SSID_MOST ? length : 0;
 	if (target_name_length != 0) {
 		memcpy(target_name, name, target_name_length);
@@ -266,6 +280,13 @@ void
 fa_m7_ask(void)
 {
 	target_address = true;
+}
+
+/* From fa_hif.c on stage 7, fuxiath12kq=0x20: with an address, it answers for a while before the stay. */
+void
+fa_m7_serve(void)
+{
+	target_serve = true;
 }
 
 /* tools/ath12k-edits.json, ath12k-mac-override. mac.c has no device-address fallback. */
@@ -864,7 +885,8 @@ join_data_count(struct fa_radio *radio, const struct sk_buff *skb, const struct 
 	}
 	radio->rx_ok++;
 	if (!radio->net_on || !fa_data_read(skb->data, skb->len, (status->flag & RX_FLAG_8023) != 0, (status->flag & RX_FLAG_IV_STRIPPED) != 0,
-	    radio->vif->addr, radio->target.address, &data) || !fa_net_wanted(data.type, data.body, data.length)) {
+	    radio->vif->addr, radio->target.address, &data) || !(fa_net_wanted(data.type, data.body, data.length) ||
+	    (radio->serving && fa_net_served(data.type, data.body, data.length, radio->own_address)))) {
 		return;
 	}
 	if (radio->inbox_count == FA_INBOX) {
@@ -2381,6 +2403,61 @@ station_address(struct fa_radio *radio)
 	net_counts(radio, "after the echoes");
 }
 
+/* What the load test says every so often, so that a panic has recent numbers before it. */
+static void
+serve_counts(struct fa_radio *radio)
+{
+	lx_tell("FUXI ATH12K: M7 serving: rx ok %u sent %u done %u dropped %u, stale %u, msdu not done %u, inbox lost %u; arp %u echo %u\n", radio->rx_ok, radio->net_sent,
+	    radio->data_done, radio->tx_dropped, rx_stale, rx_not_done, radio->inbox_lost, radio->served_arp, radio->served_echo);
+	fa_m4_credits("while serving");
+	fa_m5_rx_ring("while serving");
+}
+
+/*
+ * Stage 7's load test: for a bounded time, ARP and echoes that are for us are answered from here, and what else comes is only
+ * counted by join_data_count(). Ends early when the access point shows us the door, the link goes, or the firmware is in trouble.
+ */
+static void
+station_serve(struct fa_radio *radio)
+{
+	static uint8_t in[FA_NET_MOST], out[FA_NET_MOST];
+	unsigned long long began = lx_os_nanoseconds(), said = began;
+
+	lx_os_lock();
+	radio->serving = true;
+	lx_os_unlock();
+	lx_tell("FUXI ATH12K: M7 serving for %llu s\n", FA_SERVE_NS / 1000000000ull);
+	for (;;) {
+		unsigned long long now = lx_os_nanoseconds(), until;
+		uint8_t from[6];
+		unsigned got, type, length;
+
+		if (now - began >= FA_SERVE_NS || radio->answer == FA_ANSWER_GONE || radio->lost || radio->went_protected || fa_m4_trouble()) {
+			break;
+		}
+		if (now - said >= FA_SERVE_SAY_NS) {
+			said = now;
+			serve_counts(radio);
+		}
+		until = said + FA_SERVE_SAY_NS < began + FA_SERVE_NS ? said + FA_SERVE_SAY_NS : began + FA_SERVE_NS;
+		if ((got = net_next(radio, until, &type, from, in)) == 0) {
+			continue;
+		}
+		if (type == FA_TYPE_ARP && (length = fa_arp_reply(out, sizeof(out), radio->vif->addr, radio->own_address, in, got)) != 0) {
+			radio->served_arp++;
+			(void)net_send(radio, in + 8, FA_TYPE_ARP, out, length);
+		} else if (type == FA_TYPE_IP && (length = fa_echo_reply(out, sizeof(out), radio->own_address, in, got)) != 0) {
+			radio->served_echo++;
+			(void)net_send(radio, from, FA_TYPE_IP, out, length);
+		}
+	}
+	lx_os_lock();
+	radio->serving = false;
+	lx_os_unlock();
+	serve_counts(radio);
+	lx_tell("FUXI ATH12K: M7 served %llu ms\n", (lx_os_nanoseconds() - began) / 1000000ull);
+}
+
 /* The address goes back: a lease on somebody's network is not left behind by a test. */
 static void
 station_address_back(struct fa_radio *radio)
@@ -2499,6 +2576,9 @@ fa_m5_station(struct ieee80211_hw *hw, bool passive)
 				if (joined) {
 					if (target_address) {
 						station_address(radio);
+						if (target_serve && radio->leased) {
+							station_serve(radio);
+						}
 					}
 					station_stay(radio);
 					station_address_back(radio);
@@ -2527,6 +2607,7 @@ fa_m5_station(struct ieee80211_hw *hw, bool passive)
 
 #define FA_IOS_READY_NS		(60 * 1000000000ull)
 #define FA_IOS_LOOK_NS		(100 * 1000000ull)
+#define FA_AUTO_WAIT_NS		(30 * 1000000000ull)
 #define FA_IOS_TX_DONE_NS	(1000 * 1000000ull)
 #define FA_IOS_SAY_EVERY_NS	(60 * 1000000000ull)
 
@@ -2534,6 +2615,35 @@ void
 fa_ios_start(const struct fa_ios_input *input)
 {
 	ios_input = *input;
+}
+
+/* Before fa_firmware_ready(), fuxiwifiauto=1 only. Anything but 1 to 32 bytes of name is no network. */
+void
+fa_set_auto_join(const unsigned char *name, unsigned length, const unsigned char *key)
+{
+	auto_name_length = length >= 1 && length <= FA_SSID_MOST ? length : 0;
+	if (auto_name_length != 0) {
+		memcpy(auto_name, name, auto_name_length);
+		memcpy(auto_key, key, sizeof(auto_key));
+	}
+}
+
+static void
+auto_forget(void)
+{
+	fa_wipe(auto_key, sizeof(auto_key));
+	auto_name_length = 0;
+}
+
+/* iOS's side has said what it wants: from here its word is the only one. Holding the gate. */
+static void
+auto_gives_way(struct fa_radio *radio, const char *what)
+{
+	radio->ios_auto_joined = false;
+	if (auto_name_length != 0) {
+		auto_forget();
+		lx_tell("FUXI ATH12K: M8 auto join: given up, wifid asked for %s\n", what);
+	}
 }
 
 /* One of the station thread and ios_step() at a time: a loss must not meet a join halfway. Each holds it for a bounded time. */
@@ -2750,6 +2860,8 @@ ios_ba(struct fa_radio *radio)
 	}
 }
 
+static void ios_auto_step(struct fa_radio *radio);
+
 /* What the thread does each time it wakes. Apart from the thread itself so that the host test can run it. */
 static void
 ios_step(struct fa_radio *radio)
@@ -2766,6 +2878,10 @@ ios_step(struct fa_radio *radio)
 	} else if ((pending & IOS_LOSS) != 0 && radio->ios_joined) {
 		int answer = FA_IOS_GONE;
 
+		if (radio->ios_auto_joined) {
+			radio->ios_auto_joined = false;
+			lx_tell("FUXI ATH12K: M8 auto join: the network is lost, not joining again\n");
+		}
 		lx_tell("FUXI ATH12K: M8 the network is lost: door %d, reason %u, connection %d, changed %d\n", radio->answer == FA_ANSWER_GONE, radio->reason, radio->lost, radio->went_protected);
 		ios_frames_stop(radio);
 		ios_phase(radio, FA_IOS_IDLE, answer);
@@ -2799,7 +2915,38 @@ ios_runs(void *argument)
 		}
 		lx_os_unlock();
 		ios_step(radio);
+		ios_auto_step(radio);
 	}
+}
+
+static int ios_join_run(struct fa_radio *radio, const unsigned char *ssid, unsigned ssid_length, const unsigned char *bssid, const unsigned char *key, bool alone);
+
+/* The auto join's own turn, on this thread with nothing else held. It joins as wifid would, and only once. */
+static void
+ios_auto_step(struct fa_radio *radio)
+{
+	uint8_t name[FA_SSID_MOST], key[32];
+	unsigned length;
+	int answer;
+
+	ios_gate_in(radio);
+	if (auto_name_length == 0 || (!radio->ios_powered && lx_os_nanoseconds() - radio->ios_up_at < FA_AUTO_WAIT_NS)) {
+		ios_gate_out(radio);
+		return;
+	}
+	length = auto_name_length;
+	memcpy(name, auto_name, length);
+	memcpy(key, auto_key, sizeof(key));
+	auto_forget();
+	ios_gate_out(radio);
+	lx_tell("FUXI ATH12K: M8 auto join: name of %u bytes\n", length);
+	answer = ios_join_run(radio, name, length, NULL, key, true);
+	fa_wipe(key, sizeof(key));
+	lx_tell("FUXI ATH12K: M8 auto join: answer %d\n", answer);
+	if (answer == FA_IOS_DONE) {
+		radio->ios_auto_joined = true;
+	}
+	ios_input.joined_alone(answer);
 }
 
 /* From the poll thread, which may not wait for the firmware's dump: it notes it. */
@@ -2844,6 +2991,7 @@ fa_m8_up(struct ieee80211_hw *hw)
 	if (fa_m4_trouble()) {
 		return (-EIO);
 	}
+	radio->ios_up_at = lx_os_nanoseconds();
 	error = lx_os_thread("fa-ios", ios_runs, radio);
 	if (error != 0) {
 		lx_tell("FUXI ATH12K: M8 no thread: %d\n", error);
@@ -2866,8 +3014,14 @@ fa_ios_power(int on)
 		lx_tell("FUXI ATH12K: M8 power %d: the radio is not up\n", on);
 		return (FA_IOS_NO_ANSWER);
 	}
+	if (on) {
+		radio->ios_powered = true;
+	} else {
+		radio->ios_wifid_asked = true;
+	}
 	ios_gate_in(radio);
 	if (!on) {
+		auto_gives_way(radio, "the radio off");
 		ios_frames_stop(radio);
 		ios_clean(radio);
 	}
@@ -2964,18 +3118,23 @@ ios_why(struct fa_radio *radio)
 	return (FA_IOS_REFUSED);
 }
 
-int
-fa_ios_join(const unsigned char *ssid, unsigned ssid_length, const unsigned char *bssid, const unsigned char *key)
+/* A join, from iOS's side or from the auto join, which gives way if iOS's side has spoken in the meantime. */
+static int
+ios_join_run(struct fa_radio *radio, const unsigned char *ssid, unsigned ssid_length, const unsigned char *bssid, const unsigned char *key, bool alone)
 {
-	struct fa_radio *radio = ios_wait();
 	struct fa_target *target;
 	bool joined = false;
 	int error = 0, answer = FA_IOS_DONE;
 
-	if (radio == NULL) {
-		return (FA_IOS_NO_ANSWER);
-	}
 	ios_gate_in(radio);
+	if (alone && radio->ios_wifid_asked) {
+		lx_tell("FUXI ATH12K: M8 auto join: given up, wifid has spoken\n");
+		ios_gate_out(radio);
+		return (FA_IOS_REFUSED);
+	}
+	if (!alone) {
+		auto_gives_way(radio, "a network");
+	}
 	if (radio->ios_dead || fa_m4_trouble()) {
 		ios_gate_out(radio);
 		return (FA_IOS_RADIO_DEAD);
@@ -3080,6 +3239,18 @@ fa_ios_join(const unsigned char *ssid, unsigned ssid_length, const unsigned char
 }
 
 int
+fa_ios_join(const unsigned char *ssid, unsigned ssid_length, const unsigned char *bssid, const unsigned char *key)
+{
+	struct fa_radio *radio = ios_wait();
+
+	if (radio == NULL) {
+		return (FA_IOS_NO_ANSWER);
+	}
+	radio->ios_wifid_asked = true;
+	return (ios_join_run(radio, ssid, ssid_length, bssid, key, false));
+}
+
+int
 fa_ios_leave(void)
 {
 	struct fa_radio *radio = ios_radio;
@@ -3087,7 +3258,9 @@ fa_ios_leave(void)
 	if (radio == NULL) {
 		return (FA_IOS_DONE);
 	}
+	radio->ios_wifid_asked = true;
 	ios_gate_in(radio);
+	auto_gives_way(radio, "no network");
 	ios_frames_stop(radio);
 	ios_clean(radio);
 	if (!radio->ios_dead) {

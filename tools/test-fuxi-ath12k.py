@@ -1158,8 +1158,25 @@ static void give_dhcp(unsigned kind, bool to_all) {
     give_net(FA_TYPE_IP, m, 20 + udp_length, to_all);
 }
 /* What the network hears from us: over the air, ciphered, after the keys. It answers from inside op_tx, as the fake's clock has no other time. */
+static struct { unsigned arps, echoes, wrong; bool given; } serve;
+static uint8_t net_last_to[6];
+static int serve_end;
+static void serve_tick(void);
 static void net_heard(const uint8_t *data, unsigned n, unsigned type) {
     assert(net.on && radio_of(the_hw)->reached == IEEE80211_STA_AUTHORIZED);
+    /* Answers of the load test: to whoever asked, by the bytes. */
+    if (type == FA_TYPE_ARP && n == 28 && data[7] == 2) {
+        static const uint8_t THEM[4] = {10, 0, 0, 77};
+        serve.arps++;
+        serve.wrong += memcmp(net_last_to, OTHER, 6) != 0 || memcmp(data + 8, OWN, 6) != 0 || memcmp(data + 14, V_ME, 4) != 0 || memcmp(data + 18, OTHER, 6) != 0 || memcmp(data + 24, THEM, 4) != 0;
+        return;
+    }
+    if (type == FA_TYPE_IP && n >= 28 && data[9] == 1 && data[20] == 0) {
+        static const uint8_t THEM[4] = {10, 0, 0, 77};
+        serve.echoes++;
+        serve.wrong += memcmp(net_last_to, OTHER, 6) != 0 || fa_ip_sum(data, 20) != 0 || fa_ip_sum(data + 20, n - 20) != 0 || memcmp(data + 12, V_ME, 4) != 0 || memcmp(data + 16, THEM, 4) != 0 || fa_be16(data + 24) != 0x4242;
+        return;
+    }
     if (type == FA_TYPE_ARP) {
         net.arps++;
         assert(n == 28 && data[7] == 1 && !memcmp(data + 14, V_ME, 4) && !memcmp(data + 24, V_GW, 4));
@@ -1192,7 +1209,9 @@ static uint8_t m8_sent[1600]; static unsigned m8_sent_length, m8_sent_count; sta
 static void m8_rx(const unsigned char *f, unsigned long n) { assert(!locks && n <= sizeof(m8.frame)); memcpy(m8.frame, f, n); m8.rx_length = n; m8.rx++; }
 static void m8_link(int up) { assert(!locks); if (up) m8.ups++; else m8.downs++; }
 static void m8_lost(int a) { assert(!locks); m8.losts++; m8.lost = a; }
-static const struct fa_ios_input M8_INPUT = { .rx = m8_rx, .link = m8_link, .lost = m8_lost };
+static unsigned m8_alones; static int m8_alone;
+static void m8_joined_alone(int answer) { m8_alones++; m8_alone = answer; }
+static const struct fa_ios_input M8_INPUT = { .rx = m8_rx, .link = m8_link, .lost = m8_lost, .joined_alone = m8_joined_alone };
 /* A data frame from the network: to us or to all, and in front of its payload a CCMP header with this number and key, when `cipher` is. */
 static void m8_give(bool to_all, unsigned flags, bool cipher, unsigned long long number, unsigned key, unsigned type, const uint8_t *body, unsigned length) {
     uint8_t f[1700] = {0}; unsigned at = 26;
@@ -1219,6 +1238,7 @@ static void eapol_sent(struct ieee80211_hw *hw, struct sk_buff *skb) {
         assert(skb->data[1] == 0x41 && IEEE80211_SKB_CB(skb)->control.hw_key == radio_of(hw)->pairwise_key && radio_of(hw)->pairwise_key != NULL && skb->priority == 0 && skb->protocol == cpu_to_be16(type));
         assert(!memcmp(skb->data + header, "\xaa\xaa\x03\x00\x00\x00", 6));
         uint8_t copy[1600]; unsigned n = skb->len - header - 8; memcpy(copy, skb->data + header + 8, n);
+        memcpy(net_last_to, skb->data + 16, 6);
         IEEE80211_SKB_CB(skb)->flags |= IEEE80211_TX_STAT_ACK;
         struct ieee80211_tx_status s = { .skb = skb, .info = IEEE80211_SKB_CB(skb) };
         linuxkpi_ieee80211_tx_status_ext(hw, &s);
@@ -1502,9 +1522,42 @@ static void fresh_wpa(const uint8_t *key) {
     tick = wpa_tick;
     memset(&net, 0, sizeof(net));
 }
-static void fresh_net(void) { fresh_wpa(V_PMK); fa_m7_ask(); net.on = true; }
+static void fresh_net(void) { fresh_wpa(V_PMK); fa_m7_ask(); net.on = true; memset(&serve, 0, sizeof(serve)); serve_end = 0; tick = serve_tick; }
 static void m8_count(const struct fa_heard *h, unsigned *count) { assert(h->age_ms < 200000); (*count)++; }
 static void m8_again(void) { unsigned s = wpa.fail_key = 0; memset(&wpa, 0, sizeof(wpa)); wpa.stayed = true; eapols = key_calls = s; tick = wpa_tick; }
+/* The network's side of the load test: what comes, once the join is answering or, without the knob, staying. */
+static bool serve_on;
+static int serve_end;
+static const uint8_t V_THEM[4] = {10, 0, 0, 77};
+static void give_arp_request(const uint8_t *wanted) {
+    uint8_t q[28]; memcpy(q, "\0\1\10\0\6\4\0\1", 8); memcpy(q + 8, OTHER, 6); memcpy(q + 14, V_THEM, 4); memset(q + 18, 0, 6); memcpy(q + 24, wanted, 4);
+    give_net(FA_TYPE_ARP, q, 28, true);
+}
+static void give_echo_request(const uint8_t *to, unsigned sequence) {
+    uint8_t e[FA_ECHO_LENGTH]; (void)fa_echo_request(e, sizeof(e), V_THEM, to, 0x4242, sequence);
+    give_net(FA_TYPE_IP, e, sizeof(e), false);
+}
+static void give_udp(void) {
+    uint8_t u[64] = {0}; fa_ip_header(u, 17, V_THEM, V_ME, sizeof(u), 3); u[23] = 9; u[25] = 44;
+    give_net(FA_TYPE_IP, u, sizeof(u), false);
+}
+static void serve_tick(void) {
+    struct fa_radio *r = radio_of(the_hw);
+    wpa_tick();
+    if (!serve_on || serve.given || !r->leased || (!r->serving && target_serve)) return;
+    if (!target_serve && !strstr(said, "M5 after 5 s")) return;
+    serve.given = true;
+    give_arp_request(V_ME);
+    give_arp_request(V_THEM);			/* for another: not kept */
+    give_echo_request(V_THEM, 1);		/* for another: not kept */
+    give_udp();					/* only counted */
+    give_echo_request(V_ME, 1);
+    /* More than the inbox holds, with nothing taken out in between: two are lost, and that is said. */
+    give_arp_request(V_ME); give_echo_request(V_ME, 2); give_arp_request(V_ME); give_echo_request(V_ME, 3);
+    if (serve_end == 1) give_door(FA_KIND_DEAUTH, 3);
+    if (serve_end == 2) { linuxkpi_ieee80211_connection_loss(r->vif); }
+    if (serve_end == 3) fa_m4_evidence("died");
+}
 static const uint8_t *find_in_request(unsigned number) { return fa_element(last_assoc + 28, last_assoc_length - 28, number); }
 /* What was said and done, when an assertion stops the run. */
 static void on_abort(int s) { fprintf(stderr, "calls: %s\nsaid:\n%s\n", calls, said); signal(SIGABRT, SIG_DFL); }
@@ -1827,6 +1880,58 @@ int main(void) {
     assert(fa_m5_station(the_hw, false) == 0 && !asked_bss_open);
     done();
 
+    /* ---- stage 7's load test, fuxiath12kq=0x20 ---- */
+    /* Answers what is for it, keeps nothing else, says its numbers, is bounded, and then the stay, the address back and goodbye as ever. */
+    fresh_net(); fa_m7_serve(); serve_on = true;
+    {
+        unsigned long long began = now;
+        assert(fa_m5_station(the_hw, false) == 0 && !rddm && !evidence_count);
+        assert(now - began >= FA_SERVE_NS + FA_JOIN_STAY_NS && now - began < FA_SERVE_NS + FA_JOIN_STAY_NS + FA_REGD_WAIT_NS + 5000000000ull);
+    }
+    assert(serve.arps == 2 && serve.echoes == 2 && !serve.wrong);
+    assert(SAID("M7 serving for 240 s") && SAID("arp 2 echo 2") && SAID("inbox lost 2") && SAID("M7 served 240"));
+    assert(strstr(said, "M7 ping beyond") < strstr(said, "M7 serving for") && strstr(said, "M7 served") < strstr(said, "M5 stayed") && strstr(said, "M5 stayed") < strstr(said, "M7 the address given back"));
+    assert(net.releases == 1 && deauths == 1);
+    {
+        unsigned lines = 0; const char *at = said;
+        while ((at = strstr(at, "M7 serving: rx ok")) != NULL) { lines++; at++; }
+        assert(lines >= 23 && lines <= 25);
+    }
+    log_is_clean();
+    assert(!SAID("02:") && !SAID("10.0.0.77"));
+    done();
+    /* Without an address it does not begin. */
+    fresh_net(); fa_m7_serve(); serve_on = true; net.silent = true;
+    assert(fa_m5_station(the_hw, false) == 0 && !SAID("M7 serving") && !net.releases);
+    done();
+    /* The door, the link and the firmware each end it at once. The door and the firmware mean no goodbye. */
+    fresh_net(); fa_m7_serve(); serve_on = true; serve_end = 1;
+    {
+        unsigned long long began = now;
+        assert(fa_m5_station(the_hw, false) == 0 && now - began < FA_SERVE_NS / 2 && SAID("M7 served") && !deauths && !net.releases);
+    }
+    done();
+    fresh_net(); fa_m7_serve(); serve_on = true; serve_end = 2;
+    {
+        unsigned long long began = now;
+        assert(fa_m5_station(the_hw, false) == 0 && now - began < FA_SERVE_NS / 2 && SAID("M7 served") && !deauths);
+    }
+    done();
+    fresh_net(); fa_m7_serve(); serve_on = true; serve_end = 3;
+    {
+        unsigned long long began = now;
+        assert(fa_m5_station(the_hw, false) == -EIO && now - began < FA_SERVE_NS / 2 && rddm && SAID("M7 served") && !net.releases);
+    }
+    done();
+    /* Stage 6 and a stage 7 without the knob do not begin it, and a stage 7 without the knob keeps no request. */
+    fresh_wpa(V_PMK); fa_m7_serve(); serve_on = true; net.on = false;
+    assert(fa_m5_station(the_hw, false) == 0 && !SAID("M7 serving") && !net.discovers);
+    done();
+    fresh_net(); serve_on = true;
+    assert(fa_m5_station(the_hw, false) == 0 && !SAID("M7 serv") && !SAID("arp 2") && !serve.arps && !serve.echoes && net.echoes == 2);
+    done();
+    serve_on = false;
+
     /* ---- stage 7 ---- */
     /* The whole way: an address, the router, an echo to it and beyond it, the stay, the address given back, then goodbye. */
     fresh_net();
@@ -1870,6 +1975,85 @@ int main(void) {
     fresh_net(); net.no_beyond = true;
     assert(fa_m5_station(the_hw, false) == 0 && SAID("M7 ping router 10.0.0.1 ok") && SAID("M7 ping beyond 1.1.1.1 no answer to 3 tries") && net.releases == 1);
     done();
+
+    /* ---- stage 8's auto join, fuxiwifiauto=1 ---- */
+    {
+        const uint8_t *name = (const uint8_t *)NAME; unsigned n = sizeof(NAME) - 1;
+        static const struct fa_wpa zero_wpa;
+        static struct fa_ios_state state;
+        struct fa_radio *radio;
+        const char *alone_input = NULL;
+
+        /* Off by default: nothing given, nothing done, however long it waits. */
+        fresh_wpa(V_PMK); memset(&m8, 0, sizeof(m8)); wpa.stayed = true; radio = radio_of(the_hw); fa_ios_start(&M8_INPUT); m8_alones = 0;
+        assert(fa_m8_up(the_hw) == 0);
+        now += FA_AUTO_WAIT_NS * 2; ios_auto_step(radio); ios_auto_step(radio);
+        assert(!SAID("M8 auto join") && !m8.ups && !radio->ios_joined && !m8_alones);
+        assert(fa_ios_leave() == FA_IOS_DONE); station_down(radio); done();
+
+        /* Given: it waits for the radio to be asked for, or for its time; then joins as wifid would, with nobody asking, once. */
+        fresh_wpa(V_PMK); memset(&m8, 0, sizeof(m8)); wpa.stayed = true; radio = radio_of(the_hw); fa_ios_start(&M8_INPUT); m8_alones = 0;
+        fa_set_auto_join(name, n, V_PMK);
+        assert(fa_m8_up(the_hw) == 0);
+        ios_auto_step(radio); assert(!SAID("M8 auto join") && auto_name_length == n);
+        assert(fa_ios_power(1) == FA_IOS_DONE);
+        m8_again(); ios_auto_step(radio);
+        assert(SAID("M8 auto join: name of 13 bytes") && SAID("M8 auto join: answer 0") && SAID("M6 4-way ok") && m8.ups == 1 && m8_alones == 1 && m8_alone == FA_IOS_DONE);
+        assert(radio->ios_joined && radio->ios_auto_joined && auto_name_length == 0);
+        fa_ios_state(&state); assert(state.phase == FA_IOS_JOINED && state.bss.ssid_length == n && !memcmp(state.bss.bssid, AP, 6));
+        { static const uint8_t none[32]; assert(!memcmp(auto_key, none, 32)); }
+        ios_auto_step(radio); assert(m8.ups == 1 && m8_alones == 1);	/* once */
+        log_is_clean();
+        /* Its key is gone from what it read too: only what the join itself keeps for its messages. */
+        assert(strstr(said, "M8 auto join: name") < strstr(said, "M8 joined"));
+
+        /* Lost: said, and no other join behind anyone's back. */
+        m8.losts = 0; linuxkpi_ieee80211_connection_loss(radio->vif); ios_step(radio);
+        assert(m8.losts == 1 && !radio->ios_joined && !radio->ios_auto_joined && SAID("M8 auto join: the network is lost, not joining again"));
+        { unsigned ups = m8.ups; now += FA_AUTO_WAIT_NS * 2; ios_auto_step(radio); ios_step(radio); assert(m8.ups == ups && !radio->ios_joined); }
+        station_down(radio); done();
+
+        /* The radio asked for by nobody: the time ends the wait. */
+        fresh_wpa(V_PMK); memset(&m8, 0, sizeof(m8)); wpa.stayed = true; radio = radio_of(the_hw); fa_ios_start(&M8_INPUT); m8_alones = 0;
+        fa_set_auto_join(name, n, V_PMK);
+        assert(fa_m8_up(the_hw) == 0);
+        ios_auto_step(radio); assert(!m8.ups);
+        now += FA_AUTO_WAIT_NS + 1; m8_again(); ios_auto_step(radio); assert(m8.ups == 1 && radio->ios_auto_joined);
+        /* wifid leaves: that stands, and nothing joins again. */
+        assert(fa_ios_leave() == FA_IOS_DONE && !radio->ios_joined && !radio->ios_auto_joined);
+        { unsigned ups = m8.ups; now += FA_AUTO_WAIT_NS * 2; ios_auto_step(radio); assert(m8.ups == ups); }
+        station_down(radio); done();
+
+        /* wifid speaks first: a leave, a join of its own, or the radio off, and the key is wiped unused. */
+        for (unsigned kind = 0; kind < 3; kind++) {
+            static const uint8_t none[32];
+            fresh_wpa(V_PMK); memset(&m8, 0, sizeof(m8)); wpa.stayed = true; radio = radio_of(the_hw); fa_ios_start(&M8_INPUT); m8_alones = 0;
+            fa_set_auto_join(name, n, V_PMK);
+            assert(fa_m8_up(the_hw) == 0);
+            m8_again();
+            if (kind == 0) { assert(fa_ios_leave() == FA_IOS_DONE && SAID("M8 auto join: given up, wifid asked for no network")); }
+            if (kind == 1) { assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_DONE && SAID("M8 auto join: given up, wifid asked for a network") && m8.ups == 1 && !radio->ios_auto_joined); }
+            if (kind == 2) { assert(fa_ios_power(0) == FA_IOS_DONE && SAID("M8 auto join: given up, wifid asked for the radio off")); }
+            assert(auto_name_length == 0 && !memcmp(auto_key, none, 32));
+            { unsigned ups = m8.ups; now += FA_AUTO_WAIT_NS * 2; ios_auto_step(radio); assert(m8.ups == ups && m8_alones == 0 && !SAID("M8 auto join: name")); }
+            if (kind == 1) assert(fa_ios_leave() == FA_IOS_DONE);
+            station_down(radio); done();
+        }
+        /* It speaks between the auto join's turn and the join: the join gives way. */
+        fresh_wpa(V_PMK); memset(&m8, 0, sizeof(m8)); wpa.stayed = true; radio = radio_of(the_hw); fa_ios_start(&M8_INPUT); m8_alones = 0;
+        assert(fa_m8_up(the_hw) == 0);
+        radio->ios_wifid_asked = true;
+        assert(ios_join_run(radio, name, n, NULL, V_PMK, true) == FA_IOS_REFUSED && !m8.ups && SAID("M8 auto join: given up, wifid has spoken"));
+        station_down(radio); done();
+        /* Not heard: the answer is said and passed on, and no second try. */
+        fresh_wpa(V_PMK); memset(&m8, 0, sizeof(m8)); wpa.stayed = true; radio = radio_of(the_hw); fa_ios_start(&M8_INPUT); m8_alones = 0;
+        fa_set_auto_join(name, n, V_PMK); ap.not_heard = true;
+        assert(fa_m8_up(the_hw) == 0);
+        assert(fa_ios_power(1) == FA_IOS_DONE); m8_again(); ios_auto_step(radio);
+        assert(m8_alones == 1 && m8_alone == FA_IOS_NOT_HEARD && !m8.ups && SAID("M8 auto join: answer 3") && !radio->ios_auto_joined);
+        ios_auto_step(radio); assert(m8_alones == 1);
+        ap.not_heard = false; station_down(radio); done();
+    }
 
     /* ---- stage 8 ---- */
     {
@@ -2606,7 +2790,8 @@ def the_key_stays_in_its_place(tmp):
             assert word not in call, call
     block = wlan[wlan.index('static void\nwl_fa_join_configure(void)'):]
     block = block[:block.index('\n}\n')]
-    assert 'wl_fa_stage != 6 && wl_fa_stage != 7' in block and 'PE_parse' not in block and 'fuxi-wifi-join' in block and block.count('printf(') == 3
+    # The one boot argument it reads says whether stage 8 looks at all: never a key or a name.
+    assert 'wl_fa_stage != 6 && wl_fa_stage != 7' in block and 'PE_parse' not in block.replace('PE_parse_boot_argn("fuxiwifiauto", &wants_auto, sizeof(wants_auto))', '') and 'fuxi-wifi-join' in block and block.count('printf(') == 3
     assert 'bytes + 1 + bytes[0]' not in ''.join(line for line in block.splitlines() if 'printf' in line)
     assert not re.search(r'PE_parse[a-z_]*\("fuxiwifi(key|pmk|pass|psk)', wlan)
     guarded = wlan[wlan.index('static void\nwl_fa_ssid_configure(void)'):]
@@ -2878,6 +3063,48 @@ int main(void) {
         c[0] = 0; c[1] = 0; c[4] = 0; c[5] = 0; c[6] = 0; c[7] = 1; assert(fa_group_check(&g, c) == FA_GROUP_FRESH && g.last[1] == 0x10000000000ull);
         c[7] = 0; c[6] = 0xff; assert(fa_group_check(&g, c) == FA_GROUP_REPLAY);
     }
+    /* Answering, for stage 7's load test. */
+    {
+        uint8_t q[28], a[28], out[1600];
+        memcpy(q, "\0\1\10\0\6\4\0\1", 8); memcpy(q + 8, SERVER, 6); memcpy(q + 14, THEM, 4); memset(q + 18, 0, 6); memcpy(q + 24, ME, 4);
+        assert(fa_arp_asks_for(q, 28, ME) && !fa_arp_asks_for(q, 27, ME) && !fa_arp_asks_for(q, 28, THEM));
+        assert(fa_net_served(FA_TYPE_ARP, q, 28, ME) && !fa_net_served(FA_TYPE_ARP, q, 28, THEM) && !fa_net_wanted(FA_TYPE_ARP, q, 28));
+        assert(fa_arp_reply(a, 27, OWN, ME, q, 28) == 0 && fa_arp_reply(a, 28, OWN, THEM, q, 28) == 0 && fa_arp_reply(a, 28, OWN, ME, q, 27) == 0);
+        assert(fa_arp_reply(a, 28, OWN, ME, q, 28) == 28);
+        assert(!memcmp(a, "\0\1\10\0\6\4\0\2", 8) && !memcmp(a + 8, OWN, 6) && !memcmp(a + 14, ME, 4) && !memcmp(a + 18, SERVER, 6) && !memcmp(a + 24, THEM, 4));
+        q[7] = 2; assert(!fa_arp_asks_for(q, 28, ME) && fa_arp_reply(a, 28, OWN, ME, q, 28) == 0); q[7] = 1;
+        q[1] = 6; assert(!fa_arp_asks_for(q, 28, ME)); q[1] = 1;
+        unsigned e = fa_echo_request(f, sizeof(f), THEM, ME, 0x1234, 7), r = fa_echo_reply(out, sizeof(out), ME, f, e);
+        assert(e == FA_ECHO_LENGTH && r == e && fa_net_served(FA_TYPE_IP, f, e, ME) && !fa_net_served(FA_TYPE_IP, f, e, THEM));
+        assert(fa_ip_sum(out, 20) == 0 && out[9] == 1 && !memcmp(out + 12, ME, 4) && !memcmp(out + 16, THEM, 4) && out[20] == 0 && out[21] == 0 && fa_ip_sum(out + 20, r - 20) == 0);
+        assert(fa_be16(out + 24) == 0x1234 && fa_be16(out + 26) == 7 && !memcmp(out + 28, f + 28, FA_ECHO_DATA) && fa_echo_read(out, r, ME, THEM, 0x1234, 7));
+        assert(fa_echo_reply(out, r - 1, ME, f, e) == 0 && fa_echo_reply(out, 10, ME, f, e) == 0 && fa_echo_reply(out, sizeof(out), THEM, f, e) == 0);
+        /* A wrong ICMP checksum, or an answer, is not asked of us. */
+        f[30] ^= 1; assert(fa_echo_reply(out, sizeof(out), ME, f, e) == 0 && !fa_net_served(FA_TYPE_IP, f, e, ME)); f[30] ^= 1;
+        f[20] = 0; assert(fa_echo_reply(out, sizeof(out), ME, f, e) == 0); f[20] = 8;
+        /* Larger than a type's limit, another type, and every shorter length in memory of exactly its size. */
+        assert(!fa_net_served(FA_TYPE_ARP, q, FA_NET_MOST + 1, ME) && !fa_net_served(0x86dd, q, 28, ME));
+        for (unsigned i = 0; i < e; i++) {
+            uint8_t *x = malloc(i ? i : 1); memcpy(x, f, i);
+            assert(fa_echo_reply(out, sizeof(out), ME, x, i) == 0 && !fa_net_served(FA_TYPE_IP, x, i, ME));
+            free(x);
+        }
+        for (unsigned i = 0; i < 28; i++) {
+            uint8_t *x = malloc(i ? i : 1); memcpy(x, q, i);
+            assert(fa_arp_reply(a, 28, OWN, ME, x, i) == 0 && !fa_net_served(FA_TYPE_ARP, x, i, ME));
+            free(x);
+        }
+        for (unsigned round = 0; round < 40000; round++) {
+            unsigned size = next() % 200; uint8_t *x = malloc(size ? size : 1);
+            memcpy(x, f, size < e ? size : e);
+            for (unsigned k = next() % 6; k > 0 && size > 0; k--) x[next() % size] = (uint8_t)next();
+            if (size > 20 && (next() & 1)) { x[10] = x[11] = 0; fa_put16(x + 10, fa_ip_sum(x, 20)); }
+            unsigned g = fa_echo_reply(out, sizeof(out), ME, x, size);
+            assert(g == 0 || (g >= 28 && g <= size && fa_ip_sum(out, 20) == 0 && fa_ip_sum(out + 20, g - 20) == 0));
+            (void)fa_net_served(FA_TYPE_IP, x, size, ME); (void)fa_arp_reply(a, 28, OWN, ME, x, size);
+            free(x);
+        }
+    }
     /* Frames. */
     n = fa_data_frame(f, sizeof(f), OWN, AP, SERVER, true, FA_TYPE_ARP, (const uint8_t *)"abcd", 4);
     assert(n == 26 + 8 + 4 && f[0] == 0x88 && f[1] == 0x41 && !memcmp(f + 4, AP, 6) && !memcmp(f + 10, OWN, 6) && !memcmp(f + 16, SERVER, 6) && f[32] == 8 && f[33] == 6);
@@ -2928,6 +3155,8 @@ int fa_ios_tx(const unsigned char *f, unsigned long n) { return n == 60; }
 void fuxi_ath12k_station_address(unsigned char *m) { memcpy(m, "\x02\x46\x55\x58\x49\x01", 6); }
 void fuxi_wifi_wpa_pmk(const unsigned char *p, unsigned pl, const unsigned char *n, unsigned nl, unsigned char k[32]) { assert(pl == 13 && !memcmp(p, "the test word", 13) && nl == 4 && !memcmp(n, "name", 4)); memset(k, 0x33, 32); pmks++; }
 void fuxi_wifi_sta_lost(int e) { lost_errno = e; lost_count++; }
+static unsigned alone_links;
+void fuxi_wifi_apple80211_event(enum fuxi_wifi_sta_event event, int status) { assert(event == FUXI_WIFI_STA_LINK && status == 1); alone_links++; }
 static void in_rx(const uint8_t *f, size_t n) { rx_length = n; }
 static void in_link(bool up) { link_ups += up; }
 static const struct fuxi_wifi_input IN = { in_rx, in_link };
@@ -2987,6 +3216,24 @@ def ios_bridge_crosses_the_domains(tmp):
 
 
 @check
+def auto_join_is_off_by_default_and_says_no_key(tmp):
+    """fuxiwifiauto: stage 8 ignores the device tree without exactly 1, and iOS's word wins. No key in a line of the log."""
+    wlan = (ROOT / 'xnu/fuxi-wlan/fuxi_wlan.c').read_text()
+    block = wlan[wlan.index('static void\nwl_fa_join_configure(void)'):]
+    block = block[:block.index('\n}\n')]
+    gate = block[:block.index('SecureDTLookupEntry')]
+    assert 'wl_fa_stage == 8' in gate and 'PE_parse_boot_argn("fuxiwifiauto"' in gate and 'wants_auto != 1) { return; }' in gate
+    assert block.count('fa_set_auto_join(') == 1 and wlan.count('fa_set_auto_join(') == 1
+    assert wlan.count('"fuxiwifiauto"') == 1
+    text = (ROOT / 'xnu/fuxi-ath12k/src/fa_80211.c').read_text()
+    assert text.count('ios_auto_step(radio);') == 1 and text.index('ios_auto_step(radio);') > text.index('ios_runs(void *argument)')
+    for word in ('fa_set_auto_join', 'auto_key', 'auto_name'):
+        assert word not in text[:text.index('/* ---- stage 8: the radio for iOS') - 1].replace('static uint8_t auto_name[FA_SSID_MOST], auto_key[32];', '').replace('static unsigned auto_name_length;', ''), word
+    for call in re.findall(r'lx_tell\(.*?\);', text, flags=re.S):
+        assert 'auto_key' not in call and 'auto_name,' not in call and 'name,' not in call.replace('name, what', ''), call
+
+
+@check
 def stage_8_is_reached_from_stage_8_alone(tmp):
     """The stage that does not stop is a path of its own: stages 4 to 7 end as they did, and nothing else makes a radio stay."""
     own = ROOT / 'xnu/fuxi-ath12k/src'
@@ -3000,7 +3247,7 @@ def stage_8_is_reached_from_stage_8_alone(tmp):
     assert 'hif.ios_up = error == 0;' in ready and hif.count('hif.ios_up') == 2 and hif.count('fa_m8_firmware_gone()') == 1
     assert text.count('ios_radio = radio;') == 1 and text.index('ios_radio = radio;') > text.index('\nfa_m8_up(struct ieee80211_hw *hw)')
     assert text.count('radio->ios = true;') == 1 and text.index('radio->ios = true;') > text.index('\nfa_m8_up(struct ieee80211_hw *hw)')
-    assert 'radio->ios_joined = true;' in text[text.index('\nfa_ios_join('):] and text.count('radio->ios_joined = true;') == 1
+    assert 'radio->ios_joined = true;' in text[text.index('\nios_join_run('):] and text.count('radio->ios_joined = true;') == 1
     # What was the firmware's end on stages 4 to 7 stays so: only stage 8 may be let off.
     for word in ('"hw_scan failed"', '"scan aborted by ath12k'):
         at = text.index(word)
@@ -3008,7 +3255,10 @@ def stage_8_is_reached_from_stage_8_alone(tmp):
     # fw_thread: stage 8 returns nowhere, and the stop below it is for all the others.
     handoff = wlan[wlan.index('\nwl_fa_handoff(void)'):]
     assert handoff.index('wl_fa_stage == 8') < handoff.index('for (;;) { wl_sleep(60000); }') < handoff.index('fa_stop();')
-    assert wlan.count('wl_fa_stage == 8') == 1
+    # The hand-off's one, and the two that say stage 8 reads the device tree only when told to.
+    configure = wlan[wlan.index('static void\nwl_fa_join_configure(void)'):]
+    configure = configure[:configure.index('\n}\n')]
+    assert configure.count('wl_fa_stage == 8') == 2 and wlan.count('wl_fa_stage == 8') == 3
     # Patch 0117 alone selects it.
     patch = (ROOT / 'xnu/patches/0117-fuxi-ath12k.patch').read_text()
     assert '+bsd/dev/fuxi_ath12k_ios.c\t\tstandard' in patch and '+\tif (on == 2 && !enabled) {' in patch and '+\t\tlink.name = "ath12k";' in patch
@@ -3065,6 +3315,24 @@ def busy_watch_is_in_patch_0117_alone(tmp):
     assert added.count('fuxi_busy_give_up(busy_under);') == 1 and 'if (seconds == 30) {' in added
     for word in ('setProperty', 'terminate', 'waitQuiet', 'ssid', 'address', 'SSID'):
         assert word not in added, word
+
+
+@check
+def load_test_is_stage_7s_alone(tmp):
+    """station_serve() answers on the network: one caller, behind stage 7's own ask and the knob, and stage 8 has no way there."""
+    own = ROOT / 'xnu/fuxi-ath12k/src'
+    text = (own / 'fa_80211.c').read_text()
+    assert text.count('station_serve(') == 2 and text.count('station_serve(radio);') == 1
+    at = text.index('station_serve(radio);')
+    assert text.rindex('\nfa_m5_station(', 0, at) > text.rindex('\nstation_address_back(', 0, at)
+    assert 'if (target_serve && radio->leased) {' in text and text.count('target_serve = true;') == 1
+    ios = text[text.index('/* ---- stage 8') if '/* ---- stage 8' in text else text.index('\nfa_m8_'):]
+    assert 'station_serve' not in ios and 'fa_m7_serve' not in ios and 'target_serve' not in ios
+    hif = (own / 'fa_hif.c').read_text()
+    assert hif.count('fa_m7_serve();') == 1
+    stage = hif[hif.index('if (hif.stage == FA_STAGE_ADDRESS) {'):]
+    assert stage.index('fa_m7_serve();') < stage.index('}\n')
+    assert '(hif.knobs & FA_KNOB_SERVE) != 0' in stage
 
 
 
