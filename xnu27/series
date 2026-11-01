@@ -74,3 +74,4 @@ fuxi/0006-log-ring-fileset.patch
 fuxi/0007-root27-storage.patch
 fuxi/0008-dada-apfs.patch
 fuxi/0009-cryptex-graft.patch
+fuxi/0010-proc-log.patch

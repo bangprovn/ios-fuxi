@@ -1,0 +1,71 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 6cbeaad..b503cb4 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -3122,6 +3122,11 @@ encapsulated_binary:
+ 		}
+ 	}
+ bad:
++#if defined(FUXI)
++	if (fuxi_proc_log()) {
++		printf("fuxi: exec pid %d %s: %d\n", proc_getpid(p), excpath != NULL ? excpath : "?", error);
++	}
++#endif
+ 	proc_transend(p, 0);
+ 
+ bad_notrans:
+diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
+index b5633e4..c10a08a 100644
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1960,6 +1960,20 @@ proc_crash_coredump(proc_t p)
+ #endif /* (DEVELOPMENT || DEBUG) && CONFIG_COREDUMP */
+ }
+ 
++#if defined(FUXI)
++/* Boot-arg fuxi_proc_log=1: one console line per exec and per process exit (bring-up without logd). */
++bool
++fuxi_proc_log(void)
++{
++	static int on = -1;
++	if (on < 0) {
++		uint32_t v = 0;
++		on = (PE_parse_boot_argn("fuxi_proc_log", &v, sizeof(v)) && v == 1) ? 1 : 0;
++	}
++	return on == 1;
++}
++#endif
++
+ static void
+ proc_handle_critical_exit(proc_t p, int rv)
+ {
+@@ -2037,6 +2051,15 @@ proc_prepareexit(proc_t p, int rv, boolean_t perf_notify)
+ 	task_t task = proc_task(p);
+ 
+ 
++#if defined(FUXI)
++	if (fuxi_proc_log()) {
++		char *fuxi_desc = exit_reason_get_string_desc(p->p_exit_reason);
++		printf("fuxi: exit pid %d %s status 0x%x ns %d code 0x%llx %s\n", proc_getpid(p), p->p_comm, rv,
++		    p->p_exit_reason != OS_REASON_NULL ? (int)p->p_exit_reason->osr_namespace : -1,
++		    p->p_exit_reason != OS_REASON_NULL ? p->p_exit_reason->osr_code : 0ULL,
++		    fuxi_desc != NULL ? fuxi_desc : "");
++	}
++#endif
+ 	if (p->p_crash_behavior != 0 || p == initproc) {
+ 		proc_handle_critical_exit(p, rv);
+ 	}
+diff --git a/bsd/sys/proc_internal.h b/bsd/sys/proc_internal.h
+index 22a54a7..7669c24 100644
+--- a/bsd/sys/proc_internal.h
++++ b/bsd/sys/proc_internal.h
+@@ -1158,5 +1158,9 @@ bool proc_ignores_node_permissions(proc_t proc);
+  */
+ extern bool no_paging_space_action(uint32_t cause);
+ 
++#if defined(FUXI)
++extern bool fuxi_proc_log(void);
++#endif
++
+ __exported_pop
+ #endif  /* !_SYS_PROC_INTERNAL_H_ */
