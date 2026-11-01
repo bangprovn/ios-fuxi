@@ -30,6 +30,7 @@ static uint32_t far_tail;	/* what the DSP has read of ours */
 static bool may_send;		/* heard() fails on data otherwise */
 static bool may_vote;		/* and on a vote */
 static bool may_graph;		/* and on a graph's packet */
+static bool may_play;		/* and on a buffer */
 static uint32_t asks, votes, graphs;
 
 static void fresh(struct au_gl *g, uint32_t options)
@@ -76,7 +77,11 @@ static bool heard(uint32_t *cmd, uint32_t *p1, uint32_t *p2, char *name)
 			static const uint8_t block[4] = {FUXI_AR_HW_MACRO, FUXI_AR_HW_DCODEC, FUXI_AR_HW_DCODEC, FUXI_AR_HW_MACRO};
 			uint8_t want[128];
 			uint32_t step = word[6] - AU_GL_PRM_TOKEN, n;
-			if (word[6] >= AU_GL_GRAPH_TOKEN) {
+			if (word[6] >= AU_GL_WRITE_TOKEN) {
+				/* a buffer: the same shape as a graph's packet, its bytes by tools/fuxi-audio-host */
+				assert(may_play && word[0] <= 128);
+				total += (8 + word[0] + 7) & ~7u;
+			} else if (word[6] >= AU_GL_GRAPH_TOKEN) {
 				/* a graph's packet: checked by its size and order, its bytes by tools/fuxi-audio-host */
 				assert(may_graph && word[6] == AU_GL_GRAPH_TOKEN + graphs && word[0] <= AU_GL_GPR_BUFFER);
 				graphs++;
@@ -344,7 +349,7 @@ int main(void)
 		uint32_t big[2] = {4096, 77}, small[2] = {128, 14};
 		uint32_t answer[11] = {32, 0, 0x2060, 0x0203, 1, 1, AU_GL_GRAPH_TOKEN, AU_GL_OP_BASIC_RESULT, 0x01001000, 3, 0};
 
-		fresh(&g, AU_GL_ANSWER | AU_GL_GPR | AU_GL_PRM); may_send = may_graph = true; graphs = 0;
+		fresh(&g, AU_GL_ANSWER | AU_GL_GPR | AU_GL_PRM); may_send = may_graph = true; graphs = 0; g.graph_steps = 3;
 		assert(au_gl_start(&g)); assert(heard(&cmd, &p1, &p2, 0));
 		g.gpr_lcid = 1; g.gpr_rcid = 9; g.gpr_acked = 1; g.gpr_ready = 1; g.big_have = 1; g.big_size = 4096;
 		assert(!au_gl_big_ask(&g) && !au_gl_graph_send(&g, m, 64));	/* no option */
@@ -367,7 +372,7 @@ int main(void)
 		say(AU_GL_INTENT, 9, 1, big, 8);
 		assert(au_gl_step(&g) && g.big_have && g.big_riid == 77 && !g.big_asked);
 		assert(!au_gl_graph_send(&g, m, AU_GL_GPR_BUFFER + 4));		/* too long */
-		for (uint32_t i = 0; i < AU_GL_GRAPH_STEPS; i++) {
+		for (uint32_t i = 0; i < 3; i++) {
 			memset(m, 0x77, sizeof(m));
 			m[6] = AU_GL_GRAPH_TOKEN + i;				/* GPR's token, word 4, after GLINK's two */
 			assert(au_gl_graph_send(&g, m, i == 0 ? 500 : 60 + 4));
@@ -389,8 +394,44 @@ int main(void)
 			say(AU_GL_RX_DONE_REUSE, 9, 77, 0, 0);
 			assert(au_gl_step(&g) && g.big_have);
 		}
-		assert(!au_gl_graph_send(&g, m, 64) && g.graph_sent == AU_GL_GRAPH_STEPS);
+		assert(!au_gl_graph_send(&g, m, 64) && g.graph_sent == 3);
 		may_graph = false;
+
+		/* --play: no buffer without its option or before the map's handle; a handle by its step's token; WRITE_DONE counted and its status kept. */
+		{
+			uint32_t mapped[9] = {28, 0, 0x1c60, 0x0203, 1, 1, AU_GL_GRAPH_TOKEN + 1, AU_GL_OP_MEM_MAP_DONE, 0x55};
+			uint32_t played[13] = {40, 0, 0x2860, 0x0203, 0x6001, 1, AU_GL_WRITE_TOKEN, AU_GL_OP_WRITE_DONE, 0xd0000000u, 1, 0x55, 0, 0};
+			uint32_t good[2] = {128, 14};
+
+			fresh(&g, AU_GL_ANSWER | AU_GL_GPR | AU_GL_PRM | AU_GL_GRAPH); may_send = may_play = may_graph = true; graphs = 0; g.graph_steps = 15;
+			assert(au_gl_start(&g)); assert(heard(&cmd, &p1, &p2, 0));
+			g.gpr_lcid = 1; g.gpr_rcid = 9; g.gpr_acked = 1; g.gpr_ready = 1; g.big_size = 4096; g.big_riid = 77;
+			say(AU_GL_INTENT, 9, 1, good, 8); assert(au_gl_step(&g) && g.gpr_riid_n == 1);
+			g.map_handle = 0x55;
+			memset(m, 0x77, sizeof(m)); m[6] = AU_GL_WRITE_TOKEN;
+			assert(!au_gl_data_send(&g, m, 68));			/* no option */
+			g.options |= AU_GL_PLAY; g.map_handle = 0;
+			assert(!au_gl_data_send(&g, m, 68));			/* no map */
+			/* Two steps: the second is the map. */
+			g.big_have = 1; m[6] = AU_GL_GRAPH_TOKEN;
+			assert(au_gl_graph_send(&g, m, 64) && heard(&cmd, &p1, &p2, 0));
+			g.big_have = 1; m[6] = AU_GL_GRAPH_TOKEN + 1;
+			assert(au_gl_graph_send(&g, m, 64) && heard(&cmd, &p1, &p2, 0));
+			say(AU_GL_TX_DATA, 9, 1, mapped, 36);
+			assert(au_gl_step(&g) && g.map_handle == 0x55 && g.graph_status[1] == 0 && heard(&cmd, &p1, &p2, 0));
+			m[6] = AU_GL_WRITE_TOKEN;
+			assert(!au_gl_data_send(&g, m, 200));			/* too long for its small ones */
+			assert(au_gl_data_send(&g, m, 68) && g.write_sent == 1 && g.gpr_riid_n == 0 && heard(&cmd, &p1, &p2, 0) && cmd == AU_GL_TX_DATA && p2 == 14);
+			assert(!au_gl_data_send(&g, m, 68));			/* none left */
+			/* Its buffer back: the next can go. */
+			say(AU_GL_RX_DONE_REUSE, 9, 14, 0, 0);
+			assert(au_gl_step(&g) && g.gpr_riid_n == 1);
+			g.ms = 500; say(AU_GL_TX_DATA, 9, 1, played, 48);
+			assert(au_gl_step(&g) && g.write_done == 1 && g.write_first_ms == 500 && g.write_bad == 0 && heard(&cmd, &p1, &p2, 0));
+			played[11] = 3; g.ms = 520; say(AU_GL_TX_DATA, 9, 1, played, 48);
+			assert(au_gl_step(&g) && g.write_done == 2 && g.write_last_ms == 520 && g.write_first_ms == 500 && g.write_status == 3 && g.write_bad == 1 && heard(&cmd, &p1, &p2, 0));
+			may_play = false; may_graph = false;
+		}
 	}
 	may_send = false;
 
@@ -404,8 +445,8 @@ int main(void)
 		uint32_t seed = 0x51ed2701;
 		for (unsigned round = 0; round < 40000; round++) {
 			/* (round & 3) == 3 is --gpr, with the channel up from the start for the rings that would never open it. */
-			fresh(&g, (round & 1) | ((round & 3) == 3 ? AU_GL_GPR | AU_GL_PRM | AU_GL_GRAPH : 0)); (void)au_gl_start(&g);
-			if ((round & 3) == 3) { g.gpr_lcid = 1; g.gpr_rcid = round & 15; g.gpr_acked = round & 4; g.prm_sent = (round >> 4) & 7; g.graph_sent = (round >> 7) & 3; }
+			fresh(&g, (round & 1) | ((round & 3) == 3 ? AU_GL_GPR | AU_GL_PRM | AU_GL_GRAPH | AU_GL_PLAY : 0)); (void)au_gl_start(&g);
+			if ((round & 3) == 3) { g.gpr_lcid = 1; g.gpr_rcid = round & 15; g.gpr_acked = round & 4; g.prm_sent = (round >> 4) & 7; g.graph_steps = 15; g.graph_sent = (round >> 7) & 15; }
 			for (unsigned i = 0; i < FIFO / 4; i++) { seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5; rx[i] = (i & 1) && (seed & 8) ? seed >> 24 : seed & 0x000f000f; }
 			seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
 			desc[3] = (seed & 0xf8) % FIFO;
@@ -429,10 +470,11 @@ def main():
                         '-fsanitize=address,undefined', '-fno-sanitize-recover=all', f'-I{ROOT / "shim/fuxi-probe"}', f'-I{ROOT / "xnu/fuxi-audio"}', str(source),
                         str(ROOT / 'xnu/fuxi-audio/fuxi_audioreach.c'), str(ROOT / 'xnu/fuxi-audio/fuxi_gpr.c'), '-o', str(program)], check=True)
         subprocess.run([str(program)], check=True)
-    # What could put any other audio command on the wire is simply not there: three TX_DATA, each in its own function, and no starting.
+    # What could put any other audio command on the wire is simply not there: four TX_DATA, each in its own function. Starting comes only with --play,
+    # whose samples are zeros, and nothing here touches a pin's mux or an amplifier: the TLMM's and the I2C's ranges do not appear.
     text = (ROOT / 'shim/fuxi-probe/au_glink.h').read_text()
     code = text[text.index('#define AU_GL_FEATURE_REUSE'):]
-    assert code.count('AU_GL_TX_DATA,') == 3 and code.count('au_gl_tx(g, AU_GL_TX_DATA,') == 3
+    assert code.count('AU_GL_TX_DATA,') == 4 and code.count('au_gl_tx(g, AU_GL_TX_DATA,') == 4
     ask = code[code.index('static inline bool au_gl_gpr_ask'):code.index('static inline void au_gl_gpr_take')]
     assert 'au_gl_tx(g, AU_GL_TX_DATA,' in ask and 'AU_GL_OP_GET_SPF_STATE' in ask
     assert 'AU_GL_TX_DATA_CONT,' not in code
@@ -440,7 +482,11 @@ def main():
     assert 'au_gl_tx(g, AU_GL_TX_DATA,' in vote and 'gpr_ready' in vote and '0x08001032u' in vote
     audio = (ROOT / 'shim/fuxi-probe/audio.c').read_text()
     assert 'au_gl_tx(' not in audio.replace('au_gl_tx_', '')
-    assert 'GRAPH_START' not in audio and 'GRAPH_PREPARE' not in audio and 'fuxi_ar_write' not in audio and 'fuxi_ar_map' not in audio
+    run = audio[audio.index('#include "au_glink.h"'):]
+    assert audio.count('GRAPH_START') == 2 and audio.count('fuxi_ar_map') == 1 and audio.count('fuxi_ar_write') == 1
+    assert 'au_wr(AU_PLAY_PA + 4 * i, 0);' in run
+    for word in ('i2s1', '0xf100000', 'geni', 'cs35l41', 'au_se0', 'au_qup2'):
+        assert word not in run.lower(), word
     print('PASS: au_glink')
 
 

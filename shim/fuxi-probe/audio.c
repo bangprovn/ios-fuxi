@@ -12,11 +12,16 @@
  *      with entry master-kernel before anything starts, bit 1 also rings LPASS's SMP2P doorbell, bits 15:8 are the
  *      seconds to wait for ready (0 is the usual 5, at most 45). 'AB' is what it always was.
  *  IN  0x5a 'AZ' (0x415a): PAS shutdown of the ADSP, after a stage 2 that reached ready. Nothing else.
+ *  IN  0x5a 'AM' (0x414d) wIndex: read only, what apps_smmu has for stream wIndex: its global state and each stream match that takes it.
  *  IN  0x5a 'AG' (0x4147) wIndex: once, after a stage 2 that reached ready: GLINK over SMEM, polled, for bits 7:0 seconds
  *      (at most 45), bit 8 also completes the opening of channels (au_glink.h), bit 9 with it also asks the APM whether it is
  *      up: APM_CMD_GET_SPF_STATE on adsp_apps, the only data that goes out, every 3 s until it says ready; bit 10 with both then
  *      also votes LPASS's macro and dcodec on and off again, a step each 1.5 s; bit 11 with all three, between the votes, opens the
- *      secondary TDM endpoint's graph, configures it and closes it, never starting it. Returns its summary.
+ *      secondary TDM endpoint's graph, configures it and closes it, never starting it; bit 12 with all four, instead, opens that graph and a
+ *      playback stream into it, starts them, gives them a second of zeros from AU_PLAY_PA, and takes it all down. No pin is muxed. Returns its summary.
+ *  IN  0x5a 'AT' (0x4154) wIndex: a-play1 reset the phone with no report, so the parts of --play that the AP does, alone. Bit 0 the zeros, read back;
+ *      bit 1 the bypass stream match, read back; bit 2 takes it away. Returns what it read.
+ *  IN  0x5a 'AH' (0x4148) wIndex: page of the log. 'AI' (0x4149): what the last list's steps answered.
  *  IN  0x5a 'AH' (0x4148) wIndex=page: its log, 128 words a page.
  *  OUT 0x5b wValue=chunk[15:0], wIndex[11:0]=chunk[27:16], wIndex bit15 =
  *      image (0 adsp_dtb, 1 adsp), bit14 = restart that image at chunk 0.
@@ -576,19 +581,49 @@ static void au_boot_stage(void)
 #define AU_GL_KICK() au_wr(AU_IPCC + 0xc, AU_IPCC_GLINK)
 #include "au_glink.h"
 #include "../../xnu/fuxi-audio/fuxi_audioreach.h"
-/* What --graph sends, in order. Values of the Xiaomi 14's port, which shares these pins: unproven here, and with no start nothing depends on them yet. */
+/* What --graph and --play send, in order. Values of the Xiaomi 14's port, which shares these pins: unproven here, and nothing depends on them yet with no pin muxed. */
+static const FuxiArFormat au_format = {48000, 32, 2};
+static const FuxiArTdm au_tdm = {.intf = 1, .slot_mask = 5, .slots = 4, .slot_width = 32, .sync_mode = 1, .invert_sync = 0, .sync_data_delay = 1, .lane = 1, .clock_attribute = 4};
+#define AU_GRAPH_STEPS 3u
 static uint32_t au_graph_build(uint32_t step, uint32_t *m, uint32_t capacity)
 {
- static const FuxiArFormat format = {48000, 32, 2};
- static const FuxiArTdm tdm = {.intf = 1, .slot_mask = 5, .slots = 4, .slot_width = 32, .sync_mode = 1, .invert_sync = 0, .sync_data_delay = 1, .lane = 1, .clock_attribute = 4};
  uint8_t *out = (uint8_t *)(m + 2);
  if (step == 0) return fuxi_ar_open_speaker_tdm(out, capacity, 1, AU_GL_GRAPH_TOKEN);
- if (step == 1) return fuxi_ar_config_speaker_tdm(out, capacity, 1, AU_GL_GRAPH_TOKEN + 1, &format, &tdm);
+ if (step == 1) return fuxi_ar_config_speaker_tdm(out, capacity, 1, AU_GL_GRAPH_TOKEN + 1, &au_format, &au_tdm);
  return fuxi_ar_graph_command(out, capacity, 1, AU_GL_GRAPH_TOKEN + 2, FUXI_AR_OP_GRAPH_CLOSE, FUXI_AR_SG_SPEAKER);
+}
+/* The zeros: AP memory the DSP reads. Below 4 GiB, as the word above it is the stream's. Checked against the phone's reserved-memory: research_notes/audio-next.md. */
+#define AU_PLAY_PA 0xd0000000ull
+#define AU_PLAY_SID 1ull            /* 0x1001 & 0xf, as Linux q6apm_dai */
+#define AU_PLAY_BYTES 7680u         /* 20 ms */
+#define AU_PLAY_BUFFERS 50u
+#define AU_PLAY_STEPS 15u
+#define AU_PLAY_WRITES_AFTER 10u    /* the buffers come when the first ten steps are done */
+static uint32_t au_play_build(uint32_t step, uint32_t *m, uint32_t capacity, uint32_t handle)
+{
+ uint8_t *out = (uint8_t *)(m + 2);
+ uint32_t t = AU_GL_GRAPH_TOKEN + step;
+ switch (step) {
+ case 0: return fuxi_ar_open_speaker_tdm(out, capacity, 1, t);
+ case 1: return fuxi_ar_config_speaker_tdm(out, capacity, 1, t, &au_format, &au_tdm);
+ case 2: return fuxi_ar_open_playback_stream_tdm(out, capacity, 1, t);
+ case 3: return fuxi_ar_config_playback_stream(out, capacity, 1, t, &au_format);
+ case 4: return fuxi_ar_config_playback_shmem(out, capacity, 1, t, &au_format);
+ case 5: return fuxi_ar_map(out, capacity, 1, t, AU_PLAY_PA | AU_PLAY_SID << 32, AU_PLAY_BYTES * 4);
+ case 6: return fuxi_ar_graph_command(out, capacity, 1, t, FUXI_AR_OP_GRAPH_PREPARE, FUXI_AR_SG_SPEAKER);
+ case 7: return fuxi_ar_graph_command(out, capacity, 1, t, FUXI_AR_OP_GRAPH_PREPARE, FUXI_AR_SG_PLAY);
+ case 8: return fuxi_ar_graph_command(out, capacity, 1, t, FUXI_AR_OP_GRAPH_START, FUXI_AR_SG_SPEAKER);
+ case 9: return fuxi_ar_graph_command(out, capacity, 1, t, FUXI_AR_OP_GRAPH_START, FUXI_AR_SG_PLAY);
+ case 10: return fuxi_ar_graph_command(out, capacity, 1, t, FUXI_AR_OP_GRAPH_STOP, FUXI_AR_SG_PLAY);
+ case 11: return fuxi_ar_graph_command(out, capacity, 1, t, FUXI_AR_OP_GRAPH_STOP, FUXI_AR_SG_SPEAKER);
+ case 12: return fuxi_ar_graph_command(out, capacity, 1, t, FUXI_AR_OP_GRAPH_CLOSE, FUXI_AR_SG_PLAY);
+ case 13: return fuxi_ar_graph_command(out, capacity, 1, t, FUXI_AR_OP_GRAPH_CLOSE, FUXI_AR_SG_SPEAKER);
+ default: return fuxi_ar_unmap(out, capacity, 1, t, handle);
+ }
 }
 #define AU_GL_RECORDS 96u
 #define AU_GL_LOG_WORDS (AU_GL_RECORDS * AU_GL_REC_WORDS)
-static uint32_t au_gl_rep[128], au_gl_log[AU_GL_LOG_WORDS];
+static uint32_t au_gl_rep[128], au_gl_rep2[128], au_gl_log[AU_GL_LOG_WORDS];
 /* A cached private item, at the partition's far end (Linux qcom_smem_get_private()); the DSP may allocate its FIFO there. */
 static uint64_t au_smem_item_cached(const struct au_part *p, unsigned item, uint32_t *size)
 {
@@ -610,6 +645,43 @@ static uint64_t au_smem_item_cached(const struct au_part *p, unsigned item, uint
   e -= sz + step;
  }
  return 0;
+}
+/*
+ * a-graph2: apps_smmu has no match for the DSP's streams and faults what it does not match, so the DSP cannot read AP memory as things stand.
+ * The stream as Linux sm8550.dtsi's q6apm-dais has it: 0x1001 mask 0x80, and 0x1061. a-poke5: the hypervisor aborts a match for 0x1801, an older SoC's.
+ * For --play alone, one free stream match into context bank 4, put back when the run ends. That is what the touch lane found (ts_smmu() in
+ * probe.c): the hypervisor does not take a bypass, and a-poke2 and 3 reset the phone asking for one; bank 4 is DWC3's, with stage 1 off, so
+ * the address the DSP says is the physical one. Order as Linux arm_smmu_write_sme(): the S2CR before the SMR makes it valid.
+ */
+#define AU_SMMU 0x15000000ull
+static int au_smmu_slot = -1;
+static uint32_t au_smmu_old[2];
+static uint32_t au_smmu_step;
+unsigned probe_safe_wr32(uint64_t pa, uint32_t value);
+static void au_smmu_bypass(uint32_t sid, uint32_t mask, bool only_s2cr)
+{
+ uint32_t count = au_rd(AU_SMMU + 0x20) & 0xff;
+ for (int i = 0; i < (int)count; i++) {
+  uint32_t smr = au_rd(AU_SMMU + 0x800 + 4 * (uint32_t)i);
+  if (au_faults || (smr >> 31)) continue;
+  au_smmu_old[0] = smr; au_smmu_old[1] = au_rd(AU_SMMU + 0xc00 + 4 * (uint32_t)i);
+  if (au_smmu_old[1] != 2u << 16) continue;        /* only one set to fault, as nobody's */
+  au_smmu_slot = i;
+  au_smmu_step = 1;
+  if (probe_safe_wr32(AU_SMMU + 0xc00 + 4 * (uint32_t)i, 4)) { au_smmu_slot = -1; return; }
+  au_smmu_step = 2;
+  if (only_s2cr) return;
+  if (probe_safe_wr32(AU_SMMU + 0x800 + 4 * (uint32_t)i, 1u << 31 | mask << 16 | sid)) { au_smmu_slot = -1; return; }
+  au_smmu_step = 3;
+  return;
+ }
+}
+static void au_smmu_back(void)
+{
+ if (au_smmu_slot < 0) return;
+ (void)probe_safe_wr32(AU_SMMU + 0x800 + 4 * (uint32_t)au_smmu_slot, au_smmu_old[0]);
+ (void)probe_safe_wr32(AU_SMMU + 0xc00 + 4 * (uint32_t)au_smmu_slot, au_smmu_old[1]);
+ au_smmu_slot = -1;
 }
 static uint32_t au_glink_run(uint32_t *r, unsigned seconds, uint32_t options)
 {
@@ -633,7 +705,23 @@ static uint32_t au_glink_run(uint32_t *r, unsigned seconds, uint32_t options)
  g.log = au_gl_log; g.log_most = AU_GL_RECORDS;
  uint64_t t0 = rsr("cntpct_el0"), hz = rsr("cntfrq_el0"), limit = seconds * hz;
  if (!au_gl_start(&g)) return 0x204;
- uint32_t bits = 0, next_ask = 2000, graph_until = 0;
+ uint32_t bits = 0, next_ask = 2000, graph_until = 0, writes_until = 0, second_old[2] = {0, 0};
+ int second_slot = -1;
+ g.graph_steps = (options & AU_GL_PLAY) != 0 ? AU_PLAY_STEPS : AU_GRAPH_STEPS;
+ if ((options & AU_GL_PLAY) != 0) {
+  /* Not over the code that is running here. */
+  uint64_t here = (uint64_t)(uintptr_t)&au_gl_rep2[0], stack = (uint64_t)(uintptr_t)&bits;
+  if ((here >= AU_PLAY_PA - 0x200000 && here < AU_PLAY_PA + 0x200000) || (stack >= AU_PLAY_PA - 0x200000 && stack < AU_PLAY_PA + 0x200000)) return 0x205;
+  /* Zeros, whatever was there. Device-like writes, and the data barrier of au_wr(): the DSP does not snoop anything here. */
+  for (uint32_t i = 0; i < AU_PLAY_BYTES; i++) au_wr(AU_PLAY_PA + 4 * i, 0);
+  au_gl_rep2[40] = au_rd(AU_SMMU + 0x48);
+  au_smmu_bypass(0x1061, 0, false);
+  if (au_smmu_slot < 0) return 0x206;
+  second_slot = au_smmu_slot; second_old[0] = au_smmu_old[0]; second_old[1] = au_smmu_old[1];
+  au_smmu_bypass(0x1001, 0x80, false);
+  au_gl_rep2[41] = (uint32_t)(au_smmu_slot + 1);
+  if (au_smmu_slot < 0) return 0x206;
+ }
  for (uint64_t now = 0; now < limit; now = rsr("cntpct_el0") - t0) {
   g.ms = (uint32_t)(now * 1000 / hz);
   if (!g.rx_fifo) {
@@ -651,17 +739,27 @@ static uint32_t au_glink_run(uint32_t *r, unsigned seconds, uint32_t options)
   if (g.stuck) break;
   if (g.ms >= next_ask) {
    if (!g.gpr_ready) { if (au_gl_gpr_ask(&g)) next_ask = g.ms + 3000; }
-   else if ((options & AU_GL_GRAPH) != 0 && g.prm_sent == 2 && g.graph_sent < AU_GL_GRAPH_STEPS && g.ms < graph_until) {
+   else if ((options & AU_GL_GRAPH) != 0 && g.prm_sent == 2 && g.graph_sent < g.graph_steps && g.ms < graph_until) {
     /* Each packet into the long buffer; if the DSP gives none, on to the votes coming off. */
     static uint32_t m[2 + AU_GL_GPR_BUFFER / 4 + 2];
-    if (!g.big_have) { (void)au_gl_big_ask(&g); next_ask = g.ms + 100; }
+    const bool play = (options & AU_GL_PLAY) != 0;
+    if (play && g.graph_sent == AU_PLAY_WRITES_AFTER && g.map_handle != 0 && (g.write_sent < AU_PLAY_BUFFERS || (g.write_done < AU_PLAY_BUFFERS && g.ms < writes_until))) {
+     /* Two buffers ahead of what it has played, so that it does not run dry and neither does the wait stretch. */
+     next_ask = g.ms + 2;
+     if (g.write_sent < AU_PLAY_BUFFERS && g.write_sent < g.write_done + 2) {
+      uint32_t i = g.write_sent % 4;
+      uint32_t bytes = fuxi_ar_write((uint8_t *)(m + 2), AU_GL_GPR_BUFFER, 1, AU_GL_WRITE_TOKEN + g.write_sent, (AU_PLAY_PA + i * AU_PLAY_BYTES) | AU_PLAY_SID << 32, g.map_handle, AU_PLAY_BYTES);
+      if (bytes != 0 && au_gl_data_send(&g, m, bytes)) writes_until = g.ms + 3000;
+     }
+    }
+    else if (!g.big_have) { (void)au_gl_big_ask(&g); next_ask = g.ms + 100; }
     else {
-     uint32_t bytes = au_graph_build(g.graph_sent, m, AU_GL_GPR_BUFFER);
-     if (bytes != 0 && au_gl_graph_send(&g, m, bytes)) next_ask = g.ms + 1500;
+     uint32_t bytes = play ? au_play_build(g.graph_sent, m, AU_GL_GPR_BUFFER, g.map_handle) : au_graph_build(g.graph_sent, m, AU_GL_GPR_BUFFER);
+     if (bytes != 0 && au_gl_graph_send(&g, m, bytes)) next_ask = g.ms + (play ? 300 : 1500);
      else if (bytes == 0) graph_until = 0;
     }
    }
-   else if (au_gl_prm_step(&g)) { next_ask = g.ms + 1500; graph_until = g.ms + 8000; }
+   else if (au_gl_prm_step(&g)) { next_ask = g.ms + 1500; graph_until = g.ms + ((options & AU_GL_PLAY) != 0 ? 20000 : 8000); }
   }
  }
  r[18] = g.rx_msgs; r[19] = g.tx_msgs; r[20] = g.tx_full; r[21] = g.stuck; r[22] = g.version_seen; r[23] = g.version_acked;
@@ -678,11 +776,56 @@ static uint32_t au_glink_run(uint32_t *r, unsigned seconds, uint32_t options)
  r[79] = g.gpr_lcid | g.gpr_rcid << 16; r[80] = g.gpr_acked | g.gpr_offers << 8; r[81] = g.gpr_riid_n; r[82] = g.gpr_first_bytes; r[83] = g.gpr_last_bytes;
  for (unsigned i = 0; i < AU_GL_GPR_WORDS; i++) r[84 + i] = g.gpr_first[i];
  for (unsigned i = 0; i < 8; i++) r[100 + i] = g.gpr_last[i];
- for (unsigned i = 0; i < AU_GL_GRAPH_STEPS; i++) { r[108 + i] = g.graph_status[i]; r[111 + i] = g.graph_heard_ms[i]; }
+ for (unsigned i = 0; i < AU_GL_GRAPH_MOST; i++) { au_gl_rep2[i] = g.graph_status[i]; au_gl_rep2[16 + i] = g.graph_heard_ms[i]; }
+ au_gl_rep2[32] = g.write_sent; au_gl_rep2[33] = g.write_done; au_gl_rep2[34] = g.write_first_ms; au_gl_rep2[35] = g.write_last_ms;
+ au_gl_rep2[36] = g.write_status; au_gl_rep2[37] = g.write_bad; au_gl_rep2[38] = g.map_handle; au_gl_rep2[39] = g.graph_steps;
+ if ((options & AU_GL_PLAY) != 0) {
+  au_gl_rep2[42] = au_rd(AU_SMMU + 0x48);    /* sGFSR: a stream it could not place, or a fault */
+  au_gl_rep2[43] = au_rd(AU_SMMU + 0x50);    /* sGFSYNR0 */
+  au_gl_rep2[44] = au_rd(AU_SMMU + 0x54);    /* sGFSYNR1: the stream */
+  au_gl_rep2[45] = au_rd(AU_PLAY_PA);        /* still the zeros */
+  au_smmu_back();
+  au_smmu_slot = second_slot; au_smmu_old[0] = second_old[0]; au_smmu_old[1] = second_old[1];
+  au_smmu_back();
+ }
  r[114] = g.big_size; r[115] = g.big_refused; r[126] = g.graph_sent; r[127] = g.big_have | g.big_asked << 8;
  for (unsigned i = 0; i < AU_GL_PRM_STEPS; i++) { r[116 + i] = g.prm_status[i]; r[120 + i] = g.prm_heard_ms[i]; }
  r[124] = g.prm_sent; r[125] = g.prm_sent_ms[0];
  return g.stuck ? 0x210 + g.stuck : 1;
+}
+/*
+ * Read only: what apps_smmu would do with a stream, an LPASS one being what the DSP's shared memory reaches the AP's DRAM by. Layout as
+ * xnu/fuxi-wlan's wl_smmu_probe() reads it (arm-smmu v2). r: magic, sid, faults, sCR0, IDR0, IDR1, matches found, then for each smr, s2cr,
+ * and when it translates its context bank's SCTLR, TCR and CBAR.
+ */
+static uint32_t au_smmu_rep[128];
+static void au_smmu_look(uint32_t *r, uint32_t sid)
+{
+ const uint64_t base = 0x15000000ull;
+ uint32_t idr1, shift, pages, count, found = 0;
+ uint64_t cbs;
+ au_faults = 0;
+ r[0] = 0xa0d10004; r[1] = sid;
+ r[3] = au_rd(base); r[4] = au_rd(base + 0x20); r[5] = idr1 = au_rd(base + 0x24);
+ shift = (idr1 >> 31) ? 16 : 12;
+ pages = 1u << (((idr1 >> 28) & 7) + 1);
+ cbs = base + ((uint64_t)pages << shift);
+ count = r[4] & 0xff;
+ for (uint32_t i = 0; i < count && i < 128 && 7 + 6 * found + 5 < 128; i++) {
+  uint32_t smr = au_rd(base + 0x800 + 4 * i), id = smr & 0xffff, mask = (smr >> 16) & 0x7fff;
+  if (!(smr >> 31) || ((id ^ sid) & ~mask & 0x7fff)) continue;
+  uint32_t s2cr = au_rd(base + 0xc00 + 4 * i), *m = r + 7 + 6 * found;
+  m[0] = i; m[1] = smr; m[2] = s2cr;
+  if (((s2cr >> 16) & 3) == 0) {
+   uint32_t cb = s2cr & 0xff;
+   m[3] = au_rd(cbs + ((uint64_t)cb << shift));
+   m[4] = au_rd(cbs + ((uint64_t)cb << shift) + 0x30);
+   m[5] = au_rd(base + (1ull << shift) + 4 * cb);
+  }
+  found++;
+ }
+ r[6] = found;
+ r[2] = au_faults;
 }
 /* USB entry: returns bytes placed in out (0 = stall). */
 static uint32_t audio_request(uint16_t value, uint16_t index, uint8_t *out)
@@ -709,18 +852,47 @@ static uint32_t audio_request(uint16_t value, uint16_t index, uint8_t *out)
   uint32_t r[2] = {(uint32_t)x0, (uint32_t)x1};
   memcpy(out, r, sizeof(r)); return sizeof(r);
  }
+ if (value == 0x4154 && !monitor_report[MON_LAUNCH]) {
+  static uint32_t r[16];
+  for (unsigned i = 0; i < 16; i++) r[i] = 0;
+  r[0] = 0xa0d10005; r[1] = index;
+  au_faults = 0;
+  r[2] = (uint32_t)(uintptr_t)&au_gl_rep2[0]; r[3] = (uint32_t)(uintptr_t)__builtin_frame_address(0);
+  if (index & 1) {
+   r[4] = au_rd(AU_PLAY_PA);
+   for (uint32_t i = 0; i < AU_PLAY_BYTES; i++) au_wr(AU_PLAY_PA + 4 * i, 0);
+   r[5] = au_rd(AU_PLAY_PA); r[6] = au_rd(AU_PLAY_PA + 4 * (AU_PLAY_BYTES - 1));
+  }
+  if (index & 2) {
+   r[7] = au_rd(AU_SMMU + 0x48);
+   au_smmu_bypass(index & 16 ? 0x1061 : 0x1001, index & 16 ? 0 : 0x80, (index & 8) != 0);
+   r[8] = (uint32_t)(au_smmu_slot + 1);
+   r[14] = au_smmu_step;
+   if (au_smmu_slot >= 0) { r[9] = au_rd(AU_SMMU + 0x800 + 4 * (uint32_t)au_smmu_slot); r[10] = au_rd(AU_SMMU + 0xc00 + 4 * (uint32_t)au_smmu_slot); }
+   r[11] = au_rd(AU_SMMU + 0x48);
+  }
+  if (index & 4) { au_smmu_back(); r[12] = au_rd(AU_SMMU + 0x48); }
+  r[13] = au_faults;
+  memcpy(out, r, sizeof(r)); return sizeof(r);
+ }
+ if (value == 0x414d && !monitor_report[MON_LAUNCH]) {
+  au_smmu_look(au_smmu_rep, index);
+  memcpy(out, au_smmu_rep, sizeof(au_smmu_rep)); return sizeof(au_smmu_rep);
+ }
  if (value == 0x4147 && !monitor_report[MON_LAUNCH] && au_boot[1] == 1) {
   if (!au_gl_rep[0]) {
    unsigned seconds = index & 0xff;
    au_gl_rep[0] = 0xa0d10003;
    au_gl_rep[2] = seconds = seconds == 0 ? 10 : seconds > 45 ? 45 : seconds;
-   au_gl_rep[3] = (index >> 8) & 15;
-   au_gl_rep[1] = au_glink_run(au_gl_rep, seconds, au_gl_rep[3] == 15 ? AU_GL_ANSWER | AU_GL_GPR | AU_GL_PRM | AU_GL_GRAPH : au_gl_rep[3] == 7 ? AU_GL_ANSWER | AU_GL_GPR | AU_GL_PRM :
+   au_gl_rep[3] = (index >> 8) & 31;
+   au_gl_rep[1] = au_glink_run(au_gl_rep, seconds, au_gl_rep[3] == 31 ? AU_GL_ANSWER | AU_GL_GPR | AU_GL_PRM | AU_GL_GRAPH | AU_GL_PLAY :
+                               au_gl_rep[3] == 15 ? AU_GL_ANSWER | AU_GL_GPR | AU_GL_PRM | AU_GL_GRAPH : au_gl_rep[3] == 7 ? AU_GL_ANSWER | AU_GL_GPR | AU_GL_PRM :
                                au_gl_rep[3] == 3 ? AU_GL_ANSWER | AU_GL_GPR : au_gl_rep[3] & 1 ? AU_GL_ANSWER : 0);
    au_gl_rep[4] = au_faults;
   }
   memcpy(out, au_gl_rep, sizeof(au_gl_rep)); return sizeof(au_gl_rep);
  }
+ if (value == 0x4149 && au_gl_rep[0]) { memcpy(out, au_gl_rep2, sizeof(au_gl_rep2)); return sizeof(au_gl_rep2); }
  if (value == 0x4148 && au_gl_rep[0] && index < AU_GL_LOG_WORDS / 128) {
   memcpy(out, au_gl_log + 128u * index, 512); return 512;
  }

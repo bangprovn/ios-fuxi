@@ -5,7 +5,8 @@
  * then APM_CMD_GET_SPF_STATE alone on adsp_apps, by au_gl_gpr_ask(), which reads a state and sets up nothing. With AU_GL_PRM,
  * once that says ready, au_gl_prm_step() also votes LPASS's macro and dcodec on and off again. With AU_GL_GRAPH, au_gl_graph_send()
  * sends what audio.c builds, a packet too long for the DSP's own buffers: it opens, configures and closes a graph and never starts it,
- * so no clock reaches a pin. No amplifier and no register either way. Define AU_GL_RD, AU_GL_WR, AU_GL_WMB and AU_GL_KICK.
+ * so no clock reaches a pin. With AU_GL_PLAY the list goes on to start it and au_gl_data_send() gives it buffers: audio.c fills them with
+ * zeros and never muxes a pin, so what this proves is the DSP's clock taking them. No amplifier and no register either way. Define AU_GL_RD, AU_GL_WR, AU_GL_WMB and AU_GL_KICK.
  */
 #ifndef AU_GLINK_H
 #define AU_GLINK_H
@@ -39,8 +40,12 @@ enum { AU_GL_VERSION = 0, AU_GL_VERSION_ACK = 1, AU_GL_OPEN = 2, AU_GL_CLOSE = 3
 #define AU_GL_OP_PRM_RELEASE_DONE 0x02001003u
 #define AU_GL_PRM_TOKEN 0x100u
 #define AU_GL_GRAPH 8u         /* options: with AU_GL_PRM, between the votes, the packets of au_gl_graph_send() */
-#define AU_GL_GRAPH_STEPS 3u   /* open, configure, close */
+#define AU_GL_GRAPH_MOST 16u   /* the longest of audio.c's lists */
 #define AU_GL_GRAPH_TOKEN 0x200u
+#define AU_GL_PLAY 16u         /* options: with AU_GL_GRAPH, the buffers of au_gl_data_send() */
+#define AU_GL_WRITE_TOKEN 0x1000u
+#define AU_GL_OP_MEM_MAP_DONE 0x02001001u  /* payload {handle} */
+#define AU_GL_OP_WRITE_DONE 0x05001004u    /* payload {address, address, handle, status} */
 
 struct au_gl {
 	uint64_t desc, tx_fifo, rx_fifo;
@@ -53,7 +58,8 @@ struct au_gl {
 	uint32_t gpr_asked_ms, gpr_first_ms, gpr_last_ms, gpr_first_bytes, gpr_last_bytes, gpr_riid_n;
 	uint32_t gpr_riid[AU_GL_GPR_INTENTS], gpr_first[AU_GL_GPR_WORDS], gpr_last[AU_GL_GPR_WORDS];
 	uint32_t prm_sent, prm_status[AU_GL_PRM_STEPS], prm_opcode[AU_GL_PRM_STEPS], prm_sent_ms[AU_GL_PRM_STEPS], prm_heard_ms[AU_GL_PRM_STEPS];
-	uint32_t big_riid, big_have, big_asked, big_refused, big_size, graph_sent, graph_status[AU_GL_GRAPH_STEPS], graph_heard_ms[AU_GL_GRAPH_STEPS];
+	uint32_t big_riid, big_have, big_asked, big_refused, big_size, graph_steps, graph_sent, graph_status[AU_GL_GRAPH_MOST], graph_heard_ms[AU_GL_GRAPH_MOST];
+	uint32_t map_handle, write_sent, write_done, write_status, write_bad, write_first_ms, write_last_ms;
 };
 
 static inline uint32_t au_gl_align8(uint32_t n) { return (n + 7u) & ~7u; }
@@ -180,12 +186,25 @@ static inline bool au_gl_big_ask(struct au_gl *g)
  */
 static inline bool au_gl_graph_send(struct au_gl *g, uint32_t *m, uint32_t bytes)
 {
-	if ((g->options & AU_GL_GRAPH) == 0 || !g->gpr_ready || !g->big_have || g->graph_sent >= AU_GL_GRAPH_STEPS || bytes > AU_GL_GPR_BUFFER || bytes > g->big_size) return false;
+	if ((g->options & AU_GL_GRAPH) == 0 || !g->gpr_ready || !g->big_have || g->graph_sent >= g->graph_steps || g->graph_sent >= AU_GL_GRAPH_MOST ||
+	    bytes > AU_GL_GPR_BUFFER || bytes > g->big_size) return false;
 	m[0] = bytes; m[1] = 0;
 	if (((8u + bytes) & 7u) != 0) m[(8u + bytes) / 4u] = 0;
 	if (!au_gl_tx(g, AU_GL_TX_DATA, g->gpr_lcid, g->big_riid, m, 8u + bytes)) return false;
 	g->big_have = 0;
 	g->graph_status[g->graph_sent++] = AU_GL_PRM_NO_ANSWER;
+	return true;
+}
+
+/* One of audio.c's buffers, into one of the DSP's small ones. `m` as for au_gl_graph_send(). */
+static inline bool au_gl_data_send(struct au_gl *g, uint32_t *m, uint32_t bytes)
+{
+	if ((g->options & AU_GL_PLAY) == 0 || g->map_handle == 0u || g->gpr_riid_n == 0 || bytes > 128u) return false;
+	m[0] = bytes; m[1] = 0;
+	if (((8u + bytes) & 7u) != 0) m[(8u + bytes) / 4u] = 0;
+	if (!au_gl_tx(g, AU_GL_TX_DATA, g->gpr_lcid, g->gpr_riid[g->gpr_riid_n - 1u], m, 8u + bytes)) return false;
+	g->gpr_riid_n--;
+	g->write_sent++;
 	return true;
 }
 
@@ -207,9 +226,23 @@ static inline void au_gl_gpr_take(struct au_gl *g, uint32_t tail, uint32_t bytes
 		g->prm_opcode[step] = keep[5];
 		g->prm_heard_ms[step] = g->ms;
 	}
-	if (keep[4] >= AU_GL_GRAPH_TOKEN && keep[4] - AU_GL_GRAPH_TOKEN < g->graph_sent && keep[4] - AU_GL_GRAPH_TOKEN < AU_GL_GRAPH_STEPS && bytes >= 32u && keep[5] == AU_GL_OP_BASIC_RESULT) {
-		g->graph_status[keep[4] - AU_GL_GRAPH_TOKEN] = keep[7];
-		g->graph_heard_ms[keep[4] - AU_GL_GRAPH_TOKEN] = g->ms;
+	if (keep[4] >= AU_GL_GRAPH_TOKEN && keep[4] - AU_GL_GRAPH_TOKEN < g->graph_sent && keep[4] - AU_GL_GRAPH_TOKEN < AU_GL_GRAPH_MOST) {
+		uint32_t step = keep[4] - AU_GL_GRAPH_TOKEN;
+
+		if (bytes >= 32u && keep[5] == AU_GL_OP_BASIC_RESULT) {
+			g->graph_status[step] = keep[7];
+			g->graph_heard_ms[step] = g->ms;
+		} else if (bytes >= 28u && keep[5] == AU_GL_OP_MEM_MAP_DONE) {
+			g->map_handle = keep[6];
+			g->graph_status[step] = 0;
+			g->graph_heard_ms[step] = g->ms;
+		}
+	}
+	if (keep[5] == AU_GL_OP_WRITE_DONE && bytes >= 40u) {
+		if (g->write_done++ == 0u) g->write_first_ms = g->ms;
+		g->write_last_ms = g->ms;
+		g->write_status = keep[9];
+		g->write_bad += keep[9] != 0u;
 	}
 	g->gpr_heard++;
 }
@@ -329,7 +362,11 @@ static inline bool au_gl_step(struct au_gl *g)
 		break;
 	case AU_GL_RX_DONE_REUSE:
 		/* Our long buffer back to use again. */
-		if (gpr_channel && g->big_size != 0u && p2 == g->big_riid) g->big_have = 1;
+		if (gpr_channel && g->big_size != 0u && p2 == g->big_riid) {
+			g->big_have = 1;
+		} else if (gpr_channel && (g->options & AU_GL_PLAY) != 0 && g->gpr_riid_n < AU_GL_GPR_INTENTS) {
+			g->gpr_riid[g->gpr_riid_n++] = p2;	/* a small one of its, back for the next buffer */
+		}
 		break;
 	case AU_GL_TX_DATA: case AU_GL_TX_DATA_CONT:
 		if (!gpr_channel) { g->gpr_other++; break; }

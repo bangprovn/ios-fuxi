@@ -320,14 +320,14 @@ only if the ADT cannot carry it. The HAL plug-in stays opt-in through `fuxi-sys-
 
 ### Blockers and facts needed
 
-1. Fuxi ACDB/topology ids for the TDM speaker and the capture path (files above), plus the AudioReach TDM interface param id and layout.
+1. ~~Fuxi ACDB/topology ids~~ Not needed: a client names its own graph's ids. TDM module and parameters known, and the DSP plays through them (a-play2, research_notes/audio-next.md). Capture path still to do.
 2. CS35L41 register init for ASP RX1 direct (clock/PLL reference from the TDM SCLK, ASP enables, gain, global enable, DEVID check).
    `ShengCs35l43.c` shows the shape only; Linux's driver is GPL and is ideas only. Needed: a non-GPL register list or a carefully
    reconstructed one verified by DEVID reads and PLL-lock status before any audio.
-3. A reserved low-DRAM window for the DSP buffers and a check that audio streams stay in SMMU pass-through under the fuxi hypervisor setup.
+3. A reserved low-DRAM window for the DSP buffers. In the loader 0xd0000000 works, with streams 0x1001/0x80 and 0x1061 routed to context bank 4 (stage 1 off): bypass, and 0x1801, are refused by the hypervisor. In XNU, still to be settled.
 4. An SCM/PAS caller inside XNU (or an agreed hand-off from the loader after stage 2) and the ADSP firmware extraction.
 5. Which AMIC/micbias fuxi's built-in microphone uses (mixer_paths from the vendor image).
-6. Whether the APM needs a servreg/pd-mapper responder (the recovery log suggests so; sheng's guide does not mention one).
+6. ~~Whether the APM needs a servreg/pd-mapper responder~~ It does not: a-gpr1, status 1 two seconds after GLINK with neither.
 
 ### Tests
 

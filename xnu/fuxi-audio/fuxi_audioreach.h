@@ -77,6 +77,7 @@ uint32_t fuxi_ar_config_speaker_device(uint8_t *out, uint32_t capacity, uint32_t
 uint32_t fuxi_ar_open_speaker_tdm(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token);
 uint32_t fuxi_ar_config_speaker_tdm(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const FuxiArFormat *f, const FuxiArTdm *t);
 uint32_t fuxi_ar_open_playback_stream(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token);
+uint32_t fuxi_ar_open_playback_stream_tdm(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token);  /* the same, into the TDM endpoint */
 uint32_t fuxi_ar_config_playback_stream(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const FuxiArFormat *f);
 uint32_t fuxi_ar_config_playback_shmem(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const FuxiArFormat *f);
 uint32_t fuxi_ar_open_mic_device(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token);

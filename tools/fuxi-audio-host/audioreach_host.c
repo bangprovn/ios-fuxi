@@ -2,6 +2,7 @@
 // Host tests of the graph manager commands (xnu/fuxi-audio/fuxi_audioreach.c): packet sizes, parameter block layout and the fields the DSP
 // reads, checked against the layout the DSP's reference client produces.
 #include <assert.h>
+#define WORD_AT(t, at) ((uint32_t)(t)[at] | (uint32_t)(t)[(at) + 1] << 8 | (uint32_t)(t)[(at) + 2] << 16 | (uint32_t)(t)[(at) + 3] << 24)
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -93,6 +94,8 @@ int main(void)
         assert(WORD(at + 4) == 0x0800113Cu && WORD(at + 8) == 16 && WORD(at + 16) == 0 && WORD(at + 24) == 4 && at + 32 == m);
 #undef WORD
         assert(fuxi_ar_config_speaker_tdm(t, 40, 1, 12, &s32, &tdm) == 0);
+        m = fuxi_ar_open_playback_stream_tdm(t, sizeof t, 1, 13);
+        assert(m != 0 && m <= FUXI_GPR_MAX_PACKET && WORD_AT(t, m - 12) == FUXI_AR_IID_SPEAKER_TDM);    /* the last link ends at the sink; its port and 4 bytes of padding follow */
     }
     n = fuxi_ar_config_speaker_device(b, sizeof b, 1, 9, &stereo);
     CHECK(n && blocks(b, n, iid, id, off, 8) == 3);

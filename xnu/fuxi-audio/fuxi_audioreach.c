@@ -157,6 +157,16 @@ uint32_t fuxi_ar_open_playback_stream(uint8_t *out, uint32_t capacity, uint32_t 
     return graph_open(out, capacity, port, token, &sg, &c, m, 3, l, 3);
 }
 
+uint32_t fuxi_ar_open_playback_stream_tdm(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token)
+{
+    static const Sg sg = {FUXI_AR_SG_PLAY, PERF_LOW_LATENCY, DIR_RX, SCENARIO_PLAYBACK};
+    static const Container c = {FUXI_AR_SG_PLAY, POS_STREAM};
+    static const Module m[] = {{FUXI_AR_MOD_WR_SHMEM, FUXI_AR_IID_PLAY_SHMEM, 0, 1}, {FUXI_AR_MOD_PCM_DEC, FUXI_AR_IID_PLAY_DEC, 1, 1},
+                               {FUXI_AR_MOD_PCM_CNV, FUXI_AR_IID_PLAY_CNV, 1, 1}};
+    static const Link l[] = {{FUXI_AR_IID_PLAY_SHMEM, FUXI_AR_IID_PLAY_DEC}, {FUXI_AR_IID_PLAY_DEC, FUXI_AR_IID_PLAY_CNV}, {FUXI_AR_IID_PLAY_CNV, FUXI_AR_IID_SPEAKER_TDM}};
+    return graph_open(out, capacity, port, token, &sg, &c, m, 3, l, 3);
+}
+
 uint32_t fuxi_ar_open_mic_device(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token)
 {
     static const Sg sg = {FUXI_AR_SG_MIC, PERF_LOW_LATENCY, DIR_TX, SCENARIO_RECORD};

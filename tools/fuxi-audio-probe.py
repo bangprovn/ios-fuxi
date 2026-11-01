@@ -6,7 +6,7 @@
   upload --dtb F --fw F        stage squashed adsp_dtb/adsp MBNs over control OUT
   boot                         stage 2: PAS-boot the ADSP once, then decode
   report                       re-read the frozen stage-2 report
-  glink [--seconds N] [--answer] [--gpr] [--prm]  after a boot that reached ready: GLINK with the DSP, polled; no data is sent unless --gpr asks the APM its state; --prm then votes LPASS on and off; --graph between them opens, configures and closes the TDM graph, never starting it
+  glink [--seconds N] [--answer] [--gpr] [--prm]  after a boot that reached ready: GLINK with the DSP, polled; no data is sent unless --gpr asks the APM its state; --prm then votes LPASS on and off; --graph between them opens, configures and closes the TDM graph, never starting it; --play also starts it and gives it a second of zeros, no pin muxed
   decode FILE                  decode a saved raw page offline
 Raw pages can be saved with --save. See docs-lanes/audio.md.
 """
@@ -143,7 +143,7 @@ def decode_boot(r):
 GLINK_CMDS = {0: 'VERSION', 1: 'VERSION_ACK', 2: 'OPEN', 3: 'CLOSE', 4: 'OPEN_ACK', 5: 'INTENT', 6: 'RX_DONE', 7: 'INTENT_REQ',
               8: 'INTENT_REQ_ACK', 9: 'TX_DATA', 11: 'CLOSE_ACK', 12: 'TX_DATA_CONT', 13: 'READ_NOTIF', 14: 'RX_DONE_REUSE', 15: 'SIGNALS'}
 GLINK_RESULT = {1: 'listened to the end', 0x201: 'no AP-ADSP partition', 0x202: 'TCSR mutex 3 not taken', 0x203: 'no descriptor or FIFO of a usable size',
-                0x204: 'version could not be sent', 0x212: 'stuck: open with a bad name length', 0x213: 'stuck: intents beyond the ring',
+                0x204: 'version could not be sent', 0x205: 'the buffer would fall on this code', 0x206: 'no free stream match', 0x212: 'stuck: open with a bad name length', 0x213: 'stuck: intents beyond the ring',
                 0x214: 'stuck: data longer than the ring', 0x215: 'stuck: unknown command', 0x211: 'stuck: ring positions cannot be true'}
 
 
@@ -168,9 +168,25 @@ def decode_glink(r):
             out.append(f'  PRM: {what}: {status}, heard at {r[120 + i]} ms')
     if r[3] & 8:
         out.append(f'  GRAPH: {r[126]} packets sent; the long buffer {r[114]} bytes, refused {r[115]}, have {r[127] & 0xff} asked {r[127] >> 8}')
-        for i, what in enumerate(('open', 'configure', 'close')[:r[126]]):
-            status = 'no answer' if r[108 + i] == 0xffffffff else f'status {r[108 + i]:#x}'
-            out.append(f'  GRAPH: {what}: {status}, heard at {r[111 + i]} ms')
+    return out
+
+
+GRAPH_STEPS = {3: ('open', 'configure', 'close'),
+               15: ('open device', 'configure device', 'open stream', 'configure stream', 'configure its input', 'map the buffers', 'prepare device', 'prepare stream',
+                    'start device', 'start stream', 'stop stream', 'stop device', 'close stream', 'close device', 'unmap')}
+
+
+def decode_graph(q, sent):
+    out = []
+    for i, what in enumerate(GRAPH_STEPS.get(q[39], ())[:sent]):
+        status = 'no answer' if q[i] == 0xffffffff else f'status {q[i]:#x}'
+        out.append(f'  GRAPH: {what}: {status}, heard at {q[16 + i]} ms')
+    if q[39] == 15:
+        out.append(f'  PLAY: bypass in stream match {q[41] - 1}; sGFSR {q[40]:#x} before, {q[42]:#x} after, syndrome {q[43]:#x} {q[44]:#x}; first word of the buffer {q[45]:#x}')
+        out.append(f'  PLAY: map handle {q[38]:#x}; buffers sent {q[32]}, played {q[33]}, first at {q[34]} ms, last at {q[35]} ms, last status {q[36]:#x}, bad {q[37]}')
+        if q[33] > 1:
+            ms = (q[35] - q[34]) / (q[33] - 1)
+            out.append(f'  PLAY: {ms:.2f} ms a buffer of 20 ms')
     return out
 
 
@@ -235,12 +251,15 @@ def fnv(data):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('cmd', choices=['snapshot', 'squash', 'upload', 'boot', 'report', 'decode', 'stop', 'glink'])
+    ap.add_argument('cmd', choices=['snapshot', 'squash', 'upload', 'boot', 'report', 'decode', 'stop', 'glink', 'smmu', 'poke'])
+    ap.add_argument('--what', type=int, default=0, help='poke: 1 the zeros, 2 the stream match, 8 with it stop at the S2CR, 16 stream 0x1061 rather than 0x1001, 4 take it away, or their sum')
+    ap.add_argument('--sid', type=lambda x: int(x, 0), default=0x1001, help='smmu: the stream, by default the DSP buffers of Linux sm8550.dtsi')
     ap.add_argument('--seconds', type=int, default=30, help='glink: how long to listen, at most 45')
     ap.add_argument('--answer', action='store_true', help='glink: complete the opening of channels; still sends no data')
     ap.add_argument('--gpr', action='store_true', help='glink: with --answer, ask the APM on adsp_apps whether it is up')
     ap.add_argument('--prm', action='store_true', help='glink: with --gpr, once ready, vote the macro and dcodec on then off')
     ap.add_argument('--graph', action='store_true', help='glink: with --prm, open, configure and close the TDM graph between the votes')
+    ap.add_argument('--play', action='store_true', help='glink: with --graph, instead start them and give them a second of zeros; no pin is muxed')
     ap.add_argument('--outbound', action='store_true', help='boot: create the AP outbound SMP2P item 429 first')
     ap.add_argument('--doorbell', action='store_true', help='boot: with --outbound, also ring LPASS SMP2P')
     ap.add_argument('--wait', type=int, default=0, help='boot: seconds to wait for ready, at most 45')
@@ -316,19 +335,36 @@ def main():
             show(req(0x4158, int(a.outbound) | int(a.doorbell) << 1 | a.wait << 8))
         else:
             show(req(0x4142))
+    elif a.cmd == 'poke':
+        r = struct.unpack('<16I', req(0x4154, a.what, 64))
+        print(f'poke {r[1]}: magic {r[0]:#x}, this code at {r[2]:#x}, stack at {r[3]:#x}, faults {r[13]}')
+        print(f'  zeros: before {r[4]:#x}, after {r[5]:#x} and {r[6]:#x}')
+        print(f'  bypass: sGFSR before {r[7]:#x}; slot+1 {r[8]}, SMR {r[9]:#x} S2CR {r[10]:#x}; sGFSR after {r[11]:#x}, after taking it away {r[12]:#x}; got to step {r[14]} of 3')
+    elif a.cmd == 'smmu':
+        r = struct.unpack('<128I', req(0x414d, a.sid))
+        if r[0] != 0xa0d10004:
+            raise SystemExit(f'no smmu report: {r[0]:#x}')
+        print(f'apps_smmu for stream {r[1]:#x}: faults {r[2]} sCR0 {r[3]:#x} (unmatched streams {"fault" if r[3] & 0x400 else "bypass"}) IDR0 {r[4]:#x} IDR1 {r[5]:#x}, {r[6]} matches')
+        for i in range(min(r[6], 20)):
+            m = r[7 + 6 * i:13 + 6 * i]
+            kind = {0: 'translates', 1: 'bypass', 2: 'fault'}.get((m[2] >> 16) & 3, '?')
+            print(f'  group {m[0]}: SMR {m[1]:#x} (id {m[1] & 0xffff:#x} mask {(m[1] >> 16) & 0x7fff:#x}) S2CR {m[2]:#x} {kind}' +
+                  (f', CB {m[2] & 0xff}: SCTLR {m[3]:#x} TCR {m[4]:#x} CBAR {m[5]:#x}' if ((m[2] >> 16) & 3) == 0 else ''))
     elif a.cmd == 'stop':
         x0, x1 = struct.unpack('<2I', req(0x415a, 0, 8))
         print(f'pas shutdown x0={x0:#x} x1={x1:#x}')
     elif a.cmd == 'glink':
         if not 1 <= a.seconds <= 45:
             ap.error('--seconds is 1 to 45')
-        if (a.gpr and not a.answer) or (a.prm and not a.gpr) or (a.graph and not a.prm):
-            ap.error('--graph needs --prm, --prm needs --gpr, and --gpr needs --answer')
-        page = req(0x4147, a.seconds | int(a.answer) << 8 | int(a.gpr) << 9 | int(a.prm) << 10 | int(a.graph) << 11)
+        if (a.gpr and not a.answer) or (a.prm and not a.gpr) or (a.graph and not a.prm) or (a.play and not a.graph):
+            ap.error('--play needs --graph, --graph needs --prm, --prm needs --gpr, and --gpr needs --answer')
+        page = req(0x4147, a.seconds | int(a.answer) << 8 | int(a.gpr) << 9 | int(a.prm) << 10 | int(a.graph) << 11 | int(a.play) << 12)
         r = struct.unpack('<128I', page)
         if r[0] != 0xa0d10003:
             raise SystemExit(f'no glink report: {r[0]:#x}')
         print('\n'.join(decode_glink(r)))
+        if r[3] & 8:
+            print('\n'.join(decode_graph(struct.unpack('<128I', req(0x4149)), r[126])))
         count = min(r[27], 96)
         words = []
         for p in range((count * 12 + 127) // 128):
