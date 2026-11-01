@@ -94,6 +94,12 @@ int main(void)
         assert(WORD(at + 4) == 0x0800113Cu && WORD(at + 8) == 16 && WORD(at + 16) == 0 && WORD(at + 24) == 4 && at + 32 == m);
 #undef WORD
         assert(fuxi_ar_config_speaker_tdm(t, 40, 1, 12, &s32, &tdm) == 0);
+        m = fuxi_ar_config_monitor_tdm(t, sizeof t, 1, 14, &s32, &tdm);
+        assert(m != 0 && WORD_AT(t, 40) == FUXI_AR_IID_MONITOR_TDM && WORD_AT(t, 40 + 16 + 8) == 1u);      /* its sync the SoC's, data_out 0 in the high half */
+        m = fuxi_ar_open_monitor_tdm(t, sizeof t, 1, 15);
+        assert(m != 0 && m <= FUXI_GPR_MAX_PACKET);
+        m = fuxi_ar_open_capture_stream_tdm(t, sizeof t, 1, 16);
+        assert(m != 0 && m <= FUXI_GPR_MAX_PACKET);
         m = fuxi_ar_open_playback_stream_tdm(t, sizeof t, 1, 13);
         assert(m != 0 && m <= FUXI_GPR_MAX_PACKET && WORD_AT(t, m - 12) == FUXI_AR_IID_SPEAKER_TDM);    /* the last link ends at the sink; its port and 4 bytes of padding follow */
     }

@@ -176,7 +176,7 @@
 +}
 --- /dev/null
 +++ b/bsd/dev/fuxi_audioreach.h
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,132 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* Copyright (c) 2026, UniXNU contributors. All rights reserved.
 + * Ported from UniXNU-sheng package/ShengAudioReach.h (08cde20edc32, BSD-2-Clause-Patent) with fuxi_ names. */
@@ -217,6 +217,7 @@
 +#define FUXI_AR_MOD_PCM_DEC 0x07001005u
 +#define FUXI_AR_MOD_I2S_SINK 0x0700100Au
 +#define FUXI_AR_MOD_TDM_SINK 0x0700100Eu             /* in fuxi's ACDB too */
++#define FUXI_AR_MOD_TDM_SOURCE 0x0700100Fu
 +#define FUXI_AR_MOD_CODEC_DMA_SOURCE 0x07001024u
 +
 +#define FUXI_AR_SG_PLAY 0x4001u
@@ -229,6 +230,7 @@
 +#define FUXI_AR_IID_SPEAKER_I2S 0x6051u
 +#define FUXI_AR_IID_SPEAKER_TDM 0x6052u              /* our own: a client names its graph's parts */
 +#define FUXI_AR_IID_MIC_DMA 0x6070u
++#define FUXI_AR_IID_MONITOR_TDM 0x6072u              /* the amplifiers' voltage and current coming back */
 +#define FUXI_AR_IID_CAP_CNV 0x6022u
 +#define FUXI_AR_IID_CAP_ENC 0x6023u
 +#define FUXI_AR_IID_CAP_SHMEM 0x6024u
@@ -257,6 +259,9 @@
 +uint32_t fuxi_ar_config_speaker_tdm(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const FuxiArFormat *f, const FuxiArTdm *t);
 +uint32_t fuxi_ar_open_playback_stream(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token);
 +uint32_t fuxi_ar_open_playback_stream_tdm(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token);  /* the same, into the TDM endpoint */
++uint32_t fuxi_ar_open_monitor_tdm(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token);
++uint32_t fuxi_ar_config_monitor_tdm(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const FuxiArFormat *f, const FuxiArTdm *t);
++uint32_t fuxi_ar_open_capture_stream_tdm(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token);
 +uint32_t fuxi_ar_config_playback_stream(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const FuxiArFormat *f);
 +uint32_t fuxi_ar_config_playback_shmem(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const FuxiArFormat *f);
 +uint32_t fuxi_ar_open_mic_device(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token);
@@ -306,7 +311,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/fuxi_audioreach.c
-@@ -0,0 +1,424 @@
+@@ -0,0 +1,453 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* Copyright (c) 2026, UniXNU contributors. All rights reserved.
 + * Ported from UniXNU-sheng package/ShengAudioReach.c (08cde20edc32, BSD-2-Clause-Patent) with fuxi_ names. */
@@ -476,6 +481,25 @@
 +    return graph_open(out, capacity, port, token, &sg, &c, m, 3, l, 3);
 +}
 +
++/* The same endpoint's way in: the amplifiers' SDOUT, on gpio122. */
++uint32_t fuxi_ar_open_monitor_tdm(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token)
++{
++    static const Sg sg = {FUXI_AR_SG_MIC, PERF_LOW_LATENCY, DIR_TX, SCENARIO_RECORD};
++    static const Container c = {FUXI_AR_SG_MIC, POS_GLOBAL_DEV};
++    static const Module m[] = {{FUXI_AR_MOD_TDM_SOURCE, FUXI_AR_IID_MONITOR_TDM, 0, 1}};
++    return graph_open(out, capacity, port, token, &sg, &c, m, 1, 0, 0);
++}
++
++uint32_t fuxi_ar_open_capture_stream_tdm(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token)
++{
++    static const Sg sg = {FUXI_AR_SG_CAPTURE, PERF_LOW_LATENCY, DIR_TX, SCENARIO_RECORD};
++    static const Container c = {FUXI_AR_SG_CAPTURE, POS_GLOBAL_DEV};
++    static const Module m[] = {{FUXI_AR_MOD_PCM_CNV, FUXI_AR_IID_CAP_CNV, 1, 1}, {FUXI_AR_MOD_PCM_ENC, FUXI_AR_IID_CAP_ENC, 1, 1},
++                               {FUXI_AR_MOD_RD_SHMEM, FUXI_AR_IID_CAP_SHMEM, 1, 0}};
++    static const Link l[] = {{FUXI_AR_IID_MONITOR_TDM, FUXI_AR_IID_CAP_CNV}, {FUXI_AR_IID_CAP_CNV, FUXI_AR_IID_CAP_ENC}, {FUXI_AR_IID_CAP_ENC, FUXI_AR_IID_CAP_SHMEM}};
++    return graph_open(out, capacity, port, token, &sg, &c, m, 3, l, 3);
++}
++
 +uint32_t fuxi_ar_open_mic_device(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token)
 +{
 +    static const Sg sg = {FUXI_AR_SG_MIC, PERF_LOW_LATENCY, DIR_TX, SCENARIO_RECORD};
@@ -523,26 +547,36 @@
 +}
 +
 +/* Layouts as pcm_tdm_api.h says them, read from the Xiaomi 14's Linux port (research_notes/audio-next.md). No start here: this reaches no pin. */
-+uint32_t fuxi_ar_config_speaker_tdm(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const FuxiArFormat *f, const FuxiArTdm *t)
++static uint32_t config_tdm(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, uint32_t iid, uint32_t data_out, const FuxiArFormat *f, const FuxiArTdm *t)
 +{
 +    W w;
 +    begin(&w, out, capacity, port, FUXI_AR_APM_IID, token, FUXI_AR_OP_SET_CFG);
 +    const uint32_t cmd = cmd_payload_start(&w);
-+    uint32_t at = param_begin(&w, FUXI_AR_IID_SPEAKER_TDM, PARAM_TDM_INTF);
-+    put32(&w, LPAIF); put32(&w, t->intf); put16(&w, WS_INTERNAL); put16(&w, 1);    /* the SoC's sync, data going out */
++    uint32_t at = param_begin(&w, iid, PARAM_TDM_INTF);
++    put32(&w, LPAIF); put32(&w, t->intf); put16(&w, WS_INTERNAL); put16(&w, data_out);    /* the SoC's sync; 1 data going out */
 +    put32(&w, t->slot_mask); put16(&w, t->slots); put16(&w, t->slot_width);
 +    put16(&w, t->sync_mode); put16(&w, t->invert_sync); put16(&w, t->sync_data_delay); put16(&w, 0);
 +    param_end_exact(&w, at);
-+    hw_ep_mf(&w, FUXI_AR_IID_SPEAKER_TDM, f);
-+    frame_size_factor(&w, FUXI_AR_IID_SPEAKER_TDM);
-+    at = param_begin(&w, FUXI_AR_IID_SPEAKER_TDM, PARAM_TDM_LANE);
++    hw_ep_mf(&w, iid, f);
++    frame_size_factor(&w, iid);
++    at = param_begin(&w, iid, PARAM_TDM_LANE);
 +    put16(&w, 1u << t->lane); put16(&w, 0);
 +    param_end_exact(&w, at);
-+    at = param_begin(&w, FUXI_AR_IID_SPEAKER_TDM, PARAM_HW_INTF_CLOCK);
++    at = param_begin(&w, iid, PARAM_HW_INTF_CLOCK);
 +    put32(&w, 0); put32(&w, 0); put32(&w, t->clock_attribute); put32(&w, 0);       /* id, frequency and root left to the interface */
 +    param_end_exact(&w, at);
 +    cmd_payload_end(&w, cmd);
 +    return finish(&w);
++}
++
++uint32_t fuxi_ar_config_speaker_tdm(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const FuxiArFormat *f, const FuxiArTdm *t)
++{
++    return config_tdm(out, capacity, port, token, FUXI_AR_IID_SPEAKER_TDM, 1, f, t);
++}
++
++uint32_t fuxi_ar_config_monitor_tdm(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const FuxiArFormat *f, const FuxiArTdm *t)
++{
++    return config_tdm(out, capacity, port, token, FUXI_AR_IID_MONITOR_TDM, 0, f, t);
 +}
 +
 +uint32_t fuxi_ar_config_mic_device(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const FuxiArFormat *f, uint32_t channel_mask)
@@ -1370,7 +1404,7 @@
 +#endif /* FUXI */
 --- /dev/null
 +++ b/bsd/dev/fuxi_au_glink.h
-@@ -0,0 +1,407 @@
+@@ -0,0 +1,429 @@
 +/* Fuxi audio lane: the AP's end of GLINK over SMEM with the ADSP, polled, enough to see what the DSP opens. Plain C so that
 + * tools/test-fuxi-audio-glink.py runs it against a fake DSP under the sanitizers; audio.c gives it the SMEM accessors.
 + * The wire format follows Linux qcom_glink_native.c and qcom_glink_smem.c. It negotiates the version, answers CLOSE and an
@@ -1413,13 +1447,15 @@
 +#define AU_GL_OP_PRM_RELEASE_DONE 0x02001003u
 +#define AU_GL_PRM_TOKEN 0x100u
 +#define AU_GL_GRAPH 8u         /* options: with AU_GL_PRM, between the votes, the packets of au_gl_graph_send() */
-+#define AU_GL_GRAPH_MOST 20u   /* the longest of audio.c's lists */
++#define AU_GL_GRAPH_MOST 32u   /* the longest of audio.c's lists */
 +#define AU_GL_GRAPH_TOKEN 0x200u
 +#define AU_GL_PLAY 16u         /* options: with AU_GL_GRAPH, the buffers of au_gl_data_send() */
 +#define AU_GL_WRITE_TOKEN 0x1000u
 +#define AU_GL_TONE 32u         /* options: audio.c's first tone, on the owner's word. For its list and au_tone_stage(); nothing here reads it */
 +#define AU_GL_OP_MEM_MAP_DONE 0x02001001u  /* payload {handle} */
 +#define AU_GL_OP_WRITE_DONE 0x05001004u    /* payload {address, address, handle, status} */
++#define AU_GL_OP_READ_DONE 0x05001005u     /* payload {status, address, address, handle, bytes, offset} */
++#define AU_GL_READ_TOKEN 0x20000u
 +
 +struct au_gl {
 +	uint64_t desc, tx_fifo, rx_fifo;
@@ -1434,6 +1470,7 @@
 +	uint32_t prm_sent, prm_status[AU_GL_PRM_STEPS], prm_opcode[AU_GL_PRM_STEPS], prm_sent_ms[AU_GL_PRM_STEPS], prm_heard_ms[AU_GL_PRM_STEPS];
 +	uint32_t big_riid, big_have, big_asked, big_refused, big_size, graph_steps, graph_sent, graph_status[AU_GL_GRAPH_MOST], graph_heard_ms[AU_GL_GRAPH_MOST];
 +	uint32_t map_handle, write_sent, write_done, write_status, write_bad, write_first_ms, write_last_ms;
++	uint32_t read_sent, read_done, read_status, read_bad, read_bytes, read_offset;
 +};
 +
 +static inline uint32_t au_gl_align8(uint32_t n) { return (n + 7u) & ~7u; }
@@ -1582,6 +1619,18 @@
 +	return true;
 +}
 +
++/* One empty buffer for what comes back, the same way. */
++static inline bool au_gl_read_send(struct au_gl *g, uint32_t *m, uint32_t bytes)
++{
++	if ((g->options & AU_GL_PLAY) == 0 || g->map_handle == 0u || g->gpr_riid_n == 0 || bytes > 128u) return false;
++	m[0] = bytes; m[1] = 0;
++	if (((8u + bytes) & 7u) != 0) m[(8u + bytes) / 4u] = 0;
++	if (!au_gl_tx(g, AU_GL_TX_DATA, g->gpr_lcid, g->gpr_riid[g->gpr_riid_n - 1u], m, 8u + bytes)) return false;
++	g->gpr_riid_n--;
++	g->read_sent++;
++	return true;
++}
++
 +/* An answer on adsp_apps, while it is still in the ring. `tail` is at its header, so its bytes begin 16 past. */
 +static inline void au_gl_gpr_take(struct au_gl *g, uint32_t tail, uint32_t bytes)
 +{
@@ -1620,6 +1669,13 @@
 +		g->write_last_ms = g->ms;
 +		g->write_status = keep[9];
 +		g->write_bad += keep[9] != 0u;
++	}
++	if (keep[5] == AU_GL_OP_READ_DONE && bytes >= 44u) {
++		g->read_done++;
++		g->read_status = keep[6];
++		g->read_bad += keep[6] != 0u;
++		g->read_bytes = keep[10];
++		g->read_offset = bytes >= 48u ? keep[11] : 0u;
 +	}
 +	g->gpr_heard++;
 +}

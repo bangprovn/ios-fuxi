@@ -174,12 +174,42 @@ def decode_glink(r):
 GRAPH_STEPS = {3: ('open', 'configure', 'close'),
                15: ('open device', 'configure device', 'open stream', 'configure stream', 'configure its input', 'map the buffers', 'prepare device', 'prepare stream',
                     'start device', 'start stream', 'stop stream', 'stop device', 'close stream', 'close device', 'unmap'),
+               29: ('TDM clock on', 'open device', 'configure device', 'open stream', 'configure stream', 'configure its input', 'map the buffers', 'prepare device', 'prepare stream',
+                    'start device', 'start stream', 'open way back', 'configure way back', 'open its stream', 'configure its stream', 'prepare way back', 'prepare its stream', 'start way back', 'start its stream',
+                    'stop its stream', 'stop way back', 'close its stream', 'close way back', 'stop stream', 'stop device', 'close stream', 'close device', 'unmap', 'TDM clock off'),
                17: ('TDM clock on', 'open device', 'configure device', 'open stream', 'configure stream', 'configure its input', 'map the buffers', 'prepare device', 'prepare stream',
                     'start device', 'start stream', 'stop stream', 'stop device', 'close stream', 'close device', 'unmap', 'TDM clock off')}
 
 
 TONE_RESULT = {1: 'played to the end', 0x400: 'no map handle', 0x402: 'zeros not played', 0x403: 'the vote faulted', 0x404: 'wrapper clock', 0x405: 'engine', 0x406: "SE's clock",
                0x420: 'I2C', 0x430: 'readback', 0x440: 'OTP', 0x450: 'not who it should be', 0x460: 'PLL', 0x470: 'power up not done', 0x480: 'fault flag'}
+
+
+def decode_vi(raw, period, start, end):
+    """How much 2 kHz, and how much of anything, on each of the four slots: during the tone, and before it. 24 frames a cycle, so the sums need no float tables of their own."""
+    import math
+    cos = [math.cos(2 * math.pi * k / 24) for k in range(24)]
+    sin = [math.sin(2 * math.pi * k / 24) for k in range(24)]
+    frames = len(raw) // 16
+    untouched = sum(1 for i in range(0, frames * 16, 4) if raw[i:i + 4] == b'ZZZZ')
+    out = [f'  VI: {frames} frames back, {frames / 48000:.2f} s; {untouched} of {frames * 4} words still the pattern; first words of the tone window {raw[start * period:start * period + 16].hex()}']
+    samples = struct.unpack(f'<{frames * 4}i', raw[:frames * 16])
+    def window(first, last, what):
+        lines = []
+        for slot in range(4):
+            a_ = b_ = rms = peak = 0.0
+            n = 0
+            for f in range(first * period // 16, min(last * period // 16, frames)):
+                v = float(samples[f * 4 + slot])
+                a_ += v * cos[f % 24]; b_ += v * sin[f % 24]; rms += v * v; peak = max(peak, abs(v)); n += 1
+            if n:
+                tone = 2 * math.hypot(a_, b_) / n
+                lines.append(f'  VI: {what} slot {slot}: 2 kHz {tone:12.0f} ({20 * math.log10(max(tone, 1) / 2147483648):6.1f} dBFS), rms {math.sqrt(rms / n):12.0f}, peak {peak:12.0f}')
+        return lines
+    out += window(start + 5, end - 5, 'tone  ') if end > start + 10 else ['  VI: no tone window']
+    length = max(end - start - 10, 10)
+    out += window(max(start - length - 15, 0), max(start - 15, 1), 'before')
+    return out
 
 
 def decode_tone(q):
@@ -190,6 +220,8 @@ def decode_tone(q):
            f'  TONE: muted check {q[82]:#x}: {words(83)}',
            f'  TONE: tone: {q[87]} to {q[89]} periods played, {q[88]} to {q[90]} ms, {q[91]} frames; check {q[92]:#x}: {words(93)}',
            f'  TONE: after it check {q[97]:#x}: {words(98)}',
+           *[f'  TONE: pads {what}: ' + ' '.join(f'gpio{121 + i} high {q[at + 2 * i] & 0xffff} changes {q[at + 2 * i + 1]}' for i in range(4))
+             for what, at in (('muxed, amp in reset', 40), ('amp up, muted, zeros', 48), ('tone', 56))],
            f'  TONE: failed reg {q[102]:#x} want {q[103]:#x} got {q[104]:#x}; reset lines back: gpio183 {q[106]:#x} gpio182 {q[107]:#x}']
     return out
 
@@ -270,6 +302,7 @@ def fnv(data):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('cmd', choices=['snapshot', 'squash', 'upload', 'boot', 'report', 'decode', 'stop', 'glink', 'smmu', 'poke', 'amp', 'tone'])
+    ap.add_argument('--monitors', action='store_true', help="tone: also bring the amplifier's voltage and current back, and look for the tone in them")
     ap.add_argument('--owner-agreed', action='store_true', help='tone: the owner has agreed to writes to the amplifier: bottom speaker, lowest level, a second')
     ap.add_argument('--which', type=int, default=3, help='amp: 1 B at 0x40, 2 T at 0x42, 3 both; read only')
     ap.add_argument('--what', type=int, default=0, help='poke: 1 the zeros, 2 the stream match, 8 with it stop at the S2CR, 16 stream 0x1061 rather than 0x1001, 4 take it away, or their sum')
@@ -363,14 +396,27 @@ def main():
     elif a.cmd == 'tone':
         if not a.owner_agreed:
             ap.error('tone writes to an amplifier: --owner-agreed')
-        page = req(0x414f, 0x4231)
+        page = req(0x414f, 0x4232 if a.monitors else 0x4231)
         r = struct.unpack('<128I', page)
         if r[0] != 0xa0d10003:
             raise SystemExit(f'no report: {r[0]:#x}')
         print('\n'.join(decode_glink(r)))
         q = struct.unpack('<128I', req(0x4149))
         print('\n'.join(decode_graph(q, r[126])))
-        print('\n'.join(decode_tone(q)))
+        q3 = struct.unpack('<128I', req(0x414a))
+        print('\n'.join(decode_tone(q3)))
+        if a.monitors:
+            print(f'  VI: apps_smmu sGFSR {q3[118]:#x} syndrome {q3[119]:#x} {q3[120]:#x}; bank 4 FSR {q3[121]:#x} FAR {q3[122]:#x} {q3[123]:#x}')
+            print(f'  VI: buffers sent {q3[108]} back {q3[109]}, last status {q3[110]:#x}, bad {q3[111]}, last {q3[112]} bytes at offset {q3[113]}; during the tone {q3[114]} to {q3[115]}')
+            raw = bytearray()
+            base, period = q3[116], q3[117]
+            for page_ in range(q3[109] * period // 512):
+                raw += req(0x4156, page_)
+            beyond = bytes(req(0x4156, (q3[109] + 20) * period // 512))
+            print(f'  VI: 20 periods past the last: {beyond[:16].hex()}: the pattern if the DSP has stopped there')
+            if a.save:
+                a.save.with_suffix('.vi').write_bytes(raw)
+            print('\n'.join(decode_vi(raw, period, q3[114], q3[115])))
         count = min(r[27], 96)
         words = []
         for p_ in range((count * 12 + 127) // 128):

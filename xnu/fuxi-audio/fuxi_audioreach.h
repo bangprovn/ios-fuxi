@@ -38,6 +38,7 @@ extern "C" {
 #define FUXI_AR_MOD_PCM_DEC 0x07001005u
 #define FUXI_AR_MOD_I2S_SINK 0x0700100Au
 #define FUXI_AR_MOD_TDM_SINK 0x0700100Eu             /* in fuxi's ACDB too */
+#define FUXI_AR_MOD_TDM_SOURCE 0x0700100Fu
 #define FUXI_AR_MOD_CODEC_DMA_SOURCE 0x07001024u
 
 #define FUXI_AR_SG_PLAY 0x4001u
@@ -50,6 +51,7 @@ extern "C" {
 #define FUXI_AR_IID_SPEAKER_I2S 0x6051u
 #define FUXI_AR_IID_SPEAKER_TDM 0x6052u              /* our own: a client names its graph's parts */
 #define FUXI_AR_IID_MIC_DMA 0x6070u
+#define FUXI_AR_IID_MONITOR_TDM 0x6072u              /* the amplifiers' voltage and current coming back */
 #define FUXI_AR_IID_CAP_CNV 0x6022u
 #define FUXI_AR_IID_CAP_ENC 0x6023u
 #define FUXI_AR_IID_CAP_SHMEM 0x6024u
@@ -78,6 +80,9 @@ uint32_t fuxi_ar_open_speaker_tdm(uint8_t *out, uint32_t capacity, uint32_t port
 uint32_t fuxi_ar_config_speaker_tdm(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const FuxiArFormat *f, const FuxiArTdm *t);
 uint32_t fuxi_ar_open_playback_stream(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token);
 uint32_t fuxi_ar_open_playback_stream_tdm(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token);  /* the same, into the TDM endpoint */
+uint32_t fuxi_ar_open_monitor_tdm(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token);
+uint32_t fuxi_ar_config_monitor_tdm(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const FuxiArFormat *f, const FuxiArTdm *t);
+uint32_t fuxi_ar_open_capture_stream_tdm(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token);
 uint32_t fuxi_ar_config_playback_stream(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const FuxiArFormat *f);
 uint32_t fuxi_ar_config_playback_shmem(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const FuxiArFormat *f);
 uint32_t fuxi_ar_open_mic_device(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token);

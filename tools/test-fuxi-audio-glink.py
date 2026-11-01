@@ -77,7 +77,10 @@ static bool heard(uint32_t *cmd, uint32_t *p1, uint32_t *p2, char *name)
 			static const uint8_t block[4] = {FUXI_AR_HW_MACRO, FUXI_AR_HW_DCODEC, FUXI_AR_HW_DCODEC, FUXI_AR_HW_MACRO};
 			uint8_t want[128];
 			uint32_t step = word[6] - AU_GL_PRM_TOKEN, n;
-			if (word[6] >= AU_GL_WRITE_TOKEN) {
+			if (word[6] >= AU_GL_READ_TOKEN) {
+				assert(may_play && word[0] <= 128);
+				total += (8 + word[0] + 7) & ~7u;
+			} else if (word[6] >= AU_GL_WRITE_TOKEN) {
 				/* a buffer: the same shape as a graph's packet, its bytes by tools/fuxi-audio-host */
 				assert(may_play && word[0] <= 128);
 				total += (8 + word[0] + 7) & ~7u;
@@ -430,6 +433,15 @@ int main(void)
 			assert(au_gl_step(&g) && g.write_done == 1 && g.write_first_ms == 500 && g.write_bad == 0 && heard(&cmd, &p1, &p2, 0));
 			played[11] = 3; g.ms = 520; say(AU_GL_TX_DATA, 9, 1, played, 48);
 			assert(au_gl_step(&g) && g.write_done == 2 && g.write_last_ms == 520 && g.write_first_ms == 500 && g.write_status == 3 && g.write_bad == 1 && heard(&cmd, &p1, &p2, 0));
+			/* What comes back: one empty buffer sent, its answer counted; no answer without one. */
+			{
+				uint32_t back[13] = {44, 0, 0x2c60, 0x0203, 0x6024, 1, AU_GL_READ_TOKEN, AU_GL_OP_READ_DONE, 0, 0xd0010000u, 1, 0x55, 15360};
+				memset(m, 0x77, sizeof(m)); m[6] = AU_GL_READ_TOKEN;
+				say(AU_GL_RX_DONE_REUSE, 9, 14, 0, 0); assert(au_gl_step(&g));
+				assert(au_gl_read_send(&g, m, 64) && g.read_sent == 1 && heard(&cmd, &p1, &p2, 0) && cmd == AU_GL_TX_DATA);
+				say(AU_GL_TX_DATA, 9, 1, back, 52);
+				assert(au_gl_step(&g) && g.read_done == 1 && g.read_bad == 0 && g.read_bytes == 15360 && heard(&cmd, &p1, &p2, 0));
+			}
 			may_play = false; may_graph = false;
 		}
 	}
@@ -470,11 +482,11 @@ def main():
                         '-fsanitize=address,undefined', '-fno-sanitize-recover=all', f'-I{ROOT / "shim/fuxi-probe"}', f'-I{ROOT / "xnu/fuxi-audio"}', str(source),
                         str(ROOT / 'xnu/fuxi-audio/fuxi_audioreach.c'), str(ROOT / 'xnu/fuxi-audio/fuxi_gpr.c'), '-o', str(program)], check=True)
         subprocess.run([str(program)], check=True)
-    # What could put any other audio command on the wire is simply not there: four TX_DATA, each in its own function. Starting comes only with --play,
+    # What could put any other audio command on the wire is simply not there: five TX_DATA, each in its own function. Starting comes only with --play,
     # whose samples are zeros, and nothing here touches a pin's mux or an amplifier: the TLMM's and the I2C's ranges do not appear.
     text = (ROOT / 'shim/fuxi-probe/au_glink.h').read_text()
     code = text[text.index('#define AU_GL_FEATURE_REUSE'):]
-    assert code.count('AU_GL_TX_DATA,') == 4 and code.count('au_gl_tx(g, AU_GL_TX_DATA,') == 4
+    assert code.count('AU_GL_TX_DATA,') == 5 and code.count('au_gl_tx(g, AU_GL_TX_DATA,') == 5
     ask = code[code.index('static inline bool au_gl_gpr_ask'):code.index('static inline void au_gl_gpr_take')]
     assert 'au_gl_tx(g, AU_GL_TX_DATA,' in ask and 'AU_GL_OP_GET_SPF_STATE' in ask
     assert 'AU_GL_TX_DATA_CONT,' not in code
@@ -484,7 +496,7 @@ def main():
     assert 'au_gl_tx(' not in audio.replace('au_gl_tx_', '')
     # The GLINK and graph code alone: au_amp.h's section reads the amplifiers with its own test, and nothing in here calls it.
     run = audio[audio.index('#include "au_glink.h"'):audio.index("/* ---- the amplifiers' identities")]
-    assert audio.count('GRAPH_START') == 2 and audio.count('fuxi_ar_map') == 1 and audio.count('fuxi_ar_write') == 2
+    assert audio.count('GRAPH_START') == 4 and audio.count('fuxi_ar_map') == 1 and audio.count('fuxi_ar_write') == 2
     assert 'au_wr(AU_PLAY_PA + 4 * i, 0);' in run
     for word in ('i2s1', '0xf100000', 'geni', 'cs35l41', 'au_se0', 'au_qup2'):
         assert word not in run.lower(), word

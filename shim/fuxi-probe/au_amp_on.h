@@ -121,7 +121,7 @@ static inline int au_on_otp(struct au_on *o)
 }
 
 /* Steps 1 to 26 of the sequence, out of reset already and the other amplifier held in it: right up to the amplifier's enable, with no clocks needed yet and GLOBAL_EN off. */
-static inline int au_on_prepare(struct au_on *o, bool right_slot)
+static inline int au_on_prepare(struct au_on *o, bool right_slot, bool monitor)
 {
 	static const uint32_t errata[][2] = {{0x4100,0},{0x4310,0},{0x4400,0},{0x381c,0x51},{0x02bc20e0,0},{0x02bc2020,0},{0x2018,0},{0x6c04,0},{0x4c28,0},{0x4c2c,0}};
 	uint32_t status = 0, who = 0, rev = 0, otp = 0;
@@ -171,7 +171,13 @@ static inline int au_on_prepare(struct au_on *o, bool right_slot)
 	AU_ON_STEP(22, au_on_set(o, 0x4c00, 8));
 	for (unsigned i = 0; i < 4; i++) AU_ON_STEP(22, au_on_set(o, 0x4c20 + 4u * i, 0));
 	AU_ON_STEP(23, au_on_set(o, 0x2d10, 0x00018010));
-	AU_ON_STEP(24, au_on_set(o, 0x4800, 0x00010000));
+	AU_ON_STEP(24, au_on_set(o, 0x4800, monitor ? 0x00010003u : 0x00010000u));
+	if (monitor) {
+		/* Its voltage and current back on SDOUT, in slots 2 and 3, where nothing is sent to it: ASPTX1 VMON, ASPTX2 IMON. Only reads what it is doing. */
+		AU_ON_STEP(24, au_on_set(o, 0x4810, 0x03020302));    /* SP_FRAME_TX_SLOT */
+		AU_ON_STEP(24, au_on_set(o, 0x4c20, 0x18));
+		AU_ON_STEP(24, au_on_set(o, 0x4c24, 0x19));
+	}
 	/* The PLL from the bit clock: open loop, reference, off, source, closed, on */
 	AU_ON_STEP(25, au_on_rmw(o, 0x2c04, 0x800, 0x800));
 	AU_ON_STEP(25, au_on_rmw(o, 0x2c04, 0x7e0, 0x28u << 5));
@@ -179,7 +185,7 @@ static inline int au_on_prepare(struct au_on *o, bool right_slot)
 	AU_ON_STEP(25, au_on_rmw(o, 0x2c04, 0x7, 0));
 	AU_ON_STEP(25, au_on_rmw(o, 0x2c04, 0x800, 0));
 	AU_ON_STEP(25, au_on_rmw(o, 0x2c04, 0x10, 0x10));
-	AU_ON_STEP(26, au_on_set(o, 0x2018, 0x21));
+	AU_ON_STEP(26, au_on_set(o, 0x2018, monitor ? 0x3021u : 0x21u));    /* with VMON_EN and IMON_EN as Android has them */
 	return AU_ON_OK;
 }
 

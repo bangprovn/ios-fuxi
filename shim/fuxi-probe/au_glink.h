@@ -40,13 +40,15 @@ enum { AU_GL_VERSION = 0, AU_GL_VERSION_ACK = 1, AU_GL_OPEN = 2, AU_GL_CLOSE = 3
 #define AU_GL_OP_PRM_RELEASE_DONE 0x02001003u
 #define AU_GL_PRM_TOKEN 0x100u
 #define AU_GL_GRAPH 8u         /* options: with AU_GL_PRM, between the votes, the packets of au_gl_graph_send() */
-#define AU_GL_GRAPH_MOST 20u   /* the longest of audio.c's lists */
+#define AU_GL_GRAPH_MOST 32u   /* the longest of audio.c's lists */
 #define AU_GL_GRAPH_TOKEN 0x200u
 #define AU_GL_PLAY 16u         /* options: with AU_GL_GRAPH, the buffers of au_gl_data_send() */
 #define AU_GL_WRITE_TOKEN 0x1000u
 #define AU_GL_TONE 32u         /* options: audio.c's first tone, on the owner's word. For its list and au_tone_stage(); nothing here reads it */
 #define AU_GL_OP_MEM_MAP_DONE 0x02001001u  /* payload {handle} */
 #define AU_GL_OP_WRITE_DONE 0x05001004u    /* payload {address, address, handle, status} */
+#define AU_GL_OP_READ_DONE 0x05001005u     /* payload {status, address, address, handle, bytes, offset} */
+#define AU_GL_READ_TOKEN 0x20000u
 
 struct au_gl {
 	uint64_t desc, tx_fifo, rx_fifo;
@@ -61,6 +63,7 @@ struct au_gl {
 	uint32_t prm_sent, prm_status[AU_GL_PRM_STEPS], prm_opcode[AU_GL_PRM_STEPS], prm_sent_ms[AU_GL_PRM_STEPS], prm_heard_ms[AU_GL_PRM_STEPS];
 	uint32_t big_riid, big_have, big_asked, big_refused, big_size, graph_steps, graph_sent, graph_status[AU_GL_GRAPH_MOST], graph_heard_ms[AU_GL_GRAPH_MOST];
 	uint32_t map_handle, write_sent, write_done, write_status, write_bad, write_first_ms, write_last_ms;
+	uint32_t read_sent, read_done, read_status, read_bad, read_bytes, read_offset;
 };
 
 static inline uint32_t au_gl_align8(uint32_t n) { return (n + 7u) & ~7u; }
@@ -209,6 +212,18 @@ static inline bool au_gl_data_send(struct au_gl *g, uint32_t *m, uint32_t bytes)
 	return true;
 }
 
+/* One empty buffer for what comes back, the same way. */
+static inline bool au_gl_read_send(struct au_gl *g, uint32_t *m, uint32_t bytes)
+{
+	if ((g->options & AU_GL_PLAY) == 0 || g->map_handle == 0u || g->gpr_riid_n == 0 || bytes > 128u) return false;
+	m[0] = bytes; m[1] = 0;
+	if (((8u + bytes) & 7u) != 0) m[(8u + bytes) / 4u] = 0;
+	if (!au_gl_tx(g, AU_GL_TX_DATA, g->gpr_lcid, g->gpr_riid[g->gpr_riid_n - 1u], m, 8u + bytes)) return false;
+	g->gpr_riid_n--;
+	g->read_sent++;
+	return true;
+}
+
 /* An answer on adsp_apps, while it is still in the ring. `tail` is at its header, so its bytes begin 16 past. */
 static inline void au_gl_gpr_take(struct au_gl *g, uint32_t tail, uint32_t bytes)
 {
@@ -247,6 +262,13 @@ static inline void au_gl_gpr_take(struct au_gl *g, uint32_t tail, uint32_t bytes
 		g->write_last_ms = g->ms;
 		g->write_status = keep[9];
 		g->write_bad += keep[9] != 0u;
+	}
+	if (keep[5] == AU_GL_OP_READ_DONE && bytes >= 44u) {
+		g->read_done++;
+		g->read_status = keep[6];
+		g->read_bad += keep[6] != 0u;
+		g->read_bytes = keep[10];
+		g->read_offset = bytes >= 48u ? keep[11] : 0u;
 	}
 	g->gpr_heard++;
 }

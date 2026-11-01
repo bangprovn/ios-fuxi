@@ -23,7 +23,8 @@
  *      bit 1 the bypass stream match, read back; bit 2 takes it away. Returns what it read.
  *  IN  0x5a 'AA' (0x4141) wIndex: reads the amplifiers named, bit 0 B at 0x40, bit 1 T at 0x42, one out of reset at a time (au_amp.h): who they are and
  *      their OTP boot. Writes nothing to them. Their reset lines and the I2C pins go back as they were. Returns the report.
- *  IN  0x5a 'AO' (0x414f) wIndex 0x4231 only, once, after a stage 2 that reached ready, because the owner said so: the first tone (au_tone_stage()). Returns the summary as 'AG' does.
+ *  IN  0x5a 'AO' (0x414f) wIndex 0x4231 or, with the amplifier's own monitors coming back, 0x4232, once, after a stage 2 that reached ready, because the owner said so: the
+ *      first tone (au_tone_stage()). Returns the summary as 'AG' does. 'AJ' (0x414a): what it said of itself. 'AV' (0x4156) wIndex: page of 512 bytes of what came back.
  *  IN  0x5a 'AH' (0x4148) wIndex: page of the log. 'AI' (0x4149): what the last list's steps answered.
  *  IN  0x5a 'AH' (0x4148) wIndex=page: its log, 128 words a page.
  *  OUT 0x5b wValue=chunk[15:0], wIndex[11:0]=chunk[27:16], wIndex bit15 =
@@ -600,6 +601,7 @@ static uint32_t au_graph_build(uint32_t step, uint32_t *m, uint32_t capacity)
 #define AU_PLAY_SID 1ull            /* 0x1001 & 0xf, as Linux q6apm_dai */
 #define AU_PLAY_BYTES 7680u         /* 20 ms */
 static uint32_t au_period_bytes = AU_PLAY_BYTES;
+static uint32_t au_map_bytes = AU_PLAY_BYTES * 4;
 #define AU_PLAY_BUFFERS 50u
 #define AU_PLAY_STEPS 15u
 #define AU_PLAY_WRITES_AFTER 10u    /* the buffers come when the first ten steps are done */
@@ -612,7 +614,7 @@ static uint32_t au_play_build(uint32_t step, uint32_t t, uint32_t *m, uint32_t c
  case 2: return fuxi_ar_open_playback_stream_tdm(out, capacity, 1, t);
  case 3: return fuxi_ar_config_playback_stream(out, capacity, 1, t, &au_format);
  case 4: return fuxi_ar_config_playback_shmem(out, capacity, 1, t, &au_format);
- case 5: return fuxi_ar_map(out, capacity, 1, t, AU_PLAY_PA | AU_PLAY_SID << 32, au_period_bytes * 4);
+ case 5: return fuxi_ar_map(out, capacity, 1, t, AU_PLAY_PA | AU_PLAY_SID << 32, au_map_bytes);
  case 6: return fuxi_ar_graph_command(out, capacity, 1, t, FUXI_AR_OP_GRAPH_PREPARE, FUXI_AR_SG_SPEAKER);
  case 7: return fuxi_ar_graph_command(out, capacity, 1, t, FUXI_AR_OP_GRAPH_PREPARE, FUXI_AR_SG_PLAY);
  case 8: return fuxi_ar_graph_command(out, capacity, 1, t, FUXI_AR_OP_GRAPH_START, FUXI_AR_SG_SPEAKER);
@@ -630,19 +632,43 @@ static uint32_t au_play_build(uint32_t step, uint32_t t, uint32_t *m, uint32_t c
  */
 #define AU_TONE_STEPS 17u
 #define AU_TONE_WRITES_AFTER 11u
+#define AU_TONE_VI_STEPS 29u
+#define AU_TONE_VI_WRITES_AFTER 19u
 #define AU_TONE_CLOCK 0x202u
+#define AU_VI_PA (AU_PLAY_PA + 0x10000u)    /* after the four periods played: what comes back, one period after another, never over itself */
+#define AU_VI_PERIODS 300u
+static bool au_tone_vi;
+static const FuxiArTdm au_vi_tdm = {.intf = 1, .slot_mask = 0xf, .slots = 4, .slot_width = 32, .sync_mode = 1, .invert_sync = 0, .sync_data_delay = 1, .lane = 0, .clock_attribute = 4};  /* gpio122 */
 static uint32_t au_tone_build(uint32_t step, uint32_t *m, uint32_t capacity, uint32_t handle)
 {
  uint8_t *out = (uint8_t *)(m + 2);
  uint32_t t = AU_GL_GRAPH_TOKEN + step;
+ uint32_t steps = au_tone_vi ? AU_TONE_VI_STEPS : AU_TONE_STEPS;
  if (step == 0) return fuxi_ar_prm_clock_attr(out, capacity, 2, t, AU_TONE_CLOCK, 6144000, 4);
- if (step == AU_TONE_STEPS - 1) return fuxi_ar_prm_clock_attr(out, capacity, 2, t, AU_TONE_CLOCK, 0, 4);
- return au_play_build(step - 1, t, m, capacity, handle);
+ if (step == steps - 1) return fuxi_ar_prm_clock_attr(out, capacity, 2, t, AU_TONE_CLOCK, 0, 4);
+ if (!au_tone_vi) return au_play_build(step - 1, t, m, capacity, handle);
+ /* The way back opens after the way out, and closes before it. */
+ if (step <= 10) return au_play_build(step - 1, t, m, capacity, handle);
+ if (step >= 23) return au_play_build(step - 13, t, m, capacity, handle);
+ switch (step) {
+ case 11: return fuxi_ar_open_monitor_tdm(out, capacity, 1, t);
+ case 12: return fuxi_ar_config_monitor_tdm(out, capacity, 1, t, &au_format, &au_vi_tdm);
+ case 13: return fuxi_ar_open_capture_stream_tdm(out, capacity, 1, t);
+ case 14: return fuxi_ar_config_capture_stream(out, capacity, 1, t, &au_format);
+ case 15: return fuxi_ar_graph_command(out, capacity, 1, t, FUXI_AR_OP_GRAPH_PREPARE, FUXI_AR_SG_MIC);
+ case 16: return fuxi_ar_graph_command(out, capacity, 1, t, FUXI_AR_OP_GRAPH_PREPARE, FUXI_AR_SG_CAPTURE);
+ case 17: return fuxi_ar_graph_command(out, capacity, 1, t, FUXI_AR_OP_GRAPH_START, FUXI_AR_SG_MIC);
+ case 18: return fuxi_ar_graph_command(out, capacity, 1, t, FUXI_AR_OP_GRAPH_START, FUXI_AR_SG_CAPTURE);
+ case 19: return fuxi_ar_graph_command(out, capacity, 1, t, FUXI_AR_OP_GRAPH_STOP, FUXI_AR_SG_CAPTURE);
+ case 20: return fuxi_ar_graph_command(out, capacity, 1, t, FUXI_AR_OP_GRAPH_STOP, FUXI_AR_SG_MIC);
+ case 21: return fuxi_ar_graph_command(out, capacity, 1, t, FUXI_AR_OP_GRAPH_CLOSE, FUXI_AR_SG_CAPTURE);
+ default: return fuxi_ar_graph_command(out, capacity, 1, t, FUXI_AR_OP_GRAPH_CLOSE, FUXI_AR_SG_MIC);
+ }
 }
 static uint32_t au_tone_stage(struct au_gl *g, uint32_t *q, uint64_t t0, uint64_t hz);
 #define AU_GL_RECORDS 96u
 #define AU_GL_LOG_WORDS (AU_GL_RECORDS * AU_GL_REC_WORDS)
-static uint32_t au_gl_rep[128], au_gl_rep2[128], au_gl_log[AU_GL_LOG_WORDS];
+static uint32_t au_gl_rep[128], au_gl_rep2[128], au_gl_rep3[128], au_gl_log[AU_GL_LOG_WORDS];
 /* A cached private item, at the partition's far end (Linux qcom_smem_get_private()); the DSP may allocate its FIFO there. */
 static uint64_t au_smem_item_cached(const struct au_part *p, unsigned item, uint32_t *size)
 {
@@ -727,11 +753,12 @@ static uint32_t au_glink_run(uint32_t *r, unsigned seconds, uint32_t options)
  uint32_t bits = 0, next_ask = 2000, graph_until = 0, writes_until = 0, second_old[2] = {0, 0};
  int second_slot = -1;
  bool tone_done = false;
- g.graph_steps = (options & AU_GL_TONE) != 0 ? AU_TONE_STEPS : (options & AU_GL_PLAY) != 0 ? AU_PLAY_STEPS : AU_GRAPH_STEPS;
+ g.graph_steps = (options & AU_GL_TONE) != 0 ? (au_tone_vi ? AU_TONE_VI_STEPS : AU_TONE_STEPS) : (options & AU_GL_PLAY) != 0 ? AU_PLAY_STEPS : AU_GRAPH_STEPS;
  if ((options & AU_GL_TONE) != 0) {
   au_format.channels = 4;
   au_tdm.slot_mask = 0xf;
   au_period_bytes = 960u * 4u * 4u;
+  au_map_bytes = 0x10000u + AU_VI_PERIODS * au_period_bytes;
  }
  if ((options & AU_GL_PLAY) != 0) {
   /* Not over the code that is running here. */
@@ -739,6 +766,8 @@ static uint32_t au_glink_run(uint32_t *r, unsigned seconds, uint32_t options)
   if ((here >= AU_PLAY_PA - 0x200000 && here < AU_PLAY_PA + 0x200000) || (stack >= AU_PLAY_PA - 0x200000 && stack < AU_PLAY_PA + 0x200000)) return 0x205;
   /* Zeros, whatever was there. Device-like writes, and the data barrier of au_wr(): the DSP does not snoop anything here. */
   for (uint32_t i = 0; i < au_period_bytes; i++) au_wr(AU_PLAY_PA + 4 * i, 0);
+  /* a-tone3 read back what looked like untouched DRAM: a pattern over the way back's buffers says whether the DSP writes there at all. */
+  if (au_tone_vi) for (uint32_t i = 0; i < AU_VI_PERIODS * au_period_bytes / 4; i++) au_wr(AU_VI_PA + 4 * i, 0x5a5a5a5au);
   au_gl_rep2[40] = au_rd(AU_SMMU + 0x48);
   au_smmu_bypass(0x1061, 0, false);
   if (au_smmu_slot < 0) return 0x206;
@@ -768,9 +797,9 @@ static uint32_t au_glink_run(uint32_t *r, unsigned seconds, uint32_t options)
     /* Each packet into the long buffer; if the DSP gives none, on to the votes coming off. */
     static uint32_t m[2 + AU_GL_GPR_BUFFER / 4 + 2];
     const bool play = (options & AU_GL_PLAY) != 0, tone = (options & AU_GL_TONE) != 0;
-    if (tone && g.graph_sent == AU_TONE_WRITES_AFTER && !tone_done) {
+    if (tone && g.graph_sent == (au_tone_vi ? AU_TONE_VI_WRITES_AFTER : AU_TONE_WRITES_AFTER) && !tone_done) {
      tone_done = true;
-     au_gl_rep2[72] = g.map_handle != 0 ? au_tone_stage(&g, au_gl_rep2, t0, hz) : 0x400;
+     au_gl_rep3[72] = g.map_handle != 0 ? au_tone_stage(&g, au_gl_rep3, t0, hz) : 0x400;
      next_ask = g.ms + 20;
     }
     else if (!tone && play && g.graph_sent == AU_PLAY_WRITES_AFTER && g.map_handle != 0 && (g.write_sent < AU_PLAY_BUFFERS || (g.write_done < AU_PLAY_BUFFERS && g.ms < writes_until))) {
@@ -958,6 +987,10 @@ static void au_tone_pump(struct au_gl *g, uint64_t t0, uint64_t hz, uint32_t ms,
  while (g->ms < until && !g->stuck) {
   g->ms = (uint32_t)((rsr("cntpct_el0") - t0) * 1000 / hz);
   while (au_gl_step(g)) { }
+  if (au_tone_vi && g->read_sent < AU_VI_PERIODS && g->read_sent < g->read_done + 3) {
+   uint32_t bytes = fuxi_ar_read((uint8_t *)(m + 2), AU_GL_GPR_BUFFER, 1, AU_GL_READ_TOKEN + g->read_sent, (AU_VI_PA + g->read_sent * au_period_bytes) | AU_PLAY_SID << 32, g->map_handle, au_period_bytes);
+   if (bytes != 0) (void)au_gl_read_send(g, m, bytes);
+  }
   if (g->write_sent < g->write_done + 2) {
    uint32_t index = g->write_sent % 4;
    au_tone_fill(index, tone);
@@ -965,6 +998,20 @@ static void au_tone_pump(struct au_gl *g, uint64_t t0, uint64_t hz, uint32_t ms,
    if (bytes != 0) (void)au_gl_data_send(g, m, bytes);
   }
   delay(200);
+ }
+}
+/* What the pads themselves do: of 2000 reads of each of the TDM's four, how many high, and how many changed from the read before. Read only. */
+static void au_tone_pads(uint32_t *q)
+{
+ for (unsigned p = 0; p < 4; p++) {
+  uint32_t high = 0, changes = 0, last = 0;
+  for (unsigned i = 0; i < 2000; i++) {
+   uint32_t now = au_rd(AU_TLMM + 0x1000u * (121u + p) + 4) & 1u;
+   high += now;
+   changes += i != 0 && now != last;
+   last = now;
+  }
+  q[2 * p] = high; q[2 * p + 1] = changes;
  }
 }
 static uint32_t au_tone_stage(struct au_gl *g, uint32_t *q, uint64_t t0, uint64_t hz)
@@ -991,13 +1038,15 @@ static uint32_t au_tone_stage(struct au_gl *g, uint32_t *q, uint64_t t0, uint64_
  AU_AMP_RESET_LOW(182); AU_AMP_RESET_LOW(183);
  au_pin(0, 3u | 2u << 2, 0); au_pin(1, 3u | 2u << 2, 0);
  au_pin(121, 1u << 2 | 3u << 6, 0); au_pin(123, 1u << 2 | 3u << 6, 0); au_pin(124, 1u << 2 | 3u << 6, 0);
+ if (au_tone_vi) au_pin(122, 1u << 2, 0);
  au_tone_pump(g, t0, hz, 50, false);
  q[75] = au_rd(AU_TLMM + 0x1000u * 121); q[76] = au_rd(AU_TLMM + 0x1000u * 124);
+ au_tone_pads(q + 40);
  AU_AMP_RESET_HIGH(183);
  delay(3000);
  for (unsigned i = 0; i < sizeof(o); i++) ((volatile uint8_t *)&o)[i] = 0;
  o.se = AU_SE0; o.address = 0x40;
- r = au_on_prepare(&o, true);
+ r = au_on_prepare(&o, true, au_tone_vi);
  q[77] = (uint32_t)r; q[78] = o.step;
  if (r == AU_ON_OK) {
   au_tone_pump(g, t0, hz, 100, false);
@@ -1008,17 +1057,19 @@ static uint32_t au_tone_stage(struct au_gl *g, uint32_t *q, uint64_t t0, uint64_
   au_tone_pump(g, t0, hz, 200, false);
   r = au_on_check(&o);
   q[82] = (uint32_t)r; for (unsigned i = 0; i < 4; i++) q[83 + i] = o.status[i];
+  au_tone_pads(q + 48);
  }
  if (r == AU_ON_OK) r = au_on_unmute(&o, 0);
  if (r == AU_ON_OK) {
-  q[87] = g->write_done; q[88] = g->ms;
+  q[87] = g->write_done; q[88] = g->ms; q[114] = g->read_done;
   au_tone_frame = 0;
   /* Looked at ten times in the second; a thing wrong ends it, and the fade with it. */
   while (au_tone_frame < AU_TONE_FRAMES && r == AU_ON_OK) {
    au_tone_pump(g, t0, hz, 100, true);
    r = au_on_check(&o);
+   if (au_tone_frame >= AU_TONE_FRAMES / 2 && q[56] == 0) { au_tone_pads(q + 56); q[56] |= 0x80000000u; }
   }
-  q[89] = g->write_done; q[90] = g->ms; q[91] = au_tone_frame;
+  q[89] = g->write_done; q[90] = g->ms; q[91] = au_tone_frame; q[115] = g->read_done;
   q[92] = (uint32_t)r; for (unsigned i = 0; i < 4; i++) q[93 + i] = o.status[i];
   au_tone_pump(g, t0, hz, 200, false);
   if (r == AU_ON_OK) r = au_on_check(&o);
@@ -1036,6 +1087,11 @@ static uint32_t au_tone_stage(struct au_gl *g, uint32_t *q, uint64_t t0, uint64_
   (void)probe_safe_wr32(AU_TLMM + 0x1000u * pins[i], saved[i][0]);
  }
  q[106] = au_rd(AU_TLMM + 0x1000u * 183); q[107] = au_rd(AU_TLMM + 0x1000u * 182);
+ q[108] = g->read_sent; q[109] = g->read_done; q[110] = g->read_status; q[111] = g->read_bad; q[112] = g->read_bytes; q[113] = g->read_offset;
+ q[116] = (uint32_t)AU_VI_PA; q[117] = au_period_bytes;
+ q[118] = au_rd(AU_SMMU + 0x48); q[119] = au_rd(AU_SMMU + 0x50); q[120] = au_rd(AU_SMMU + 0x54);
+ /* apps_smmu's own record, if a stream of the DSP's was refused, and context bank 4's. */
+ { uint64_t cb4 = AU_SMMU + 0x80000 + 4 * 0x1000; q[121] = au_rd(cb4 + 0x58); q[122] = au_rd(cb4 + 0x60); q[123] = au_rd(cb4 + 0x68); }
  return result;
 }
 /* USB entry: returns bytes placed in out (0 = stall). */
@@ -1109,7 +1165,13 @@ static uint32_t audio_request(uint16_t value, uint16_t index, uint8_t *out)
   }
   memcpy(out, au_gl_rep, sizeof(au_gl_rep)); return sizeof(au_gl_rep);
  }
- if (value == 0x414f && index == 0x4231 && !monitor_report[MON_LAUNCH] && au_boot[1] == 1 && !au_gl_rep[0]) {
+ if (value == 0x414a && au_gl_rep[0]) { memcpy(out, au_gl_rep3, sizeof(au_gl_rep3)); return sizeof(au_gl_rep3); }
+ if (value == 0x4156 && au_gl_rep[0] && au_tone_vi && (uint64_t)index * 512u + 512u <= AU_VI_PERIODS * au_period_bytes) {
+  for (uint32_t i = 0; i < 128; i++) ((uint32_t *)(void *)out)[i] = au_rd(AU_VI_PA + (uint64_t)index * 512u + 4 * i);
+  return 512;
+ }
+ if (value == 0x414f && (index == 0x4231 || index == 0x4232) && !monitor_report[MON_LAUNCH] && au_boot[1] == 1 && !au_gl_rep[0]) {
+  au_tone_vi = index == 0x4232;
   au_gl_rep[0] = 0xa0d10003;
   au_gl_rep[2] = 45;
   au_gl_rep[3] = 15 | 16 | 32;

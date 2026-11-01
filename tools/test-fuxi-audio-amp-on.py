@@ -106,7 +106,7 @@ int main(void)
 	struct au_on o = on();
 
 	fresh();
-	assert(au_on_prepare(&o, true) == AU_ON_OK);
+	assert(au_on_prepare(&o, true, false) == AU_ON_OK);
 	/* The boost's limit comes before anything that can enable it; analog and digital at their lowest. */
 	assert(amp[0x3808 / 4] == 0x40);
 	int ipk = index_of(0x3808, 0x40), bst = index_of(0x2018, 0x20), en = index_of(0x2018, 0x21);
@@ -128,23 +128,28 @@ int main(void)
 	au_on_down(&o);
 	assert(amp[0x6000 / 4] == AU_ON_MUTE && (amp[0x2014 / 4] & 1) == 0 && amp[0x4800 / 4] == 0 && (amp[0x2018 / 4] & 1) == 0 && amp[0x2084 / 4] == 0x002f1aa3);
 
+	/* With the monitors: the same, plus only these. */
+	fresh(); o = on();
+	assert(au_on_prepare(&o, true, true) == AU_ON_OK && amp[0x4800 / 4] == 0x10003 && amp[0x4c20 / 4] == 0x18 && amp[0x4c24 / 4] == 0x19 && amp[0x2018 / 4] == 0x3021 && amp[0x4810 / 4] == 0x03020302);
+	assert(amp[0x6000 / 4] == AU_ON_MUTE && amp[0x6c04 / 4] == 0 && amp[0x3808 / 4] == 0x40 && amp[0x2014 / 4] == 0);
+
 	/* Not who it should be: not one write. */
-	fresh(); o = on(); amp[0] = 0x35b40; assert(au_on_prepare(&o, false) == AU_ON_WHO && writes_to_amp == 0);
-	fresh(); o = on(); amp[1] = 0xa0;    assert(au_on_prepare(&o, false) == AU_ON_WHO && writes_to_amp == 0);
-	fresh(); o = on(); amp[0x10 / 4] = 2; assert(au_on_prepare(&o, false) == AU_ON_WHO && writes_to_amp == 0);
-	fresh(); o = on(); amp[0x10018 / 4] = 1u << 31; assert(au_on_prepare(&o, false) == AU_ON_OTP && writes_to_amp == 0);
-	fresh(); o = on(); amp[0x1001c / 4] = 0; assert(au_on_prepare(&o, false) == AU_ON_OTP && writes_to_amp == 0 && ms >= 100);
+	fresh(); o = on(); amp[0] = 0x35b40; assert(au_on_prepare(&o, false, false) == AU_ON_WHO && writes_to_amp == 0);
+	fresh(); o = on(); amp[1] = 0xa0;    assert(au_on_prepare(&o, false, false) == AU_ON_WHO && writes_to_amp == 0);
+	fresh(); o = on(); amp[0x10 / 4] = 2; assert(au_on_prepare(&o, false, false) == AU_ON_WHO && writes_to_amp == 0);
+	fresh(); o = on(); amp[0x10018 / 4] = 1u << 31; assert(au_on_prepare(&o, false, false) == AU_ON_OTP && writes_to_amp == 0);
+	fresh(); o = on(); amp[0x1001c / 4] = 0; assert(au_on_prepare(&o, false, false) == AU_ON_OTP && writes_to_amp == 0 && ms >= 100);
 	/* A register that does not take what it is told: stops there, says which, and nothing after it goes. */
 	fresh(); o = on(); stuck_reg = 0x6000;
-	assert(au_on_prepare(&o, false) == AU_ON_READBACK && o.failed_reg == 0x6000 && index_of(0x2018, 0x21) < 0 && index_of(0x2c0c, 3) < 0);
+	assert(au_on_prepare(&o, false, false) == AU_ON_READBACK && o.failed_reg == 0x6000 && index_of(0x2018, 0x21) < 0 && index_of(0x2c0c, 3) < 0);
 	fresh(); o = on(); stuck_reg = 0x3808;
-	assert(au_on_prepare(&o, false) == AU_ON_READBACK && o.failed_reg == 0x3808 && index_of(0x2018, 0x20) < 0);
+	assert(au_on_prepare(&o, false, false) == AU_ON_READBACK && o.failed_reg == 0x3808 && index_of(0x2018, 0x20) < 0);
 	/* A bus that goes away part of the way. */
-	fresh(); o = on(); nack_after = 40; assert(au_on_prepare(&o, false) == AU_ON_I2C && index_of(0x2018, 0x21) < 0);
+	fresh(); o = on(); nack_after = 40; assert(au_on_prepare(&o, false, false) == AU_ON_I2C && index_of(0x2018, 0x21) < 0);
 	/* Power up: a boost fault, no done, no lock: each stops, still muted. */
-	fresh(); o = on(); assert(au_on_prepare(&o, false) == AU_ON_OK); fault_at_pup = true; assert(au_on_power_up(&o) == AU_ON_FAULT && amp[0x6000 / 4] == AU_ON_MUTE);
-	fresh(); o = on(); assert(au_on_prepare(&o, false) == AU_ON_OK); no_pup = true; assert(au_on_power_up(&o) == AU_ON_PUP && o.pup_ms == 100);
-	fresh(); o = on(); assert(au_on_prepare(&o, false) == AU_ON_OK); no_pll = true; assert(au_on_power_up(&o) == AU_ON_PLL);
+	fresh(); o = on(); assert(au_on_prepare(&o, false, false) == AU_ON_OK); fault_at_pup = true; assert(au_on_power_up(&o) == AU_ON_FAULT && amp[0x6000 / 4] == AU_ON_MUTE);
+	fresh(); o = on(); assert(au_on_prepare(&o, false, false) == AU_ON_OK); no_pup = true; assert(au_on_power_up(&o) == AU_ON_PUP && o.pup_ms == 100);
+	fresh(); o = on(); assert(au_on_prepare(&o, false, false) == AU_ON_OK); no_pll = true; assert(au_on_power_up(&o) == AU_ON_PLL);
 	/* OTP's bits: LSB first across words. */
 	{
 		uint32_t words[32] = {0}, bit = 28;
@@ -175,7 +180,7 @@ def main():
     assert audio.count('au_on_unmute(') == 1 and tone.count('au_on_unmute(&o, 0)') == 1
     assert 'o.address = 0x40;' in tone and '0x42' not in tone and 'AU_AMP_RESET_HIGH(183)' in tone and 'AU_AMP_RESET_HIGH(182)' not in tone
     assert 'AU_AMP_RESET_LOW(182)' in tone and 'pins[8] = {0, 1, 182, 183, 121, 122, 123, 124}' in tone and ', 68' not in tone
-    assert audio.count('#define AU_TONE_FRAMES 48000u') == 1 and audio.count('value == 0x414f && index == 0x4231') == 1
+    assert audio.count('#define AU_TONE_FRAMES 48000u') == 1 and audio.count('value == 0x414f && (index == 0x4231 || index == 0x4232)') == 1
     assert tone.index('au_on_prepare') < tone.index('au_on_power_up') < tone.index('au_on_check') < tone.index('au_on_unmute') and tone.rindex('au_on_down(&o)') > tone.index('au_on_unmute')
     assert (ROOT / 'tools/fuxi-audio-probe.py').read_text().count('0x414f') == 1
     print('PASS: au_amp_on')

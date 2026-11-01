@@ -167,6 +167,25 @@ uint32_t fuxi_ar_open_playback_stream_tdm(uint8_t *out, uint32_t capacity, uint3
     return graph_open(out, capacity, port, token, &sg, &c, m, 3, l, 3);
 }
 
+/* The same endpoint's way in: the amplifiers' SDOUT, on gpio122. */
+uint32_t fuxi_ar_open_monitor_tdm(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token)
+{
+    static const Sg sg = {FUXI_AR_SG_MIC, PERF_LOW_LATENCY, DIR_TX, SCENARIO_RECORD};
+    static const Container c = {FUXI_AR_SG_MIC, POS_GLOBAL_DEV};
+    static const Module m[] = {{FUXI_AR_MOD_TDM_SOURCE, FUXI_AR_IID_MONITOR_TDM, 0, 1}};
+    return graph_open(out, capacity, port, token, &sg, &c, m, 1, 0, 0);
+}
+
+uint32_t fuxi_ar_open_capture_stream_tdm(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token)
+{
+    static const Sg sg = {FUXI_AR_SG_CAPTURE, PERF_LOW_LATENCY, DIR_TX, SCENARIO_RECORD};
+    static const Container c = {FUXI_AR_SG_CAPTURE, POS_GLOBAL_DEV};
+    static const Module m[] = {{FUXI_AR_MOD_PCM_CNV, FUXI_AR_IID_CAP_CNV, 1, 1}, {FUXI_AR_MOD_PCM_ENC, FUXI_AR_IID_CAP_ENC, 1, 1},
+                               {FUXI_AR_MOD_RD_SHMEM, FUXI_AR_IID_CAP_SHMEM, 1, 0}};
+    static const Link l[] = {{FUXI_AR_IID_MONITOR_TDM, FUXI_AR_IID_CAP_CNV}, {FUXI_AR_IID_CAP_CNV, FUXI_AR_IID_CAP_ENC}, {FUXI_AR_IID_CAP_ENC, FUXI_AR_IID_CAP_SHMEM}};
+    return graph_open(out, capacity, port, token, &sg, &c, m, 3, l, 3);
+}
+
 uint32_t fuxi_ar_open_mic_device(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token)
 {
     static const Sg sg = {FUXI_AR_SG_MIC, PERF_LOW_LATENCY, DIR_TX, SCENARIO_RECORD};
@@ -214,26 +233,36 @@ uint32_t fuxi_ar_config_speaker_device(uint8_t *out, uint32_t capacity, uint32_t
 }
 
 /* Layouts as pcm_tdm_api.h says them, read from the Xiaomi 14's Linux port (research_notes/audio-next.md). No start here: this reaches no pin. */
-uint32_t fuxi_ar_config_speaker_tdm(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const FuxiArFormat *f, const FuxiArTdm *t)
+static uint32_t config_tdm(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, uint32_t iid, uint32_t data_out, const FuxiArFormat *f, const FuxiArTdm *t)
 {
     W w;
     begin(&w, out, capacity, port, FUXI_AR_APM_IID, token, FUXI_AR_OP_SET_CFG);
     const uint32_t cmd = cmd_payload_start(&w);
-    uint32_t at = param_begin(&w, FUXI_AR_IID_SPEAKER_TDM, PARAM_TDM_INTF);
-    put32(&w, LPAIF); put32(&w, t->intf); put16(&w, WS_INTERNAL); put16(&w, 1);    /* the SoC's sync, data going out */
+    uint32_t at = param_begin(&w, iid, PARAM_TDM_INTF);
+    put32(&w, LPAIF); put32(&w, t->intf); put16(&w, WS_INTERNAL); put16(&w, data_out);    /* the SoC's sync; 1 data going out */
     put32(&w, t->slot_mask); put16(&w, t->slots); put16(&w, t->slot_width);
     put16(&w, t->sync_mode); put16(&w, t->invert_sync); put16(&w, t->sync_data_delay); put16(&w, 0);
     param_end_exact(&w, at);
-    hw_ep_mf(&w, FUXI_AR_IID_SPEAKER_TDM, f);
-    frame_size_factor(&w, FUXI_AR_IID_SPEAKER_TDM);
-    at = param_begin(&w, FUXI_AR_IID_SPEAKER_TDM, PARAM_TDM_LANE);
+    hw_ep_mf(&w, iid, f);
+    frame_size_factor(&w, iid);
+    at = param_begin(&w, iid, PARAM_TDM_LANE);
     put16(&w, 1u << t->lane); put16(&w, 0);
     param_end_exact(&w, at);
-    at = param_begin(&w, FUXI_AR_IID_SPEAKER_TDM, PARAM_HW_INTF_CLOCK);
+    at = param_begin(&w, iid, PARAM_HW_INTF_CLOCK);
     put32(&w, 0); put32(&w, 0); put32(&w, t->clock_attribute); put32(&w, 0);       /* id, frequency and root left to the interface */
     param_end_exact(&w, at);
     cmd_payload_end(&w, cmd);
     return finish(&w);
+}
+
+uint32_t fuxi_ar_config_speaker_tdm(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const FuxiArFormat *f, const FuxiArTdm *t)
+{
+    return config_tdm(out, capacity, port, token, FUXI_AR_IID_SPEAKER_TDM, 1, f, t);
+}
+
+uint32_t fuxi_ar_config_monitor_tdm(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const FuxiArFormat *f, const FuxiArTdm *t)
+{
+    return config_tdm(out, capacity, port, token, FUXI_AR_IID_MONITOR_TDM, 0, f, t);
 }
 
 uint32_t fuxi_ar_config_mic_device(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const FuxiArFormat *f, uint32_t channel_mask)
