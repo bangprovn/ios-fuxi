@@ -251,7 +251,8 @@ def fnv(data):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('cmd', choices=['snapshot', 'squash', 'upload', 'boot', 'report', 'decode', 'stop', 'glink', 'smmu', 'poke'])
+    ap.add_argument('cmd', choices=['snapshot', 'squash', 'upload', 'boot', 'report', 'decode', 'stop', 'glink', 'smmu', 'poke', 'amp'])
+    ap.add_argument('--which', type=int, default=3, help='amp: 1 B at 0x40, 2 T at 0x42, 3 both; read only')
     ap.add_argument('--what', type=int, default=0, help='poke: 1 the zeros, 2 the stream match, 8 with it stop at the S2CR, 16 stream 0x1061 rather than 0x1001, 4 take it away, or their sum')
     ap.add_argument('--sid', type=lambda x: int(x, 0), default=0x1001, help='smmu: the stream, by default the DSP buffers of Linux sm8550.dtsi')
     ap.add_argument('--seconds', type=int, default=30, help='glink: how long to listen, at most 45')
@@ -340,6 +341,21 @@ def main():
         print(f'poke {r[1]}: magic {r[0]:#x}, this code at {r[2]:#x}, stack at {r[3]:#x}, faults {r[13]}')
         print(f'  zeros: before {r[4]:#x}, after {r[5]:#x} and {r[6]:#x}')
         print(f'  bypass: sGFSR before {r[7]:#x}; slot+1 {r[8]}, SMR {r[9]:#x} S2CR {r[10]:#x}; sGFSR after {r[11]:#x}, after taking it away {r[12]:#x}; got to step {r[14]} of 3')
+    elif a.cmd == 'amp':
+        r = struct.unpack('<128I', req(0x4141, a.which, 512))
+        results = {1: 'done', 0x301: 'the vote faulted', 0x302: 'wrapper clocks did not come', 0x303: 'the engine could not be read',
+                   0x304: 'no I2C firmware with FIFOs, or busy', 0x305: "the SE's clock did not come"}
+        print(f'amp: result {r[1]:#x} ({results.get(r[1], "?")}), which {r[2]}, faults {r[21]}; vote {r[4]:#x}, m_ahb {r[5]:#x} s_ahb {r[6]:#x}, se0 {r[10]:#x}')
+        print(f'  engine: fw {r[7]:#x}, if disable {r[8]:#x}, status {r[9]:#x}')
+        print(f'  pins found: gpio0 {r[11]:#x} gpio1 {r[12]:#x} gpio182 {r[13]:#x} gpio183 {r[14]:#x}; reset set low {r[15]:#x} {r[16]:#x}; back {r[19]:#x} {r[20]:#x}; SDA, SCL idle in {r[17] & 1} {r[18] & 1}')
+        outcome = {0: 'ok', 1: 'NACK', 2: 'bus error', 3: 'timeout', 4: 'fault', 5: 'short'}
+        for p, name in enumerate(('B', 'T')):
+            m = r[24 + 12 * p:36 + 12 * p]
+            if not m[10]:
+                continue
+            good = m[6] == 0x35a40 and m[7] in (0xb0, 0xb2) and not (m[5] >> 31)
+            print(f'  {name} @{m[1]:#x}: {outcome.get(m[2], m[2])}, reset line io {m[0]:#x}; OTP boot {m[4]:#x} after {m[3]} ms, error word {m[5]:#x}; DEVID {m[6]:#x} REVID {m[7]:#x} OTPID {m[8]:#x}; irq seen {m[9]:#x}' +
+                  (' -- a CS35L41' if good else ''))
     elif a.cmd == 'smmu':
         r = struct.unpack('<128I', req(0x414d, a.sid))
         if r[0] != 0xa0d10004:

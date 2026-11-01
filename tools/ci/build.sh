@@ -228,6 +228,7 @@ kernel() {
     python3 tools/sync-fuxi-perf.py --check
     python3 tools/test-fuxi-audio.py
     python3 tools/test-fuxi-audio-glink.py
+    python3 tools/test-fuxi-audio-amp.py
     python3 tools/sync-fuxi-audio.py --check
     python3 tools/test-fuxi-pac.py
     python3 tools/sync-fuxi-pac.py --check

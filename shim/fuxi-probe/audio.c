@@ -21,6 +21,8 @@
  *      playback stream into it, starts them, gives them a second of zeros from AU_PLAY_PA, and takes it all down. No pin is muxed. Returns its summary.
  *  IN  0x5a 'AT' (0x4154) wIndex: a-play1 reset the phone with no report, so the parts of --play that the AP does, alone. Bit 0 the zeros, read back;
  *      bit 1 the bypass stream match, read back; bit 2 takes it away. Returns what it read.
+ *  IN  0x5a 'AA' (0x4141) wIndex: reads the amplifiers named, bit 0 B at 0x40, bit 1 T at 0x42, one out of reset at a time (au_amp.h): who they are and
+ *      their OTP boot. Writes nothing to them. Their reset lines and the I2C pins go back as they were. Returns the report.
  *  IN  0x5a 'AH' (0x4148) wIndex: page of the log. 'AI' (0x4149): what the last list's steps answered.
  *  IN  0x5a 'AH' (0x4148) wIndex=page: its log, 128 words a page.
  *  OUT 0x5b wValue=chunk[15:0], wIndex[11:0]=chunk[27:16], wIndex bit15 =
@@ -827,6 +829,78 @@ static void au_smmu_look(uint32_t *r, uint32_t sid)
  r[6] = found;
  r[2] = au_faults;
 }
+/* ---- the amplifiers' identities (au_amp.h) ---- */
+#define AU_AMP_RD(pa) au_rd(pa)
+#define AU_AMP_WR(pa, v) probe_safe_wr32((pa), (v))
+#define AU_AMP_DELAY_US(us) delay(us)
+#include "au_amp.h"
+static uint32_t au_amp_rep[128];
+/* TLMM: CTL pull [1:0] (1 down, 3 up), func [5:2], drive [8:6] = mA/2-1, OE [9], eGPIO present [11], owned by the TLMM [12]. IO: bit 1 out, bit 0 in. */
+static void au_pin(unsigned n, uint32_t ctl, uint32_t out)
+{
+ uint64_t c = AU_TLMM + 0x1000u * n;
+ uint32_t was = au_rd(c);
+ ctl |= was & (1u << 11);
+ if (was & (1u << 11)) ctl |= 1u << 12;     /* as Linux msm_pinmux_set_mux(): claimed from LPASS when it can be */
+ if (ctl & (1u << 9)) (void)probe_safe_wr32(c + 4, out << 1);
+ (void)probe_safe_wr32(c, ctl);
+}
+#define AU_AMP_RESET_LOW(n)  au_pin((n), 1u | 1u << 9, 0)
+#define AU_AMP_RESET_HIGH(n) au_pin((n), 1u | 1u << 9, 1)
+static uint32_t au_amp_run(uint32_t *r, uint32_t which)
+{
+ static const struct { uint8_t address, reset; } part[2] = {{0x40, 183}, {0x42, 182}};
+ static const uint8_t pins[4] = {0, 1, 182, 183};
+ static struct au_amp a[2];
+ uint32_t saved[4][2], vote;
+ au_faults = 0;
+ /* Wrapper 2's clocks, as APCS votes them: core, its AHBs, core2x, SE0. Only with them may the engine be touched: gated, it hangs the bus (touch lane ts-02). */
+ vote = au_rd(AU_GCC + 0x52010);
+ r[4] = vote;
+ if (probe_safe_wr32(AU_GCC + 0x52010, vote | 0x1fu)) return 0x301;
+ /* s_ahb is under hardware gating (bit 1, as Linux's hwcg_reg), so its off bit says nothing while idle: a-amp1. Read as ON or that. a-snap read this engine in that state. */
+ for (unsigned i = 0; i < 10000 && !(au_on(au_rd(AU_GCC + 0x233cc)) && (au_on(au_rd(AU_GCC + 0x233d0)) || (au_rd(AU_GCC + 0x233d0) & 2u))); i++) delay(10);
+ r[5] = au_rd(AU_GCC + 0x233cc); r[6] = au_rd(AU_GCC + 0x233d0); r[3] = au_rd(AU_GCC + 0x52010);
+ if (!au_on(r[5]) || !(au_on(r[6]) || (r[6] & 2u))) return 0x302;
+ r[7] = au_rd(AU_SE0 + AU_SE_FW_REV); r[8] = au_rd(AU_SE0 + AU_SE_IF_DISABLE); r[9] = au_rd(AU_SE0 + AU_SE_STATUS);
+ if (au_faults) return 0x303;
+ if (!au_amp_engine(AU_SE0)) return 0x304;
+ /* The SE's own clock is a DFS root: it comes up once the engine asks for a level, as ts_clock's S4 does. */
+ for (unsigned i = 0; i < 10000 && !au_on(au_rd(AU_GCC + 0x1e004)); i++) delay(10);
+ r[10] = au_rd(AU_GCC + 0x1e004);
+ if (!au_on(r[10])) return 0x305;
+ for (unsigned i = 0; i < 4; i++) { saved[i][0] = au_rd(AU_TLMM + 0x1000u * pins[i]); saved[i][1] = au_rd(AU_TLMM + 0x1000u * pins[i] + 4); }
+ r[11] = saved[0][0]; r[12] = saved[1][0]; r[13] = saved[2][0]; r[14] = saved[3][0];
+ /* Both held in reset before the I2C pins come up, and the line idle high with its pull-ups before any command: 2 mA, pull up, func 2 qup2_se0_mirb. */
+ AU_AMP_RESET_LOW(182); AU_AMP_RESET_LOW(183);
+ r[15] = au_rd(AU_TLMM + 0x1000u * 182); r[16] = au_rd(AU_TLMM + 0x1000u * 183);
+ au_pin(0, 3u | 2u << 2, 0); au_pin(1, 3u | 2u << 2, 0);
+ delay(3000);
+ r[17] = au_rd(AU_TLMM + 4); r[18] = au_rd(AU_TLMM + 0x1000 + 4);
+ for (unsigned p = 0; p < 2; p++) {
+  uint32_t *m = r + 24 + 12 * p;
+  a[p].address = part[p].address;
+  if (!(which & (1u << p))) continue;
+  AU_AMP_RESET_LOW(part[p].reset);
+  delay(3000);
+  AU_AMP_RESET_HIGH(part[p].reset);
+  delay(3000);
+  m[0] = au_rd(AU_TLMM + 0x1000u * part[p].reset + 4);
+  au_amp_identify(AU_SE0, &a[p]);
+  AU_AMP_RESET_LOW(part[p].reset);
+  delay(3000);
+  m[1] = a[p].address; m[2] = a[p].result; m[3] = a[p].boot_ms; m[4] = a[p].boot_status; m[5] = a[p].boot_error;
+  m[6] = a[p].devid; m[7] = a[p].revid; m[8] = a[p].otpid; m[9] = a[p].irq_seen; m[10] = 1;
+ }
+ /* Everything back: the pins as they were found, so reset lines to their pull-down, the amplifiers held. */
+ for (unsigned i = 0; i < 4; i++) {
+  (void)probe_safe_wr32(AU_TLMM + 0x1000u * pins[i] + 4, saved[i][1] & 2u);
+  (void)probe_safe_wr32(AU_TLMM + 0x1000u * pins[i], saved[i][0]);
+ }
+ r[19] = au_rd(AU_TLMM + 0x1000u * 182); r[20] = au_rd(AU_TLMM + 0x1000u * 183);
+ r[21] = au_faults;
+ return 1;
+}
 /* USB entry: returns bytes placed in out (0 = stall). */
 static uint32_t audio_request(uint16_t value, uint16_t index, uint8_t *out)
 {
@@ -874,6 +948,12 @@ static uint32_t audio_request(uint16_t value, uint16_t index, uint8_t *out)
   if (index & 4) { au_smmu_back(); r[12] = au_rd(AU_SMMU + 0x48); }
   r[13] = au_faults;
   memcpy(out, r, sizeof(r)); return sizeof(r);
+ }
+ if (value == 0x4141 && !monitor_report[MON_LAUNCH]) {
+  for (unsigned i = 0; i < 128; i++) au_amp_rep[i] = 0;
+  au_amp_rep[0] = 0xa0d10006; au_amp_rep[2] = index;
+  au_amp_rep[1] = au_amp_run(au_amp_rep, index & 3u);
+  memcpy(out, au_amp_rep, sizeof(au_amp_rep)); return sizeof(au_amp_rep);
  }
  if (value == 0x414d && !monitor_report[MON_LAUNCH]) {
   au_smmu_look(au_smmu_rep, index);
