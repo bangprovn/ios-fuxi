@@ -1579,7 +1579,7 @@
 +#endif /* FUXI */
 --- /dev/null
 +++ b/bsd/dev/fuxi_au_glink.h
-@@ -0,0 +1,429 @@
+@@ -0,0 +1,430 @@
 +/* Fuxi audio lane: the AP's end of GLINK over SMEM with the ADSP, polled, enough to see what the DSP opens. Plain C so that
 + * tools/test-fuxi-audio-glink.py runs it against a fake DSP under the sanitizers; audio.c gives it the SMEM accessors.
 + * The wire format follows Linux qcom_glink_native.c and qcom_glink_smem.c. It negotiates the version, answers CLOSE and an
@@ -1627,6 +1627,7 @@
 +#define AU_GL_PLAY 16u         /* options: with AU_GL_GRAPH, the buffers of au_gl_data_send() */
 +#define AU_GL_WRITE_TOKEN 0x1000u
 +#define AU_GL_TONE 32u         /* options: audio.c's first tone, on the owner's word. For its list and au_tone_stage(); nothing here reads it */
++#define AU_GL_MIC 64u          /* options: audio.c's mic, au_mic.h, between the votes. For its list and au_mic_turn(); nothing here reads it */
 +#define AU_GL_OP_MEM_MAP_DONE 0x02001001u  /* payload {handle} */
 +#define AU_GL_OP_WRITE_DONE 0x05001004u    /* payload {address, address, handle, status} */
 +#define AU_GL_OP_READ_DONE 0x05001005u     /* payload {status, address, address, handle, bytes, offset} */
