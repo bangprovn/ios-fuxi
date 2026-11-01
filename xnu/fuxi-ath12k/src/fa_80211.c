@@ -123,6 +123,7 @@ struct fa_radio {
 	unsigned short action[128];		/* action frames from the access point, by category */
 	unsigned action_ciphered;
 	struct fa_tx_counts tx, tx_then[FA_TX_STEPS];
+	unsigned tx_filtered;			/* since the join: what iOS was told went out, and did not */
 	unsigned long long tx_then_at[FA_TX_STEPS], ios_joined_at;
 	struct { int number, value; unsigned long long at; } asks[FA_ASKS_MOST];
 	unsigned asks_count;
@@ -247,6 +248,7 @@ static bool target_protected;
 static bool auto_quiet;				/* fuxiwifiauto=2 */
 static bool target_address;			/* stage 7 */
 static bool target_serve;			/* stage 7, fuxiath12kq=0x20 */
+static unsigned tx_filter;			/* stage 8, fuxiath12kq: FA_TX_DROP_ bits, none unless asked */
 /* Stage 8, fuxiwifiauto=1: a network to join with nobody asking, once. The key is wiped when it is used or given up. */
 static uint8_t auto_name[FA_SSID_MOST], auto_key[32];
 static unsigned auto_name_length;
@@ -308,6 +310,14 @@ void
 fa_m7_serve(void)
 {
 	target_serve = true;
+}
+
+/* From fa_hif.c on stage 8 alone, before the radio: what iOS sends that goes no further, to learn which of it upsets an access point. */
+void
+fa_m8_tx_filter(bool ip6, bool tcp, bool udp, bool group)
+{
+	tx_filter = (ip6 ? FA_TX_DROP_IP6 : 0) | (tcp ? FA_TX_DROP_TCP : 0) | (udp ? FA_TX_DROP_UDP : 0) | (group ? FA_TX_DROP_GROUP : 0);
+	lx_tell("FUXI ATH12K: M8 tx filter: ipv6 %d tcp %d udp %d multicast %d\n", ip6, tcp, udp, group);
 }
 
 /* tools/ath12k-edits.json, ath12k-mac-override. mac.c has no device-address fallback. */
@@ -2941,6 +2951,7 @@ ios_heard_say(struct fa_radio *radio)
 	lx_tell("FUXI ATH12K: M8 heard: eapol %u lost %u others %u, door others %u, slots peak %u, msdu done later %u; action ciphered %u, by category: %s\n", radio->eapol_heard,
 	    radio->eapol_lost, radio->link_others, radio->door_other, slots, rx_done_later, radio->action_ciphered, actions);
 	ios_tx_say("since the join", &radio->tx, &none);
+	lx_tell("FUXI ATH12K: M8 filtered %u\n", radio->tx_filtered);
 }
 
 /* A loss's account, on the thread, before the link's state goes. Numbers alone. */
@@ -3316,6 +3327,7 @@ ios_join_run(struct fa_radio *radio, const unsigned char *ssid, unsigned ssid_le
 	radio->door_other = radio->action_ciphered = radio->beacon_seq = 0;
 	memset(radio->action, 0, sizeof(radio->action));
 	memset(&radio->tx, 0, sizeof(radio->tx));
+	radio->tx_filtered = 0;
 	memset(radio->tx_then, 0, sizeof(radio->tx_then));
 	memset(radio->tx_then_at, 0, sizeof(radio->tx_then_at));
 	lx_os_unlock();
@@ -3458,7 +3470,7 @@ fa_ios_tx(const unsigned char *frame, unsigned long length)
 {
 	struct fa_radio *radio = ios_radio;
 	unsigned type;
-	bool sent;
+	bool sent, filtered;
 
 	if (radio == NULL || length < 14 || length > 14 + FA_NET_MOST) {
 		return (0);
@@ -3467,10 +3479,16 @@ fa_ios_tx(const unsigned char *frame, unsigned long length)
 	if (type < 0x0600 || type == 0x888e) {
 		return (0);
 	}
+	filtered = fa_tx_filtered(tx_filter, frame, (unsigned)length);
 	lx_os_lock();
 	if (!radio->ios_joined || memcmp(frame + 6, radio->vif->addr, ETH_ALEN) != 0) {
 		lx_os_unlock();
 		return (0);
+	}
+	if (filtered) {
+		radio->tx_filtered++;
+		lx_os_unlock();
+		return (1);		/* as if sent: nothing is to tell iOS that it was not */
 	}
 	radio->ios_tx_busy++;
 	fa_tx_note(&radio->tx, type, frame + 14, (unsigned)length - 14);

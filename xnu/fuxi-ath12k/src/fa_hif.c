@@ -76,6 +76,11 @@ _Static_assert(ATH12K_MAX_SPT_ENTRIES * 8 == ATH12K_PAGE_SIZE, "fuxi-ath12k R2: 
 #define FA_KNOB_SETTLE		0x08u		/* wait after the vdev create command, before its first set_param */
 #define FA_KNOB_PASSIVE		0x10u		/* passive scan: nothing is sent over the air */
 #define FA_KNOB_SERVE		0x20u		/* stage 7: answer ARP and echoes for a while, for a load from the network */
+/* Stage 8 only, a test: what iOS sends that goes no further, while iOS is told it went. ARP and DHCP always pass. */
+#define FA_KNOB_TX_NO_IP6	0x40u		/* IPv6 */
+#define FA_KNOB_TX_NO_TCP	0x80u		/* IPv4 TCP */
+#define FA_KNOB_TX_NO_UDP	0x100u		/* IPv4 UDP except ports 67 and 68 */
+#define FA_KNOB_TX_NO_GROUP	0x200u		/* multicast and broadcast */
 #define FA_SETTLE_MS		1000u
 
 #define FA_CREDIT_STALL_NS	(10 * 1000000000ull)	/* of no WMI credit at all, while a scan runs and nothing else is asked */
@@ -751,6 +756,10 @@ fa_firmware_ready(const struct fa_caps *caps, unsigned stage)
 		lx_tell("FUXI ATH12K: M4 knobs %#x: no idle ps %d no hw mode %d settle %d passive %d serve %d%s\n", hif.knobs,
 		    (hif.knobs & FA_KNOB_NO_IDLE_PS) != 0, (hif.knobs & FA_KNOB_NO_HW_MODE) != 0, (hif.knobs & FA_KNOB_SETTLE) != 0,
 		    (hif.knobs & FA_KNOB_PASSIVE) != 0, (hif.knobs & FA_KNOB_SERVE) != 0, (hif.knobs & FA_KNOB_ONE_CREDIT) != 0 ? "; one credit is not built" : "");
+		if (stage == FA_STAGE_IOS) {
+			fa_m8_tx_filter((hif.knobs & FA_KNOB_TX_NO_IP6) != 0, (hif.knobs & FA_KNOB_TX_NO_TCP) != 0, (hif.knobs & FA_KNOB_TX_NO_UDP) != 0,
+			    (hif.knobs & FA_KNOB_TX_NO_GROUP) != 0);
+		}
 	}
 
 	ab = ath12k_core_alloc(&device, 0, ATH12K_BUS_PCI);

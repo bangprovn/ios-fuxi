@@ -95,6 +95,65 @@ fa_tx_note(struct fa_tx_counts *counts, unsigned type, const uint8_t *body, unsi
 	}
 }
 
+/* ---- a test's filter on what iOS sends: stage 8, fuxiath12kq ------------------------------------------------ */
+
+#define FA_TX_DROP_IP6		0x01u		/* IPv6 */
+#define FA_TX_DROP_TCP		0x02u		/* IPv4 TCP */
+#define FA_TX_DROP_UDP		0x04u		/* IPv4 UDP but DHCP */
+#define FA_TX_DROP_GROUP	0x08u		/* to many, multicast or broadcast, but ARP and DHCP */
+
+/*
+ * Whether this, after the Ethernet header, is DHCP: a whole IPv4 UDP datagram with port 67 or 68 at either end. Not a fragment, whose
+ * ports cannot be read, nor one that goes past the frame. Its checksums are not asked after: filling them may be left to others.
+ */
+static inline bool
+fa_tx_is_dhcp(const uint8_t *body, unsigned length)
+{
+	unsigned header, total, source, target;
+
+	if (length < FA_IP_HEADER || (body[0] >> 4) != 4 || body[9] != FA_PROTO_UDP || (fa_be16(body + 6) & 0x3fff) != 0) {
+		return (false);
+	}
+	header = (body[0] & 0x0fu) * 4;
+	total = fa_be16(body + 2);
+	if (header < FA_IP_HEADER || total < header + FA_UDP_HEADER || total > length) {
+		return (false);
+	}
+	source = fa_be16(body + header);
+	target = fa_be16(body + header + 2);
+	return (source == FA_PORT_SERVER || source == FA_PORT_CLIENT || target == FA_PORT_SERVER || target == FA_PORT_CLIENT);
+}
+
+/*
+ * Whether `filter`, of FA_TX_DROP_ bits, takes this Ethernet frame. ARP and DHCP always pass, and so does the handshake's type. An IPv4
+ * header that cannot be one says neither TCP nor UDP. Reads nothing past `length`, and with no bits nothing at all.
+ */
+static inline bool
+fa_tx_filtered(unsigned filter, const uint8_t *frame, unsigned length)
+{
+	const uint8_t *body = frame + 14;
+	unsigned type, size;
+
+	if (filter == 0 || length < 14) {
+		return (false);
+	}
+	type = fa_be16(frame + 12);
+	size = length - 14;
+	if (type == FA_TYPE_ARP || type == 0x888e || (type == FA_TYPE_IP && fa_tx_is_dhcp(body, size))) {
+		return (false);
+	}
+	if ((filter & FA_TX_DROP_GROUP) != 0 && (frame[0] & 1) != 0) {
+		return (true);
+	}
+	if (type == 0x86dd) {
+		return ((filter & FA_TX_DROP_IP6) != 0);
+	}
+	if (type != FA_TYPE_IP || size < FA_IP_HEADER || (body[0] >> 4) != 4 || (body[0] & 0x0fu) < FA_IP_HEADER / 4) {
+		return (false);
+	}
+	return (body[9] == 6 ? (filter & FA_TX_DROP_TCP) != 0 : body[9] == FA_PROTO_UDP && (filter & FA_TX_DROP_UDP) != 0);
+}
+
 /* ---- data frames ------------------------------------------------------------------------------------------- */
 
 struct fa_data {

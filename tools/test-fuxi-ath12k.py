@@ -2116,6 +2116,49 @@ int main(void) {
         eth[12] = 0x88; eth[13] = 0x8e; assert(!fa_ios_tx(eth, 60)); eth[12] = 0; eth[13] = 60; assert(!fa_ios_tx(eth, 60)); eth[12] = 8; eth[13] = 0;
         eth[6] ^= 2; assert(!fa_ios_tx(eth, 60)); eth[6] ^= 2;
         radio->ios_said = 0; ios_step(radio); assert(SAID("M8 joined: rx ok 0 dropped unprotected 0"));
+        assert(SAID("M8 filtered 0\n") && strstr(said, "M8 since the join") < strstr(said, "M8 filtered 0\n"));
+        /* A test's filter on what iOS sends. Off, as here by default, everything goes. On, what it takes says yes to iOS, goes nowhere and is counted, and only that. */
+        {
+            static const uint8_t ALL[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+            uint8_t t[60]; struct fa_tx_counts before;
+            memset(t, 0, sizeof(t)); memcpy(t, OTHER, 6); memcpy(t + 6, OWN, 6); t[12] = 8; t[14] = 0x45; t[17] = 46; t[37] = 53;
+            assert(!radio->tx_filtered);
+            m8_sent_count = 0; before = radio->tx;
+            t[14 + 9] = 6; assert(fa_ios_tx(t, 60) == 1 && m8_sent_count == 1 && radio->tx.tcp == before.tcp + 1);
+            t[14 + 9] = 17; assert(fa_ios_tx(t, 60) == 1 && m8_sent_count == 2 && radio->tx.udp == before.udp + 1);
+            t[12] = 0x86; t[13] = 0xdd; assert(fa_ios_tx(t, 60) == 1 && m8_sent_count == 3 && radio->tx.ip6 == before.ip6 + 1);
+            memcpy(t, ALL, 6); t[12] = 8; t[13] = 0; assert(fa_ios_tx(t, 60) == 1 && m8_sent_count == 4);
+            assert(!radio->tx_filtered);
+            fa_m8_tx_filter(true, true, true, true); assert(SAID("M8 tx filter: ipv6 1 tcp 1 udp 1 multicast 1"));
+            before = radio->tx; m8_sent_count = 0;
+            assert(fa_ios_tx(t, 60) == 1 && radio->tx_filtered == 1);				/* a broadcast */
+            memcpy(t, OTHER, 6);
+            assert(fa_ios_tx(t, 60) == 1 && radio->tx_filtered == 2);				/* UDP to 53 */
+            t[14 + 9] = 6; assert(fa_ios_tx(t, 60) == 1 && radio->tx_filtered == 3);		/* TCP */
+            t[12] = 0x86; t[13] = 0xdd; assert(fa_ios_tx(t, 60) == 1 && radio->tx_filtered == 4);	/* IPv6 */
+            assert(!m8_sent_count && !memcmp(&before, &radio->tx, sizeof(before)));
+            /* What was never to go out is still refused, not counted. */
+            t[12] = 8; t[13] = 0; t[6] ^= 2; assert(!fa_ios_tx(t, 60)); t[6] ^= 2;
+            t[12] = 0x88; t[13] = 0x8e; assert(!fa_ios_tx(t, 60));
+            t[12] = 0; t[13] = 60; assert(!fa_ios_tx(t, 60));
+            assert(!fa_ios_tx(t, 13) && !fa_ios_tx(t, 1515) && radio->tx_filtered == 4 && !m8_sent_count);
+            /* ARP and DHCP pass with everything on, to one and to all; an echo to one passes too. */
+            t[12] = 8; t[13] = 6; assert(fa_ios_tx(t, 60) == 1 && m8_sent_count == 1 && radio->tx.arp == before.arp + 1);
+            memcpy(t, ALL, 6); assert(fa_ios_tx(t, 60) == 1 && m8_sent_count == 2 && radio->tx.arp == before.arp + 2);
+            t[13] = 0; t[14 + 9] = 17; t[35] = 68; t[37] = 67; assert(fa_ios_tx(t, 60) == 1 && m8_sent_count == 3 && radio->tx.udp == before.udp + 1);
+            memcpy(t, OTHER, 6); t[35] = 67; t[37] = 68; assert(fa_ios_tx(t, 60) == 1 && m8_sent_count == 4 && radio->tx.udp == before.udp + 2);
+            t[14 + 9] = 1; assert(fa_ios_tx(t, 60) == 1 && m8_sent_count == 5 && radio->tx.icmp == before.icmp + 1);
+            assert(radio->tx_filtered == 4);
+            said[0] = 0; radio->ios_said = 0; ios_step(radio); assert(SAID("M8 filtered 4\n") && SAID("tx arp ") && strstr(said, "M8 since the join") < strstr(said, "M8 filtered 4\n"));
+            /* Each bit alone takes what is its own. */
+            fa_m8_tx_filter(true, false, false, false); assert(tx_filter == FA_TX_DROP_IP6);
+            fa_m8_tx_filter(false, true, false, false); assert(tx_filter == FA_TX_DROP_TCP);
+            fa_m8_tx_filter(false, false, true, false); assert(tx_filter == FA_TX_DROP_UDP);
+            fa_m8_tx_filter(false, false, false, true); assert(tx_filter == FA_TX_DROP_GROUP);
+            fa_m8_tx_filter(false, false, false, false); assert(tx_filter == 0);
+            m8_sent_count = 0; t[14 + 9] = 6; assert(fa_ios_tx(t, 60) == 1 && m8_sent_count == 1 && radio->tx_filtered == 4);
+            log_is_clean();
+        }
         /* Block ack: heard on the poll thread, done on the stage's own, answered in the standard's bytes. */
         {
             static const uint8_t ADDBA[9] = { 3, 0, 0x5a, 0x17, 0x08, 0xe8, 0x03, 0x30, 0x12 }, WANT[9] = { 3, 1, 0x5a, 0, 0, 0x17, 0x08, 0xe8, 0x03 };
@@ -2153,7 +2196,9 @@ int main(void) {
             calls[0] = 0; deauths = 0;
             assert(fa_ios_leave() == FA_IOS_DONE && strstr(calls, "deauth,flush,ba_stop,ba_stop,ba_stop,off_g,off_p,sta43,") && !radio->ba_live && !radio->ba_want);
             m8_again();
+            assert(radio->tx_filtered == 4);
             assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_DONE && !radio->ba_live);
+            assert(!radio->tx_filtered);	/* the count is since the join */
             /* Loss: no goodbye, and live classes back. */
             give_action(AP, ADDBA, 9); ios_step(radio); assert(radio->ba_live == 1u << 5);
             {
@@ -2172,6 +2217,7 @@ int main(void) {
             calls[0] = 0; deauths = 0; m8.losts = 0; m8.downs = 0; give_door(FA_KIND_DEAUTH, 7); ios_step(radio);
             assert(SAID("M8 door: kind 0xc0 reason 7 seq 0 retry 0 protected 0, 26 bytes, rssi -40") && SAID("door others 1") && SAID("M8 the last ") && SAID("udp 1"));
             assert(SAID("by category: 3:1 5:1 ") && SAID("M8 before the loss: wifid set 383 value 4,") && SAID("M8 before the loss: wifid set 365 value 19,") && !SAID("value 3,"));
+            assert(SAID("M8 filtered 0\n"));
             assert(!SAID("fuxi-test") && !SAID("d4:") && !SAID("a1:b2"));
             assert(strstr(calls, "ba_stop,off_g,off_p,") && !strstr(calls, "action") && !deauths && m8.losts == 1 && !radio->ba_live);
             m8_again();
@@ -2235,6 +2281,8 @@ int main(void) {
         assert(fa_ios_leave() == FA_IOS_DONE && m8.downs == 1 && deauths == 1 && strstr(calls, "deauth,flush,off_g,off_p,sta43,sta32,sta21,sta10,disassoc_told,unassign,remove_chanctx,"));
         fa_ios_state(&state); assert(state.phase == FA_IOS_IDLE && !radio->ios_joined && !radio->joining && !radio->wpa.kck[0]);
         assert(!fa_ios_tx(eth, 60));
+        /* The filter's yes is for a joined station alone. */
+        eth[12] = 0x86; eth[13] = 0xdd; fa_m8_tx_filter(true, false, false, false); assert(!fa_ios_tx(eth, 60) && !radio->tx_filtered); fa_m8_tx_filter(false, false, false, false); eth[12] = 8; eth[13] = 0;
         assert(radio->vif != NULL && radio->started);
         { void *memory = radio->sta_memory;
           m8_again();
@@ -3005,6 +3053,20 @@ FA_NET_HOST = r"""
 static const uint8_t OWN[6] = {2, 0x46, 0x55, 0x58, 0x49, 1}, AP[6] = {0x02, 0xa1, 0xb2, 0xc3, 0xd4, 0x55}, SERVER[6] = {0x02, 0, 0, 0, 0, 9};
 static const uint8_t ME[4] = {10, 0, 0, 9}, THEM[4] = {10, 0, 0, 1};
 static uint32_t seed = 0x1234567;
+/* The filter on what iOS sends, in memory of exactly the frame's size. */
+static bool tx_takes(unsigned filter, const uint8_t *frame, unsigned length) {
+    uint8_t *x = malloc(length ? length : 1); memcpy(x, frame, length);
+    bool taken = fa_tx_filtered(filter, x, length);
+    free(x);
+    return taken;
+}
+/* An IPv4 frame with a header of `words` and ports after it, of 60 bytes: to one, or to all. */
+static unsigned tx_ip(uint8_t *t, bool all, unsigned protocol, unsigned words, unsigned source, unsigned target) {
+    memset(t, 0, 100); memset(t, all ? 0xff : 2, 6); memcpy(t + 6, OWN, 6); t[12] = 8;
+    t[14] = (uint8_t)(0x40 | words); t[14 + 3] = 46; t[14 + 9] = (uint8_t)protocol;
+    if (words >= 5 && words <= 10) { fa_put16(t + 14 + words * 4, source); fa_put16(t + 14 + words * 4 + 2, target); }
+    return 60;
+}
 static uint32_t next(void) { seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5; return seed; }
 /* A server's answer, by the RFC's bytes. */
 static unsigned offer(uint8_t *out, unsigned kind, uint32_t xid, const uint8_t *chaddr) {
@@ -3065,6 +3127,74 @@ int main(void) {
         fa_tx_note(&c, FA_TYPE_IP, b, 19);
         b[9] = 17; fa_tx_note(&c, FA_TYPE_IP, b, 20); b[9] = 6; fa_tx_note(&c, FA_TYPE_IP, b, 20); b[9] = 1; fa_tx_note(&c, FA_TYPE_IP, b, 20); b[9] = 47; fa_tx_note(&c, FA_TYPE_IP, b, 20);
         assert(c.arp == 1 && c.ip6 == 1 && c.eapol == 1 && c.other == 1 && c.udp == 1 && c.tcp == 1 && c.icmp == 1 && c.ip_other == 2);
+    }
+    /* The filter on what iOS sends: what each bit takes, and that it reads nothing past the frame. */
+    {
+        enum { I = FA_TX_DROP_IP6, T = FA_TX_DROP_TCP, U = FA_TX_DROP_UDP, G = FA_TX_DROP_GROUP, EVERY = I | T | U | G };
+        uint8_t t[100]; unsigned size;
+        /* Each kind of frame against every mask: `wanted` says the bits that take it. */
+        static const struct { bool all; unsigned type, protocol, source, target, wanted; } KINDS[] = {
+            { false, 0x86dd, 6, 1000, 80, I },		{ true, 0x86dd, 17, 546, 547, I | G },		/* IPv6, DHCPv6 is no exception */
+            { false, 0x0800, 6, 1000, 443, T },		{ true, 0x0800, 6, 1000, 443, T | G },
+            { false, 0x0800, 6, 68, 67, T },		{ true, 0x0800, 6, 67, 68, T | G },		/* the ports are UDP's alone */
+            { false, 0x0800, 17, 1000, 53, U },		{ true, 0x0800, 17, 5353, 5353, U | G },
+            { false, 0x0800, 17, 66, 69, U },
+            { false, 0x0800, 1, 0, 0, 0 },		{ true, 0x0800, 1, 0, 0, G },			/* neither TCP nor UDP */
+            { false, 0x0800, 47, 0, 0, 0 },		{ true, 0x0800, 47, 0, 0, G },
+            { false, 0x88b5, 0, 0, 0, 0 },		{ true, 0x88b5, 0, 0, 0, G },
+            { false, 0x8100, 0, 0, 0, 0 },							/* what is inside a tag is not looked at */
+            { false, 0x0806, 0, 0, 0, 0 },		{ true, 0x0806, 0, 0, 0, 0 },			/* ARP always */
+            { false, 0x888e, 0, 0, 0, 0 },		{ true, 0x888e, 0, 0, 0, 0 },
+            { false, 0x0800, 17, 68, 67, 0 },		{ true, 0x0800, 17, 68, 67, 0 },		/* DHCP always, any end */
+            { false, 0x0800, 17, 67, 68, 0 },		{ true, 0x0800, 17, 67, 68, 0 },
+            { false, 0x0800, 17, 1000, 67, 0 },		{ true, 0x0800, 17, 68, 1000, 0 },
+        };
+        for (unsigned k = 0; k < sizeof(KINDS) / sizeof(KINDS[0]); k++) {
+            for (unsigned mask = 0; mask <= EVERY; mask++) {
+                size = tx_ip(t, KINDS[k].all, KINDS[k].protocol, 5, KINDS[k].source, KINDS[k].target);
+                t[17] = 46; fa_put16(t + 12, KINDS[k].type);
+                assert(tx_takes(mask, t, size) == ((mask & KINDS[k].wanted) != 0));
+            }
+        }
+        /* Off: nothing, even what is no frame at all. */
+        assert(!fa_tx_filtered(0, NULL, 0) && !tx_takes(EVERY, t, 0) && !tx_takes(EVERY, t, 13));
+        /* Headers alone, to one: nothing says TCP or UDP but a header that can be one; to all, whatever is not ARP or DHCP goes. */
+        size = tx_ip(t, false, 17, 5, 1000, 53);
+        for (unsigned n = 14; n < 14 + 20; n++) { assert(!tx_takes(T | U | I, t, n)); memset(t, 0xff, 6); assert(tx_takes(G, t, n)); memset(t, 2, 6); }
+        assert(tx_takes(U, t, 14 + 20) && !tx_takes(T, t, 14 + 20));			/* no room for ports: not DHCP */
+        t[14] = 0x44; assert(!tx_takes(EVERY & ~G, t, size)); memset(t, 0xff, 6); assert(tx_takes(G, t, size)); memset(t, 2, 6);	/* words below 5 */
+        t[14] = 0x65; assert(!tx_takes(EVERY & ~G, t, size)); t[14] = 0x45;		/* version 6 under the IPv4 type */
+        { uint8_t a[14]; memcpy(a, t, 14); a[12] = 8; a[13] = 6; assert(!tx_takes(EVERY, a, 14)); a[0] = 0xff; assert(!tx_takes(EVERY, a, 14)); }	/* an ARP with nothing in it */
+        /* What only looks like DHCP. */
+        size = tx_ip(t, true, 17, 5, 68, 67); t[17] = 28; assert(!tx_takes(EVERY, t, size));
+        t[17] = 27; assert(tx_takes(U, t, size) && tx_takes(G, t, size));		/* its length has no room for the UDP header */
+        t[17] = 19; assert(tx_takes(U, t, size));					/* nor for the IP header */
+        fa_put16(t + 16, 47); assert(!tx_takes(EVERY, t, 14 + 47) && tx_takes(U, t, 14 + 46) && tx_takes(G, t, 14 + 46));	/* longer than the frame */
+        fa_put16(t + 16, 28); assert(!tx_takes(EVERY, t, 14 + 28) && tx_takes(U, t, 14 + 27) && tx_takes(U, t, 14 + 22) && tx_takes(U, t, 14 + 21));
+        t[20] = 0x20; assert(tx_takes(U, t, size) && tx_takes(G, t, size)); t[20] = 0;	/* a first fragment */
+        t[21] = 1; assert(tx_takes(U, t, size)); t[21] = 0;				/* a later one: its first bytes are no ports */
+        t[20] = 0x40; assert(!tx_takes(EVERY, t, size)); t[20] = 0;			/* "do not fragment" is no fragment */
+        t[24] = 0xde; t[25] = 0xad; assert(!tx_takes(EVERY, t, size));			/* a wrong checksum is not asked after */
+        /* The ports are after the header as long as it says. */
+        size = tx_ip(t, true, 17, 6, 68, 67); fa_put16(t + 16, 32); assert(!tx_takes(EVERY, t, size));
+        size = tx_ip(t, true, 17, 6, 1000, 53); fa_put16(t + 16, 32); t[34] = 0; t[35] = 68; t[36] = 0; t[37] = 67; assert(tx_takes(U, t, size));
+        size = tx_ip(t, true, 17, 15, 0, 0); assert(tx_takes(U, t, 14 + 21) && tx_takes(U, t, size));	/* a header past the frame */
+        fa_put16(t + 16, 68); t[14 + 60] = 0; t[14 + 61] = 68; t[14 + 62] = 0; t[14 + 63] = 67; assert(tx_takes(U, t, 14 + 64) && !tx_takes(EVERY, t, 14 + 68));
+        /* Random bytes, of each size: the sanitizers read along; off takes nothing, ARP passes, and more bits never take less. */
+        for (int i = 0; i < 20000; i++) {
+            unsigned length = next() % 96; uint8_t *x = malloc(length ? length : 1);
+            for (unsigned at = 0; at < length; at++) x[at] = (uint8_t)next();
+            if (length > 13 && (next() & 1)) x[12] = 8, x[13] = next() & 1 ? 0 : 6;
+            if (length > 14 && (next() & 1)) x[14] = 0x45;
+            if (length > 23 && (next() & 1)) x[23] = next() & 1 ? 17 : 6;
+            assert(!fa_tx_filtered(0, x, length));
+            for (unsigned mask = 1; mask <= EVERY; mask++) {
+                bool taken = fa_tx_filtered(mask, x, length);
+                if (taken) assert(fa_tx_filtered(EVERY, x, length));
+                if (length >= 14 && x[12] == 8 && x[13] == 6) assert(!taken);
+            }
+            free(x);
+        }
     }
     /* ARP and the echo. */
     assert(fa_arp_request(f, 27, OWN, ME, THEM) == 0 && fa_arp_request(f, 28, OWN, ME, THEM) == 28 && f[7] == 1 && !memcmp(f + 8, OWN, 6) && !memcmp(f + 14, ME, 4) && !memcmp(f + 24, THEM, 4));
@@ -3375,6 +3505,29 @@ def busy_watch_is_in_patch_0117_alone(tmp):
     assert added.count('fuxi_busy_give_up(busy_under);') == 1 and 'if (seconds == 30) {' in added
     for word in ('setProperty', 'terminate', 'waitQuiet', 'ssid', 'address', 'SSID'):
         assert word not in added, word
+
+
+@check
+def tx_filter_is_stage_8s_alone_and_off_by_default(tmp):
+    """fuxiath12kq's filter on what iOS sends: four free bits, none on unless asked, set on stage 8 alone, and past the refusals in fa_ios_tx() alone."""
+    own = ROOT / 'xnu/fuxi-ath12k/src'
+    hif = (own / 'fa_hif.c').read_text()
+    text = (own / 'fa_80211.c').read_text()
+    knobs = {name: int(value, 16) for name, value in re.findall(r'#define (FA_KNOB_\w+)\s+(0x[0-9a-f]+)u', hif)}
+    assert len(knobs) == 10 and sum(knobs.values()) == 0x3ff and all(bin(value).count('1') == 1 for value in knobs.values())
+    assert (knobs['FA_KNOB_TX_NO_IP6'], knobs['FA_KNOB_TX_NO_TCP'], knobs['FA_KNOB_TX_NO_UDP'], knobs['FA_KNOB_TX_NO_GROUP']) == (0x40, 0x80, 0x100, 0x200)
+    assert hif.count('fa_m8_tx_filter(') == 1
+    at = hif.index('fa_m8_tx_filter(')
+    assert hif.rindex('if (stage == FA_STAGE_IOS) {', 0, at) > hif.index('hif.knobs = lx_os_option("fuxiath12kq");') and hif.rindex('}', 0, at) < hif.rindex('if (stage == FA_STAGE_IOS) {', 0, at)
+    call = hif[at:hif.index(';', at)]
+    assert call.index('NO_IP6') < call.index('NO_TCP') < call.index('NO_UDP') < call.index('NO_GROUP')
+    assert 'static unsigned tx_filter;' in text and text.count('tx_filter =') == 1 and text.count('fa_m8_tx_filter(') == 1
+    tx = text[text.index('\nfa_ios_tx('):text.index('/* Design section 2: recovery')]
+    assert tx.index('type == 0x888e') < tx.index('fa_tx_filtered(tx_filter,') < tx.index('!radio->ios_joined') < tx.index('if (filtered) {') < tx.index('radio->ios_tx_busy++') < tx.index('fa_tx_note(') < tx.index('net_send(')
+    gone = tx[tx.index('if (filtered) {'):tx.index('radio->ios_tx_busy++')]
+    assert 'radio->tx_filtered++;' in gone and 'lx_os_unlock();' in gone and 'return (1);' in gone
+    assert len(re.findall(r'\btx_filter\b', text)) == 3 and text.count('radio->tx_filtered = 0;') == 1
+    assert text.index('memset(&radio->tx, 0,') < text.index('radio->tx_filtered = 0;') < text.index('memset(radio->tx_then, 0,')
 
 
 @check

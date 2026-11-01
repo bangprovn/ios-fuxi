@@ -27,6 +27,7 @@ void	fa_m4_firmware_dead(void);		/* fa_hif.c: fw_thread only: rings stopped, RDD
 /* Stage 5: the same evidence, and these. */
 int	fa_m8_up(struct ieee80211_hw *hw);	/* fa_80211.c: stage 8: up and staying; 0 or -errno */
 void	fa_m8_firmware_gone(void);	/* fa_80211.c: from the poll thread: it only notes it, and its thread does the rest */
+void	fa_m8_tx_filter(bool ip6, bool tcp, bool udp, bool group);	/* fa_80211.c: what iOS sends that goes no further: fuxiath12kq=0x40 to 0x200 */
 void	fa_m7_serve(void);	/* fa_80211.c: and answers ARP and echoes for a while: fuxiath12kq=0x20 */
 void	fa_m7_ask(void);	/* fa_80211.c: the join goes on to ask for an address */
 int	fa_m5_station(struct ieee80211_hw *hw, bool passive);	/* fa_80211.c: up, scan, join, stay, leave, down; 0 or -errno */
