@@ -316,6 +316,9 @@ an unrelated address. `tools/ios27-prelink-pairs.json` now pairs it with `_kerne
 
 `fuxi_root27_norootauth=1` skips that `FSIOC_KERNEL_ROOTAUTH` check.
 
+| L | + `fuxi_root27_norootauth=1` | root kept; `load_init_program` reaches `/sbin/launchd`; kernel data abort in `upl_page_present(pl, 0x7fff)` called from APFS (two-entry page list, 0x8000-byte range) |
+| M | + `PAGE_SHIFT_CONST` pair (APFS's last unbound kernel data reference) | same abort, same registers |
+
 Boot G makes the refusal a global APFS gate: it does not depend on the device, the volume or the DT root
 properties. `ios27-prelink.py` now writes `targets.json` (every kernel reference of each root kext with the native
 symbol and the match method) to audit what APFS calls; 427 of APFS's 856 kernel references are bound by
