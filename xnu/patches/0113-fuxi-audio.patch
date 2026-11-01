@@ -798,3 +798,773 @@
 +    return FUXI_RPMH_OK;
 +}
 +#endif
+--- /dev/null
++++ b/bsd/dev/fuxi_audio_dsp.c
+@@ -0,0 +1,361 @@
++/* Fuxi audio lane, P-AU3 and P-AU4 in XNU: the ADSP the loader left running (boot/ios-remote.sh ADSP=1), spoken to from a kernel thread.
++ * boot-arg fuxiaudio=1: GLINK over SMEM, polled, as shim/fuxi-probe/au_glink.h; the APM's state; LPASS's votes; the secondary TDM endpoint's graph and a stream into
++ * it, started on a second of zeros, and taken down again. What a-play2 did before iOS, here beside iOS. No pin is muxed, no amplifier reached, nothing is heard.
++ * The loader has put apps_smmu's streams 0x1001/0x80 and 0x1061 into context bank 4 (poke 2 and 18); this does not touch the SMMU. The buffer is outside the bank XNU owns. */
++#ifdef FUXI
++#include <stdint.h>
++#include <stdbool.h>
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <string.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include "fuxi_audioreach.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void fuxi_audio_dsp_init(void);
++
++#define FA_SMEM         0x81d00000ull   /* smem_region */
++#define FA_SMEM_SIZE    0x00200000u
++#define FA_IPCC         0x00408000ull
++#define FA_IPCC_SIZE    0x00001000u
++#define FA_IPCC_GLINK   ((3u << 16) | 0u)    /* client LPASS, signal GLINK_QMP */
++#define FA_BUFFER       0xd0000000ull
++#define FA_BUFFER_BYTES (4u * 7680u)
++#define FA_BUFFER_SID   1ull            /* 0x1001 & 0xf, as Linux q6apm_dai */
++#define FA_PERIOD_BYTES 7680u           /* 20 ms of 48 kHz, 2 channels of 32 bits */
++#define FA_PERIODS      50u
++
++static vm_offset_t fa_smem, fa_ipcc, fa_buffer;
++
++static uint32_t
++fa_rd(uint64_t pa)
++{
++	if (pa >= FA_SMEM && pa + 4 <= FA_SMEM + FA_SMEM_SIZE) {
++		return *(volatile uint32_t *)(fa_smem + (vm_offset_t)(pa - FA_SMEM));
++	}
++	return 0xffffffffu;
++}
++
++static void
++fa_wr(uint64_t pa, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	if (pa >= FA_SMEM && pa + 4 <= FA_SMEM + FA_SMEM_SIZE) {
++		*(volatile uint32_t *)(fa_smem + (vm_offset_t)(pa - FA_SMEM)) = v;
++	}
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++#define AU_GL_RD(pa) fa_rd(pa)
++#define AU_GL_WR(pa, v) fa_wr((pa), (v))
++#define AU_GL_WMB() __asm__ volatile ("dsb osh" ::: "memory")
++#define AU_GL_KICK() (*(volatile uint32_t *)(fa_ipcc + 0xc) = FA_IPCC_GLINK)
++#include "fuxi_au_glink.h"
++
++struct fa_part {
++	uint64_t pa;
++	uint32_t size, free_unc;
++};
++
++/* SMEM's table of partitions, then the uncached items of one: Linux smem.c, bounded, as shim/fuxi-probe/audio.c reads them. */
++static bool
++fa_smem_part(unsigned h0, unsigned h1, struct fa_part *p)
++{
++	uint64_t pt = FA_SMEM + FA_SMEM_SIZE - 0x1000;
++	uint32_t n;
++
++	if (fa_rd(pt) != 0x434f5424u || (n = fa_rd(pt + 8)) > 64) {
++		return false;
++	}
++	for (unsigned i = 0; i < n; i++) {
++		uint64_t e = pt + 0x20 + 0x30 * i;
++		uint32_t off = fa_rd(e), size = fa_rd(e + 4), hosts = fa_rd(e + 12);
++		unsigned a = hosts & 0xffff, b = hosts >> 16;
++
++		if (!((a == h0 && b == h1) || (a == h1 && b == h0))) {
++			continue;
++		}
++		if (off == 0 || off >= FA_SMEM_SIZE || size < 0x20 || size > FA_SMEM_SIZE - off) {
++			return false;
++		}
++		p->pa = FA_SMEM + off;
++		p->size = size;
++		if (fa_rd(p->pa) != 0x54525024u) {
++			return false;
++		}
++		p->free_unc = fa_rd(p->pa + 12);
++		return p->free_unc >= 0x20 && p->free_unc <= size;
++	}
++	return false;
++}
++
++static uint64_t
++fa_smem_item(const struct fa_part *p, unsigned item, uint32_t *size)
++{
++	uint64_t e = p->pa + 0x20, end = p->pa + p->free_unc;
++
++	for (unsigned i = 0; i < 512 && e + 16 <= end; i++) {
++		uint32_t w0 = fa_rd(e), sz = fa_rd(e + 4), w2 = fa_rd(e + 8);
++		uint64_t data = e + 16 + (w2 >> 16);
++
++		if ((w0 & 0xffff) != 0xa5a5 || sz > end - data) {
++			return 0;
++		}
++		if ((w0 >> 16) == item) {
++			if (size != NULL) {
++				*size = sz - (w2 & 0xffff);
++			}
++			return data;
++		}
++		e = data + sz;
++	}
++	return 0;
++}
++
++/* The DSP's ready bits, from its SMP2P item: "slave-kernel" fatal b0, ready b1, handover b2. */
++static uint32_t
++fa_ready_bits(const struct fa_part *p)
++{
++	uint64_t in = fa_smem_item(p, 443, NULL);
++
++	if (in == 0 || fa_rd(in) != 0x504d5324u) {
++		return 0x40000000u;
++	}
++	unsigned valid = fa_rd(in + 12) >> 16;
++	for (unsigned e = 0; e < valid && e < 16; e++) {
++		uint64_t ent = in + 20 + 20 * e;
++
++		if (fa_rd(ent) == 0x76616c73u && fa_rd(ent + 4) == 0x656b2d65u) {
++			return fa_rd(ent + 16) & 0xffff;
++		}
++	}
++	return 0x10000000u;
++}
++
++static struct au_gl fa_g;
++static uint32_t fa_log[AU_GL_REC_WORDS * 8];
++static uint32_t fa_m[2 + AU_GL_GPR_BUFFER / 4 + 2];
++static uint64_t fa_start;
++
++static void
++fa_sleep_ms(unsigned ms)
++{
++	assert_wait_timeout((event_t)&fa_g, THREAD_UNINT, ms, NSEC_PER_MSEC);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* What has come, for up to `ms`, a millisecond at a time. False if the ring cannot be trusted any more or the DSP says it has fallen over. */
++static bool
++fa_poll(unsigned ms)
++{
++	struct fa_part p;
++
++	for (unsigned i = 0; i <= ms; i++) {
++		uint64_t ns;
++
++		absolutetime_to_nanoseconds(mach_absolute_time() - fa_start, &ns);
++		fa_g.ms = (uint32_t)(ns / NSEC_PER_MSEC);
++		while (au_gl_step(&fa_g)) {
++		}
++		if (fa_g.stuck != 0) {
++			printf("FUXI AUDIO: GLINK stuck %u\n", fa_g.stuck);
++			return false;
++		}
++		if (fa_smem_part(0, 2, &p)) {
++			uint32_t bits = fa_ready_bits(&p);
++
++			if ((bits & 0xf0000000u) == 0 && (bits & 1) != 0) {
++				printf("FUXI AUDIO: the DSP says it has fallen over, bits %#x\n", bits);
++				return false;
++			}
++		}
++		if (i < ms) {
++			fa_sleep_ms(1);
++		}
++	}
++	return true;
++}
++
++/* One step of the list, into the long buffer: waits for its answer, up to a second. The status, or AU_GL_PRM_NO_ANSWER. */
++static uint32_t
++fa_step(uint32_t bytes)
++{
++	uint32_t step = fa_g.graph_sent;
++
++	for (unsigned i = 0; i < 50 && !fa_g.big_have; i++) {
++		(void)au_gl_big_ask(&fa_g);
++		if (!fa_poll(20)) {
++			return AU_GL_PRM_NO_ANSWER;
++		}
++	}
++	if (bytes == 0 || !au_gl_graph_send(&fa_g, fa_m, bytes)) {
++		printf("FUXI AUDIO: step %u not sent: %u bytes, the long buffer %u\n", step, bytes, fa_g.big_have);
++		fa_g.graph_steps = 0;
++		return AU_GL_PRM_NO_ANSWER;
++	}
++	for (unsigned i = 0; i < 1000; i++) {
++		if (!fa_poll(1)) {
++			break;
++		}
++		if (fa_g.graph_status[step] != AU_GL_PRM_NO_ANSWER) {
++			break;
++		}
++	}
++	return fa_g.graph_status[step];
++}
++
++#define FA_STEP(what, build, ...) do { \
++	uint32_t status = fa_step(build(((uint8_t *)(fa_m + 2)), AU_GL_GPR_BUFFER, 1, AU_GL_GRAPH_TOKEN + fa_g.graph_sent, ##__VA_ARGS__)); \
++	printf("FUXI AUDIO: %s: status %#x\n", what, status); \
++	if (status != 0) { bad++; } \
++} while (0)
++
++static void
++fa_thread(void *arg, wait_result_t result)
++{
++#pragma unused(arg, result)
++	static const FuxiArFormat format = {48000, 32, 2};
++	static const FuxiArTdm tdm = {.intf = 1, .slot_mask = 5, .slots = 4, .slot_width = 32, .sync_mode = 1, .invert_sync = 0, .sync_data_delay = 1, .lane = 1, .clock_attribute = 4};
++	struct fa_part p;
++	uint32_t desc_size = 0, tx_size = 0, rx_size = 0, bad = 0;
++	uint64_t desc, tx, rx = 0;
++	unsigned i;
++
++	fa_start = mach_absolute_time();
++	fa_smem = ml_io_map((vm_offset_t)FA_SMEM, FA_SMEM_SIZE);
++	fa_ipcc = ml_io_map((vm_offset_t)FA_IPCC, FA_IPCC_SIZE);
++	fa_buffer = ml_io_map((vm_offset_t)FA_BUFFER, FA_BUFFER_BYTES);
++	if (fa_smem == 0 || fa_ipcc == 0 || fa_buffer == 0) {
++		printf("FUXI AUDIO: no mapping\n");
++		goto out;
++	}
++	if (!fa_smem_part(0, 2, &p)) {
++		printf("FUXI AUDIO: no AP-ADSP partition\n");
++		goto out;
++	}
++	uint32_t bits = fa_ready_bits(&p);
++	printf("FUXI AUDIO: DSP ready bits %#x\n", bits);
++	if (bits != 6) {
++		printf("FUXI AUDIO: not ready: was the loader told ADSP=1?\n");
++		goto out;
++	}
++	desc = fa_smem_item(&p, 478, &desc_size);
++	tx = fa_smem_item(&p, 479, &tx_size);
++	if (desc == 0 || desc_size != 32 || tx == 0 || tx_size < 1024 || tx_size > 0x100000 || (tx_size & 7) != 0) {
++		printf("FUXI AUDIO: GLINK's items: descriptor %#llx %u, tx %#llx %u\n", (unsigned long long)desc, desc_size, (unsigned long long)tx, tx_size);
++		goto out;
++	}
++	fa_g.desc = desc;
++	fa_g.tx_fifo = tx;
++	fa_g.tx_len = tx_size;
++	fa_g.options = AU_GL_ANSWER | AU_GL_GPR | AU_GL_PRM | AU_GL_GRAPH | AU_GL_PLAY;
++	fa_g.log = fa_log;
++	fa_g.log_most = 8;
++	fa_g.graph_steps = 15;
++	if (!au_gl_start(&fa_g)) {
++		printf("FUXI AUDIO: GLINK did not start\n");
++		goto out;
++	}
++	for (i = 0; i < 30000 && rx == 0; i++) {
++		rx = fa_smem_item(&p, 480, &rx_size);
++		if (rx == 0) {
++			fa_sleep_ms(1);
++			(void)fa_smem_part(0, 2, &p);
++		}
++	}
++	if (rx == 0 || rx_size < 1024 || rx_size > 0x100000 || (rx_size & 7) != 0) {
++		printf("FUXI AUDIO: the DSP's FIFO: %#llx %u\n", (unsigned long long)rx, rx_size);
++		goto out;
++	}
++	fa_g.rx_fifo = rx;
++	fa_g.rx_len = rx_size;
++	if (!fa_poll(2000)) {
++		goto out;
++	}
++	printf("FUXI AUDIO: GLINK up: messages %u, channels %u, adsp_apps %u, its buffers %u\n", fa_g.rx_msgs, fa_g.opened, fa_g.gpr_lcid, fa_g.gpr_riid_n);
++	(void)au_gl_gpr_ask(&fa_g);
++	if (!fa_poll(500)) {
++		goto out;
++	}
++	printf("FUXI AUDIO: APM ready %u after %u answers\n", fa_g.gpr_ready, fa_g.gpr_heard);
++	if (!fa_g.gpr_ready) {
++		goto out;
++	}
++	for (i = 0; i < 2; i++) {
++		(void)au_gl_prm_step(&fa_g);
++		if (!fa_poll(100)) {
++			goto out;
++		}
++		printf("FUXI AUDIO: vote %u: status %#x\n", i, fa_g.prm_status[i]);
++	}
++	for (i = 0; i < FA_BUFFER_BYTES / 4; i++) {
++		((volatile uint32_t *)fa_buffer)[i] = 0;
++	}
++	__asm__ volatile ("dsb osh" ::: "memory");
++	FA_STEP("open device", fuxi_ar_open_speaker_tdm);
++	FA_STEP("configure device", fuxi_ar_config_speaker_tdm, &format, &tdm);
++	FA_STEP("open stream", fuxi_ar_open_playback_stream_tdm);
++	FA_STEP("configure stream", fuxi_ar_config_playback_stream, &format);
++	FA_STEP("configure its input", fuxi_ar_config_playback_shmem, &format);
++	FA_STEP("map the buffers", fuxi_ar_map, FA_BUFFER | FA_BUFFER_SID << 32, FA_BUFFER_BYTES);
++	FA_STEP("prepare device", fuxi_ar_graph_command, FUXI_AR_OP_GRAPH_PREPARE, FUXI_AR_SG_SPEAKER);
++	FA_STEP("prepare stream", fuxi_ar_graph_command, FUXI_AR_OP_GRAPH_PREPARE, FUXI_AR_SG_PLAY);
++	FA_STEP("start device", fuxi_ar_graph_command, FUXI_AR_OP_GRAPH_START, FUXI_AR_SG_SPEAKER);
++	FA_STEP("start stream", fuxi_ar_graph_command, FUXI_AR_OP_GRAPH_START, FUXI_AR_SG_PLAY);
++	if (bad == 0 && fa_g.map_handle != 0) {
++		for (i = 0; i < 4000 && (fa_g.write_sent < FA_PERIODS || fa_g.write_done < FA_PERIODS); i++) {
++			if (fa_g.write_sent < FA_PERIODS && fa_g.write_sent < fa_g.write_done + 2) {
++				uint32_t bytes = fuxi_ar_write((uint8_t *)(fa_m + 2), AU_GL_GPR_BUFFER, 1, AU_GL_WRITE_TOKEN + fa_g.write_sent,
++				    (FA_BUFFER + (fa_g.write_sent % 4) * FA_PERIOD_BYTES) | FA_BUFFER_SID << 32, fa_g.map_handle, FA_PERIOD_BYTES);
++
++				if (bytes != 0) {
++					(void)au_gl_data_send(&fa_g, fa_m, bytes);
++				}
++			}
++			if (!fa_poll(1)) {
++				break;
++			}
++		}
++		printf("FUXI AUDIO: buffers sent %u played %u, first at %u ms, last at %u ms, last status %#x, bad %u\n", fa_g.write_sent, fa_g.write_done,
++		    fa_g.write_first_ms, fa_g.write_last_ms, fa_g.write_status, fa_g.write_bad);
++		if (fa_g.write_done > 1) {
++			printf("FUXI AUDIO: %u us a buffer of 20 ms\n", (fa_g.write_last_ms - fa_g.write_first_ms) * 1000u / (fa_g.write_done - 1u));
++		}
++	}
++	FA_STEP("stop stream", fuxi_ar_graph_command, FUXI_AR_OP_GRAPH_STOP, FUXI_AR_SG_PLAY);
++	FA_STEP("stop device", fuxi_ar_graph_command, FUXI_AR_OP_GRAPH_STOP, FUXI_AR_SG_SPEAKER);
++	FA_STEP("close stream", fuxi_ar_graph_command, FUXI_AR_OP_GRAPH_CLOSE, FUXI_AR_SG_PLAY);
++	FA_STEP("close device", fuxi_ar_graph_command, FUXI_AR_OP_GRAPH_CLOSE, FUXI_AR_SG_SPEAKER);
++	FA_STEP("unmap", fuxi_ar_unmap, fa_g.map_handle);
++	for (i = 2; i < 4; i++) {
++		(void)au_gl_prm_step(&fa_g);
++		if (!fa_poll(100)) {
++			goto out;
++		}
++		printf("FUXI AUDIO: vote %u: status %#x\n", i, fa_g.prm_status[i]);
++	}
++	printf("FUXI AUDIO: done, %u steps failed; rx %u tx %u full %u\n", bad, fa_g.rx_msgs, fa_g.tx_msgs, fa_g.tx_full);
++out:
++	thread_terminate(current_thread());
++}
++
++void
++fuxi_audio_dsp_init(void)
++{
++	int on = 0;
++	thread_t thread;
++
++	if (!PE_parse_boot_argn("fuxiaudio", &on, sizeof(on)) || on <= 0) {
++		return;
++	}
++	if (kernel_thread_start(fa_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("FUXI AUDIO: kernel_thread_start failed\n");
++	}
++}
++#endif /* FUXI */
+--- /dev/null
++++ b/bsd/dev/fuxi_au_glink.h
+@@ -0,0 +1,403 @@
++/* Fuxi audio lane: the AP's end of GLINK over SMEM with the ADSP, polled, enough to see what the DSP opens. Plain C so that
++ * tools/test-fuxi-audio-glink.py runs it against a fake DSP under the sanitizers; audio.c gives it the SMEM accessors.
++ * The wire format follows Linux qcom_glink_native.c and qcom_glink_smem.c. It negotiates the version, answers CLOSE and an
++ * intent request, and with AU_GL_ANSWER also completes the opening of a channel. Only with AU_GL_GPR does any data leave, and
++ * then APM_CMD_GET_SPF_STATE alone on adsp_apps, by au_gl_gpr_ask(), which reads a state and sets up nothing. With AU_GL_PRM,
++ * once that says ready, au_gl_prm_step() also votes LPASS's macro and dcodec on and off again. With AU_GL_GRAPH, au_gl_graph_send()
++ * sends what audio.c builds, a packet too long for the DSP's own buffers: it opens, configures and closes a graph and never starts it,
++ * so no clock reaches a pin. With AU_GL_PLAY the list goes on to start it and au_gl_data_send() gives it buffers: audio.c fills them with
++ * zeros and never muxes a pin, so what this proves is the DSP's clock taking them. No amplifier and no register either way. Define AU_GL_RD, AU_GL_WR, AU_GL_WMB and AU_GL_KICK.
++ */
++#ifndef AU_GLINK_H
++#define AU_GLINK_H
++
++enum { AU_GL_VERSION = 0, AU_GL_VERSION_ACK = 1, AU_GL_OPEN = 2, AU_GL_CLOSE = 3, AU_GL_OPEN_ACK = 4, AU_GL_INTENT = 5,
++       AU_GL_RX_DONE = 6, AU_GL_INTENT_REQ = 7, AU_GL_INTENT_REQ_ACK = 8, AU_GL_TX_DATA = 9, AU_GL_CLOSE_ACK = 11,
++       AU_GL_TX_DATA_CONT = 12, AU_GL_READ_NOTIF = 13, AU_GL_RX_DONE_REUSE = 14, AU_GL_SIGNALS = 15 };
++#define AU_GL_FEATURE_REUSE 1u
++#define AU_GL_RESERVE 16u      /* FIFO_FULL_RESERVE + TX_BLOCKED_CMD_RESERVE */
++#define AU_GL_NAME_MOST 32u    /* GLINK_NAME_SIZE */
++#define AU_GL_ANSWER 1u        /* options: complete the opening of what the DSP opens */
++#define AU_GL_REC_WORDS 12u    /* ms, cmd | param1 << 16, param2, bytes after the header, then 32 bytes of them */
++#define AU_GL_FROM_US 0x8000u  /* in a record's cmd: what we sent */
++#define AU_GL_CHANNELS 16u
++#define AU_GL_RESENDS 4u
++#define AU_GL_GPR 2u           /* options: ask the APM on adsp_apps whether it is up. Needs AU_GL_ANSWER */
++#define AU_GL_GPR_ASKS 8u
++#define AU_GL_GPR_INTENTS 8u   /* of the DSP's buffers, as many as there are asks */
++#define AU_GL_GPR_WORDS 16u    /* kept of an answer */
++#define AU_GL_GPR_BUFFER 512u  /* offered for its answers: a size only, what comes in is read from the ring. Linux GPR_MAX 4096 is for graphs */
++#define AU_GL_GPR_OFFERS 16u
++#define AU_GL_OP_GET_SPF_STATE 0x01001021u
++#define AU_GL_OP_SPF_STATE 0x02001007u  /* payload {status}: 1 ready */
++#define AU_GL_PRM 4u           /* options: with AU_GL_GPR, once ready, the votes of au_gl_prm_step() */
++#define AU_GL_PRM_STEPS 4u     /* macro on, dcodec on, dcodec off, macro off */
++#define AU_GL_PRM_NO_ANSWER 0xffffffffu
++#define AU_GL_OP_PRM_REQUEST 0x0100100Fu
++#define AU_GL_OP_PRM_RELEASE 0x01001010u
++#define AU_GL_OP_BASIC_RESULT 0x02001005u  /* payload {opcode, status} */
++#define AU_GL_OP_PRM_REQUEST_DONE 0x02001002u
++#define AU_GL_OP_PRM_RELEASE_DONE 0x02001003u
++#define AU_GL_PRM_TOKEN 0x100u
++#define AU_GL_GRAPH 8u         /* options: with AU_GL_PRM, between the votes, the packets of au_gl_graph_send() */
++#define AU_GL_GRAPH_MOST 16u   /* the longest of audio.c's lists */
++#define AU_GL_GRAPH_TOKEN 0x200u
++#define AU_GL_PLAY 16u         /* options: with AU_GL_GRAPH, the buffers of au_gl_data_send() */
++#define AU_GL_WRITE_TOKEN 0x1000u
++#define AU_GL_OP_MEM_MAP_DONE 0x02001001u  /* payload {handle} */
++#define AU_GL_OP_WRITE_DONE 0x05001004u    /* payload {address, address, handle, status} */
++
++struct au_gl {
++	uint64_t desc, tx_fifo, rx_fifo;
++	uint32_t tx_len, rx_len, options, features, ms;
++	uint32_t *log;
++	uint32_t log_most, log_n, log_lost;
++	uint32_t rx_msgs, tx_msgs, tx_full, stuck, version_acked, version_seen, resends, opened, acked_by_dsp;
++	uint16_t rcid[AU_GL_CHANNELS];
++	uint32_t gpr_lcid, gpr_rcid, gpr_acked, gpr_offers, gpr_asked, gpr_heard, gpr_other, gpr_ready;
++	uint32_t gpr_asked_ms, gpr_first_ms, gpr_last_ms, gpr_first_bytes, gpr_last_bytes, gpr_riid_n;
++	uint32_t gpr_riid[AU_GL_GPR_INTENTS], gpr_first[AU_GL_GPR_WORDS], gpr_last[AU_GL_GPR_WORDS];
++	uint32_t prm_sent, prm_status[AU_GL_PRM_STEPS], prm_opcode[AU_GL_PRM_STEPS], prm_sent_ms[AU_GL_PRM_STEPS], prm_heard_ms[AU_GL_PRM_STEPS];
++	uint32_t big_riid, big_have, big_asked, big_refused, big_size, graph_steps, graph_sent, graph_status[AU_GL_GRAPH_MOST], graph_heard_ms[AU_GL_GRAPH_MOST];
++	uint32_t map_handle, write_sent, write_done, write_status, write_bad, write_first_ms, write_last_ms;
++};
++
++static inline uint32_t au_gl_align8(uint32_t n) { return (n + 7u) & ~7u; }
++
++static inline void au_gl_note(struct au_gl *g, uint32_t cmd, uint32_t p1, uint32_t p2, uint32_t extra, const uint32_t *w, uint32_t words)
++{
++	if (g->log_n >= g->log_most) { g->log_lost++; return; }
++	uint32_t *r = g->log + AU_GL_REC_WORDS * g->log_n++;
++	r[0] = g->ms; r[1] = cmd | p1 << 16; r[2] = p2; r[3] = extra;
++	for (uint32_t i = 0; i < 8; i++) r[4 + i] = i < words ? w[i] : 0;
++}
++
++/* Nothing is sent unless all of it fits. False when it does not, or when the far end's tail cannot be true. */
++static inline bool au_gl_tx(struct au_gl *g, uint32_t cmd, uint32_t p1, uint32_t p2, const uint32_t *extra, uint32_t extra_bytes)
++{
++	uint32_t head = AU_GL_RD(g->desc + 4), tail = AU_GL_RD(g->desc), total = 8u + au_gl_align8(extra_bytes);
++	uint32_t room;
++
++	if (head >= g->tx_len || tail >= g->tx_len || (head & 7u) != 0) { g->tx_full++; return false; }
++	room = tail <= head ? g->tx_len - head + tail : tail - head;
++	if (room < AU_GL_RESERVE + total) { g->tx_full++; return false; }
++	AU_GL_WR(g->tx_fifo + head, cmd | p1 << 16);
++	AU_GL_WR(g->tx_fifo + (head + 4u) % g->tx_len, p2);
++	for (uint32_t i = 0; i < au_gl_align8(extra_bytes) / 4u; i++) {
++		AU_GL_WR(g->tx_fifo + (head + 8u + 4u * i) % g->tx_len, extra[i]);
++	}
++	AU_GL_WMB();
++	AU_GL_WR(g->desc + 4, (head + total) % g->tx_len);
++	AU_GL_KICK();
++	g->tx_msgs++;
++	au_gl_note(g, cmd | AU_GL_FROM_US, p1, p2, extra_bytes, extra, extra_bytes / 4u + ((extra_bytes & 3u) != 0));
++	return true;
++}
++
++static inline bool au_gl_start(struct au_gl *g)
++{
++	AU_GL_WR(g->desc + 8, 0);    /* our tail of what it sends */
++	AU_GL_WR(g->desc + 4, 0);    /* our head of what we send */
++	g->features = AU_GL_FEATURE_REUSE;
++	return au_gl_tx(g, AU_GL_VERSION, 1, g->features, 0, 0);
++}
++
++/* The word `offset` bytes past the tail. Offsets stay word aligned, as the head is 8 byte aligned. */
++static inline uint32_t au_gl_word(const struct au_gl *g, uint32_t tail, uint32_t offset)
++{
++	return AU_GL_RD(g->rx_fifo + (tail + offset) % g->rx_len);
++}
++
++static inline int au_gl_channel(const struct au_gl *g, uint32_t rcid)
++{
++	for (uint32_t i = 0; i < g->opened && i < AU_GL_CHANNELS; i++) {
++		if (g->rcid[i] == rcid) return (int)i;
++	}
++	return -1;
++}
++
++static inline void au_gl_gpr_offer(struct au_gl *g, uint32_t iid)
++{
++	uint32_t pair[2] = {AU_GL_GPR_BUFFER, iid};
++
++	if (g->gpr_offers >= AU_GL_GPR_OFFERS) return;
++	if (au_gl_tx(g, AU_GL_INTENT, g->gpr_lcid, 1, pair, sizeof(pair))) g->gpr_offers++;
++}
++
++/* The one data packet that can leave here. True when it went: a buffer of the DSP's was there and the ring had room. */
++static inline bool au_gl_gpr_ask(struct au_gl *g)
++{
++	uint32_t m[8];
++
++	if ((g->options & AU_GL_GPR) == 0 || !g->gpr_acked || g->gpr_riid_n == 0 || g->gpr_asked >= AU_GL_GPR_ASKS) return false;
++	m[0] = 24; m[1] = 0;                            /* chunk size, left size */
++	m[2] = 0u | 6u << 4 | 24u << 8;                 /* GPR: version 0, 6 header words, 24 bytes */
++	m[3] = 2u | 3u << 8;                            /* to the ADSP's domain, from the APPS' */
++	m[4] = 1; m[5] = 1;                             /* source port and destination: the APM's, as Linux q6apm */
++	m[6] = g->gpr_asked + 1u;                       /* token */
++	m[7] = AU_GL_OP_GET_SPF_STATE;
++	if (!au_gl_tx(g, AU_GL_TX_DATA, g->gpr_lcid, g->gpr_riid[g->gpr_riid_n - 1u], m, sizeof(m))) return false;
++	g->gpr_riid_n--;
++	if (g->gpr_asked++ == 0) g->gpr_asked_ms = g->ms;
++	return true;
++}
++
++/*
++ * The next vote, as Linux q6prm_vote_lpass_core_hw(): PRM_CMD_REQUEST_HW_RSC or _RELEASE_HW_RSC of PARAM_ID_RSC_HW_CORE, blocks 1 the macro
++ * and 2 the dcodec. They go on then come off in the opposite order, whatever each one answers, so nothing stays voted. xnu/fuxi-audio's
++ * fuxi_ar_prm_vote() is held to these bytes by tools/test-fuxi-audio-glink.py. True when it went.
++ */
++static inline bool au_gl_prm_step(struct au_gl *g)
++{
++	static const uint8_t block[AU_GL_PRM_STEPS] = {1, 2, 2, 1};
++	uint32_t step = g->prm_sent, m[18];
++
++	if ((g->options & AU_GL_PRM) == 0 || !g->gpr_ready || g->gpr_riid_n == 0 || step >= AU_GL_PRM_STEPS) return false;
++	m[0] = 60; m[1] = 0;                            /* chunk size, left size */
++	m[2] = 0u | 6u << 4 | 60u << 8;
++	m[3] = 2u | 3u << 8;
++	m[4] = 2; m[5] = 2;                             /* the PRM's port both ways, as Linux q6prm */
++	m[6] = AU_GL_PRM_TOKEN + step;
++	m[7] = step < 2u ? AU_GL_OP_PRM_REQUEST : AU_GL_OP_PRM_RELEASE;
++	m[8] = 0; m[9] = 0; m[10] = 0; m[11] = 20;      /* no shared memory: the 20 bytes come here */
++	m[12] = 2; m[13] = 0x08001032u; m[14] = 4; m[15] = 0;  /* the PRM's parameter, 4 bytes */
++	m[16] = block[step];
++	m[17] = 0;                                      /* the ring's padding, au_gl_tx() goes to 8 bytes */
++	if (!au_gl_tx(g, AU_GL_TX_DATA, g->gpr_lcid, g->gpr_riid[g->gpr_riid_n - 1u], m, 68)) return false;
++	g->gpr_riid_n--;
++	g->prm_status[step] = AU_GL_PRM_NO_ANSWER;
++	g->prm_sent_ms[step] = g->ms;
++	g->prm_sent = step + 1u;
++	return true;
++}
++
++/* A buffer of the DSP's long enough for a graph's packet, as Linux qcom_glink_request_intent(). Once, until it has been used. */
++static inline bool au_gl_big_ask(struct au_gl *g)
++{
++	if ((g->options & AU_GL_GRAPH) == 0 || !g->gpr_acked || g->big_have || g->big_asked) return false;
++	if (!au_gl_tx(g, AU_GL_INTENT_REQ, g->gpr_lcid, AU_GL_GPR_BUFFER, 0, 0)) return false;
++	g->big_asked = 1;
++	return true;
++}
++
++/*
++ * The next packet of audio.c's list, `bytes` long, in `m` after two words kept for GLINK's own sizes, and with room to reach 8 bytes.
++ * True when it went: only into the long buffer, and only that many times.
++ */
++static inline bool au_gl_graph_send(struct au_gl *g, uint32_t *m, uint32_t bytes)
++{
++	if ((g->options & AU_GL_GRAPH) == 0 || !g->gpr_ready || !g->big_have || g->graph_sent >= g->graph_steps || g->graph_sent >= AU_GL_GRAPH_MOST ||
++	    bytes > AU_GL_GPR_BUFFER || bytes > g->big_size) return false;
++	m[0] = bytes; m[1] = 0;
++	if (((8u + bytes) & 7u) != 0) m[(8u + bytes) / 4u] = 0;
++	if (!au_gl_tx(g, AU_GL_TX_DATA, g->gpr_lcid, g->big_riid, m, 8u + bytes)) return false;
++	g->big_have = 0;
++	g->graph_status[g->graph_sent++] = AU_GL_PRM_NO_ANSWER;
++	return true;
++}
++
++/* One of audio.c's buffers, into one of the DSP's small ones. `m` as for au_gl_graph_send(). */
++static inline bool au_gl_data_send(struct au_gl *g, uint32_t *m, uint32_t bytes)
++{
++	if ((g->options & AU_GL_PLAY) == 0 || g->map_handle == 0u || g->gpr_riid_n == 0 || bytes > 128u) return false;
++	m[0] = bytes; m[1] = 0;
++	if (((8u + bytes) & 7u) != 0) m[(8u + bytes) / 4u] = 0;
++	if (!au_gl_tx(g, AU_GL_TX_DATA, g->gpr_lcid, g->gpr_riid[g->gpr_riid_n - 1u], m, 8u + bytes)) return false;
++	g->gpr_riid_n--;
++	g->write_sent++;
++	return true;
++}
++
++/* An answer on adsp_apps, while it is still in the ring. `tail` is at its header, so its bytes begin 16 past. */
++static inline void au_gl_gpr_take(struct au_gl *g, uint32_t tail, uint32_t bytes)
++{
++	uint32_t *keep = g->gpr_heard == 0 ? g->gpr_first : g->gpr_last;
++
++	for (uint32_t i = 0; i < AU_GL_GPR_WORDS; i++) keep[i] = i * 4u < bytes ? au_gl_word(g, tail, 16u + 4u * i) : 0;
++	if (g->gpr_heard == 0) { g->gpr_first_ms = g->ms; g->gpr_first_bytes = bytes; }
++	g->gpr_last_ms = g->ms; g->gpr_last_bytes = bytes;
++	if (keep[5] == AU_GL_OP_SPF_STATE && bytes >= 28u && keep[6] == 1u) g->gpr_ready = 1;
++	/* A vote's answer, by its token. As fuxi_ar_parse(): the status is the second word of the payload, or the only one. */
++	if (keep[4] >= AU_GL_PRM_TOKEN && keep[4] - AU_GL_PRM_TOKEN < AU_GL_PRM_STEPS && keep[4] - AU_GL_PRM_TOKEN < g->prm_sent && bytes >= 28u &&
++	    (keep[5] == AU_GL_OP_BASIC_RESULT || keep[5] == AU_GL_OP_PRM_REQUEST_DONE || keep[5] == AU_GL_OP_PRM_RELEASE_DONE)) {
++		uint32_t step = keep[4] - AU_GL_PRM_TOKEN;
++
++		g->prm_status[step] = bytes >= 32u ? keep[7] : keep[6];
++		g->prm_opcode[step] = keep[5];
++		g->prm_heard_ms[step] = g->ms;
++	}
++	if (keep[4] >= AU_GL_GRAPH_TOKEN && keep[4] - AU_GL_GRAPH_TOKEN < g->graph_sent && keep[4] - AU_GL_GRAPH_TOKEN < AU_GL_GRAPH_MOST) {
++		uint32_t step = keep[4] - AU_GL_GRAPH_TOKEN;
++
++		if (bytes >= 32u && keep[5] == AU_GL_OP_BASIC_RESULT) {
++			g->graph_status[step] = keep[7];
++			g->graph_heard_ms[step] = g->ms;
++		} else if (bytes >= 28u && keep[5] == AU_GL_OP_MEM_MAP_DONE) {
++			g->map_handle = keep[6];
++			g->graph_status[step] = 0;
++			g->graph_heard_ms[step] = g->ms;
++		}
++	}
++	if (keep[5] == AU_GL_OP_WRITE_DONE && bytes >= 40u) {
++		if (g->write_done++ == 0u) g->write_first_ms = g->ms;
++		g->write_last_ms = g->ms;
++		g->write_status = keep[9];
++		g->write_bad += keep[9] != 0u;
++	}
++	g->gpr_heard++;
++}
++
++/*
++ * One message from the DSP, if a whole one is there. True when one was taken. Lengths come from the far end, so each is
++ * bounded before use; what cannot be read safely stops the reader for good (g->stuck), as there is no way to find the next.
++ */
++static inline bool au_gl_step(struct au_gl *g)
++{
++	uint32_t head, tail, avail, w0, cmd, p1, p2, extra = 0, total, words[8];
++	bool gpr_channel;
++
++	if (g->stuck || !g->rx_fifo || !g->rx_len) return false;
++	head = AU_GL_RD(g->desc + 12);
++	tail = AU_GL_RD(g->desc + 8);
++	if (head >= g->rx_len || tail >= g->rx_len || ((head | tail) & 3u) != 0) { g->stuck = 1; return false; }
++	avail = head < tail ? g->rx_len - tail + head : head - tail;
++	if (avail < 8) return false;
++	w0 = au_gl_word(g, tail, 0);
++	p2 = au_gl_word(g, tail, 4);
++	cmd = w0 & 0xffffu;
++	p1 = w0 >> 16;
++	total = 8;
++	switch (cmd) {
++	case AU_GL_VERSION: case AU_GL_VERSION_ACK: case AU_GL_CLOSE: case AU_GL_OPEN_ACK: case AU_GL_RX_DONE:
++	case AU_GL_INTENT_REQ: case AU_GL_INTENT_REQ_ACK: case AU_GL_CLOSE_ACK: case AU_GL_READ_NOTIF:
++	case AU_GL_RX_DONE_REUSE: case AU_GL_SIGNALS:
++		break;
++	case AU_GL_OPEN:
++		if (p2 == 0 || p2 > g->rx_len / 2) { g->stuck = 2; return false; }
++		extra = p2;
++		total = 8u + au_gl_align8(p2);
++		break;
++	case AU_GL_INTENT:
++		if (p2 > g->rx_len / 16) { g->stuck = 3; return false; }
++		extra = 8u * p2;
++		total = 8u + extra;
++		break;
++	case AU_GL_TX_DATA: case AU_GL_TX_DATA_CONT:
++		if (avail < 16) return false;
++		extra = au_gl_word(g, tail, 8);
++		if (extra > g->rx_len / 2) { g->stuck = 4; return false; }
++		total = au_gl_align8(16u + extra);
++		break;
++	default:
++		g->stuck = 5;
++		au_gl_note(g, cmd, p1, p2, 0, 0, 0);
++		return false;
++	}
++	if (avail < total) return false;
++	for (uint32_t i = 0; i < 8; i++) {
++		words[i] = i * 4u < total - 8u ? au_gl_word(g, tail, 8u + 4u * i) : 0;
++	}
++	g->rx_msgs++;
++	gpr_channel = g->gpr_lcid != 0 && p1 == g->gpr_rcid;
++	/* Every channel's buffers would fill the log before the answer comes. */
++	if ((g->options & AU_GL_GPR) == 0 || cmd != AU_GL_INTENT || gpr_channel) au_gl_note(g, cmd, p1, p2, extra, words, 8);
++	if (cmd == AU_GL_TX_DATA && gpr_channel) au_gl_gpr_take(g, tail, extra);
++	AU_GL_WR(g->desc + 8, (tail + total) % g->rx_len);
++
++	switch (cmd) {
++	case AU_GL_VERSION:
++		if (p1 == 0) break;
++		if (p1 == 1) g->features &= p2;
++		g->version_seen = 1;
++		(void)au_gl_tx(g, AU_GL_VERSION_ACK, 1, g->features, 0, 0);
++		break;
++	case AU_GL_VERSION_ACK:
++		if (p1 == 0) break;
++		if (p1 == 1 && p2 == g->features) { g->version_acked = 1; break; }
++		if (p1 == 1) g->features &= p2;
++		if (g->resends++ < AU_GL_RESENDS) (void)au_gl_tx(g, AU_GL_VERSION, 1, g->features, 0, 0);
++		break;
++	case AU_GL_OPEN:
++		if ((g->options & AU_GL_ANSWER) != 0 && g->opened < AU_GL_CHANNELS && p2 <= AU_GL_NAME_MOST && au_gl_channel(g, p1) < 0) {
++			/* As qcom_glink_create_remote(): its opening acknowledged, then ours under the same name. */
++			uint32_t lcid = ++g->opened;
++
++			g->rcid[lcid - 1] = (uint16_t)p1;
++			(void)au_gl_tx(g, AU_GL_OPEN_ACK, p1, 0, 0, 0);
++			(void)au_gl_tx(g, AU_GL_OPEN, lcid, p2, words, p2);
++			/* "adsp_apps" and its NUL */
++			if ((g->options & AU_GL_GPR) != 0 && p2 == 10u && words[0] == 0x70736461u && words[1] == 0x7070615fu && (words[2] & 0xffffu) == 0x0073u) {
++				g->gpr_lcid = lcid;
++				g->gpr_rcid = p1;
++			}
++		}
++		break;
++	case AU_GL_OPEN_ACK:
++		g->acked_by_dsp++;
++		/* As Linux once a channel is up: buffers offered, so that the APM has somewhere to answer. */
++		if (g->gpr_lcid != 0 && p1 == g->gpr_lcid && !g->gpr_acked) {
++			g->gpr_acked = 1;
++			au_gl_gpr_offer(g, 1);
++			au_gl_gpr_offer(g, 2);
++		}
++		break;
++	case AU_GL_INTENT:
++		if (gpr_channel) {
++			for (uint32_t i = 0; i < p2 && i < 4u; i++) {
++				if (words[2u * i] >= AU_GL_GPR_BUFFER) {
++					if ((g->options & AU_GL_GRAPH) != 0) {
++						g->big_riid = words[2u * i + 1u];
++						g->big_size = words[2u * i];
++						g->big_have = 1;
++						g->big_asked = 0;
++					}
++				} else if (words[2u * i] >= 24u && g->gpr_riid_n < AU_GL_GPR_INTENTS) {
++					g->gpr_riid[g->gpr_riid_n++] = words[2u * i + 1u];
++				}
++			}
++		}
++		break;
++	case AU_GL_INTENT_REQ_ACK:
++		if (gpr_channel && p2 == 0u) g->big_refused++;
++		break;
++	case AU_GL_RX_DONE_REUSE:
++		/* Our long buffer back to use again. */
++		if (gpr_channel && g->big_size != 0u && p2 == g->big_riid) {
++			g->big_have = 1;
++		} else if (gpr_channel && (g->options & AU_GL_PLAY) != 0 && g->gpr_riid_n < AU_GL_GPR_INTENTS) {
++			g->gpr_riid[g->gpr_riid_n++] = p2;	/* a small one of its, back for the next buffer */
++		}
++		break;
++	case AU_GL_TX_DATA: case AU_GL_TX_DATA_CONT:
++		if (!gpr_channel) { g->gpr_other++; break; }
++		/* Its buffer back at once, once all of it is in. */
++		if (words[1] == 0u) {
++			if ((g->features & AU_GL_FEATURE_REUSE) != 0) { (void)au_gl_tx(g, AU_GL_RX_DONE_REUSE, g->gpr_lcid, p2, 0, 0); }
++			else { (void)au_gl_tx(g, AU_GL_RX_DONE, g->gpr_lcid, p2, 0, 0); au_gl_gpr_offer(g, p2); }
++		}
++		break;
++	case AU_GL_CLOSE:
++		(void)au_gl_tx(g, AU_GL_CLOSE_ACK, p1, 0, 0, 0);
++		break;
++	case AU_GL_INTENT_REQ: {
++		int channel = au_gl_channel(g, p1);
++
++		/* adsp_apps is given what it asks, up to a point. Anywhere else no buffer is offered: nothing is to come in there. */
++		if (gpr_channel && p2 <= AU_GL_GPR_BUFFER && g->gpr_offers < AU_GL_GPR_OFFERS) {
++			au_gl_gpr_offer(g, g->gpr_offers + 1u);
++			(void)au_gl_tx(g, AU_GL_INTENT_REQ_ACK, g->gpr_lcid, 1, 0, 0);
++		} else if (channel >= 0) {
++			(void)au_gl_tx(g, AU_GL_INTENT_REQ_ACK, (uint32_t)channel + 1u, 0, 0, 0);
++		}
++		break;
++	}
++	case AU_GL_READ_NOTIF:
++		AU_GL_KICK();
++		break;
++	default:
++		break;
++	}
++	return true;
++}
++
++#endif

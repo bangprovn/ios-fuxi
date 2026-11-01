@@ -1,0 +1,30 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,4 +112,7 @@
+ bsd/dev/fuxi_adreno.c			standard
+ bsd/dev/fuxi_perf.c			standard
++bsd/dev/fuxi_gpr.c			standard
++bsd/dev/fuxi_audioreach.c		standard
++bsd/dev/fuxi_audio_dsp.c		standard
+ bsd/dev/fuxi_keys.c			standard
+ bsd/dev/fuxi_wlan.c			standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -54,7 +54,8 @@
+ extern void sweet_touch_init(void);
+ extern void fuxi_touch_init(void);
+ extern void fuxi_keys_init(void);
+ extern void fuxi_wlan_init(void);
++extern void fuxi_audio_dsp_init(void);
+ extern void sweet_usb_probe(void);
+
+ #define REG_CAP         0x00
+@@ -861,6 +862,8 @@
+ 	fuxi_keys_init();
+ 	/* WCN7850 PCIe0/MHI probe, boot-arg fuxiwlan (bsd/dev/fuxi_wlan.c). */
+ 	fuxi_wlan_init();
++	/* The ADSP the loader left running, boot-arg fuxiaudio (bsd/dev/fuxi_audio_dsp.c). */
++	fuxi_audio_dsp_init();
+ #else
+ 	sweet_log_start();
+ 	sweet_sample_start();
