@@ -3608,6 +3608,106 @@ def remote_control_stays_in_its_place(tmp):
     act = monitor[monitor.index('def remote_act(req):'):monitor.index('def remote_tick():')]
     assert re.findall(r"op == '(\w+)'", act) == ['see', 'tap', 'flick', 'key']
 
+FK_DENSE_HOST = r"""
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+typedef int wait_result_t;
+#define THREAD_CONTINUE_NULL ((void *)0)
+struct fuxi_key_inject { unsigned key, kind, ms; };
+#define FUXI_KEY_INJECT_CLICK 3u
+static int sweet_fb_display_off = 1;
+static unsigned fk_human_loops = 10;
+static unsigned long now_ms;
+static void fuxi_perf_input(void) {}
+static void sweet_hid_touch(int finger, int down, int x, int y) { printf("touch %lu %d %d %d %d\n", now_ms, finger, down, x, y); }
+static void fk_script_sleep(unsigned ms) { printf("sleep %u\n", ms); now_ms += ms; }
+static int fk_inject(const struct fuxi_key_inject *cmd) { printf("key %u\n", cmd->kind); sweet_fb_display_off = 0; return 0; }
+static void *current_thread(void) { return NULL; }
+static int thread_terminate(void *thread) { (void)thread; return 0; }
+static void thread_block(void *next) { (void)next; printf("end %lu\n", now_ms); exit(0); }
+FK_TAP
+FK_DENSE
+int main(void) { fk_human_dense((void *)(uintptr_t)60, 0); return 1; }
+"""
+
+
+@check
+def dense_touches_are_dense(tmp):
+    """Run fuxihumanm=1's own code on a clock of its sleeps, and read what the screen would be told."""
+    spec = importlib.util.spec_from_file_location('sync_ath12k', ROOT / 'tools/sync-fuxi-ath12k.py')
+    sync = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sync)
+    keys = (ROOT / 'xnu/fuxi-h1/fuxi_keys.c').read_text()
+    tap = keys[keys.index('static void\nfk_tap(int x, int y)'):keys.index('static void\nfk_tour_shot(')]
+    (tmp / 'dense.c').write_text(FK_DENSE_HOST.replace('FK_TAP', tap).replace('FK_DENSE', sync.KEYS_DENSE))
+    cc = os.environ.get('CC', 'cc')
+    program = tmp / 'dense'
+    subprocess.run([cc, '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-Wno-unused-function', '-g', '-O1', '-fsanitize=address,undefined',
+                    '-fno-sanitize-recover=all', str(tmp / 'dense.c'), '-o', str(program)], check=True)
+    said = subprocess.run([str(program)], check=True, capture_output=True, text=True).stdout.splitlines()
+    assert said.count('key 3') == 1 and sum(line.startswith('FUXI HUMAN: loop') and line.endswith('start') for line in said) == 10
+    # One wait of the start and one wake, and after them no sleep a person would call a pause.
+    sleeps = sorted(int(line.split()[1]) for line in said if line.startswith('sleep '))
+    assert sleeps[-2:] == [1500, 60000] and sleeps[-3] <= 600, sleeps[-3:]
+    contacts, loops, loop = [], [], None
+    for line in said:
+        if line.endswith(' start') and line.startswith('FUXI HUMAN: loop'):
+            loop = []
+            loops.append(loop)
+        if not line.startswith('touch '):
+            continue
+        at, finger, down, x, y = map(int, line.split()[1:])
+        assert finger == 0 and 0 <= x < 1080 and 0 <= y < 2400, line
+        if down:
+            if not contacts or contacts[-1]['up'] is not None:
+                contacts.append(dict(start=at, points=[], up=None))
+                loop.append(contacts[-1])
+            contacts[-1]['points'].append((x, y))
+        else:
+            contacts[-1]['up'] = at
+    # Long enough for a 300 s boot from 60 s, with fuxihumann left out: the clock here is the shortest the phone can take.
+    assert int(said[-1].split()[1]) - 61500 >= 240000
+    gaps = [b['start'] - a['up'] for a, b in zip(contacts, contacts[1:])]
+    assert max(gaps) <= 600, max(gaps)
+    assert sum(gap <= 100 for gap in gaps) / len(gaps) >= 0.85
+    # Taps: only these, and each once a loop. Nothing lands on Phone or Messages.
+    taps = [c['points'][0] for c in contacts if len(set(c['points'])) == 1]
+    assert sorted(set(taps)) == [(148, 285), (148, 570), (540, 2247)] and all(taps.count(t) == 10 for t in set(taps))
+    for c in contacts:
+        for dock in ((280, 2247), (800, 2247)):
+            assert abs(c['points'][0][0] - dock[0]) > 60 or abs(c['points'][0][1] - dock[1]) > 60, c
+    # Let go at speed: a flick's last step is no slower than its average, or iOS has nothing to coast on. The switcher does slow.
+    switcher = lambda c: c['points'][0] == (680, 2375)
+    for c in contacts:
+        if len(set(c['points'])) > 1 and not switcher(c):
+            first, near, last = c['points'][0], c['points'][-2], c['points'][-1]
+            whole = abs(last[0] - first[0]) + abs(last[1] - first[1])
+            assert (abs(last[0] - near[0]) + abs(last[1] - near[1])) * (len(c['points']) - 1) >= whole * 0.8, c
+    for loop in loops:
+        assert sum(map(switcher, loop)) >= 4
+        # The far-left page: from page 1 the finger goes right before it ever goes left.
+        sideways = [c for c in loop if c['points'][0][1] in (1500, 1520)]
+        assert all(c['points'][0][0] < c['points'][-1][0] for c in sideways[:3])
+        # Settings: a long run one way, then back.
+        at = next(i for i, c in enumerate(loop) if c['points'][0] == (148, 570))
+        run = 0
+        while loop[at + 1 + run]['points'][0] == (800, 1900):
+            run += 1
+        assert run >= 12, run
+    # Only kernel-metal4wifi has it, and fk_human stays as it is when the argument is absent.
+    assert 'fuxihumanm' not in keys and 'fk_human_dense' not in keys
+    for patch in sorted((ROOT / 'xnu/patches').glob('*.patch')):
+        if patch.name != '0117-fuxi-ath12k.patch':
+            assert 'fuxihumanm' not in patch.read_text(errors='surrogateescape'), patch.name
+    text = (ROOT / 'xnu/patches/0117-fuxi-ath12k.patch').read_text(errors='surrogateescape')
+    hunk = text[text.index('--- a/bsd/dev/fuxi_keys.c'):]
+    hunk = hunk[:hunk.index('\n--- a/', 10)]
+    gone = [line[1:] for line in hunk.splitlines() if line.startswith('-') and not line.startswith('---')]
+    assert gone == [sync.KEYS_DENSE_START_FIND.rstrip('\n')]
+    assert 'dense == 1 ? fk_human_dense : fk_human' in hunk and 'fk_dense_flick(' in hunk
+
+
 FA_BSS_DRIVER = r"""
 #include <assert.h>
 #include <stdbool.h>

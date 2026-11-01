@@ -346,7 +346,7 @@ def keystore():
     return ''.join(difflib.unified_diff(before.splitlines(True), after.splitlines(True), fromfile='a/' + KEYSTORE, tofile='b/' + KEYSTORE))
 
 
-# fuxiremote=1, as a change to the file 0092 adds: boot/phone.py's taps. Without 0117 the file and every other kernel's inputs stay as they are.
+# fuxiremote=1 and fuxihumanm=1, as a change to the file 0092 adds: boot/phone.py's taps, and touches dense enough to measure Hz. Without 0117 the file and every other kernel's inputs stay as they are.
 KEYS_SOURCE = ROOT / 'xnu/fuxi-h1/fuxi_keys.c'
 KEYS_INCLUDE_FIND = """#include "fuxi_key_state.h"
 """
@@ -444,10 +444,152 @@ KEYS_START = """	unsigned remote = 0;
 """
 
 
+KEYS_DENSE = """/*
+ * fuxihumanm=1, beside fuxihuman=S: fuxihuman's places at a hand's pace, for measuring Hz. Each finger comes down about
+ * 100 ms after the last one left, while what it threw still moves. Sizes and speeds are the hand of boot-logs/h-e5, 480
+ * contacts: up or down 690 px in 76 ms, sideways 400 px in 112 ms, from the bottom edge 480 px in 104 ms. fk_flick slows
+ * to its release and iOS throws a list at the speed it is let go, so nothing slows here. fk_tour_home and fk_switcher end
+ * in seconds of sleep, so neither is used. Tap targets as fk_human's. Nothing here taps Phone, which hangs white.
+ */
+#define FK_DENSE_GAP_MS 80      /* finger up to finger down */
+#define FK_DENSE_SETTLE_MS 400  /* a page still moving takes a tap as a stop, not a press */
+#define FK_DENSE_OPEN_MS 600    /* tap to first flick: the app opening is what draws meanwhile */
+
+static void
+fk_dense_flick(int x0, int y0, int x1, int y1, unsigned ms)
+{
+	int steps = (int)(ms / 8u);
+
+	for (int i = 0; i <= steps; ++i) {
+		fuxi_perf_input();
+		sweet_hid_touch(0, 1, x0 + (x1 - x0) * i / steps, y0 + (y1 - y0) * i / steps);
+		fk_script_sleep(8);
+	}
+	sweet_hid_touch(0, 0, x1, y1);
+	fk_script_sleep(FK_DENSE_GAP_MS);
+}
+
+/* N flicks one way along a list, then N back. */
+static void
+fk_dense_scroll(unsigned flicks)
+{
+	static const unsigned ms[] = {68, 76, 88, 72};
+
+	for (unsigned i = 0; i < flicks; ++i) {
+		fk_dense_flick(800, 1900, 820, 1210, ms[i % 4u]);
+	}
+	for (unsigned i = 0; i < flicks; ++i) {
+		fk_dense_flick(820, 1210, 800, 1900, ms[i % 4u]);
+	}
+}
+
+/* N flicks left, along home pages or switcher cards, then N right. */
+static void
+fk_dense_sides(unsigned flicks)
+{
+	static const unsigned ms[] = {99, 112, 127, 104};
+
+	for (unsigned i = 0; i < flicks; ++i) {
+		fk_dense_flick(640, 1500, 240, 1520, ms[i % 4u]);
+	}
+	for (unsigned i = 0; i < flicks; ++i) {
+		fk_dense_flick(240, 1520, 640, 1500, ms[i % 4u]);
+	}
+}
+
+static void
+fk_dense_home(void)
+{
+	fk_dense_flick(540, 2375, 540, 1880, 104);
+}
+
+/* A home gesture on another page only returns to page 1 the second time. */
+static void
+fk_dense_page1(void)
+{
+	fk_dense_home();
+	fk_script_sleep(FK_DENSE_SETTLE_MS);
+	fk_dense_home();
+	fk_script_sleep(FK_DENSE_SETTLE_MS);
+}
+
+/* fk_switcher's swipe, then along the cards and out. */
+static void
+fk_dense_switcher(void)
+{
+	for (int i = 0; i <= 34; ++i) {
+		int left = 34 - i, done = 34 * 34 - left * left;
+
+		fuxi_perf_input();
+		sweet_hid_touch(0, 1, 680 + 60 * done / (34 * 34), 2375 - 430 * done / (34 * 34));
+		fk_script_sleep(8);
+	}
+	sweet_hid_touch(0, 0, 740, 1945);
+	fk_script_sleep(FK_DENSE_SETTLE_MS);
+	fk_dense_sides(3);
+	fk_dense_home();
+}
+
+static void
+fk_dense_open(int x, int y)
+{
+	fk_dense_page1();
+	fk_tap(x, y);
+	fk_script_sleep(FK_DENSE_OPEN_MS);
+}
+
+/* About 32 s a loop: fuxihumann's default of 10 outlasts a 300 s boot, with no room in the cmdline to say more. */
+static void
+fk_human_dense(void *arg, wait_result_t wr)
+{
+	(void)wr;
+	printf("FUXI HUMAN: dense, starts in %u s, %u loops\\n", (unsigned)(uintptr_t)arg, fk_human_loops);
+	fk_script_sleep((unsigned)(uintptr_t)arg * 1000u);
+	for (unsigned loop = 1; loop <= fk_human_loops; ++loop) {
+		if (__atomic_load_n(&sweet_fb_display_off, __ATOMIC_RELAXED)) {
+			struct fuxi_key_inject cmd = {0, FUXI_KEY_INJECT_CLICK, 120};
+			(void)fk_inject(&cmd);
+			fk_script_sleep(1500);
+		}
+		printf("FUXI HUMAN: loop %u start\\n", loop);
+		fk_dense_page1();                       /* unlock, or home, then page 1 */
+		for (unsigned i = 0; i < 3; ++i) {
+			fk_dense_flick(240, 1500, 640, 1520, 112);  /* the far-left widget page, and past its edge */
+		}
+		fk_dense_scroll(3);
+		fk_dense_sides(5);
+		fk_dense_sides(5);
+		fk_dense_switcher();
+		fk_dense_open(148, 570);                /* Settings */
+		fk_dense_scroll(12);
+		fk_dense_scroll(12);
+		fk_dense_switcher();
+		fk_dense_open(540, 2247);               /* Safari */
+		fk_dense_scroll(4);
+		fk_dense_switcher();
+		fk_dense_open(148, 285);                /* Photos */
+		fk_dense_scroll(6);
+		fk_dense_switcher();
+		printf("FUXI HUMAN: loop %u done\\n", loop);
+	}
+	printf("FUXI HUMAN: done\\n");
+	(void)thread_terminate(current_thread());
+	thread_block(THREAD_CONTINUE_NULL);
+}
+
+"""
+KEYS_DENSE_START_FIND = """		if (kernel_thread_start(fk_human, (void *)(uintptr_t)human, &thread) == KERN_SUCCESS) {
+"""
+KEYS_DENSE_START = """		unsigned dense = 0;
+		(void)PE_parse_boot_argn("fuxihumanm", &dense, sizeof(dense));
+		if (kernel_thread_start(dense == 1 ? fk_human_dense : fk_human, (void *)(uintptr_t)human, &thread) == KERN_SUCCESS) {
+"""
+
+
 def remote_keys():
     before = KEYS_SOURCE.read_text()
-    assert before.count(KEYS_INCLUDE_FIND) == 1 and before.count(KEYS_HELPER_FIND) == 1 and before.count(KEYS_START_FIND) == 1
-    after = before.replace(KEYS_INCLUDE_FIND, KEYS_INCLUDE).replace(KEYS_HELPER_FIND, KEYS_HELPER + KEYS_HELPER_FIND).replace(KEYS_START_FIND, KEYS_START)
+    assert before.count(KEYS_INCLUDE_FIND) == 1 and before.count(KEYS_HELPER_FIND) == 1 and before.count(KEYS_START_FIND) == 1 and before.count(KEYS_DENSE_START_FIND) == 1
+    after = before.replace(KEYS_INCLUDE_FIND, KEYS_INCLUDE).replace(KEYS_HELPER_FIND, KEYS_HELPER + KEYS_DENSE + KEYS_HELPER_FIND).replace(KEYS_START_FIND, KEYS_START).replace(KEYS_DENSE_START_FIND, KEYS_DENSE_START)
     return ''.join(difflib.unified_diff(before.splitlines(True), after.splitlines(True),
                                         fromfile='a/bsd/dev/fuxi_keys.c', tofile='b/bsd/dev/fuxi_keys.c'))
 
