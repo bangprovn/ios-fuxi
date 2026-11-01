@@ -308,6 +308,14 @@ Boots I and J rule out `MNT_ROOTFS` and the mountroot entry point: `apfs_vfsop_m
 left in the root mount is that nothing is mounted yet (no covered vnode, no `rootvnode`); a pivot from a temporary
 root would change that (GUESS).
 
+That guess was wrong. The gate compares `current_task()` with `kernel_task`, and the prelink had left the
+`kernel_task` slot of APFS (and of IOGPUFamily, IOSurface, IOStorageFamily, IOHIDFamily) unbound, so it pointed at
+an unrelated address. `tools/ios27-prelink-pairs.json` now pairs it with `_kernel_task`.
+
+| K | `_kernel_task` pair, plain mountroot | APFS mounts `Rave24A446.D421D431OS` as root; panic `rootvp not authenticated after mounting` (bsd_init: the IPSW OS volume is not sealed) |
+
+`fuxi_root27_norootauth=1` skips that `FSIOC_KERNEL_ROOTAUTH` check.
+
 Boot G makes the refusal a global APFS gate: it does not depend on the device, the volume or the DT root
 properties. `ios27-prelink.py` now writes `targets.json` (every kernel reference of each root kext with the native
 symbol and the match method) to audit what APFS calls; 427 of APFS's 856 kernel references are bound by

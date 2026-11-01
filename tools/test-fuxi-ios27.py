@@ -705,6 +705,8 @@ def k4_patch_check():
     assert drv.split('*/\n', 1)[1].startswith('#if defined(FUXI)\n') and drv.rstrip().endswith('#endif /* FUXI */')
     init = patch.split('+++ b/bsd/kern/bsd_init.c\n', 1)[1].split('\ndiff --git', 1)[0]
     assert '+#if defined(FUXI)\n+\tfuxi_root27_start();\n+#endif' in init
+    # fuxi_root27_norootauth=1 skips FSIOC_KERNEL_ROOTAUTH for the unsealed IPSW OS volume (K4 boot K).
+    assert 'PE_parse_boot_argn("fuxi_root27_norootauth", &fuxi_norootauth, sizeof(fuxi_norootauth))' in init
     # fuxi_root27_nomockfs=1 drops mockfs from vfs_mountroot's candidates; every added line is FUXI-gated.
     vfs = patch.split('+++ b/bsd/vfs/vfs_subr.c\n', 1)[1]
     added = [l[1:] for l in vfs.splitlines() if l.startswith('+')]

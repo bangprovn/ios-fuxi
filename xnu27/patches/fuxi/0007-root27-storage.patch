@@ -1,5 +1,4 @@
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
-index 190aa96..a8d7e53 100644
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
 @@ -81,6 +81,7 @@
@@ -20,6 +19,21 @@ index 190aa96..a8d7e53 100644
  
  #if CONFIG_PROC_UUID_POLICY
  	/* Initial proc_uuid_policy subsystem */
+@@ -953,6 +957,14 @@ bsd_init(void)
+ 		require_rootauth = TRUE;
+ #endif // XNU_TARGET_OS_OSX && defined(__arm64__)
+ 
++#if defined(FUXI)
++		/* fuxi_root27_norootauth=1: the IPSW OS volume is not sealed, so FSIOC_KERNEL_ROOTAUTH cannot succeed. */
++		uint32_t fuxi_norootauth = 0;
++		if (PE_parse_boot_argn("fuxi_root27_norootauth", &fuxi_norootauth, sizeof(fuxi_norootauth)) && fuxi_norootauth == 1) {
++			printf("fuxi: root volume authentication skipped (fuxi_root27_norootauth=1)\n");
++			require_rootauth = FALSE;
++		}
++#endif
+ 		if (require_rootauth) {
+ 			/* enforce sealedness */
+ 			int autherr = VNOP_IOCTL(rootvnode, FSIOC_KERNEL_ROOTAUTH, NULL, 0, vfs_context_kernel());
 diff --git a/iokit/Kernel/arm/FuxiRoot27.cpp b/iokit/Kernel/arm/FuxiRoot27.cpp
 new file mode 100644
 index 0000000..e6d5bd6
