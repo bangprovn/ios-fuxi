@@ -23,6 +23,7 @@
  *      bit 1 the bypass stream match, read back; bit 2 takes it away. Returns what it read.
  *  IN  0x5a 'AA' (0x4141) wIndex: reads the amplifiers named, bit 0 B at 0x40, bit 1 T at 0x42, one out of reset at a time (au_amp.h): who they are and
  *      their OTP boot. Writes nothing to them. Their reset lines and the I2C pins go back as they were. Returns the report.
+ *  IN  0x5a 'AO' (0x414f) wIndex 0x4231 only, once, after a stage 2 that reached ready, because the owner said so: the first tone (au_tone_stage()). Returns the summary as 'AG' does.
  *  IN  0x5a 'AH' (0x4148) wIndex: page of the log. 'AI' (0x4149): what the last list's steps answered.
  *  IN  0x5a 'AH' (0x4148) wIndex=page: its log, 128 words a page.
  *  OUT 0x5b wValue=chunk[15:0], wIndex[11:0]=chunk[27:16], wIndex bit15 =
@@ -584,8 +585,8 @@ static void au_boot_stage(void)
 #include "au_glink.h"
 #include "../../xnu/fuxi-audio/fuxi_audioreach.h"
 /* What --graph and --play send, in order. Values of the Xiaomi 14's port, which shares these pins: unproven here, and nothing depends on them yet with no pin muxed. */
-static const FuxiArFormat au_format = {48000, 32, 2};
-static const FuxiArTdm au_tdm = {.intf = 1, .slot_mask = 5, .slots = 4, .slot_width = 32, .sync_mode = 1, .invert_sync = 0, .sync_data_delay = 1, .lane = 1, .clock_attribute = 4};
+static FuxiArFormat au_format = {48000, 32, 2};
+static FuxiArTdm au_tdm = {.intf = 1, .slot_mask = 5, .slots = 4, .slot_width = 32, .sync_mode = 1, .invert_sync = 0, .sync_data_delay = 1, .lane = 1, .clock_attribute = 4};
 #define AU_GRAPH_STEPS 3u
 static uint32_t au_graph_build(uint32_t step, uint32_t *m, uint32_t capacity)
 {
@@ -598,20 +599,20 @@ static uint32_t au_graph_build(uint32_t step, uint32_t *m, uint32_t capacity)
 #define AU_PLAY_PA 0xd0000000ull
 #define AU_PLAY_SID 1ull            /* 0x1001 & 0xf, as Linux q6apm_dai */
 #define AU_PLAY_BYTES 7680u         /* 20 ms */
+static uint32_t au_period_bytes = AU_PLAY_BYTES;
 #define AU_PLAY_BUFFERS 50u
 #define AU_PLAY_STEPS 15u
 #define AU_PLAY_WRITES_AFTER 10u    /* the buffers come when the first ten steps are done */
-static uint32_t au_play_build(uint32_t step, uint32_t *m, uint32_t capacity, uint32_t handle)
+static uint32_t au_play_build(uint32_t step, uint32_t t, uint32_t *m, uint32_t capacity, uint32_t handle)
 {
  uint8_t *out = (uint8_t *)(m + 2);
- uint32_t t = AU_GL_GRAPH_TOKEN + step;
  switch (step) {
  case 0: return fuxi_ar_open_speaker_tdm(out, capacity, 1, t);
  case 1: return fuxi_ar_config_speaker_tdm(out, capacity, 1, t, &au_format, &au_tdm);
  case 2: return fuxi_ar_open_playback_stream_tdm(out, capacity, 1, t);
  case 3: return fuxi_ar_config_playback_stream(out, capacity, 1, t, &au_format);
  case 4: return fuxi_ar_config_playback_shmem(out, capacity, 1, t, &au_format);
- case 5: return fuxi_ar_map(out, capacity, 1, t, AU_PLAY_PA | AU_PLAY_SID << 32, AU_PLAY_BYTES * 4);
+ case 5: return fuxi_ar_map(out, capacity, 1, t, AU_PLAY_PA | AU_PLAY_SID << 32, au_period_bytes * 4);
  case 6: return fuxi_ar_graph_command(out, capacity, 1, t, FUXI_AR_OP_GRAPH_PREPARE, FUXI_AR_SG_SPEAKER);
  case 7: return fuxi_ar_graph_command(out, capacity, 1, t, FUXI_AR_OP_GRAPH_PREPARE, FUXI_AR_SG_PLAY);
  case 8: return fuxi_ar_graph_command(out, capacity, 1, t, FUXI_AR_OP_GRAPH_START, FUXI_AR_SG_SPEAKER);
@@ -623,6 +624,22 @@ static uint32_t au_play_build(uint32_t step, uint32_t *m, uint32_t capacity, uin
  default: return fuxi_ar_unmap(out, capacity, 1, t, handle);
  }
 }
+/*
+ * The tone's list is that one inside the secondary TDM bit clock, which Linux's card asks of the PRM before it opens anything (clk_set_rate, then enable): 6.144 MHz,
+ * inverted, as the Xiaomi 14's port. Four channels on all four slots, for the slots' mapping is the weakest part of the research and this way any of them carries the tone.
+ */
+#define AU_TONE_STEPS 17u
+#define AU_TONE_WRITES_AFTER 11u
+#define AU_TONE_CLOCK 0x202u
+static uint32_t au_tone_build(uint32_t step, uint32_t *m, uint32_t capacity, uint32_t handle)
+{
+ uint8_t *out = (uint8_t *)(m + 2);
+ uint32_t t = AU_GL_GRAPH_TOKEN + step;
+ if (step == 0) return fuxi_ar_prm_clock_attr(out, capacity, 2, t, AU_TONE_CLOCK, 6144000, 4);
+ if (step == AU_TONE_STEPS - 1) return fuxi_ar_prm_clock_attr(out, capacity, 2, t, AU_TONE_CLOCK, 0, 4);
+ return au_play_build(step - 1, t, m, capacity, handle);
+}
+static uint32_t au_tone_stage(struct au_gl *g, uint32_t *q, uint64_t t0, uint64_t hz);
 #define AU_GL_RECORDS 96u
 #define AU_GL_LOG_WORDS (AU_GL_RECORDS * AU_GL_REC_WORDS)
 static uint32_t au_gl_rep[128], au_gl_rep2[128], au_gl_log[AU_GL_LOG_WORDS];
@@ -709,13 +726,19 @@ static uint32_t au_glink_run(uint32_t *r, unsigned seconds, uint32_t options)
  if (!au_gl_start(&g)) return 0x204;
  uint32_t bits = 0, next_ask = 2000, graph_until = 0, writes_until = 0, second_old[2] = {0, 0};
  int second_slot = -1;
- g.graph_steps = (options & AU_GL_PLAY) != 0 ? AU_PLAY_STEPS : AU_GRAPH_STEPS;
+ bool tone_done = false;
+ g.graph_steps = (options & AU_GL_TONE) != 0 ? AU_TONE_STEPS : (options & AU_GL_PLAY) != 0 ? AU_PLAY_STEPS : AU_GRAPH_STEPS;
+ if ((options & AU_GL_TONE) != 0) {
+  au_format.channels = 4;
+  au_tdm.slot_mask = 0xf;
+  au_period_bytes = 960u * 4u * 4u;
+ }
  if ((options & AU_GL_PLAY) != 0) {
   /* Not over the code that is running here. */
   uint64_t here = (uint64_t)(uintptr_t)&au_gl_rep2[0], stack = (uint64_t)(uintptr_t)&bits;
   if ((here >= AU_PLAY_PA - 0x200000 && here < AU_PLAY_PA + 0x200000) || (stack >= AU_PLAY_PA - 0x200000 && stack < AU_PLAY_PA + 0x200000)) return 0x205;
   /* Zeros, whatever was there. Device-like writes, and the data barrier of au_wr(): the DSP does not snoop anything here. */
-  for (uint32_t i = 0; i < AU_PLAY_BYTES; i++) au_wr(AU_PLAY_PA + 4 * i, 0);
+  for (uint32_t i = 0; i < au_period_bytes; i++) au_wr(AU_PLAY_PA + 4 * i, 0);
   au_gl_rep2[40] = au_rd(AU_SMMU + 0x48);
   au_smmu_bypass(0x1061, 0, false);
   if (au_smmu_slot < 0) return 0x206;
@@ -744,8 +767,13 @@ static uint32_t au_glink_run(uint32_t *r, unsigned seconds, uint32_t options)
    else if ((options & AU_GL_GRAPH) != 0 && g.prm_sent == 2 && g.graph_sent < g.graph_steps && g.ms < graph_until) {
     /* Each packet into the long buffer; if the DSP gives none, on to the votes coming off. */
     static uint32_t m[2 + AU_GL_GPR_BUFFER / 4 + 2];
-    const bool play = (options & AU_GL_PLAY) != 0;
-    if (play && g.graph_sent == AU_PLAY_WRITES_AFTER && g.map_handle != 0 && (g.write_sent < AU_PLAY_BUFFERS || (g.write_done < AU_PLAY_BUFFERS && g.ms < writes_until))) {
+    const bool play = (options & AU_GL_PLAY) != 0, tone = (options & AU_GL_TONE) != 0;
+    if (tone && g.graph_sent == AU_TONE_WRITES_AFTER && !tone_done) {
+     tone_done = true;
+     au_gl_rep2[72] = g.map_handle != 0 ? au_tone_stage(&g, au_gl_rep2, t0, hz) : 0x400;
+     next_ask = g.ms + 20;
+    }
+    else if (!tone && play && g.graph_sent == AU_PLAY_WRITES_AFTER && g.map_handle != 0 && (g.write_sent < AU_PLAY_BUFFERS || (g.write_done < AU_PLAY_BUFFERS && g.ms < writes_until))) {
      /* Two buffers ahead of what it has played, so that it does not run dry and neither does the wait stretch. */
      next_ask = g.ms + 2;
      if (g.write_sent < AU_PLAY_BUFFERS && g.write_sent < g.write_done + 2) {
@@ -756,12 +784,13 @@ static uint32_t au_glink_run(uint32_t *r, unsigned seconds, uint32_t options)
     }
     else if (!g.big_have) { (void)au_gl_big_ask(&g); next_ask = g.ms + 100; }
     else {
-     uint32_t bytes = play ? au_play_build(g.graph_sent, m, AU_GL_GPR_BUFFER, g.map_handle) : au_graph_build(g.graph_sent, m, AU_GL_GPR_BUFFER);
+     uint32_t bytes = tone ? au_tone_build(g.graph_sent, m, AU_GL_GPR_BUFFER, g.map_handle) :
+                      play ? au_play_build(g.graph_sent, AU_GL_GRAPH_TOKEN + g.graph_sent, m, AU_GL_GPR_BUFFER, g.map_handle) : au_graph_build(g.graph_sent, m, AU_GL_GPR_BUFFER);
      if (bytes != 0 && au_gl_graph_send(&g, m, bytes)) next_ask = g.ms + (play ? 300 : 1500);
      else if (bytes == 0) graph_until = 0;
     }
    }
-   else if (au_gl_prm_step(&g)) { next_ask = g.ms + 1500; graph_until = g.ms + ((options & AU_GL_PLAY) != 0 ? 20000 : 8000); }
+   else if (au_gl_prm_step(&g)) { next_ask = g.ms + 1500; graph_until = g.ms + ((options & AU_GL_PLAY) != 0 ? 25000 : 8000); }
   }
  }
  r[18] = g.rx_msgs; r[19] = g.tx_msgs; r[20] = g.tx_full; r[21] = g.stuck; r[22] = g.version_seen; r[23] = g.version_acked;
@@ -778,7 +807,7 @@ static uint32_t au_glink_run(uint32_t *r, unsigned seconds, uint32_t options)
  r[79] = g.gpr_lcid | g.gpr_rcid << 16; r[80] = g.gpr_acked | g.gpr_offers << 8; r[81] = g.gpr_riid_n; r[82] = g.gpr_first_bytes; r[83] = g.gpr_last_bytes;
  for (unsigned i = 0; i < AU_GL_GPR_WORDS; i++) r[84 + i] = g.gpr_first[i];
  for (unsigned i = 0; i < 8; i++) r[100 + i] = g.gpr_last[i];
- for (unsigned i = 0; i < AU_GL_GRAPH_MOST; i++) { au_gl_rep2[i] = g.graph_status[i]; au_gl_rep2[16 + i] = g.graph_heard_ms[i]; }
+ for (unsigned i = 0; i < AU_GL_GRAPH_MOST; i++) { au_gl_rep2[i] = g.graph_status[i]; au_gl_rep2[48 + i] = g.graph_heard_ms[i]; }
  au_gl_rep2[32] = g.write_sent; au_gl_rep2[33] = g.write_done; au_gl_rep2[34] = g.write_first_ms; au_gl_rep2[35] = g.write_last_ms;
  au_gl_rep2[36] = g.write_status; au_gl_rep2[37] = g.write_bad; au_gl_rep2[38] = g.map_handle; au_gl_rep2[39] = g.graph_steps;
  if ((options & AU_GL_PLAY) != 0) {
@@ -901,6 +930,114 @@ static uint32_t au_amp_run(uint32_t *r, uint32_t which)
  r[21] = au_faults;
  return 1;
 }
+/* ---- the first tone. The owner's word, 1 November: unattended, bottom speaker alone, the lowest of the levels, a second. ---- */
+#include "au_amp_on.h"
+static const int32_t au_sine[24] = {0, 55580967, 107374182, 151850025, 185977539, 207430992, 214748365, 207430992, 185977539, 151850025, 107374182, 55580967, 0, -55580967, -107374182, -151850025, -185977539, -207430992, -214748365, -207430992, -185977539, -151850025, -107374182, -55580967};
+#define AU_TONE_FRAMES 48000u       /* a second */
+#define AU_TONE_FADE 1920u          /* 40 ms each way */
+static uint32_t au_tone_frame;
+/* A period into the DSP's next buffer: zeros, or the tone while there are frames of it left. tone is 2 kHz at -20 dBFS: 24 frames a cycle. The same on all four slots. */
+static void au_tone_fill(uint32_t index, bool tone)
+{
+ uint64_t at = AU_PLAY_PA + index * au_period_bytes;
+ for (uint32_t i = 0; i < 960; i++) {
+  int32_t v = 0;
+  if (tone && au_tone_frame < AU_TONE_FRAMES) {
+   uint32_t left = AU_TONE_FRAMES - au_tone_frame, gain = au_tone_frame < AU_TONE_FADE ? au_tone_frame : left < AU_TONE_FADE ? left : AU_TONE_FADE;
+   v = (int32_t)((int64_t)au_sine[au_tone_frame % 24] * gain / AU_TONE_FADE);
+   au_tone_frame++;
+  }
+  for (uint32_t c = 0; c < 4; c++) au_wr(at + 16 * i + 4 * c, (uint32_t)v);
+ }
+}
+/* GLINK and the DSP's buffers kept going for ms, two periods ahead. */
+static void au_tone_pump(struct au_gl *g, uint64_t t0, uint64_t hz, uint32_t ms, bool tone)
+{
+ static uint32_t m[2 + AU_GL_GPR_BUFFER / 4 + 2];
+ uint32_t until = g->ms + ms;
+ while (g->ms < until && !g->stuck) {
+  g->ms = (uint32_t)((rsr("cntpct_el0") - t0) * 1000 / hz);
+  while (au_gl_step(g)) { }
+  if (g->write_sent < g->write_done + 2) {
+   uint32_t index = g->write_sent % 4;
+   au_tone_fill(index, tone);
+   uint32_t bytes = fuxi_ar_write((uint8_t *)(m + 2), AU_GL_GPR_BUFFER, 1, AU_GL_WRITE_TOKEN + (g->write_sent & 0xffffu), (AU_PLAY_PA + index * au_period_bytes) | AU_PLAY_SID << 32, g->map_handle, au_period_bytes);
+   if (bytes != 0) (void)au_gl_data_send(g, m, bytes);
+  }
+  delay(200);
+ }
+}
+static uint32_t au_tone_stage(struct au_gl *g, uint32_t *q, uint64_t t0, uint64_t hz)
+{
+ static const uint8_t pins[8] = {0, 1, 182, 183, 121, 122, 123, 124};
+ static struct au_on o;
+ uint32_t saved[8][2], result = 1;
+ int r = AU_ON_OK;
+ /* Every step of the list so far said yes, and zeros are being played, or the amplifier is not touched at all. */
+ for (uint32_t i = 0; i < AU_TONE_WRITES_AFTER; i++) { if (g->graph_status[i] != 0) return 0x401 + (i << 8); }
+ au_tone_pump(g, t0, hz, 300, false);
+ q[73] = g->write_done; q[74] = g->write_bad;
+ if (g->write_done < 5 || g->write_bad != 0) return 0x402;
+ /* The bus, as au_amp_run() brings it up. */
+ au_faults = 0;
+ if (probe_safe_wr32(AU_GCC + 0x52010, au_rd(AU_GCC + 0x52010) | 0x1fu)) return 0x403;
+ for (unsigned i = 0; i < 10000 && !au_on(au_rd(AU_GCC + 0x233cc)); i++) delay(10);
+ if (!au_on(au_rd(AU_GCC + 0x233cc)) || au_faults) return 0x404;
+ if (!au_amp_engine(AU_SE0)) return 0x405;
+ for (unsigned i = 0; i < 10000 && !au_on(au_rd(AU_GCC + 0x1e004)); i++) delay(10);
+ if (!au_on(au_rd(AU_GCC + 0x1e004))) return 0x406;
+ for (unsigned i = 0; i < 8; i++) { saved[i][0] = au_rd(AU_TLMM + 0x1000u * pins[i]); saved[i][1] = au_rd(AU_TLMM + 0x1000u * pins[i] + 4); }
+ /* Both in reset, whatever comes; I2C and the TDM's clocks and data out, 8 mA as the Xiaomi 14's port. gpio68, the top amplifier's switch, is not touched. */
+ AU_AMP_RESET_LOW(182); AU_AMP_RESET_LOW(183);
+ au_pin(0, 3u | 2u << 2, 0); au_pin(1, 3u | 2u << 2, 0);
+ au_pin(121, 1u << 2 | 3u << 6, 0); au_pin(123, 1u << 2 | 3u << 6, 0); au_pin(124, 1u << 2 | 3u << 6, 0);
+ au_tone_pump(g, t0, hz, 50, false);
+ q[75] = au_rd(AU_TLMM + 0x1000u * 121); q[76] = au_rd(AU_TLMM + 0x1000u * 124);
+ AU_AMP_RESET_HIGH(183);
+ delay(3000);
+ for (unsigned i = 0; i < sizeof(o); i++) ((volatile uint8_t *)&o)[i] = 0;
+ o.se = AU_SE0; o.address = 0x40;
+ r = au_on_prepare(&o, true);
+ q[77] = (uint32_t)r; q[78] = o.step;
+ if (r == AU_ON_OK) {
+  au_tone_pump(g, t0, hz, 100, false);
+  r = au_on_power_up(&o);
+  q[79] = (uint32_t)r; q[80] = o.step; q[81] = o.pup_ms;
+ }
+ if (r == AU_ON_OK) {
+  au_tone_pump(g, t0, hz, 200, false);
+  r = au_on_check(&o);
+  q[82] = (uint32_t)r; for (unsigned i = 0; i < 4; i++) q[83 + i] = o.status[i];
+ }
+ if (r == AU_ON_OK) r = au_on_unmute(&o, 0);
+ if (r == AU_ON_OK) {
+  q[87] = g->write_done; q[88] = g->ms;
+  au_tone_frame = 0;
+  /* Looked at ten times in the second; a thing wrong ends it, and the fade with it. */
+  while (au_tone_frame < AU_TONE_FRAMES && r == AU_ON_OK) {
+   au_tone_pump(g, t0, hz, 100, true);
+   r = au_on_check(&o);
+  }
+  q[89] = g->write_done; q[90] = g->ms; q[91] = au_tone_frame;
+  q[92] = (uint32_t)r; for (unsigned i = 0; i < 4; i++) q[93 + i] = o.status[i];
+  au_tone_pump(g, t0, hz, 200, false);
+  if (r == AU_ON_OK) r = au_on_check(&o);
+  q[97] = (uint32_t)r; for (unsigned i = 0; i < 4; i++) q[98 + i] = o.status[i];
+ }
+ q[102] = o.failed_reg; q[103] = o.failed_want; q[104] = o.failed_got; q[105] = o.otp_fields;
+ if (r != AU_ON_OK) result = 0x410 + (uint32_t)r;
+ /* However it went: down, into reset, and the pins as they were found: the reset lines' pull-downs hold it there. */
+ au_on_down(&o);
+ AU_AMP_RESET_LOW(183);
+ delay(3000);
+ au_tone_pump(g, t0, hz, 40, false);
+ for (unsigned i = 0; i < 8; i++) {
+  (void)probe_safe_wr32(AU_TLMM + 0x1000u * pins[i] + 4, saved[i][1] & 2u);
+  (void)probe_safe_wr32(AU_TLMM + 0x1000u * pins[i], saved[i][0]);
+ }
+ q[106] = au_rd(AU_TLMM + 0x1000u * 183); q[107] = au_rd(AU_TLMM + 0x1000u * 182);
+ return result;
+}
 /* USB entry: returns bytes placed in out (0 = stall). */
 static uint32_t audio_request(uint16_t value, uint16_t index, uint8_t *out)
 {
@@ -970,6 +1107,14 @@ static uint32_t audio_request(uint16_t value, uint16_t index, uint8_t *out)
                                au_gl_rep[3] == 3 ? AU_GL_ANSWER | AU_GL_GPR : au_gl_rep[3] & 1 ? AU_GL_ANSWER : 0);
    au_gl_rep[4] = au_faults;
   }
+  memcpy(out, au_gl_rep, sizeof(au_gl_rep)); return sizeof(au_gl_rep);
+ }
+ if (value == 0x414f && index == 0x4231 && !monitor_report[MON_LAUNCH] && au_boot[1] == 1 && !au_gl_rep[0]) {
+  au_gl_rep[0] = 0xa0d10003;
+  au_gl_rep[2] = 45;
+  au_gl_rep[3] = 15 | 16 | 32;
+  au_gl_rep[1] = au_glink_run(au_gl_rep, 45, AU_GL_ANSWER | AU_GL_GPR | AU_GL_PRM | AU_GL_GRAPH | AU_GL_PLAY | AU_GL_TONE);
+  au_gl_rep[4] = au_faults;
   memcpy(out, au_gl_rep, sizeof(au_gl_rep)); return sizeof(au_gl_rep);
  }
  if (value == 0x4149 && au_gl_rep[0]) { memcpy(out, au_gl_rep2, sizeof(au_gl_rep2)); return sizeof(au_gl_rep2); }

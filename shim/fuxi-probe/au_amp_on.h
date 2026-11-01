@@ -1,6 +1,6 @@
 /* Fuxi audio lane: one CS35L41 up, muted, by its registers, for a first tone with no DSP on the amplifier. The sequence is research_notes/cs35l41-research.md 3.2, 3.3 and 3.5,
  * from driver sources: there is no datasheet, and it has never run on anything. **Writing to an amplifier is the one thing in this lane that can damage hardware: a DC or a
- * misframed full-scale signal into the speaker.** Nothing compiles this into the loader yet, and tools/test-fuxi-audio-amp-on.py holds that: wiring it in waits for the owner's word.
+ * misframed full-scale signal into the speaker.** Only audio.c's au_tone_stage() calls this, at the lowest level, on the bottom amplifier, on the owner's word; tools/test-fuxi-audio-amp-on.py holds that.
  *
  * Every write of a whole register is read back, and a difference ends it. Boost peak is set before anything can enable the boost. Analog gain stays at its lowest, 0.5 dB, the
  * digital volume muted, until au_amp_on_unmute() with one of three fixed levels. Any error: au_amp_on_abort(), then the caller holds the amplifier in reset. Nothing is retried.

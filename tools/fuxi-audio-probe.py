@@ -173,14 +173,32 @@ def decode_glink(r):
 
 GRAPH_STEPS = {3: ('open', 'configure', 'close'),
                15: ('open device', 'configure device', 'open stream', 'configure stream', 'configure its input', 'map the buffers', 'prepare device', 'prepare stream',
-                    'start device', 'start stream', 'stop stream', 'stop device', 'close stream', 'close device', 'unmap')}
+                    'start device', 'start stream', 'stop stream', 'stop device', 'close stream', 'close device', 'unmap'),
+               17: ('TDM clock on', 'open device', 'configure device', 'open stream', 'configure stream', 'configure its input', 'map the buffers', 'prepare device', 'prepare stream',
+                    'start device', 'start stream', 'stop stream', 'stop device', 'close stream', 'close device', 'unmap', 'TDM clock off')}
+
+
+TONE_RESULT = {1: 'played to the end', 0x400: 'no map handle', 0x402: 'zeros not played', 0x403: 'the vote faulted', 0x404: 'wrapper clock', 0x405: 'engine', 0x406: "SE's clock",
+               0x420: 'I2C', 0x430: 'readback', 0x440: 'OTP', 0x450: 'not who it should be', 0x460: 'PLL', 0x470: 'power up not done', 0x480: 'fault flag'}
+
+
+def decode_tone(q):
+    words = lambda at: ' '.join(f'{x:#x}' for x in q[at:at + 4])
+    out = [f'  TONE: result {q[72]:#x} ({TONE_RESULT.get(q[72], "see the code: 0x401 + step << 8 is a list step")})',
+           f'  TONE: zeros played before it {q[73]}, bad {q[74]}; gpio121 {q[75]:#x} gpio124 {q[76]:#x}',
+           f'  TONE: prepare {q[77]:#x} at step {q[78]}, OTP fields {q[105]}; power up {q[79]:#x} at step {q[80]} after {q[81]} ms',
+           f'  TONE: muted check {q[82]:#x}: {words(83)}',
+           f'  TONE: tone: {q[87]} to {q[89]} periods played, {q[88]} to {q[90]} ms, {q[91]} frames; check {q[92]:#x}: {words(93)}',
+           f'  TONE: after it check {q[97]:#x}: {words(98)}',
+           f'  TONE: failed reg {q[102]:#x} want {q[103]:#x} got {q[104]:#x}; reset lines back: gpio183 {q[106]:#x} gpio182 {q[107]:#x}']
+    return out
 
 
 def decode_graph(q, sent):
     out = []
     for i, what in enumerate(GRAPH_STEPS.get(q[39], ())[:sent]):
         status = 'no answer' if q[i] == 0xffffffff else f'status {q[i]:#x}'
-        out.append(f'  GRAPH: {what}: {status}, heard at {q[16 + i]} ms')
+        out.append(f'  GRAPH: {what}: {status}, heard at {q[48 + i]} ms')
     if q[39] == 15:
         out.append(f'  PLAY: bypass in stream match {q[41] - 1}; sGFSR {q[40]:#x} before, {q[42]:#x} after, syndrome {q[43]:#x} {q[44]:#x}; first word of the buffer {q[45]:#x}')
         out.append(f'  PLAY: map handle {q[38]:#x}; buffers sent {q[32]}, played {q[33]}, first at {q[34]} ms, last at {q[35]} ms, last status {q[36]:#x}, bad {q[37]}')
@@ -251,7 +269,8 @@ def fnv(data):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('cmd', choices=['snapshot', 'squash', 'upload', 'boot', 'report', 'decode', 'stop', 'glink', 'smmu', 'poke', 'amp'])
+    ap.add_argument('cmd', choices=['snapshot', 'squash', 'upload', 'boot', 'report', 'decode', 'stop', 'glink', 'smmu', 'poke', 'amp', 'tone'])
+    ap.add_argument('--owner-agreed', action='store_true', help='tone: the owner has agreed to writes to the amplifier: bottom speaker, lowest level, a second')
     ap.add_argument('--which', type=int, default=3, help='amp: 1 B at 0x40, 2 T at 0x42, 3 both; read only')
     ap.add_argument('--what', type=int, default=0, help='poke: 1 the zeros, 2 the stream match, 8 with it stop at the S2CR, 16 stream 0x1061 rather than 0x1001, 4 take it away, or their sum')
     ap.add_argument('--sid', type=lambda x: int(x, 0), default=0x1001, help='smmu: the stream, by default the DSP buffers of Linux sm8550.dtsi')
@@ -341,6 +360,25 @@ def main():
         print(f'poke {r[1]}: magic {r[0]:#x}, this code at {r[2]:#x}, stack at {r[3]:#x}, faults {r[13]}')
         print(f'  zeros: before {r[4]:#x}, after {r[5]:#x} and {r[6]:#x}')
         print(f'  bypass: sGFSR before {r[7]:#x}; slot+1 {r[8]}, SMR {r[9]:#x} S2CR {r[10]:#x}; sGFSR after {r[11]:#x}, after taking it away {r[12]:#x}; got to step {r[14]} of 3')
+    elif a.cmd == 'tone':
+        if not a.owner_agreed:
+            ap.error('tone writes to an amplifier: --owner-agreed')
+        page = req(0x414f, 0x4231)
+        r = struct.unpack('<128I', page)
+        if r[0] != 0xa0d10003:
+            raise SystemExit(f'no report: {r[0]:#x}')
+        print('\n'.join(decode_glink(r)))
+        q = struct.unpack('<128I', req(0x4149))
+        print('\n'.join(decode_graph(q, r[126])))
+        print('\n'.join(decode_tone(q)))
+        count = min(r[27], 96)
+        words = []
+        for p_ in range((count * 12 + 127) // 128):
+            words += struct.unpack('<128I', req(0x4148, p_))
+        print('\n'.join(decode_glink_log(words, count)))
+        if a.save:
+            with a.save.open('ab') as f:
+                f.write(page + struct.pack('<128I', *q))
     elif a.cmd == 'amp':
         r = struct.unpack('<128I', req(0x4141, a.which, 512))
         results = {1: 'done', 0x301: 'the vote faulted', 0x302: 'wrapper clocks did not come', 0x303: 'the engine could not be read',

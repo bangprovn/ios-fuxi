@@ -484,7 +484,7 @@ def main():
     assert 'au_gl_tx(' not in audio.replace('au_gl_tx_', '')
     # The GLINK and graph code alone: au_amp.h's section reads the amplifiers with its own test, and nothing in here calls it.
     run = audio[audio.index('#include "au_glink.h"'):audio.index("/* ---- the amplifiers' identities")]
-    assert audio.count('GRAPH_START') == 2 and audio.count('fuxi_ar_map') == 1 and audio.count('fuxi_ar_write') == 1
+    assert audio.count('GRAPH_START') == 2 and audio.count('fuxi_ar_map') == 1 and audio.count('fuxi_ar_write') == 2
     assert 'au_wr(AU_PLAY_PA + 4 * i, 0);' in run
     for word in ('i2s1', '0xf100000', 'geni', 'cs35l41', 'au_se0', 'au_qup2'):
         assert word not in run.lower(), word

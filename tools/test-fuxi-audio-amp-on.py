@@ -170,8 +170,14 @@ def main():
                         '-fsanitize=address,undefined', '-fno-sanitize-recover=all', f'-I{ROOT / "shim/fuxi-probe"}', str(source), '-o', str(program)], check=True)
         subprocess.run([str(program)], check=True)
     audio = (ROOT / 'shim/fuxi-probe/audio.c').read_text()
-    # Nothing compiles this into the loader yet; when something does, it comes with the owner's own say.
-    assert 'au_amp_on.h' not in audio
+    # What the owner agreed on 1 November: unattended, the bottom amplifier, the lowest level, a second. To go further is a change here, and a new word from them.
+    tone = audio[audio.index('static uint32_t au_tone_stage(struct au_gl *g, uint32_t *q, uint64_t t0, uint64_t hz)\n{'):audio.index('/* USB entry: returns bytes')]
+    assert audio.count('au_on_unmute(') == 1 and tone.count('au_on_unmute(&o, 0)') == 1
+    assert 'o.address = 0x40;' in tone and '0x42' not in tone and 'AU_AMP_RESET_HIGH(183)' in tone and 'AU_AMP_RESET_HIGH(182)' not in tone
+    assert 'AU_AMP_RESET_LOW(182)' in tone and 'pins[8] = {0, 1, 182, 183, 121, 122, 123, 124}' in tone and ', 68' not in tone
+    assert audio.count('#define AU_TONE_FRAMES 48000u') == 1 and audio.count('value == 0x414f && index == 0x4231') == 1
+    assert tone.index('au_on_prepare') < tone.index('au_on_power_up') < tone.index('au_on_check') < tone.index('au_on_unmute') and tone.rindex('au_on_down(&o)') > tone.index('au_on_unmute')
+    assert (ROOT / 'tools/fuxi-audio-probe.py').read_text().count('0x414f') == 1
     print('PASS: au_amp_on')
 
 

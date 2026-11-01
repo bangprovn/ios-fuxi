@@ -40,10 +40,11 @@ enum { AU_GL_VERSION = 0, AU_GL_VERSION_ACK = 1, AU_GL_OPEN = 2, AU_GL_CLOSE = 3
 #define AU_GL_OP_PRM_RELEASE_DONE 0x02001003u
 #define AU_GL_PRM_TOKEN 0x100u
 #define AU_GL_GRAPH 8u         /* options: with AU_GL_PRM, between the votes, the packets of au_gl_graph_send() */
-#define AU_GL_GRAPH_MOST 16u   /* the longest of audio.c's lists */
+#define AU_GL_GRAPH_MOST 20u   /* the longest of audio.c's lists */
 #define AU_GL_GRAPH_TOKEN 0x200u
 #define AU_GL_PLAY 16u         /* options: with AU_GL_GRAPH, the buffers of au_gl_data_send() */
 #define AU_GL_WRITE_TOKEN 0x1000u
+#define AU_GL_TONE 32u         /* options: audio.c's first tone, on the owner's word. For its list and au_tone_stage(); nothing here reads it */
 #define AU_GL_OP_MEM_MAP_DONE 0x02001001u  /* payload {handle} */
 #define AU_GL_OP_WRITE_DONE 0x05001004u    /* payload {address, address, handle, status} */
 
@@ -231,6 +232,9 @@ static inline void au_gl_gpr_take(struct au_gl *g, uint32_t tail, uint32_t bytes
 
 		if (bytes >= 32u && keep[5] == AU_GL_OP_BASIC_RESULT) {
 			g->graph_status[step] = keep[7];
+			g->graph_heard_ms[step] = g->ms;
+		} else if (bytes >= 32u && (keep[5] == AU_GL_OP_PRM_REQUEST_DONE || keep[5] == AU_GL_OP_PRM_RELEASE_DONE)) {
+			g->graph_status[step] = keep[7];    /* the clock, on a list that has it */
 			g->graph_heard_ms[step] = g->ms;
 		} else if (bytes >= 28u && keep[5] == AU_GL_OP_MEM_MAP_DONE) {
 			g->map_handle = keep[6];
