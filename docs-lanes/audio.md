@@ -1,4 +1,24 @@
-# Audio lane — milestone 1 (research + probes)
+# Audio lane
+
+## Where it stands, 2 November (device results; the log is research_notes/audio-next.md, which is not in this repository)
+
+| What | State | Run |
+|---|---|---|
+| ADSP boots from the loader and stays up under iOS | works | `a-ios3`, 30 min in `a-ios6` |
+| Graph and buffers, loader and kernel, TDM clock and 4 slots | works, 0 errors | `a-play2`, `a-kmic1` |
+| iOS's mix reaches the DSP through the HAL plug-in | works: a ringtone from Settings, peaks 6553 and 11116, 0 dropped | `a-ios5` |
+| CS35L41 B and T identify over I2C | DEVID 0x35A40 REV B2 | `a-amp2` |
+| Bottom speaker from the loader at the lowest level (-30 dB, analog 0.5 dB, 2 kHz at -20 dBFS, 1 s) | no flags, PLL locked; coil current in IMON | `a-tone1`, `a-tone5` |
+| Mic: TX clock 0x30C, macros, SoundWire master, WCD938x enumerated, bias 2.75 V, ADC1 | 7 of 7 proof steps | `a-mic2` |
+| Mic capture through the DSP in the loader | 1641 periods, 0 bad. Gain 8 to 16: four times the level. Bias off: sample-to-sample change falls twelve times | `a-cap2` |
+| The speaker heard by the mic, at the same lowest level | 2 kHz: 0.167 LSB before, 25.28 during, 0.754 after. Bias off: 0.019, 0.053, 0.041 | `a-loop1`, `a-loop2` |
+| Mic in the XNU kernel, `fuxiaudio=4` | 7 of 7, 772 periods, 0 bad, came back down | `a-kmic1` |
+| iOS sound through the amplifier (`fuxiaudioamp=1`), the top speaker, any higher level | written or not, **not run: each needs the owner's word** | |
+| `/dev/fuxiaudiomic` read by the plug-in in mediaserverd | written, root v7 made, not yet run | |
+
+Only numbers leave the phone in the mic's runs; the probes have no request that returns its samples.
+
+## Milestone 1 (research + probes)
 
 Goal: iOS sound on the fuxi speakers, then headphones over USB-C. This round
 covers research, a read-only loader probe, and a gated ADSP PAS boot stage. No
@@ -321,12 +341,10 @@ only if the ADT cannot carry it. The HAL plug-in stays opt-in through `fuxi-sys-
 ### Blockers and facts needed
 
 1. ~~Fuxi ACDB/topology ids~~ Not needed: a client names its own graph's ids. TDM module and parameters known, and the DSP plays through them (a-play2, research_notes/audio-next.md). Capture path still to do.
-2. CS35L41 register init for ASP RX1 direct (clock/PLL reference from the TDM SCLK, ASP enables, gain, global enable, DEVID check).
-   `ShengCs35l43.c` shows the shape only; Linux's driver is GPL and is ideas only. Needed: a non-GPL register list or a carefully
-   reconstructed one verified by DEVID reads and PLL-lock status before any audio.
-3. A reserved low-DRAM window for the DSP buffers. In the loader 0xd0000000 works, with streams 0x1001/0x80 and 0x1061 routed to context bank 4 (stage 1 off): bypass, and 0x1801, are refused by the hypervisor. In XNU, still to be settled.
-4. An SCM/PAS caller inside XNU (or an agreed hand-off from the loader after stage 2) and the ADSP firmware extraction.
-5. Which AMIC/micbias fuxi's built-in microphone uses (mixer_paths from the vendor image).
+2. ~~CS35L41 register init for ASP RX1 direct.~~ `shim/fuxi-probe/au_amp_on.h`, every step read back; run in the loader at the lowest level. Levels above that, and the protection firmware's absence at them, are the open question: no datasheet.
+3. ~~A reserved low-DRAM window for the DSP buffers.~~ 0xd0000000 up works in the loader and in XNU, outside the bank XNU owns, with streams 0x1001/0x80 and 0x1061 routed by the loader to context bank 4 (stage 1 off): bypass, and 0x1801, are refused by the hypervisor.
+4. ~~An SCM/PAS caller inside XNU~~ A hand-off from the loader after stage 2 (`ADSP=1` in boot/ios-remote.sh). A DSP restart under iOS is still not possible.
+5. ~~Which AMIC/micbias fuxi's built-in microphone uses~~ AMIC1, MIC BIAS1 at 2.75 V, ADC1, master port 3 lane 1, SWR_MIC4, codec DMA TX3 (a-cap2).
 6. ~~Whether the APM needs a servreg/pd-mapper responder~~ It does not: a-gpr1, status 1 two seconds after GLINK with neither.
 
 ### Tests
