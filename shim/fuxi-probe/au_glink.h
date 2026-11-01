@@ -1,8 +1,9 @@
 /* Fuxi audio lane: the AP's end of GLINK over SMEM with the ADSP, polled, enough to see what the DSP opens. Plain C so that
  * tools/test-fuxi-audio-glink.py runs it against a fake DSP under the sanitizers; audio.c gives it the SMEM accessors.
- * The wire format follows Linux qcom_glink_native.c and qcom_glink_smem.c. It says nothing to a channel: it negotiates the
- * version, answers CLOSE and an intent request, and with AU_GL_ANSWER also completes the opening of a channel. No data is
- * ever sent, so no GPR, APM or other audio command can leave from here. Define AU_GL_RD, AU_GL_WR, AU_GL_WMB and AU_GL_KICK.
+ * The wire format follows Linux qcom_glink_native.c and qcom_glink_smem.c. It negotiates the version, answers CLOSE and an
+ * intent request, and with AU_GL_ANSWER also completes the opening of a channel. Only with AU_GL_GPR does any data leave, and
+ * then one fixed packet alone: APM_CMD_GET_SPF_STATE on adsp_apps, by au_gl_gpr_ask(), which reads a state and sets up nothing.
+ * Define AU_GL_RD, AU_GL_WR, AU_GL_WMB and AU_GL_KICK.
  */
 #ifndef AU_GLINK_H
 #define AU_GLINK_H
@@ -18,6 +19,14 @@ enum { AU_GL_VERSION = 0, AU_GL_VERSION_ACK = 1, AU_GL_OPEN = 2, AU_GL_CLOSE = 3
 #define AU_GL_FROM_US 0x8000u  /* in a record's cmd: what we sent */
 #define AU_GL_CHANNELS 16u
 #define AU_GL_RESENDS 4u
+#define AU_GL_GPR 2u           /* options: ask the APM on adsp_apps whether it is up. Needs AU_GL_ANSWER */
+#define AU_GL_GPR_ASKS 8u
+#define AU_GL_GPR_INTENTS 8u   /* of the DSP's buffers, as many as there are asks */
+#define AU_GL_GPR_WORDS 16u    /* kept of an answer */
+#define AU_GL_GPR_BUFFER 512u  /* offered for its answers: a size only, what comes in is read from the ring. Linux GPR_MAX 4096 is for graphs */
+#define AU_GL_GPR_OFFERS 16u
+#define AU_GL_OP_GET_SPF_STATE 0x01001021u
+#define AU_GL_OP_SPF_STATE 0x02001007u  /* payload {status}: 1 ready */
 
 struct au_gl {
 	uint64_t desc, tx_fifo, rx_fifo;
@@ -26,6 +35,9 @@ struct au_gl {
 	uint32_t log_most, log_n, log_lost;
 	uint32_t rx_msgs, tx_msgs, tx_full, stuck, version_acked, version_seen, resends, opened, acked_by_dsp;
 	uint16_t rcid[AU_GL_CHANNELS];
+	uint32_t gpr_lcid, gpr_rcid, gpr_acked, gpr_offers, gpr_asked, gpr_heard, gpr_other, gpr_ready;
+	uint32_t gpr_asked_ms, gpr_first_ms, gpr_last_ms, gpr_first_bytes, gpr_last_bytes, gpr_riid_n;
+	uint32_t gpr_riid[AU_GL_GPR_INTENTS], gpr_first[AU_GL_GPR_WORDS], gpr_last[AU_GL_GPR_WORDS];
 };
 
 static inline uint32_t au_gl_align8(uint32_t n) { return (n + 7u) & ~7u; }
@@ -82,6 +94,44 @@ static inline int au_gl_channel(const struct au_gl *g, uint32_t rcid)
 	return -1;
 }
 
+static inline void au_gl_gpr_offer(struct au_gl *g, uint32_t iid)
+{
+	uint32_t pair[2] = {AU_GL_GPR_BUFFER, iid};
+
+	if (g->gpr_offers >= AU_GL_GPR_OFFERS) return;
+	if (au_gl_tx(g, AU_GL_INTENT, g->gpr_lcid, 1, pair, sizeof(pair))) g->gpr_offers++;
+}
+
+/* The one data packet that can leave here. True when it went: a buffer of the DSP's was there and the ring had room. */
+static inline bool au_gl_gpr_ask(struct au_gl *g)
+{
+	uint32_t m[8];
+
+	if ((g->options & AU_GL_GPR) == 0 || !g->gpr_acked || g->gpr_riid_n == 0 || g->gpr_asked >= AU_GL_GPR_ASKS) return false;
+	m[0] = 24; m[1] = 0;                            /* chunk size, left size */
+	m[2] = 0u | 6u << 4 | 24u << 8;                 /* GPR: version 0, 6 header words, 24 bytes */
+	m[3] = 2u | 3u << 8;                            /* to the ADSP's domain, from the APPS' */
+	m[4] = 1; m[5] = 1;                             /* source port and destination: the APM's, as Linux q6apm */
+	m[6] = g->gpr_asked + 1u;                       /* token */
+	m[7] = AU_GL_OP_GET_SPF_STATE;
+	if (!au_gl_tx(g, AU_GL_TX_DATA, g->gpr_lcid, g->gpr_riid[g->gpr_riid_n - 1u], m, sizeof(m))) return false;
+	g->gpr_riid_n--;
+	if (g->gpr_asked++ == 0) g->gpr_asked_ms = g->ms;
+	return true;
+}
+
+/* An answer on adsp_apps, while it is still in the ring. `tail` is at its header, so its bytes begin 16 past. */
+static inline void au_gl_gpr_take(struct au_gl *g, uint32_t tail, uint32_t bytes)
+{
+	uint32_t *keep = g->gpr_heard == 0 ? g->gpr_first : g->gpr_last;
+
+	for (uint32_t i = 0; i < AU_GL_GPR_WORDS; i++) keep[i] = i * 4u < bytes ? au_gl_word(g, tail, 16u + 4u * i) : 0;
+	if (g->gpr_heard == 0) { g->gpr_first_ms = g->ms; g->gpr_first_bytes = bytes; }
+	g->gpr_last_ms = g->ms; g->gpr_last_bytes = bytes;
+	if (keep[5] == AU_GL_OP_SPF_STATE && bytes >= 28u && keep[6] == 1u) g->gpr_ready = 1;
+	g->gpr_heard++;
+}
+
 /*
  * One message from the DSP, if a whole one is there. True when one was taken. Lengths come from the far end, so each is
  * bounded before use; what cannot be read safely stops the reader for good (g->stuck), as there is no way to find the next.
@@ -89,6 +139,7 @@ static inline int au_gl_channel(const struct au_gl *g, uint32_t rcid)
 static inline bool au_gl_step(struct au_gl *g)
 {
 	uint32_t head, tail, avail, w0, cmd, p1, p2, extra = 0, total, words[8];
+	bool gpr_channel;
 
 	if (g->stuck || !g->rx_fifo || !g->rx_len) return false;
 	head = AU_GL_RD(g->desc + 12);
@@ -132,7 +183,10 @@ static inline bool au_gl_step(struct au_gl *g)
 		words[i] = i * 4u < total - 8u ? au_gl_word(g, tail, 8u + 4u * i) : 0;
 	}
 	g->rx_msgs++;
-	au_gl_note(g, cmd, p1, p2, extra, words, 8);
+	gpr_channel = g->gpr_lcid != 0 && p1 == g->gpr_rcid;
+	/* Every channel's buffers would fill the log before the answer comes. */
+	if ((g->options & AU_GL_GPR) == 0 || cmd != AU_GL_INTENT || gpr_channel) au_gl_note(g, cmd, p1, p2, extra, words, 8);
+	if (cmd == AU_GL_TX_DATA && gpr_channel) au_gl_gpr_take(g, tail, extra);
 	AU_GL_WR(g->desc + 8, (tail + total) % g->rx_len);
 
 	switch (cmd) {
@@ -156,10 +210,36 @@ static inline bool au_gl_step(struct au_gl *g)
 			g->rcid[lcid - 1] = (uint16_t)p1;
 			(void)au_gl_tx(g, AU_GL_OPEN_ACK, p1, 0, 0, 0);
 			(void)au_gl_tx(g, AU_GL_OPEN, lcid, p2, words, p2);
+			/* "adsp_apps" and its NUL */
+			if ((g->options & AU_GL_GPR) != 0 && p2 == 10u && words[0] == 0x70736461u && words[1] == 0x7070615fu && (words[2] & 0xffffu) == 0x0073u) {
+				g->gpr_lcid = lcid;
+				g->gpr_rcid = p1;
+			}
 		}
 		break;
 	case AU_GL_OPEN_ACK:
 		g->acked_by_dsp++;
+		/* As Linux once a channel is up: buffers offered, so that the APM has somewhere to answer. */
+		if (g->gpr_lcid != 0 && p1 == g->gpr_lcid && !g->gpr_acked) {
+			g->gpr_acked = 1;
+			au_gl_gpr_offer(g, 1);
+			au_gl_gpr_offer(g, 2);
+		}
+		break;
+	case AU_GL_INTENT:
+		if (gpr_channel) {
+			for (uint32_t i = 0; i < p2 && i < 4u; i++) {
+				if (words[2u * i] >= 24u && g->gpr_riid_n < AU_GL_GPR_INTENTS) g->gpr_riid[g->gpr_riid_n++] = words[2u * i + 1u];
+			}
+		}
+		break;
+	case AU_GL_TX_DATA: case AU_GL_TX_DATA_CONT:
+		if (!gpr_channel) { g->gpr_other++; break; }
+		/* Its buffer back at once, once all of it is in. */
+		if (words[1] == 0u) {
+			if ((g->features & AU_GL_FEATURE_REUSE) != 0) { (void)au_gl_tx(g, AU_GL_RX_DONE_REUSE, g->gpr_lcid, p2, 0, 0); }
+			else { (void)au_gl_tx(g, AU_GL_RX_DONE, g->gpr_lcid, p2, 0, 0); au_gl_gpr_offer(g, p2); }
+		}
 		break;
 	case AU_GL_CLOSE:
 		(void)au_gl_tx(g, AU_GL_CLOSE_ACK, p1, 0, 0, 0);
@@ -167,8 +247,13 @@ static inline bool au_gl_step(struct au_gl *g)
 	case AU_GL_INTENT_REQ: {
 		int channel = au_gl_channel(g, p1);
 
-		/* No buffer is ever offered: nothing is to come in on a channel here. */
-		if (channel >= 0) (void)au_gl_tx(g, AU_GL_INTENT_REQ_ACK, (uint32_t)channel + 1u, 0, 0, 0);
+		/* adsp_apps is given what it asks, up to a point. Anywhere else no buffer is offered: nothing is to come in there. */
+		if (gpr_channel && p2 <= AU_GL_GPR_BUFFER && g->gpr_offers < AU_GL_GPR_OFFERS) {
+			au_gl_gpr_offer(g, g->gpr_offers + 1u);
+			(void)au_gl_tx(g, AU_GL_INTENT_REQ_ACK, g->gpr_lcid, 1, 0, 0);
+		} else if (channel >= 0) {
+			(void)au_gl_tx(g, AU_GL_INTENT_REQ_ACK, (uint32_t)channel + 1u, 0, 0, 0);
+		}
 		break;
 	}
 	case AU_GL_READ_NOTIF:

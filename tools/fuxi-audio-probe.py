@@ -6,7 +6,7 @@
   upload --dtb F --fw F        stage squashed adsp_dtb/adsp MBNs over control OUT
   boot                         stage 2: PAS-boot the ADSP once, then decode
   report                       re-read the frozen stage-2 report
-  glink [--seconds N] [--answer]  after a boot that reached ready: GLINK with the DSP, polled; no data is ever sent
+  glink [--seconds N] [--answer] [--gpr]  after a boot that reached ready: GLINK with the DSP, polled; no data is sent unless --gpr asks the APM its state
   decode FILE                  decode a saved raw page offline
 Raw pages can be saved with --save. See docs-lanes/audio.md.
 """
@@ -155,7 +155,21 @@ def decode_glink(r):
            f'  channels answered {r[25]}, their acks {r[26]}; log {r[27]} records, {r[28]} lost; last at {r[29]} ms',
            f'  tx tail {r[30]:#x} head {r[31]:#x}, rx tail {r[32]:#x} head {r[33]:#x}; ready bits {ready_text(r[34])}, fatal bits {r[16]:#x}',
            f'  crash reason 423 @{r[35]:#x} size {r[36]}: {cstr(r[40:72])!r}']
+    if r[3] & 2:
+        out += [f'  GPR: adsp_apps lcid {r[79] & 0xffff} rcid {r[79] >> 16}, its ack {r[80] & 0xff}, buffers offered {r[80] >> 8}, its buffers left {r[81]}, data on other channels {r[74]}',
+                f'  GPR: asked {r[72]} times, first at {r[76]} ms; answers {r[73]}, first at {r[77]} ms, last at {r[78]} ms; APM READY {r[75]}']
+        for what, bytes_, words in (('first', r[82], r[84:100]), ('last', r[83], r[100:116])):
+            if bytes_:
+                out.append(f'  GPR: {what} answer, {bytes_} bytes: ' + decode_gpr(words, bytes_))
     return out
+
+
+GPR_OPCODES = {0x02001005: 'BASIC_RESULT {opcode, status}', 0x02001007: 'APM_CMD_RSP_GET_SPF_STATE {status: 1 ready}'}
+
+
+def decode_gpr(w, size):
+    text = f'size {w[0] >> 8} domains to {w[1] & 0xff} from {(w[1] >> 8) & 0xff} port {w[2]:#x}->{w[3]:#x} token {w[4]} opcode {w[5]:#x} ({GPR_OPCODES.get(w[5], "?")})'
+    return text + ' payload ' + ' '.join(f'{x:#x}' for x in w[6:min(16, (size + 3) // 4)])
 
 
 def decode_glink_log(words, count):
@@ -214,6 +228,7 @@ def main():
     ap.add_argument('cmd', choices=['snapshot', 'squash', 'upload', 'boot', 'report', 'decode', 'stop', 'glink'])
     ap.add_argument('--seconds', type=int, default=30, help='glink: how long to listen, at most 45')
     ap.add_argument('--answer', action='store_true', help='glink: complete the opening of channels; still sends no data')
+    ap.add_argument('--gpr', action='store_true', help='glink: with --answer, ask the APM on adsp_apps whether it is up, the one data packet')
     ap.add_argument('--outbound', action='store_true', help='boot: create the AP outbound SMP2P item 429 first')
     ap.add_argument('--doorbell', action='store_true', help='boot: with --outbound, also ring LPASS SMP2P')
     ap.add_argument('--wait', type=int, default=0, help='boot: seconds to wait for ready, at most 45')
@@ -295,7 +310,9 @@ def main():
     elif a.cmd == 'glink':
         if not 1 <= a.seconds <= 45:
             ap.error('--seconds is 1 to 45')
-        page = req(0x4147, a.seconds | int(a.answer) << 8)
+        if a.gpr and not a.answer:
+            ap.error('--gpr needs --answer')
+        page = req(0x4147, a.seconds | int(a.answer) << 8 | int(a.gpr) << 9)
         r = struct.unpack('<128I', page)
         if r[0] != 0xa0d10003:
             raise SystemExit(f'no glink report: {r[0]:#x}')

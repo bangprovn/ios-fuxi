@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""shim/fuxi-probe/au_glink.h against a fake DSP under the sanitizers: the handshake, wrap, malformed lengths, and no data."""
+"""shim/fuxi-probe/au_glink.h against a fake DSP under the sanitizers: the handshake, wrap, malformed lengths, no data unless asked, and then the one packet."""
 import os
 from pathlib import Path
 import subprocess
@@ -26,6 +26,8 @@ static unsigned kicks, wmbs;
 static uint32_t desc[8], tx[FIFO / 4], rx[FIFO / 4], logs[AU_GL_REC_WORDS * 32];
 static uint32_t far_head;	/* what the DSP has written to */
 static uint32_t far_tail;	/* what the DSP has read of ours */
+static bool may_send;		/* heard() fails on data otherwise */
+static uint32_t asks;
 
 static void fresh(struct au_gl *g, uint32_t options)
 {
@@ -56,7 +58,20 @@ static bool heard(uint32_t *cmd, uint32_t *p1, uint32_t *p2, char *name)
 		total += (*p2 + 7) & ~7u;
 		if (name) for (uint32_t i = 0; i < *p2; i++) name[i] = ((char *)tx)[(far_tail + 8 + i) % FIFO];
 	}
-	assert(*cmd != AU_GL_TX_DATA && *cmd != AU_GL_TX_DATA_CONT);	/* never data, whatever it is asked */
+	if (*cmd == AU_GL_TX_DATA) {
+		/* only the one packet, and only when asked */
+		static const uint32_t ask[6] = {0x1860, 0x0302, 1, 1, 0, AU_GL_OP_GET_SPF_STATE};
+		uint32_t word[8];
+		assert(may_send);
+		for (uint32_t i = 0; i < 8; i++) word[i] = tx[(far_tail + 8 + 4 * i) % FIFO / 4];
+		assert(word[0] == 24 && word[1] == 0);
+		for (uint32_t i = 0; i < 6; i++) assert(i == 4 ? word[2 + i] == asks + 1 : word[2 + i] == ask[i]);
+		asks++;
+		total += 32;
+	} else if (*cmd == AU_GL_INTENT) {
+		total += 8 * *p2;
+	}
+	assert(*cmd != AU_GL_TX_DATA_CONT);
 	far_tail = (far_tail + total) % FIFO;
 	desc[0] = far_tail;
 	return true;
@@ -181,6 +196,93 @@ int main(void)
 	desc[1] = 0; desc[0] = FIFO + 4;
 	assert(!au_gl_tx(&g, AU_GL_VERSION, 1, 1, 0, 0) && desc[1] == 0);
 
+	/* --gpr. Without its option nothing can be asked, even with a channel and a buffer there. */
+	fresh(&g, AU_GL_ANSWER); assert(au_gl_start(&g)); assert(heard(&cmd, &p1, &p2, 0));
+	g.gpr_lcid = 5; g.gpr_acked = 1; g.gpr_riid_n = 1;
+	assert(!au_gl_gpr_ask(&g));
+	/* Another channel's name is not adsp_apps. */
+	fresh(&g, AU_GL_ANSWER | AU_GL_GPR); assert(au_gl_start(&g)); assert(heard(&cmd, &p1, &p2, 0));
+	say(AU_GL_OPEN, 7, 10, "adsp_appz\0", 10);
+	assert(au_gl_step(&g) && g.gpr_lcid == 0);
+	assert(heard(&cmd, &p1, &p2, 0) && heard(&cmd, &p1, &p2, 0));
+	say(AU_GL_OPEN_ACK, 1, 0, 0, 0);
+	assert(au_gl_step(&g) && !g.gpr_acked && !heard(&cmd, &p1, &p2, 0) && !au_gl_gpr_ask(&g));
+	/* The way it goes on the phone: lcid 2 for its rcid 9. */
+	fresh(&g, AU_GL_ANSWER | AU_GL_GPR); may_send = true; asks = 0;
+	assert(au_gl_start(&g)); assert(heard(&cmd, &p1, &p2, 0));
+	g.opened = 1; g.rcid[0] = 3;
+	say(AU_GL_OPEN, 9, 10, "adsp_apps\0", 10);
+	assert(au_gl_step(&g) && g.gpr_lcid == 2 && g.gpr_rcid == 9);
+	assert(heard(&cmd, &p1, &p2, 0) && cmd == AU_GL_OPEN_ACK && p1 == 9);
+	assert(heard(&cmd, &p1, &p2, name) && cmd == AU_GL_OPEN && p1 == 2 && !strcmp(name, "adsp_apps"));
+	assert(!au_gl_gpr_ask(&g));	/* not before its ack */
+	say(AU_GL_OPEN_ACK, 2, 0, 0, 0);
+	assert(au_gl_step(&g) && g.gpr_acked && g.gpr_offers == 2);
+	assert(heard(&cmd, &p1, &p2, 0) && cmd == AU_GL_INTENT && p1 == 2 && p2 == 1);
+	assert(heard(&cmd, &p1, &p2, 0) && cmd == AU_GL_INTENT && p1 == 2 && p2 == 1);
+	assert(!au_gl_gpr_ask(&g));	/* not before a buffer of its own */
+	{
+		uint32_t small[2] = {16, 30}, other[2] = {128, 31}, good[2] = {128, 14};
+		say(AU_GL_INTENT, 3, 1, other, 8);	/* another channel's */
+		assert(au_gl_step(&g) && g.gpr_riid_n == 0);
+		say(AU_GL_INTENT, 9, 1, small, 8);	/* too small for the packet */
+		assert(au_gl_step(&g) && g.gpr_riid_n == 0);
+		say(AU_GL_INTENT, 9, 1, good, 8);
+		assert(au_gl_step(&g) && g.gpr_riid_n == 1);
+	}
+	assert(au_gl_gpr_ask(&g) && asks == 0 && heard(&cmd, &p1, &p2, 0) && cmd == AU_GL_TX_DATA && p1 == 2 && p2 == 14 && asks == 1);
+	assert(!au_gl_gpr_ask(&g) && g.gpr_asked == 1);	/* out of its buffers */
+	{
+		/* Not up yet: answered, its buffer back with reuse, nothing ready. */
+		uint32_t later[10] = {28, 0, 0x1c60, 0x0203, 1, 1, 1, AU_GL_OP_SPF_STATE, 0, 0};
+		say(AU_GL_TX_DATA, 9, 1, later, 36);
+		assert(au_gl_step(&g) && g.gpr_heard == 1 && !g.gpr_ready && g.gpr_first[6] == 0 && g.gpr_first_bytes == 28);
+		assert(heard(&cmd, &p1, &p2, 0) && cmd == AU_GL_RX_DONE_REUSE && p1 == 2 && p2 == 1);
+		/* A basic result is not a yes. */
+		uint32_t refused[10] = {32, 0, 0x2060, 0x0203, 1, 1, 1, 0x02001005, AU_GL_OP_GET_SPF_STATE, 1};
+		say(AU_GL_TX_DATA, 9, 1, refused, 40);
+		assert(au_gl_step(&g) && g.gpr_heard == 2 && !g.gpr_ready && g.gpr_last[7] == 1);
+		assert(heard(&cmd, &p1, &p2, 0) && cmd == AU_GL_RX_DONE_REUSE);
+		/* Ready; the first answer is kept apart. */
+		uint32_t yes[10] = {28, 0, 0x1c60, 0x0203, 1, 1, 2, AU_GL_OP_SPF_STATE, 1, 0};
+		say(AU_GL_TX_DATA, 9, 1, yes, 36);
+		assert(au_gl_step(&g) && g.gpr_heard == 3 && g.gpr_ready && g.gpr_first[6] == 0 && g.gpr_last[6] == 1);
+		assert(heard(&cmd, &p1, &p2, 0) && cmd == AU_GL_RX_DONE_REUSE);
+		/* Without reuse its buffer is gone, so another is offered. */
+		g.features = 0;
+		say(AU_GL_TX_DATA, 9, 7, yes, 36);
+		assert(au_gl_step(&g));
+		assert(heard(&cmd, &p1, &p2, 0) && cmd == AU_GL_RX_DONE && p1 == 2 && p2 == 7);
+		assert(heard(&cmd, &p1, &p2, 0) && cmd == AU_GL_INTENT && p1 == 2);
+		/* Data elsewhere is only counted. */
+		say(AU_GL_TX_DATA, 3, 1, yes, 36);
+		assert(au_gl_step(&g) && g.gpr_other == 1 && !heard(&cmd, &p1, &p2, 0));
+		/* A request for a buffer on it: granted while small, refused when big, and offers end. */
+		say(AU_GL_INTENT_REQ, 9, 64, 0, 0);
+		assert(au_gl_step(&g));
+		assert(heard(&cmd, &p1, &p2, 0) && cmd == AU_GL_INTENT);
+		assert(heard(&cmd, &p1, &p2, 0) && cmd == AU_GL_INTENT_REQ_ACK && p1 == 2 && p2 == 1);
+		say(AU_GL_INTENT_REQ, 9, AU_GL_GPR_BUFFER + 1, 0, 0);
+		assert(au_gl_step(&g) && heard(&cmd, &p1, &p2, 0) && cmd == AU_GL_INTENT_REQ_ACK && p2 == 0);
+		g.gpr_offers = AU_GL_GPR_OFFERS;
+		say(AU_GL_INTENT_REQ, 9, 64, 0, 0);
+		assert(au_gl_step(&g) && heard(&cmd, &p1, &p2, 0) && cmd == AU_GL_INTENT_REQ_ACK && p2 == 0);
+	}
+	/* Asks are bounded, whatever buffers it gives. */
+	{
+		uint32_t good[2] = {128, 14};
+		g.gpr_asked = 0; asks = 0;
+		for (unsigned i = 0; i < AU_GL_GPR_ASKS + 4; i++) {
+			say(AU_GL_INTENT, 9, 1, good, 8);
+			assert(au_gl_step(&g));
+			bool asked = au_gl_gpr_ask(&g);
+			assert(asked == (i < AU_GL_GPR_ASKS));
+			if (asked) assert(heard(&cmd, &p1, &p2, 0) && cmd == AU_GL_TX_DATA);
+		}
+		assert(g.gpr_asked == AU_GL_GPR_ASKS && asks == AU_GL_GPR_ASKS);
+	}
+	may_send = false;
+
 	/* The log is bounded and says how much it lost. */
 	fresh(&g, 0); desc[1] = 0; desc[2] = 0; g.log_most = 2;
 	for (unsigned i = 0; i < 5; i++) { say(AU_GL_SIGNALS, 1, i, 0, 0); assert(au_gl_step(&g)); }
@@ -190,7 +292,9 @@ int main(void)
 	{
 		uint32_t seed = 0x51ed2701;
 		for (unsigned round = 0; round < 40000; round++) {
-			fresh(&g, round & 1); (void)au_gl_start(&g);
+			/* (round & 3) == 3 is --gpr, with the channel up from the start for the rings that would never open it. */
+			fresh(&g, (round & 1) | ((round & 3) == 3 ? AU_GL_GPR : 0)); (void)au_gl_start(&g);
+			if ((round & 3) == 3) { g.gpr_lcid = 1; g.gpr_rcid = round & 15; g.gpr_acked = round & 4; }
 			for (unsigned i = 0; i < FIFO / 4; i++) { seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5; rx[i] = (i & 1) && (seed & 8) ? seed >> 24 : seed & 0x000f000f; }
 			seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
 			desc[3] = (seed & 0xf8) % FIFO;
@@ -199,7 +303,7 @@ int main(void)
 			for (unsigned i = 0; i < FIFO / 4; i++) { (void)tx[i]; }
 		}
 	}
-	puts("au_glink: handshake, opening and refusals, wrap, half messages, malformed input, no data ever");
+	puts("au_glink: handshake, opening and refusals, wrap, half messages, malformed input, the one packet and only when asked");
 	return 0;
 }
 """
@@ -213,11 +317,13 @@ def main():
         subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra', '-Wno-unused-function', '-Wno-unused-parameter', '-g', '-O1',
                         '-fsanitize=address,undefined', '-fno-sanitize-recover=all', f'-I{ROOT / "shim/fuxi-probe"}', str(source), '-o', str(program)], check=True)
         subprocess.run([str(program)], check=True)
-    # What could put an audio command on the wire is simply not there.
+    # What could put any other audio command on the wire is simply not there: one TX_DATA, in the function with the fixed packet.
     text = (ROOT / 'shim/fuxi-probe/au_glink.h').read_text()
     code = text[text.index('#define AU_GL_FEATURE_REUSE'):]
-    assert 'AU_GL_TX_DATA,' not in code.replace('case AU_GL_TX_DATA: case AU_GL_TX_DATA_CONT:', '')
-    assert 'au_gl_tx(g, AU_GL_TX_DATA' not in code
+    assert code.count('AU_GL_TX_DATA,') == 1 and code.count('au_gl_tx(g, AU_GL_TX_DATA,') == 1
+    ask = code[code.index('static inline bool au_gl_gpr_ask'):code.index('static inline void au_gl_gpr_take')]
+    assert 'au_gl_tx(g, AU_GL_TX_DATA,' in ask and 'AU_GL_OP_GET_SPF_STATE' in ask
+    assert 'AU_GL_TX_DATA_CONT,' not in code
     audio = (ROOT / 'shim/fuxi-probe/audio.c').read_text()
     assert 'au_gl_tx(' not in audio.replace('au_gl_tx_', '')
     print('PASS: au_glink')
