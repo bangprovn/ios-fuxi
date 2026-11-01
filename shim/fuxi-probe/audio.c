@@ -14,7 +14,8 @@
  *  IN  0x5a 'AZ' (0x415a): PAS shutdown of the ADSP, after a stage 2 that reached ready. Nothing else.
  *  IN  0x5a 'AG' (0x4147) wIndex: once, after a stage 2 that reached ready: GLINK over SMEM, polled, for bits 7:0 seconds
  *      (at most 45), bit 8 also completes the opening of channels (au_glink.h), bit 9 with it also asks the APM whether it is
- *      up: APM_CMD_GET_SPF_STATE on adsp_apps, the only data that goes out, every 3 s until it says ready. Returns its summary.
+ *      up: APM_CMD_GET_SPF_STATE on adsp_apps, the only data that goes out, every 3 s until it says ready; bit 10 with both then
+ *      also votes LPASS's macro and dcodec on and off again, a step each 1.5 s. Returns its summary.
  *  IN  0x5a 'AH' (0x4148) wIndex=page: its log, 128 words a page.
  *  OUT 0x5b wValue=chunk[15:0], wIndex[11:0]=chunk[27:16], wIndex bit15 =
  *      image (0 adsp_dtb, 1 adsp), bit14 = restart that image at chunk 0.
@@ -636,7 +637,10 @@ static uint32_t au_glink_run(uint32_t *r, unsigned seconds, uint32_t options)
   if (!(bits & 0xf0000000u) && (bits & 1)) { r[16] = bits; break; }   /* the DSP says it has fallen over */
   if (!au_gl_step(&g)) delay(200);
   if (g.stuck) break;
-  if (!g.gpr_ready && g.ms >= next_ask && au_gl_gpr_ask(&g)) next_ask = g.ms + 3000;
+  if (g.ms >= next_ask) {
+   if (!g.gpr_ready) { if (au_gl_gpr_ask(&g)) next_ask = g.ms + 3000; }
+   else if (au_gl_prm_step(&g)) next_ask = g.ms + 1500;
+  }
  }
  r[18] = g.rx_msgs; r[19] = g.tx_msgs; r[20] = g.tx_full; r[21] = g.stuck; r[22] = g.version_seen; r[23] = g.version_acked;
  r[24] = g.features; r[25] = g.opened; r[26] = g.acked_by_dsp; r[27] = g.log_n; r[28] = g.log_lost; r[29] = g.ms;
@@ -651,6 +655,8 @@ static uint32_t au_glink_run(uint32_t *r, unsigned seconds, uint32_t options)
  r[72] = g.gpr_asked; r[73] = g.gpr_heard; r[74] = g.gpr_other; r[75] = g.gpr_ready; r[76] = g.gpr_asked_ms; r[77] = g.gpr_first_ms; r[78] = g.gpr_last_ms;
  r[79] = g.gpr_lcid | g.gpr_rcid << 16; r[80] = g.gpr_acked | g.gpr_offers << 8; r[81] = g.gpr_riid_n; r[82] = g.gpr_first_bytes; r[83] = g.gpr_last_bytes;
  for (unsigned i = 0; i < AU_GL_GPR_WORDS; i++) { r[84 + i] = g.gpr_first[i]; r[100 + i] = g.gpr_last[i]; }
+ for (unsigned i = 0; i < AU_GL_PRM_STEPS; i++) { r[116 + i] = g.prm_status[i]; r[120 + i] = g.prm_heard_ms[i]; }
+ r[124] = g.prm_sent; r[125] = g.prm_sent_ms[0];
  return g.stuck ? 0x210 + g.stuck : 1;
 }
 /* USB entry: returns bytes placed in out (0 = stall). */
@@ -683,8 +689,9 @@ static uint32_t audio_request(uint16_t value, uint16_t index, uint8_t *out)
    unsigned seconds = index & 0xff;
    au_gl_rep[0] = 0xa0d10003;
    au_gl_rep[2] = seconds = seconds == 0 ? 10 : seconds > 45 ? 45 : seconds;
-   au_gl_rep[3] = (index >> 8) & 3;
-   au_gl_rep[1] = au_glink_run(au_gl_rep, seconds, au_gl_rep[3] == 3 ? AU_GL_ANSWER | AU_GL_GPR : au_gl_rep[3] & 1 ? AU_GL_ANSWER : 0);
+   au_gl_rep[3] = (index >> 8) & 7;
+   au_gl_rep[1] = au_glink_run(au_gl_rep, seconds, au_gl_rep[3] == 7 ? AU_GL_ANSWER | AU_GL_GPR | AU_GL_PRM : au_gl_rep[3] == 3 ? AU_GL_ANSWER | AU_GL_GPR :
+                               au_gl_rep[3] & 1 ? AU_GL_ANSWER : 0);
    au_gl_rep[4] = au_faults;
   }
   memcpy(out, au_gl_rep, sizeof(au_gl_rep)); return sizeof(au_gl_rep);

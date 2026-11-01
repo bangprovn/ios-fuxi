@@ -6,7 +6,7 @@
   upload --dtb F --fw F        stage squashed adsp_dtb/adsp MBNs over control OUT
   boot                         stage 2: PAS-boot the ADSP once, then decode
   report                       re-read the frozen stage-2 report
-  glink [--seconds N] [--answer] [--gpr]  after a boot that reached ready: GLINK with the DSP, polled; no data is sent unless --gpr asks the APM its state
+  glink [--seconds N] [--answer] [--gpr] [--prm]  after a boot that reached ready: GLINK with the DSP, polled; no data is sent unless --gpr asks the APM its state; --prm then votes LPASS on and off
   decode FILE                  decode a saved raw page offline
 Raw pages can be saved with --save. See docs-lanes/audio.md.
 """
@@ -161,6 +161,11 @@ def decode_glink(r):
         for what, bytes_, words in (('first', r[82], r[84:100]), ('last', r[83], r[100:116])):
             if bytes_:
                 out.append(f'  GPR: {what} answer, {bytes_} bytes: ' + decode_gpr(words, bytes_))
+    if r[3] & 4:
+        out.append(f'  PRM: {r[124]} steps sent, the first at {r[125]} ms')
+        for i, what in enumerate(('macro on', 'dcodec on', 'dcodec off', 'macro off')[:r[124]]):
+            status = 'no answer' if r[116 + i] == 0xffffffff else f'status {r[116 + i]:#x}'
+            out.append(f'  PRM: {what}: {status}, heard at {r[120 + i]} ms')
     return out
 
 
@@ -228,7 +233,8 @@ def main():
     ap.add_argument('cmd', choices=['snapshot', 'squash', 'upload', 'boot', 'report', 'decode', 'stop', 'glink'])
     ap.add_argument('--seconds', type=int, default=30, help='glink: how long to listen, at most 45')
     ap.add_argument('--answer', action='store_true', help='glink: complete the opening of channels; still sends no data')
-    ap.add_argument('--gpr', action='store_true', help='glink: with --answer, ask the APM on adsp_apps whether it is up, the one data packet')
+    ap.add_argument('--gpr', action='store_true', help='glink: with --answer, ask the APM on adsp_apps whether it is up')
+    ap.add_argument('--prm', action='store_true', help='glink: with --gpr, once ready, vote the macro and dcodec on then off')
     ap.add_argument('--outbound', action='store_true', help='boot: create the AP outbound SMP2P item 429 first')
     ap.add_argument('--doorbell', action='store_true', help='boot: with --outbound, also ring LPASS SMP2P')
     ap.add_argument('--wait', type=int, default=0, help='boot: seconds to wait for ready, at most 45')
@@ -310,9 +316,9 @@ def main():
     elif a.cmd == 'glink':
         if not 1 <= a.seconds <= 45:
             ap.error('--seconds is 1 to 45')
-        if a.gpr and not a.answer:
-            ap.error('--gpr needs --answer')
-        page = req(0x4147, a.seconds | int(a.answer) << 8 | int(a.gpr) << 9)
+        if (a.gpr and not a.answer) or (a.prm and not a.gpr):
+            ap.error('--prm needs --gpr, and --gpr needs --answer')
+        page = req(0x4147, a.seconds | int(a.answer) << 8 | int(a.gpr) << 9 | int(a.prm) << 10)
         r = struct.unpack('<128I', page)
         if r[0] != 0xa0d10003:
             raise SystemExit(f'no glink report: {r[0]:#x}')

@@ -2,7 +2,8 @@
  * tools/test-fuxi-audio-glink.py runs it against a fake DSP under the sanitizers; audio.c gives it the SMEM accessors.
  * The wire format follows Linux qcom_glink_native.c and qcom_glink_smem.c. It negotiates the version, answers CLOSE and an
  * intent request, and with AU_GL_ANSWER also completes the opening of a channel. Only with AU_GL_GPR does any data leave, and
- * then one fixed packet alone: APM_CMD_GET_SPF_STATE on adsp_apps, by au_gl_gpr_ask(), which reads a state and sets up nothing.
+ * then APM_CMD_GET_SPF_STATE alone on adsp_apps, by au_gl_gpr_ask(), which reads a state and sets up nothing. With AU_GL_PRM,
+ * once that says ready, au_gl_prm_step() also votes LPASS's macro and dcodec on and off again: no graph, no amplifier, no register.
  * Define AU_GL_RD, AU_GL_WR, AU_GL_WMB and AU_GL_KICK.
  */
 #ifndef AU_GLINK_H
@@ -27,6 +28,15 @@ enum { AU_GL_VERSION = 0, AU_GL_VERSION_ACK = 1, AU_GL_OPEN = 2, AU_GL_CLOSE = 3
 #define AU_GL_GPR_OFFERS 16u
 #define AU_GL_OP_GET_SPF_STATE 0x01001021u
 #define AU_GL_OP_SPF_STATE 0x02001007u  /* payload {status}: 1 ready */
+#define AU_GL_PRM 4u           /* options: with AU_GL_GPR, once ready, the votes of au_gl_prm_step() */
+#define AU_GL_PRM_STEPS 4u     /* macro on, dcodec on, dcodec off, macro off */
+#define AU_GL_PRM_NO_ANSWER 0xffffffffu
+#define AU_GL_OP_PRM_REQUEST 0x0100100Fu
+#define AU_GL_OP_PRM_RELEASE 0x01001010u
+#define AU_GL_OP_BASIC_RESULT 0x02001005u  /* payload {opcode, status} */
+#define AU_GL_OP_PRM_REQUEST_DONE 0x02001002u
+#define AU_GL_OP_PRM_RELEASE_DONE 0x02001003u
+#define AU_GL_PRM_TOKEN 0x100u
 
 struct au_gl {
 	uint64_t desc, tx_fifo, rx_fifo;
@@ -38,6 +48,7 @@ struct au_gl {
 	uint32_t gpr_lcid, gpr_rcid, gpr_acked, gpr_offers, gpr_asked, gpr_heard, gpr_other, gpr_ready;
 	uint32_t gpr_asked_ms, gpr_first_ms, gpr_last_ms, gpr_first_bytes, gpr_last_bytes, gpr_riid_n;
 	uint32_t gpr_riid[AU_GL_GPR_INTENTS], gpr_first[AU_GL_GPR_WORDS], gpr_last[AU_GL_GPR_WORDS];
+	uint32_t prm_sent, prm_status[AU_GL_PRM_STEPS], prm_opcode[AU_GL_PRM_STEPS], prm_sent_ms[AU_GL_PRM_STEPS], prm_heard_ms[AU_GL_PRM_STEPS];
 };
 
 static inline uint32_t au_gl_align8(uint32_t n) { return (n + 7u) & ~7u; }
@@ -120,6 +131,35 @@ static inline bool au_gl_gpr_ask(struct au_gl *g)
 	return true;
 }
 
+/*
+ * The next vote, as Linux q6prm_vote_lpass_core_hw(): PRM_CMD_REQUEST_HW_RSC or _RELEASE_HW_RSC of PARAM_ID_RSC_HW_CORE, blocks 1 the macro
+ * and 2 the dcodec. They go on then come off in the opposite order, whatever each one answers, so nothing stays voted. xnu/fuxi-audio's
+ * fuxi_ar_prm_vote() is held to these bytes by tools/test-fuxi-audio-glink.py. True when it went.
+ */
+static inline bool au_gl_prm_step(struct au_gl *g)
+{
+	static const uint8_t block[AU_GL_PRM_STEPS] = {1, 2, 2, 1};
+	uint32_t step = g->prm_sent, m[18];
+
+	if ((g->options & AU_GL_PRM) == 0 || !g->gpr_ready || g->gpr_riid_n == 0 || step >= AU_GL_PRM_STEPS) return false;
+	m[0] = 60; m[1] = 0;                            /* chunk size, left size */
+	m[2] = 0u | 6u << 4 | 60u << 8;
+	m[3] = 2u | 3u << 8;
+	m[4] = 2; m[5] = 2;                             /* the PRM's port both ways, as Linux q6prm */
+	m[6] = AU_GL_PRM_TOKEN + step;
+	m[7] = step < 2u ? AU_GL_OP_PRM_REQUEST : AU_GL_OP_PRM_RELEASE;
+	m[8] = 0; m[9] = 0; m[10] = 0; m[11] = 20;      /* no shared memory: the 20 bytes come here */
+	m[12] = 2; m[13] = 0x08001032u; m[14] = 4; m[15] = 0;  /* the PRM's parameter, 4 bytes */
+	m[16] = block[step];
+	m[17] = 0;                                      /* the ring's padding, au_gl_tx() goes to 8 bytes */
+	if (!au_gl_tx(g, AU_GL_TX_DATA, g->gpr_lcid, g->gpr_riid[g->gpr_riid_n - 1u], m, 68)) return false;
+	g->gpr_riid_n--;
+	g->prm_status[step] = AU_GL_PRM_NO_ANSWER;
+	g->prm_sent_ms[step] = g->ms;
+	g->prm_sent = step + 1u;
+	return true;
+}
+
 /* An answer on adsp_apps, while it is still in the ring. `tail` is at its header, so its bytes begin 16 past. */
 static inline void au_gl_gpr_take(struct au_gl *g, uint32_t tail, uint32_t bytes)
 {
@@ -129,6 +169,15 @@ static inline void au_gl_gpr_take(struct au_gl *g, uint32_t tail, uint32_t bytes
 	if (g->gpr_heard == 0) { g->gpr_first_ms = g->ms; g->gpr_first_bytes = bytes; }
 	g->gpr_last_ms = g->ms; g->gpr_last_bytes = bytes;
 	if (keep[5] == AU_GL_OP_SPF_STATE && bytes >= 28u && keep[6] == 1u) g->gpr_ready = 1;
+	/* A vote's answer, by its token. As fuxi_ar_parse(): the status is the second word of the payload, or the only one. */
+	if (keep[4] >= AU_GL_PRM_TOKEN && keep[4] - AU_GL_PRM_TOKEN < AU_GL_PRM_STEPS && keep[4] - AU_GL_PRM_TOKEN < g->prm_sent && bytes >= 28u &&
+	    (keep[5] == AU_GL_OP_BASIC_RESULT || keep[5] == AU_GL_OP_PRM_REQUEST_DONE || keep[5] == AU_GL_OP_PRM_RELEASE_DONE)) {
+		uint32_t step = keep[4] - AU_GL_PRM_TOKEN;
+
+		g->prm_status[step] = bytes >= 32u ? keep[7] : keep[6];
+		g->prm_opcode[step] = keep[5];
+		g->prm_heard_ms[step] = g->ms;
+	}
 	g->gpr_heard++;
 }
 
