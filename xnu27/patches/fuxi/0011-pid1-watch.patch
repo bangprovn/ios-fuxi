@@ -63,17 +63,16 @@ index 7669c24..fa8a663 100644
  
  __exported_pop
 diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
-index bac41b9..479d41d 100644
+index bac41b9..3859b95 100644
 --- a/osfmk/kern/task.c
 +++ b/osfmk/kern/task.c
-@@ -10881,3 +10881,53 @@ task_set_ast_synthesize_async_fault_mach_exception(task_t task)
+@@ -10881,3 +10881,52 @@ task_set_ast_synthesize_async_fault_mach_exception(task_t task)
  
  	task_unlock(task);
  }
 +
 +#if defined(FUXI) && defined(__arm64__)
-+#include <kern/thread_kernel_state.h>
-+#include <ptrauth.h>
++#include <ptrauth.h>   /* kern/thread_kernel_state.h comes in through other headers and has no guard */
 +
 +void fuxi_task_report(task_t task, int pid);
 +
