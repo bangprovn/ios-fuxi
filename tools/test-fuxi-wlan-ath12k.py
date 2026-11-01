@@ -160,16 +160,16 @@ int main(void) {
 
     /* fuxiath12k>0 alone is the recipe of design section 5, argument by argument. */
     ath12k_arg=1;wl_fa_configure();assert(wl_fa_stage==1);
-    assert(strstr(logbuf,"fuxiath12k=1, recipe defaults on, running stage 1; stages built are 1, 2, 4, 5, 6 and 7"));
+    assert(strstr(logbuf,"fuxiath12k=1, recipe defaults on, running stage 1; stages built are 1, 2, 4, 5, 6, 7 and 8"));
     ath12k_arg=2;wl_fa_configure();assert(wl_fa_stage==2);
-    assert(strstr(logbuf,"fuxiath12k=2, recipe defaults on, running stage 2; stages built are 1, 2, 4, 5, 6 and 7"));
+    assert(strstr(logbuf,"fuxiath12k=2, recipe defaults on, running stage 2; stages built are 1, 2, 4, 5, 6, 7 and 8"));
     ath12k_arg=4;wl_fa_configure();assert(wl_fa_stage==4);
-    assert(strstr(logbuf,"fuxiath12k=4, recipe defaults on, running stage 4; stages built are 1, 2, 4, 5, 6 and 7"));
+    assert(strstr(logbuf,"fuxiath12k=4, recipe defaults on, running stage 4; stages built are 1, 2, 4, 5, 6, 7 and 8"));
     ath12k_arg=5;wl_fa_configure();assert(wl_fa_stage==5);
-    assert(strstr(logbuf,"fuxiath12k=5, recipe defaults on, running stage 5; stages built are 1, 2, 4, 5, 6 and 7"));
+    assert(strstr(logbuf,"fuxiath12k=5, recipe defaults on, running stage 5; stages built are 1, 2, 4, 5, 6, 7 and 8"));
     /* All RF needs exactly 4 or 5. Anything else not built runs stage 2, and says so. */
     ath12k_arg=3;wl_fa_configure();assert(wl_fa_stage==2);
-    assert(strstr(logbuf,"fuxiath12k=3, recipe defaults on, running stage 2; stages built are 1, 2, 4, 5, 6 and 7"));
+    assert(strstr(logbuf,"fuxiath12k=3, recipe defaults on, running stage 2; stages built are 1, 2, 4, 5, 6, 7 and 8"));
     ath12k_arg=6;wl_fa_configure();assert(wl_fa_stage==6);
     /* Stage 6's network: from the device tree alone, its length said, its key never. */
     {
@@ -185,8 +185,9 @@ int main(void) {
         wl_fa_stage=6;dt_join=NULL;joins_set=0;
     }
     ath12k_arg=7;wl_fa_configure();assert(wl_fa_stage==7);
-    ath12k_arg=8;wl_fa_configure();assert(wl_fa_stage==2);
-    assert(strstr(logbuf,"fuxiath12k=8, recipe defaults on, running stage 2; stages built are 1, 2, 4, 5, 6 and 7"));
+    ath12k_arg=8;wl_fa_configure();assert(wl_fa_stage==8);
+    ath12k_arg=9;wl_fa_configure();assert(wl_fa_stage==2);
+    assert(strstr(logbuf,"fuxiath12k=9, recipe defaults on, running stage 2; stages built are 1, 2, 4, 5, 6, 7 and 8"));
     const struct {const char *name;int v;} numbers[]={{"fuxiwlan",1},{"fuxiwlanclk",1},{"fuxiwlanqrtr",5},
         {"fuxiwlanmlo",0x1c1},{"fuxiwlanp18",6},{"fuxiwlankeep",1}};
     for(unsigned i=0;i<6;i++){assert(wl_fa_recipe_arg(numbers[i].name,&number,sizeof(number)) && number==numbers[i].v);}

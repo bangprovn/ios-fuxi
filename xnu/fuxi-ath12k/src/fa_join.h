@@ -244,6 +244,8 @@ struct fa_target {
 	bool		found;
 	bool		fixed;			/* the join has chosen: only this access point's frames count now */
 	enum fa_protection wanted;		/* FA_OPEN (stage 5), or FA_PROTECT_RSN (stage 6) */
+	bool		only_one;		/* stage 8: only this access point was asked for ... */
+	uint8_t		only[6];		/* ... this one */
 	uint8_t		address[6];		/* BSSID, never said in the log */
 	uint16_t	frequency;		/* MHz, where it was heard at its strongest */
 	uint16_t	capability, interval;
@@ -306,6 +308,9 @@ fa_target_take(struct fa_target *t, const uint8_t *frame, unsigned length, unsig
 			return (FA_TARGET_TAKEN);
 		}
 	} else {
+		if (t->only_one && memcmp(bssid, t->only, 6) != 0) {
+			return (FA_TARGET_ELSEWHERE);
+		}
 		ssid = fa_element(elements, elements_length, FA_EID_SSID);
 		if (ssid == NULL) {
 			/* Only a frame that cannot be read at all: without its name it may still be of this network. */

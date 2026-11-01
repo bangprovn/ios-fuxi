@@ -9,7 +9,8 @@
  * listening, and away again. Stage 6 joins one WPA2 network the same way, with its key from fuxi_wlan.c: between the
  * association and the authorized state comes the four-way handshake, then the two keys. The key itself and what is made
  * from it are never said, and are wiped on the way out. Stage 7 then asks for an address by DHCP, finds the router, sends
- * it and a host beyond it one echo, and gives the address back: all from here, nothing above this layer. What stands in for mac80211 without
+ * it and a host beyond it one echo, and gives the address back: all from here, nothing above this layer. Stage 8 does not
+ * stop: it is the radio for iOS, whose side says what to scan and join and takes the frames. What stands in for mac80211 without
  * doing its work logs its name at runtime through STUB(). The probe request offers legacy rates only.
  *
  * What the scan hears comes here by both of ath12k's routes: linuxkpi_ieee80211_rx() below. wmi.c says
@@ -40,6 +41,7 @@
 #include "fa_join.h"
 #include "fa_wpa.h"
 #include "fa_net.h"
+#include "fa_ios.h"
 
 /* Says the name a few times and keeps going; each caller then gives its own documented answer. */
 #define STUB()	lx_stub(__func__)
@@ -105,7 +107,7 @@ struct fa_radio {
 	unsigned eapol_sent;			/* our messages, and what the data path has finished */
 	unsigned data_done, data_acked;
 	struct ieee80211_key_conf *pairwise_key, *group_key;	/* set for as long as the driver has them */
-	void *key_memory[2];			/* kept until the wiphy goes, wiped: the driver's peer may still name them */
+	void *key_memory[3];			/* kept until used again or the wiphy goes, wiped: the driver's peer may still name them. 0 pairwise, 1 and 2 by turns the group's */
 	unsigned rx_ok, rx_clear;		/* with the keys in: data the radio deciphered, and data it did not */
 	/* the address of stage 7 */
 	volatile bool net_on;			/* the poll thread keeps what fa_net_wanted() wants, once it was deciphered */
@@ -115,7 +117,28 @@ struct fa_radio {
 	uint8_t own_address[4], server[4], server_hardware[6];
 	uint32_t xid;
 	unsigned net_sent;
+	/* stage 8 */
+	bool ios;
+	volatile bool ios_joined;		/* frames pass, under the layer's lock */
+	volatile unsigned ios_pending;		/* what the thread is to do: below */
+	volatile bool ios_gate;			/* one of station thread and ios_step() at a time */
+	volatile unsigned ios_tx_busy;
+	bool ios_dead;
+	int ios_phase, ios_last_answer;
+	struct fa_heard *ios_table;		/* what the last scan heard */
+	unsigned ios_table_count;
+	const uint8_t *ios_scan_name;
+	unsigned ios_scan_name_length;
+	const unsigned short *scan_only;	/* when not NULL, the only frequencies a scan goes to */
+	unsigned scan_only_count;
+	struct fa_heard ios_bss;
+	struct fa_group_pn group_pn;
+	unsigned group_slot;
+	unsigned rx_replay, rx_no_key, rx_long;
+	unsigned long long ios_said;
 };
+
+enum { IOS_EAPOL = 1, IOS_LOSS = 2, IOS_DEAD = 4 };
 
 enum { SCAN_NONE, SCAN_RUNNING, SCAN_OVER, SCAN_ABORTED };
 
@@ -158,6 +181,10 @@ enum { SCAN_NONE, SCAN_RUNNING, SCAN_OVER, SCAN_ABORTED };
 static const uint8_t no_network[ETH_ALEN];
 
 static unsigned char radio_mac[ETH_ALEN];
+
+/* Stage 8: iOS's side, and the radio once it is up. Set before there is a radio, so not in it. */
+static struct fa_ios_input ios_input;
+static struct fa_radio *ios_radio;
 
 /* The name of the network stage 5 joins, from fuxi_wlan.c. It is said by its length alone. */
 static uint8_t target_name[FA_SSID_MOST];
@@ -387,9 +414,14 @@ linuxkpi_wiphy_free(struct wiphy *wiphy)
 	kfree(radio->vif_memory);
 	kfree(radio->key_memory[0]);
 	kfree(radio->key_memory[1]);
+	kfree(radio->key_memory[2]);
+	kfree(radio->ios_table);
 	kfree(radio->sta_memory);
 	if (the_radio == radio) {
 		the_radio = NULL;
+	}
+	if (ios_radio == radio) {
+		ios_radio = NULL;
 	}
 	kfree(radio->memory);
 }
@@ -826,25 +858,79 @@ join_data_count(struct fa_radio *radio, const struct sk_buff *skb, const struct 
 	lx_os_wakeup(&radio->answer);
 }
 
-/* What the join reads of a frame from the air: under the layer's lock, on the poll thread. */
+/*
+ * Stage 8, once frames pass: what iOS gets, in Ethernet form in the frame's own bytes, for the caller to hand over outside
+ * the lock. Design W3: on a protected link nothing that was not deciphered. Design W4: a frame to everybody is checked by its
+ * packet number, which the hardware does not do (dp_rx.c), and needs that number to be there. Under the layer's lock.
+ */
 static void
-join_rx(struct fa_radio *radio, const struct sk_buff *skb, const struct ieee80211_rx_status *status)
+ios_data(struct fa_radio *radio, struct sk_buff *skb, const struct ieee80211_rx_status *status, uint8_t **frame, unsigned *length)
+{
+	struct fa_data data;
+	uint8_t *ethernet;
+
+	radio->link_data++;
+	if (radio->protect && (status->flag & (RX_FLAG_8023 | RX_FLAG_DECRYPTED)) == 0) {
+		radio->rx_clear++;
+		return;
+	}
+	if (!fa_data_read(skb->data, skb->len, (status->flag & RX_FLAG_8023) != 0, (status->flag & RX_FLAG_IV_STRIPPED) != 0, radio->vif->addr,
+	    radio->target.address, &data) || data.type < 0x0600) {
+		radio->link_others++;
+		return;
+	}
+	if (radio->protect && (data.to[0] & 1) != 0 && (status->flag & RX_FLAG_8023) == 0) {
+		enum fa_group_answer answer = data.cipher != NULL ? fa_group_check(&radio->group_pn, data.cipher) : FA_GROUP_NO_KEY;
+
+		if (answer != FA_GROUP_FRESH) {
+			*(answer == FA_GROUP_REPLAY ? &radio->rx_replay : &radio->rx_no_key) += 1;
+			return;
+		}
+	}
+	if (data.length + 14 > FA_NET_MOST + 14) {
+		radio->rx_long++;
+		return;
+	}
+	ethernet = (uint8_t *)(uintptr_t)data.body - 14;
+	memcpy(ethernet, data.to, 6);
+	memcpy(ethernet + 6, data.from, 6);
+	fa_put16(ethernet + 12, data.type);
+	radio->rx_ok++;
+	*frame = ethernet;
+	*length = data.length + 14;
+}
+
+/* What the join reads of a frame from the air: under the layer's lock, on the poll thread. Stage 8 may leave a frame in *frame for iOS. */
+static void
+join_rx(struct fa_radio *radio, struct sk_buff *skb, const struct ieee80211_rx_status *status, uint8_t **frame, unsigned *length)
 {
 	struct fa_reply reply;
 
 	lx_os_lock();
 	if (join_eapol(radio, skb, status)) {
+		if (radio->ios_joined) {
+			radio->ios_pending |= IOS_EAPOL;
+			lx_os_wakeup(&radio->ios_pending);
+		}
 		lx_os_unlock();
 		return;
 	}
 	if ((status->flag & RX_FLAG_8023) != 0) {
-		join_data_count(radio, skb, status);
+		if (radio->ios_joined) {
+			ios_data(radio, skb, status, frame, length);
+		} else {
+			join_data_count(radio, skb, status);
+		}
 		lx_os_unlock();
 		return;
 	}
 	switch (fa_rx_kind(skb->data, skb->len, radio->target.address)) {
 	case FA_RX_DATA:
-		join_data_count(radio, skb, status);
+		if (radio->ios_joined) {
+			ios_data(radio, skb, status, frame, length);
+		} else {
+			join_data_count(radio, skb, status);
+		}
 		break;
 	case FA_RX_BEACON:
 		radio->link_beacons++;
@@ -855,6 +941,10 @@ join_rx(struct fa_radio *radio, const struct sk_buff *skb, const struct ieee8021
 		    FA_TARGET_PROTECTED) {
 			radio->went_protected = true;
 			lx_os_wakeup(&radio->answer);
+			if (radio->ios_joined) {
+				radio->ios_pending |= IOS_LOSS;
+				lx_os_wakeup(&radio->ios_pending);
+			}
 		}
 		break;
 	case FA_RX_MANAGEMENT:
@@ -865,6 +955,10 @@ join_rx(struct fa_radio *radio, const struct sk_buff *skb, const struct ieee8021
 			radio->answer = FA_ANSWER_GONE;
 			radio->reason = reply.code;
 			lx_os_wakeup(&radio->answer);
+			if (radio->ios_joined) {
+				radio->ios_pending |= IOS_LOSS;
+				lx_os_wakeup(&radio->ios_pending);
+			}
 		} else if (reply.kind == radio->answer_kind && radio->answer != FA_ANSWER_GONE) {
 			/* What is not being waited for moves nothing: an answer to an earlier step is not the one asked for. */
 			radio->answer = reply.answer;
@@ -897,7 +991,13 @@ linuxkpi_ieee80211_rx(struct ieee80211_hw *hw, struct sk_buff *skb, struct ieee8
 	const struct ieee80211_rx_status *status = IEEE80211_SKB_RXCB(skb);
 
 	if (radio->joining) {
-		join_rx(radio, skb, status);
+		uint8_t *frame = NULL;
+		unsigned length = 0;
+
+		join_rx(radio, skb, status, &frame, &length);
+		if (frame != NULL) {
+			ios_input.rx(frame, length);
+		}
 		dev_kfree_skb_any(skb);
 		return;
 	}
@@ -921,6 +1021,10 @@ linuxkpi_ieee80211_rx(struct ieee80211_hw *hw, struct sk_buff *skb, struct ieee8
 		int signal = (status->flag & RX_FLAG_NO_SIGNAL_VAL) != 0 ? FA_RSSI_NONE : status->signal;
 
 		(void)fa_bss_take(&radio->heard, skb->data, skb->len, status->freq, signal);
+		if (radio->ios_table != NULL) {
+			(void)fa_heard_take(radio->ios_table, &radio->ios_table_count, skb->data, skb->len, status->freq, signal, lx_os_nanoseconds(),
+			    radio->ios_scan_name, radio->ios_scan_name_length);
+		}
 		if (!radio->say_names && target_name_length != 0) {
 			(void)fa_target_take(&radio->target, skb->data, skb->len, status->freq, signal, target_name, target_name_length);
 		}
@@ -956,6 +1060,10 @@ linuxkpi_ieee80211_connection_loss(struct ieee80211_vif *vif)
 		lx_os_lock();
 		radio->lost = true;
 		lx_os_wakeup(&radio->answer);
+		if (radio->ios_joined) {
+			radio->ios_pending |= IOS_LOSS;
+			lx_os_wakeup(&radio->ios_pending);
+		}
 		lx_os_unlock();
 	}
 	lx_tell("FUXI ATH12K: M5 connection loss from the driver\n");
@@ -1103,7 +1211,12 @@ station_scan(struct fa_radio *radio, bool passive)
 		struct ieee80211_supported_band *has = hw->wiphy->bands[band];
 
 		for (int i = 0; has != NULL && i < has->n_channels; i++) {
-			if ((has->channels[i].flags & IEEE80211_CHAN_DISABLED) == 0) {
+			bool asked = radio->scan_only == NULL;
+
+			for (unsigned k = 0; !asked && k < radio->scan_only_count; k++) {
+				asked = radio->scan_only[k] == has->channels[i].center_freq;
+			}
+			if ((has->channels[i].flags & IEEE80211_CHAN_DISABLED) == 0 && asked) {
 				request->req.channels[request->req.n_channels++] = &has->channels[i];
 				no_ir += (has->channels[i].flags & (IEEE80211_CHAN_NO_IR | IEEE80211_CHAN_RADAR)) != 0;
 			}
@@ -1139,7 +1252,10 @@ station_scan(struct fa_radio *radio, bool passive)
 		radio->scan = SCAN_NONE;
 		radio->collecting = false;
 		lx_os_unlock();
-		fa_m4_evidence("hw_scan failed");
+		/* Stage 8: a scan the driver will not start now is no dead firmware: fa_m4_trouble() has its own ways of knowing that. */
+		if (!radio->ios) {
+			fa_m4_evidence("hw_scan failed");
+		}
 		kfree(request);
 		return (error);
 	}
@@ -1165,7 +1281,9 @@ station_scan(struct fa_radio *radio, bool passive)
 		lx_tell("FUXI ATH12K: M4 scan done channels %d bss %u\n", request->req.n_channels, radio->heard.count);
 	} else {
 		lx_tell("FUXI ATH12K: M4 not proven: channels %d bss %u heard before the end\n", request->req.n_channels, radio->heard.count);
-		fa_m4_evidence(trouble ? "scan given up" : state == SCAN_ABORTED ? "scan aborted by ath12k's timeout" : "scan timeout");
+		if (!radio->ios) {
+			fa_m4_evidence(trouble ? "scan given up" : state == SCAN_ABORTED ? "scan aborted by ath12k's timeout" : "scan timeout");
+		}
 	}
 	say_heard(radio);
 	kfree(request);
@@ -1506,7 +1624,7 @@ build_auth(struct fa_radio *radio, uint8_t *frame, unsigned size)
 
 /* A key for the driver to give the firmware: CCMP, for frames between us and the access point or for the group's. 0, or what it said. */
 static int
-key_give(struct fa_radio *radio, const uint8_t *key, unsigned index, bool pairwise, struct ieee80211_key_conf **given)
+key_give(struct fa_radio *radio, const uint8_t *key, unsigned index, bool pairwise, unsigned slot, struct ieee80211_key_conf **given)
 {
 	struct ieee80211_key_conf *conf = kzalloc(sizeof(*conf) + 16, GFP_KERNEL);
 	int error;
@@ -1515,7 +1633,8 @@ key_give(struct fa_radio *radio, const uint8_t *key, unsigned index, bool pairwi
 	if (conf == NULL) {
 		return (-ENOMEM);
 	}
-	radio->key_memory[pairwise ? 0 : 1] = conf;
+	kfree(radio->key_memory[slot]);
+	radio->key_memory[slot] = conf;
 	conf->cipher = WLAN_CIPHER_SUITE_CCMP;
 	conf->keyidx = (uint8_t)index;
 	conf->keylen = 16;
@@ -1550,9 +1669,9 @@ key_take_back(struct fa_radio *radio, struct ieee80211_key_conf **given, bool pa
 	}
 }
 
-/* Our answer to a message of the handshake: 802.11 data, which the driver takes to the firmware unciphered until there are keys. */
+/* Our answer to a message of the handshake: 802.11 data, which the driver takes to the firmware unciphered until there are keys, and ciphered once there are. */
 static bool
-eapol_send(struct fa_radio *radio, const uint8_t *body, unsigned length)
+eapol_send(struct fa_radio *radio, const uint8_t *body, unsigned length, bool ciphered)
 {
 	bool qos = radio->sta->wme;
 	struct sk_buff *skb;
@@ -1564,6 +1683,10 @@ eapol_send(struct fa_radio *radio, const uint8_t *body, unsigned length)
 		return (false);
 	}
 	(void)fa_eapol_frame(bytes, total, radio->vif->addr, radio->target.address, qos, body, length);
+	if (ciphered) {
+		bytes[1] |= 0x40;
+		IEEE80211_SKB_CB(skb)->control.hw_key = radio->pairwise_key;
+	}
 	skb->protocol = cpu_to_be16(0x888e);
 	skb->priority = FA_TID_CONTROL;
 	radio->eapol_sent++;
@@ -1613,7 +1736,7 @@ station_handshake(struct fa_radio *radio)
 		    (lx_os_nanoseconds() - began) / 1000000ull, said == FA_WPA_ANSWER ? "message 1, answered" : said == FA_WPA_KEYS ? "message 3, good, answered" :
 		    said == FA_WPA_GROUP ? "a new group key, left unanswered at this stage" : said == FA_WPA_BAD ? "not good: " : "not one to answer", why);
 		if (said == FA_WPA_ANSWER || said == FA_WPA_KEYS) {
-			if (!eapol_send(radio, reply, reply_length)) {
+			if (!eapol_send(radio, reply, reply_length, false)) {
 				break;
 			}
 		}
@@ -1648,9 +1771,10 @@ station_keys(struct fa_radio *radio)
 		lx_os_unlock();
 	}
 	lx_tell("FUXI ATH12K: M6 message 4 after %llu ms: data done %u acked %u\n", (lx_os_nanoseconds() - began) / 1000000ull, radio->data_done, radio->data_acked);
-	error = key_give(radio, radio->wpa.pairwise, 0, true, &radio->pairwise_key);
+	error = key_give(radio, radio->wpa.pairwise, 0, true, 0, &radio->pairwise_key);
 	if (error == 0) {
-		error = key_give(radio, radio->wpa.group, radio->wpa.group_index, false, &radio->group_key);
+		error = key_give(radio, radio->wpa.group, radio->wpa.group_index, false, 1, &radio->group_key);
+		radio->group_slot = 1;
 	}
 	lx_tell("FUXI ATH12K: M6 keys to the driver: %d, group number %u\n", error, radio->wpa.group_index);
 	return (error);
@@ -1813,7 +1937,12 @@ station_join(struct fa_radio *radio, bool *joined)
 		return (0);
 	}
 	radio->chanctx = kzalloc(64 + sizeof(*radio->chanctx) + hw->chanctx_data_size, GFP_KERNEL);
-	radio->sta_memory = kzalloc(64 + sizeof(*radio->sta) + hw->sta_data_size, GFP_KERNEL);
+	/* Used again by a later join of stage 8: the driver's station is gone by then, and its data path's may still name this. */
+	if (radio->sta_memory != NULL) {
+		memset(radio->sta_memory, 0, 64 + sizeof(*radio->sta) + hw->sta_data_size);
+	} else {
+		radio->sta_memory = kzalloc(64 + sizeof(*radio->sta) + hw->sta_data_size, GFP_KERNEL);
+	}
 	if (radio->chanctx == NULL || radio->sta_memory == NULL) {
 		lx_tell("FUXI ATH12K: M5 no memory for the join\n");
 		kfree(radio->chanctx);
@@ -2020,7 +2149,11 @@ net_send(struct fa_radio *radio, const uint8_t *to, unsigned type, const uint8_t
 		return (false);
 	}
 	(void)fa_data_frame(bytes, total, radio->vif->addr, radio->target.address, to, qos, type, body, length);
-	IEEE80211_SKB_CB(skb)->control.hw_key = radio->pairwise_key;
+	if (radio->protect) {
+		IEEE80211_SKB_CB(skb)->control.hw_key = radio->pairwise_key;
+	} else {
+		bytes[1] &= (uint8_t)~0x40;
+	}
 	skb->protocol = cpu_to_be16(type);
 	skb->priority = 0;
 	radio->net_sent++;
@@ -2330,6 +2463,567 @@ fa_m5_station(struct ieee80211_hw *hw, bool passive)
 		return (error != 0 ? error : -EIO);
 	}
 	return (error);
+}
+
+/* ---- stage 8: the radio for iOS ---------------------------------------------------------------------------- */
+
+#define FA_IOS_READY_NS		(60 * 1000000000ull)
+#define FA_IOS_LOOK_NS		(100 * 1000000ull)
+#define FA_IOS_TX_DONE_NS	(1000 * 1000000ull)
+#define FA_IOS_SAY_EVERY_NS	(60 * 1000000000ull)
+
+void
+fa_ios_start(const struct fa_ios_input *input)
+{
+	ios_input = *input;
+}
+
+/* One of the station thread and ios_step() at a time: a loss must not meet a join halfway. Each holds it for a bounded time. */
+static void
+ios_gate_in(struct fa_radio *radio)
+{
+	lx_os_lock();
+	while (radio->ios_gate) {
+		lx_os_sleep(&radio->ios_gate, FA_IOS_LOOK_NS);
+	}
+	radio->ios_gate = true;
+	lx_os_unlock();
+}
+
+static void
+ios_gate_out(struct fa_radio *radio)
+{
+	lx_os_lock();
+	radio->ios_gate = false;
+	lx_os_wakeup(&radio->ios_gate);
+	lx_os_unlock();
+}
+
+/* The radio, waiting for it to come up: its firmware needs the root, and iOS asks as soon as there is a wifid. NULL when it did not come. */
+static struct fa_radio *
+ios_wait(void)
+{
+	unsigned long long began = lx_os_nanoseconds();
+	struct fa_radio *radio;
+
+	lx_os_lock();
+	while ((radio = ios_radio) == NULL && lx_os_nanoseconds() - began < FA_IOS_READY_NS) {
+		lx_os_sleep(&ios_radio, FA_IOS_LOOK_NS);
+	}
+	lx_os_unlock();
+	return (radio);
+}
+
+static void
+ios_phase(struct fa_radio *radio, int phase, int answer)
+{
+	lx_os_lock();
+	radio->ios_phase = phase;
+	radio->ios_last_answer = answer;
+	lx_os_unlock();
+}
+
+/* From here frames do not pass: said to iOS's side, and whoever is sending finished, before the driver's station goes. */
+static void
+ios_frames_stop(struct fa_radio *radio)
+{
+	unsigned long long began = lx_os_nanoseconds();
+	bool was;
+
+	lx_os_lock();
+	was = radio->ios_joined;
+	radio->ios_joined = false;		/* design W9: before anything is taken away */
+	while (radio->ios_tx_busy != 0 && lx_os_nanoseconds() - began < FA_IOS_TX_DONE_NS) {
+		lx_os_sleep(&radio->ios_tx_busy, FA_NET_LOOK_NS);
+	}
+	lx_os_unlock();
+	if (was) {
+		ios_input.link(0);
+	}
+}
+
+/* What a join has made, gone, and nothing of the key left. Ready for the next one. */
+static void
+ios_clean(struct fa_radio *radio)
+{
+	if (radio->chanctx != NULL) {
+		station_leave(radio);
+	}
+	lx_os_lock();
+	radio->eapol_length = 0;
+	radio->ios_pending &= IOS_DEAD;
+	memset(&radio->group_pn, 0, sizeof(radio->group_pn));
+	lx_os_unlock();
+	fa_wipe(&radio->wpa, sizeof(radio->wpa));
+	fa_wipe(radio->eapol, sizeof(radio->eapol));
+	fa_wipe(target_key, sizeof(target_key));
+	target_name_length = 0;
+	target_protected = false;
+}
+
+/* The firmware is gone, and with it everything this stage could do: iOS hears it once, the dump follows, then only the host is touched. */
+static void
+ios_dies(struct fa_radio *radio)
+{
+	lx_tell("FUXI ATH12K: M8 the firmware is gone\n");
+	radio->ios_dead = true;
+	ios_frames_stop(radio);
+	ios_phase(radio, FA_IOS_OFF, FA_IOS_RADIO_DEAD);
+	ios_input.lost(FA_IOS_RADIO_DEAD);
+	fa_m4_firmware_dead();
+	ios_clean(radio);
+}
+
+/* A message after the handshake. Only a new group key is taken: a new four-way is refused (W1), and the access point's going follows as loss. */
+static void
+ios_eapol(struct fa_radio *radio)
+{
+	static uint8_t message[FA_EAPOL_MOST];
+	uint8_t reply[FA_WPA_REPLY_MOST];
+	unsigned length, reply_length = 0, index;
+	const char *why = "";
+	struct ieee80211_key_conf *old, *fresh = NULL;
+	int said, error;
+
+	lx_os_lock();
+	length = radio->eapol_length;
+	if (length != 0) {
+		memcpy(message, radio->eapol, length);
+		radio->eapol_length = 0;
+	}
+	lx_os_unlock();
+	if (length == 0) {
+		return;
+	}
+	said = fa_wpa_message(&radio->wpa, message, length, reply, &reply_length, &why);
+	fa_wipe(message, sizeof(message));
+	if (said != FA_WPA_GROUP) {
+		lx_tell("FUXI ATH12K: M8 handshake message after the keys, %u bytes: %s%s\n", length, said == FA_WPA_BAD ? "not good: " : "not one to answer", why);
+		fa_wipe(reply, sizeof(reply));
+		return;
+	}
+	(void)eapol_send(radio, reply, reply_length, true);
+	fa_wipe(reply, sizeof(reply));
+	index = radio->wpa.group_index;
+	old = radio->group_key;
+	/* Design W10: the old key stays until the new one is in. A key kept under the same number is replaced by giving it. */
+	error = key_give(radio, radio->wpa.group, index, false, radio->group_slot == 1 ? 2 : 1, &fresh);
+	lx_tell("FUXI ATH12K: M8 new group key, number %u: %d\n", index, error);
+	if (error != 0) {
+		return;
+	}
+	radio->group_slot = radio->group_slot == 1 ? 2 : 1;
+	lx_os_lock();
+	radio->group_pn.last[index] = fa_rsc_read(radio->wpa.group_counter);
+	radio->group_pn.known[index] = true;
+	if (old != NULL && old->keyidx != index) {
+		radio->group_pn.known[old->keyidx] = false;
+	}
+	radio->group_key = fresh;
+	lx_os_unlock();
+	if (old != NULL) {
+		if (old->keyidx != index) {
+			key_take_back(radio, &old, false);
+		} else {
+			fa_wipe(old->key, 16);
+		}
+	}
+}
+
+/* What the thread does each time it wakes. Apart from the thread itself so that the host test can run it. */
+static void
+ios_step(struct fa_radio *radio)
+{
+	unsigned pending;
+
+	ios_gate_in(radio);
+	lx_os_lock();
+	pending = radio->ios_pending;
+	radio->ios_pending = 0;
+	lx_os_unlock();
+	if ((pending & IOS_DEAD) != 0 && !radio->ios_dead) {
+		ios_dies(radio);
+	} else if ((pending & IOS_LOSS) != 0 && radio->ios_joined) {
+		int answer = FA_IOS_GONE;
+
+		lx_tell("FUXI ATH12K: M8 the network is lost: door %d, reason %u, connection %d, changed %d\n", radio->answer == FA_ANSWER_GONE, radio->reason, radio->lost, radio->went_protected);
+		ios_frames_stop(radio);
+		ios_phase(radio, FA_IOS_IDLE, answer);
+		ios_input.lost(answer);
+		ios_clean(radio);
+	} else if ((pending & IOS_EAPOL) != 0 && radio->ios_joined) {
+		ios_eapol(radio);
+	}
+	if (radio->ios_joined && lx_os_nanoseconds() - radio->ios_said >= FA_IOS_SAY_EVERY_NS) {
+		radio->ios_said = lx_os_nanoseconds();
+		lx_tell("FUXI ATH12K: M8 joined: rx ok %u dropped unprotected %u, played again %u, no key %u, too long %u; sent %u, done %u acked %u dropped %u; beacons %u losses %u\n",
+		    radio->rx_ok, radio->rx_clear, radio->rx_replay, radio->rx_no_key, radio->rx_long, radio->net_sent, radio->data_done, radio->data_acked, radio->tx_dropped,
+		    radio->link_beacons, radio->beacon_losses);
+		fa_m5_rx_ring("while joined");
+	}
+	ios_gate_out(radio);
+}
+
+static void
+ios_runs(void *argument)
+{
+	struct fa_radio *radio = argument;
+
+	for (;;) {
+		lx_os_lock();
+		if (radio->ios_pending == 0) {
+			lx_os_sleep(&radio->ios_pending, 10 * FA_IOS_LOOK_NS);
+		}
+		lx_os_unlock();
+		ios_step(radio);
+	}
+}
+
+/* From the poll thread, which may not wait for the firmware's dump: it notes it. */
+void
+fa_m8_firmware_gone(void)
+{
+	struct fa_radio *radio = ios_radio;
+
+	if (radio != NULL && !radio->ios_dead) {
+		lx_os_lock();
+		radio->ios_pending |= IOS_DEAD;
+		lx_os_wakeup(&radio->ios_pending);
+		lx_os_unlock();
+	}
+}
+
+/*
+ * Stage 8, from fa_firmware_ready() when core.c is through: the radio started and the interface on it, and from here it
+ * stays. Not inside fa_stage_up() as the others are: that one runs with core.c's hardware group locked. 0, or -errno, and then
+ * the firmware's account follows as for any failed hand-off.
+ */
+int
+fa_m8_up(struct ieee80211_hw *hw)
+{
+	struct fa_radio *radio = radio_of(hw);
+	unsigned regd_before = radio->regd_applied;
+	int error;
+
+	radio->ios = true;
+	radio->ios_phase = FA_IOS_IDLE;
+	radio->ios_table = kzalloc(FA_HEARD_MOST * sizeof(*radio->ios_table), GFP_KERNEL);
+	if (radio->ios_table == NULL) {
+		return (-ENOMEM);
+	}
+	error = station_up(radio);
+	if (error != 0) {
+		lx_tell("FUXI ATH12K: M8 not proven: bring-up %d\n", error);
+		fa_m4_evidence("bring-up failed");
+		return (error);
+	}
+	regd_wait(radio, regd_before);
+	if (fa_m4_trouble()) {
+		return (-EIO);
+	}
+	error = lx_os_thread("fa-ios", ios_runs, radio);
+	if (error != 0) {
+		lx_tell("FUXI ATH12K: M8 no thread: %d\n", error);
+		return (-ENOMEM);
+	}
+	lx_os_lock();
+	ios_radio = radio;
+	lx_os_wakeup(&ios_radio);
+	lx_os_unlock();
+	lx_tell("FUXI ATH12K: M8 radio up\n");
+	return (0);
+}
+
+int
+fa_ios_power(int on)
+{
+	struct fa_radio *radio = ios_wait();
+
+	if (radio == NULL) {
+		lx_tell("FUXI ATH12K: M8 power %d: the radio is not up\n", on);
+		return (FA_IOS_NO_ANSWER);
+	}
+	ios_gate_in(radio);
+	if (!on) {
+		ios_frames_stop(radio);
+		ios_clean(radio);
+	}
+	if (!radio->ios_dead) {
+		ios_phase(radio, on ? FA_IOS_IDLE : FA_IOS_OFF, FA_IOS_DONE);
+	}
+	lx_tell("FUXI ATH12K: M8 power %d, firmware %s\n", on, radio->ios_dead ? "gone" : "up");
+	ios_gate_out(radio);
+	return (radio->ios_dead ? FA_IOS_RADIO_DEAD : FA_IOS_DONE);
+}
+
+/*
+ * A scan for iOS. While joined nothing goes on the air: what the last scan heard is what there is. mac80211 would leave the
+ * channel, and that has not been tried on this firmware: a list a little old costs less than a link dropped by a scan.
+ */
+int
+fa_ios_scan(const unsigned char *ssid, unsigned ssid_length, const unsigned short *frequencies, unsigned frequency_count, int passive)
+{
+	struct fa_radio *radio = ios_wait();
+	int error, answer = FA_IOS_DONE;
+
+	if (radio == NULL) {
+		return (FA_IOS_NO_ANSWER);
+	}
+	ios_gate_in(radio);
+	if (radio->ios_dead || fa_m4_trouble()) {
+		ios_gate_out(radio);
+		return (FA_IOS_RADIO_DEAD);
+	}
+	if (radio->ios_joined) {
+		lx_tell("FUXI ATH12K: M8 scan while joined: none, %u kept\n", radio->ios_table_count);
+		ios_gate_out(radio);
+		return (FA_IOS_DONE);
+	}
+	ios_phase(radio, FA_IOS_SCANNING, FA_IOS_DONE);
+	memset(&radio->heard, 0, sizeof(radio->heard));
+	lx_os_lock();
+	radio->ios_table_count = 0;
+	radio->ios_scan_name = ssid;
+	radio->ios_scan_name_length = ssid_length > FA_SSID_MOST ? 0 : ssid_length;
+	lx_os_unlock();
+	target_name_length = 0;
+	radio->asked.ssid_len = (uint8_t)radio->ios_scan_name_length;
+	if (radio->ios_scan_name_length != 0) {
+		memcpy(radio->asked.ssid, ssid, radio->ios_scan_name_length);
+	}
+	radio->scan_only = frequency_count != 0 ? frequencies : NULL;
+	radio->scan_only_count = frequency_count;
+	error = station_scan(radio, passive != 0);
+	if (radio->scan == SCAN_RUNNING) {
+		wiphy_lock(radio->wiphy);
+		radio->ops->cancel_hw_scan(&radio->hw, radio->vif);
+		wiphy_unlock(radio->wiphy);
+		radio->scan = SCAN_NONE;
+	}
+	radio->scan_only = NULL;
+	lx_os_lock();
+	radio->ios_scan_name = NULL;
+	radio->ios_scan_name_length = 0;
+	lx_os_unlock();
+	if (error != 0 && error != -EINVAL) {	/* (asked only for channels out of the domain: an empty list) */
+		answer = fa_m4_trouble() ? FA_IOS_RADIO_DEAD : FA_IOS_NO_ANSWER;
+	}
+	lx_tell("FUXI ATH12K: M8 scan: %d, %u networks\n", error, radio->ios_table_count);
+	ios_phase(radio, FA_IOS_IDLE, FA_IOS_DONE);
+	ios_gate_out(radio);
+	return (answer);
+}
+
+void
+fa_ios_heard(void (*each)(const struct fa_heard *, void *), void *context)
+{
+	struct fa_radio *radio = ios_radio;
+	unsigned long long now = lx_os_nanoseconds();
+
+	for (unsigned i = 0; radio != NULL && i < radio->ios_table_count; i++) {
+		struct fa_heard *one = &radio->ios_table[i];
+
+		one->age_ms = (unsigned)((now - one->heard_at) / 1000000ull);
+		each(one, context);
+	}
+}
+
+/* What a join that did not come to anything amounted to, for wifid. */
+static int
+ios_why(struct fa_radio *radio)
+{
+	if (radio->protect && radio->reached >= IEEE80211_STA_ASSOC) {
+		return (radio->eapol_heard != 0 || radio->answer == FA_ANSWER_GONE ? FA_IOS_NO_AUTH : FA_IOS_NO_ANSWER);
+	}
+	if (radio->answer == FA_ANSWER_NONE) {
+		return (radio->chanctx != NULL ? FA_IOS_NO_ANSWER : FA_IOS_NOT_BUILT);
+	}
+	return (FA_IOS_REFUSED);
+}
+
+int
+fa_ios_join(const unsigned char *ssid, unsigned ssid_length, const unsigned char *bssid, const unsigned char *key)
+{
+	struct fa_radio *radio = ios_wait();
+	struct fa_target *target;
+	bool joined = false;
+	int error = 0, answer = FA_IOS_DONE;
+
+	if (radio == NULL) {
+		return (FA_IOS_NO_ANSWER);
+	}
+	ios_gate_in(radio);
+	if (radio->ios_dead || fa_m4_trouble()) {
+		ios_gate_out(radio);
+		return (FA_IOS_RADIO_DEAD);
+	}
+	ios_frames_stop(radio);
+	ios_clean(radio);
+	ios_phase(radio, FA_IOS_JOINING, FA_IOS_DONE);
+	target = &radio->target;
+	lx_os_lock();
+	memset(target, 0, sizeof(*target));
+	target->wanted = key != NULL ? FA_PROTECT_RSN : FA_OPEN;
+	if (bssid != NULL) {
+		target->only_one = true;
+		memcpy(target->only, bssid, sizeof(target->only));
+	}
+	radio->protect = key != NULL;
+	radio->answer = FA_ANSWER_NONE;
+	radio->answer_code = radio->reason = 0;
+	radio->lost = radio->went_protected = false;
+	radio->eapol_length = radio->eapol_heard = radio->eapol_lost = 0;
+	radio->eapol_sent = radio->data_done = radio->data_acked = 0;
+	radio->rx_ok = radio->rx_clear = radio->rx_replay = radio->rx_no_key = radio->rx_long = radio->net_sent = 0;
+	radio->link_data = radio->link_beacons = radio->link_others = 0;
+	radio->beacon_losses = 0;
+	lx_os_unlock();
+	memset(&radio->heard, 0, sizeof(radio->heard));
+	fa_set_target_ssid(ssid, ssid_length);
+	if (target_name_length == 0) {
+		ios_phase(radio, FA_IOS_IDLE, FA_IOS_NOT_HEARD);
+		ios_gate_out(radio);
+		return (FA_IOS_NOT_HEARD);
+	}
+	target_protected = key != NULL;
+	if (key != NULL) {
+		memcpy(target_key, key, sizeof(target_key));
+	}
+	lx_tell("FUXI ATH12K: M8 join: name of %u bytes, %s, %s access point\n", target_name_length, key != NULL ? "a key" : "open", bssid != NULL ? "one" : "any");
+	radio->asked.ssid_len = (uint8_t)target_name_length;
+	memcpy(radio->asked.ssid, target_name, target_name_length);
+	error = join_find(radio, false);
+	if (radio->scan == SCAN_RUNNING) {
+		wiphy_lock(radio->wiphy);
+		radio->ops->cancel_hw_scan(&radio->hw, radio->vif);
+		wiphy_unlock(radio->wiphy);
+		radio->scan = SCAN_NONE;
+	}
+	if (fa_m4_trouble()) {
+		answer = FA_IOS_RADIO_DEAD;
+	} else if (target->protected_frames != 0) {
+		lx_tell("FUXI ATH12K: M8 refused: the target has %s (%u frames)\n", fa_protection_name(target->why), target->protected_frames);
+		answer = FA_IOS_NOT_BUILT;
+	} else if (!target->found) {
+		lx_tell("FUXI ATH12K: M8 not heard in %u scans: %d\n", FA_JOIN_SCANS, error);
+		answer = FA_IOS_NOT_HEARD;
+	} else if (key != NULL && !handshake_prepare(radio)) {
+		answer = FA_IOS_NOT_BUILT;
+	}
+	fa_wipe(target_key, sizeof(target_key));
+	if (answer == FA_IOS_DONE) {
+		error = station_join(radio, &joined);
+		if (fa_m4_trouble() || error != 0) {
+			answer = FA_IOS_RADIO_DEAD;
+		} else if (!joined) {
+			answer = ios_why(radio);
+		}
+	}
+	if (answer != FA_IOS_DONE) {
+		lx_tell("FUXI ATH12K: M8 join over: answer %d\n", answer);
+		if (answer == FA_IOS_RADIO_DEAD) {
+			ios_dies(radio);
+		} else {
+			ios_clean(radio);
+			ios_phase(radio, FA_IOS_IDLE, answer);
+		}
+		ios_gate_out(radio);
+		return (answer);
+	}
+	lx_os_lock();
+	memset(&radio->ios_bss, 0, sizeof(radio->ios_bss));
+	memcpy(radio->ios_bss.bssid, target->address, sizeof(radio->ios_bss.bssid));
+	memcpy(radio->ios_bss.ssid, target_name, target_name_length);
+	radio->ios_bss.ssid_length = (unsigned char)target_name_length;
+	radio->ios_bss.frequency = target->frequency;
+	radio->ios_bss.interval = target->interval;
+	radio->ios_bss.capability = target->capability;
+	radio->ios_bss.elements_length = (unsigned short)(target->elements_length < sizeof(radio->ios_bss.elements) ? target->elements_length : sizeof(radio->ios_bss.elements));
+	memcpy(radio->ios_bss.elements, target->elements, radio->ios_bss.elements_length);
+	memset(&radio->group_pn, 0, sizeof(radio->group_pn));
+	if (radio->protect) {
+		radio->group_pn.last[radio->wpa.group_index] = fa_rsc_read(radio->wpa.group_counter);
+		radio->group_pn.known[radio->wpa.group_index] = true;
+	}
+	radio->ios_phase = FA_IOS_JOINED;
+	radio->ios_last_answer = FA_IOS_DONE;
+	radio->ios_joined = true;		/* the keys are in: station_keys() said so */
+	radio->ios_said = lx_os_nanoseconds();
+	lx_os_unlock();
+	lx_tell("FUXI ATH12K: M8 joined %u MHz at %d dBm\n", target->frequency, target->rssi);
+	ios_gate_out(radio);
+	ios_input.link(1);
+	return (FA_IOS_DONE);
+}
+
+int
+fa_ios_leave(void)
+{
+	struct fa_radio *radio = ios_radio;
+
+	if (radio == NULL) {
+		return (FA_IOS_DONE);
+	}
+	ios_gate_in(radio);
+	ios_frames_stop(radio);
+	ios_clean(radio);
+	if (!radio->ios_dead) {
+		ios_phase(radio, FA_IOS_IDLE, FA_IOS_DONE);
+	}
+	lx_tell("FUXI ATH12K: M8 left when asked\n");
+	ios_gate_out(radio);
+	return (FA_IOS_DONE);
+}
+
+void
+fa_ios_state(struct fa_ios_state *state)
+{
+	struct fa_radio *radio = ios_radio;
+
+	memset(state, 0, sizeof(*state));
+	state->phase = FA_IOS_IDLE;
+	if (radio == NULL) {
+		return;
+	}
+	lx_os_lock();
+	state->phase = radio->ios_phase;
+	state->protect = radio->protect;
+	state->last_answer = radio->ios_last_answer;
+	if (radio->ios_phase == FA_IOS_JOINED) {
+		state->bss = radio->ios_bss;
+		state->bss.rssi = (short)radio->rssi;
+	}
+	lx_os_unlock();
+}
+
+/* An Ethernet frame from iOS. ath12k's own TX does not sleep (mac80211 calls it with bottom halves off). Not its handshake's: those are ours. */
+int
+fa_ios_tx(const unsigned char *frame, unsigned long length)
+{
+	struct fa_radio *radio = ios_radio;
+	unsigned type;
+	bool sent;
+
+	if (radio == NULL || length < 14 || length > 14 + FA_NET_MOST) {
+		return (0);
+	}
+	type = fa_be16(frame + 12);
+	if (type < 0x0600 || type == 0x888e) {
+		return (0);
+	}
+	lx_os_lock();
+	if (!radio->ios_joined || memcmp(frame + 6, radio->vif->addr, ETH_ALEN) != 0) {
+		lx_os_unlock();
+		return (0);
+	}
+	radio->ios_tx_busy++;
+	lx_os_unlock();
+	sent = net_send(radio, frame, type, frame + 14, (unsigned)length - 14);
+	lx_os_lock();
+	radio->ios_tx_busy--;
+	lx_os_wakeup(&radio->ios_tx_busy);
+	lx_os_unlock();
+	return (sent);
 }
 
 /* Design section 2: recovery is not supported at first. The dump is all that follows. */

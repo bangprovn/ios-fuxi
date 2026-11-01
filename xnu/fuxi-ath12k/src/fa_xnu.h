@@ -46,7 +46,53 @@ FA_PUBLIC void	fa_set_radio_mac(const unsigned char *mac);	/* before fa_firmware
 FA_PUBLIC void	fa_set_target_ssid(const unsigned char *name, unsigned length);	/* before it, stage 5: the open network, 1-32 bytes */
 FA_PUBLIC void	fa_set_target_join(const unsigned char *name, unsigned length, const unsigned char *key);	/* before it, stage 6: the network and its 32-byte key */
 
+/* ---- stage 8: the radio for iOS. bsd/dev/fuxi_ath12k_ios.c is the other side. Plain answers: the domains' errno differ. ---- */
+
+enum { FA_IOS_DONE, FA_IOS_NO_AUTH, FA_IOS_NO_ANSWER, FA_IOS_NOT_HEARD, FA_IOS_REFUSED, FA_IOS_NOT_BUILT, FA_IOS_NO_MEMORY, FA_IOS_GONE, FA_IOS_RADIO_DEAD, FA_IOS_FAILED };
+enum { FA_IOS_OFF, FA_IOS_IDLE, FA_IOS_SCANNING, FA_IOS_JOINING, FA_IOS_JOINED };	/* as enum fuxi_wifi_sta_phase */
+
+#define FA_IOS_ELEMENTS_MOST	1024
+
+struct fa_heard {
+	unsigned char	bssid[6];
+	unsigned char	ssid[32];
+	unsigned char	ssid_length;
+	unsigned short	frequency;		/* MHz */
+	short		rssi;			/* dBm */
+	unsigned short	interval, capability;
+	unsigned	age_ms;			/* filled when it is handed over */
+	unsigned long long heard_at;
+	unsigned short	elements_length;
+	unsigned char	elements[FA_IOS_ELEMENTS_MOST];
+};
+
+struct fa_ios_state {
+	int		phase;
+	int		protect;		/* the network joined or being joined asks for a key */
+	int		last_answer;		/* why the last join failed or the network was lost */
+	struct fa_heard	bss;
+};
+
+/* Called on the radio's threads, never under its lock. Frames are the callee's to copy before returning. */
+struct fa_ios_input {
+	void	(*rx)(const unsigned char *frame, unsigned long length);
+	void	(*link)(int up);
+	void	(*lost)(int answer);
+};
+
+FA_PUBLIC void	fa_ios_start(const struct fa_ios_input *input);	/* once, before the radio is up; sends nothing yet */
+/* One thread, one at a time, each bounded. Each waits for the radio, at most a minute, and answers as above. */
+FA_PUBLIC int	fa_ios_power(int on);		/* off leaves the network and keeps the firmware up */
+FA_PUBLIC int	fa_ios_scan(const unsigned char *ssid, unsigned ssid_length, const unsigned short *frequencies, unsigned frequency_count, int passive);
+FA_PUBLIC void	fa_ios_heard(void (*each)(const struct fa_heard *, void *), void *context);
+FA_PUBLIC int	fa_ios_join(const unsigned char *ssid, unsigned ssid_length, const unsigned char *bssid, const unsigned char *key);	/* key NULL: open; bssid NULL: the best heard */
+FA_PUBLIC int	fa_ios_leave(void);
+/* Any thread. */
+FA_PUBLIC void	fa_ios_state(struct fa_ios_state *state);
+FA_PUBLIC int	fa_ios_tx(const unsigned char *frame, unsigned long length);	/* an Ethernet frame: 1 sent to the driver, 0 dropped */
+
 /* fuxi_wlan.c (FUXI_ATH12K) owes these. */
+void	 fuxi_ath12k_station_address(unsigned char *mac);	/* fuxiwifimac, or the default; says nothing */
 void	*fuxi_ath12k_bar(unsigned long *length);	/* BAR0 mapped contiguously for 0x100000 */
 unsigned fuxi_ath12k_read32(unsigned offset);		/* below 0x100000 of BAR0, fault contained */
 void	 fuxi_ath12k_write32(unsigned offset, unsigned value);

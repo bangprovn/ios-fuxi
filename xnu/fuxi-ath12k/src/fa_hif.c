@@ -60,11 +60,13 @@ _Static_assert(ATH12K_MAX_SPT_ENTRIES * 8 == ATH12K_PAGE_SIZE, "fuxi-ath12k R2: 
 #define FA_IDLE_AFTER		100		/* quiet rounds before backing off */
 #define FA_WMI_EVENTS_SAID	64		/* of the first ones: which, and how long */
 
-#define FA_STAGE_SCAN		4		/* stages 4 to 7 are the only ones that touch the radio's RF */
+#define FA_STAGE_SCAN		4		/* stages 4 to 8 are the only ones that touch the radio's RF */
 #define FA_STAGE_JOIN		5
 #define FA_STAGE_WPA		6
 #define FA_STAGE_ADDRESS	7
-#define FA_STAGE_USES_RF(stage)	((stage) == FA_STAGE_SCAN || (stage) == FA_STAGE_JOIN || (stage) == FA_STAGE_WPA || (stage) == FA_STAGE_ADDRESS)
+#define FA_STAGE_IOS		8		/* the one stage that does not stop: fa_firmware_ready() returns with the poll thread running */
+#define FA_STAGE_USES_RF(stage)	((stage) == FA_STAGE_SCAN || (stage) == FA_STAGE_JOIN || (stage) == FA_STAGE_WPA || (stage) == FA_STAGE_ADDRESS || (stage) == FA_STAGE_IOS)
+#define FA_IOS_WATCH_NS		(1000 * 1000000ull)
 
 /* fuxiath12kq=MASK, stages 4 and 5 only, each one idea for hunting a dying firmware (design section 6). */
 #define FA_KNOB_NO_IDLE_PS	0x01u		/* do not ask for idle power save in ops.start */
@@ -92,6 +94,7 @@ static struct {
 	volatile bool dead;			/* fa_stop(): no more register access */
 	unsigned stage;
 	bool stage_hit;
+	volatile bool ios_up;			/* stage 8 has come up: the poll thread looks out for the firmware */
 	int stage_error;			/* what stage 4 came to */
 	unsigned knobs;
 	volatile bool trouble;			/* the firmware is taken as dead */
@@ -164,7 +167,7 @@ static void
 hif_poll(void *argument)
 {
 	struct ath12k_base *ab = argument;
-	unsigned long long serviced = lx_os_nanoseconds();
+	unsigned long long serviced = lx_os_nanoseconds(), watched = serviced;
 	unsigned quiet = 0;
 
 	hif.looks = true;
@@ -187,6 +190,13 @@ hif_poll(void *argument)
 			}
 		}
 		fuxi_ath12k_mhi_service();
+		/* Stage 8 lives for as long as the phone does, and nobody else is there to see the firmware go. */
+		if (hif.ios_up && lx_os_nanoseconds() - watched > FA_IOS_WATCH_NS) {
+			watched = lx_os_nanoseconds();
+			if (fa_m4_trouble()) {
+				fa_m8_firmware_gone();
+			}
+		}
 		if (lx_os_nanoseconds() - serviced > 300000000000ull) {
 			serviced = lx_os_nanoseconds();
 			lx_memory_say();
@@ -586,6 +596,9 @@ fa_stage_up(struct ath12k_base *ab)
 	fa_m4_rx_ring("before the scan");
 	srng = &ab->hal.srng_list[ath12k_ab_to_dp(ab)->rx_refill_buf_ring.refill_buf_ring.ring_id];
 	hif.rx_head_before = srng->u.src_ring.hp / srng->entry_size;
+	if (hif.stage == FA_STAGE_IOS) {
+		return (false);			/* it stays: fa_firmware_ready() brings the interface up when core.c is through */
+	}
 	if (hif.stage == FA_STAGE_ADDRESS) {
 		fa_m7_ask();
 	}
@@ -684,13 +697,15 @@ fa_firmware_ready(const struct fa_caps *caps, unsigned stage)
 	hif.window = ~0u;			/* unknown: fuxi_wlan.c's diagnostics move and restore it too */
 	hif.stage = stage;
 	ath12k_debug_mask |= ATH12K_DBG_HTC;	/* design M1: "Target ready!" is part of the proof */
-	if (stage >= 2) {
+	if (stage >= 2 && stage != FA_STAGE_IOS) {
 		/* All one-time at this stage, no data path: what WMI_INIT and the regulatory domain did. */
 		ath12k_debug_mask |= ATH12K_DBG_WMI | ATH12K_DBG_REG | ATH12K_DBG_BOOT;
 	}
 	if (FA_STAGE_USES_RF(stage)) {
-		/* Vdev and scan steps. ATH12K_DBG_MGMT stays off: it would be a line for each frame heard. */
-		ath12k_debug_mask |= ATH12K_DBG_MAC;
+		/* Vdev and scan steps. ATH12K_DBG_MGMT stays off: it would be a line for each frame heard. Stage 8 lives long and joins real networks: none. */
+		if (stage != FA_STAGE_IOS) {
+			ath12k_debug_mask |= ATH12K_DBG_MAC;
+		}
 		hif.knobs = lx_os_option("fuxiath12kq");
 		lx_tell("FUXI ATH12K: M4 knobs %#x: no idle ps %d no hw mode %d settle %d passive %d%s\n", hif.knobs,
 		    (hif.knobs & FA_KNOB_NO_IDLE_PS) != 0, (hif.knobs & FA_KNOB_NO_HW_MODE) != 0, (hif.knobs & FA_KNOB_SETTLE) != 0,
@@ -761,6 +776,11 @@ fa_firmware_ready(const struct fa_caps *caps, unsigned stage)
 		return (error);
 	}
 	set_bit(ATH12K_FLAG_QMI_FW_READY_COMPLETE, &ab->dev_flags);
+	if (stage == FA_STAGE_IOS) {
+		error = fa_m8_up(ath12k_ar_to_hw(ath12k_ah_to_ar(ath12k_ag_to_ah(ab->ag, 0), 0)));
+		hif.ios_up = error == 0;
+		return (error);
+	}
 	return (0);
 }
 

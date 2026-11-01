@@ -70,7 +70,8 @@ struct fa_data {
 	unsigned	type;
 	const uint8_t	*body;
 	unsigned	length;
-	uint8_t		from[6];
+	uint8_t		from[6], to[6];
+	const uint8_t	*cipher;		/* the cipher's 8 bytes, when they are there */
 };
 
 /*
@@ -85,6 +86,7 @@ fa_data_read(const uint8_t *frame, unsigned length, bool ethernet, bool cipher_h
 	unsigned header = FA_FRAME_HEADER;
 	const uint8_t *to, *from;
 
+	data->cipher = NULL;
 	if (ethernet) {
 		if (length < 14) {
 			return (false);
@@ -102,7 +104,13 @@ fa_data_read(const uint8_t *frame, unsigned length, bool ethernet, bool cipher_h
 		if ((frame[0] & 0x80) != 0) {
 			header += 2 + ((frame[1] & 0x80) != 0 ? FA_FRAME_HT_CONTROL : 0);
 		}
-		header += (frame[1] & 0x40) != 0 && !cipher_header_gone ? 8 : 0;
+		if ((frame[1] & 0x40) != 0 && !cipher_header_gone) {
+			if (length < header + 8) {
+				return (false);
+			}
+			data->cipher = frame + header;
+			header += 8;
+		}
 	}
 	if (((to[0] & 1) == 0 && memcmp(to, own, 6) != 0) || memcmp(from, own, 6) == 0) {
 		return (false);
@@ -121,6 +129,7 @@ fa_data_read(const uint8_t *frame, unsigned length, bool ethernet, bool cipher_h
 	data->body = frame + header;
 	data->length = length - header;
 	memcpy(data->from, from, 6);
+	memcpy(data->to, to, 6);
 	return (true);
 }
 

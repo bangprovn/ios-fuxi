@@ -599,6 +599,7 @@ enum ieee80211_iface_iter { IEEE80211_IFACE_ITER_NORMAL };
 
 FA_80211_DRIVER = r"""
 #include "fa_80211.c"
+int lx_os_thread(const char *name, void (*function)(void *), void *argument) { return 0; }
 int fail_workqueue, queues_destroyed, fail_skb;
 static char said[8192];
 static unsigned locks, notified, notified_initiator, rddm;
@@ -733,6 +734,7 @@ def fa_80211_runs_on_fake_headers(tmp):
 
 STATION_DRIVER = r"""
 #include "fa_80211.c"
+int lx_os_thread(const char *name, void (*function)(void *), void *argument) { return 0; }
 int fail_workqueue, queues_destroyed, fail_skb;
 static char said[65536];
 static unsigned locks, rddm;
@@ -1027,9 +1029,9 @@ JOIN_DRIVER = r"""
 #include <signal.h>
 #include "fa_80211.c"
 int fail_workqueue, queues_destroyed, fail_skb;
-static char said[65536];
+static char said[1048576];
 static unsigned locks, rddm;
-static char calls[1024];
+static char calls[65536];
 static unsigned long long now = 1;
 static int trouble_after = -1;
 static unsigned trouble_asks, evidence_count, r6_count;
@@ -1117,7 +1119,7 @@ static const uint8_t OPEN_HT[] = { 1, 8, 0x82, 0x84, 0x8b, 0x96, 12, 18, 24, 36,
 static const uint8_t WMM_PARAM[] = { 221, 24, 0x00, 0x50, 0xf2, 2, 1, 1, 0, 0, 3, 0xa4, 0, 0, 0x27, 0xa4, 0, 0, 0x42, 0x43, 94, 0, 0x62, 0x32, 47, 0 };
 
 /* ---- the handshake's peer, stage 6 ---- */
-static struct { bool forged_first, any_reply, silent, no_m3, door, die_at_m3, goes_open; int fail_key; bool m1_given, m3_given, forged_given, stayed; } wpa;
+static struct { bool forged_first, any_reply, silent, no_m3, door, die_at_m3, goes_open; int fail_key; bool m1_given, m3_given, forged_given, stayed; const unsigned char *group_reply; unsigned group_reply_length; } wpa;
 static unsigned eapols, key_calls;
 static bool asked_bss, bss_had_rsn, asked_bss_open;
 static uint8_t WPA_HEARD[sizeof((uint8_t[]){ 0 }) * 22 + 128];
@@ -1181,8 +1183,34 @@ static void net_heard(const uint8_t *data, unsigned n, unsigned type) {
     else if (kind == FA_DHCP_REQUEST) { net.requests++; assert(!memcmp(fa_element(b + 240, 60, 50) + 2, V_ME, 4) && !memcmp(fa_element(b + 240, 60, 54) + 2, V_GW, 4)); give_dhcp(net.nak ? FA_DHCP_NAK : FA_DHCP_ACK, all); }
     else { assert(kind == FA_DHCP_RELEASE && !memcmp(data + 12, V_ME, 4) && !memcmp(data + 16, V_GW, 4) && !memcmp(b + 12, V_ME, 4)); net.releases++; }
 }
+/* ---- stage 8: iOS's side, and frames from the network ---- */
+static struct { unsigned rx, rx_length, ups, downs, losts; int lost; uint8_t frame[1600]; } m8;
+static uint8_t m8_sent[1600]; static unsigned m8_sent_length, m8_sent_count; static bool m8_sent_key;
+static void m8_rx(const unsigned char *f, unsigned long n) { assert(!locks && n <= sizeof(m8.frame)); memcpy(m8.frame, f, n); m8.rx_length = n; m8.rx++; }
+static void m8_link(int up) { assert(!locks); if (up) m8.ups++; else m8.downs++; }
+static void m8_lost(int a) { assert(!locks); m8.losts++; m8.lost = a; }
+static const struct fa_ios_input M8_INPUT = { .rx = m8_rx, .link = m8_link, .lost = m8_lost };
+/* A data frame from the network: to us or to all, and in front of its payload a CCMP header with this number and key, when `cipher` is. */
+static void m8_give(bool to_all, unsigned flags, bool cipher, unsigned long long number, unsigned key, unsigned type, const uint8_t *body, unsigned length) {
+    uint8_t f[1700] = {0}; unsigned at = 26;
+    f[0] = 0x88; f[1] = 0x02 | (cipher ? 0x40 : 0);
+    memcpy(f + 4, to_all ? (const uint8_t *)"\xff\xff\xff\xff\xff\xff" : OWN, 6); memcpy(f + 10, AP, 6); memcpy(f + 16, OTHER, 6);
+    if (cipher) { f[at] = number; f[at + 1] = number >> 8; f[at + 3] = (uint8_t)(0x20 | key << 6); f[at + 4] = number >> 16; f[at + 5] = number >> 24; f[at + 6] = number >> 32; f[at + 7] = number >> 40; at += 8; }
+    memcpy(f + at, "\xaa\xaa\x03\x00\x00\x00", 6); f[at + 6] = type >> 8; f[at + 7] = type; at += 8;
+    memcpy(f + at, body, length); at += length;
+    deliver(f, at, 2412, 0, RX_FLAG_NO_SIGNAL_VAL | flags, true);
+}
 static void eapol_sent(struct ieee80211_hw *hw, struct sk_buff *skb) {
     unsigned header = skb->data[0] == 0x88 ? 26 : 24;
+    if (skb->protocol != cpu_to_be16(0x888e) && radio_of(hw)->ios) {
+        memcpy(m8_sent, skb->data, skb->len); m8_sent_length = skb->len; m8_sent_count++;
+        m8_sent_key = IEEE80211_SKB_CB(skb)->control.hw_key != NULL;
+        assert(m8_sent_key == radio_of(hw)->protect && skb->priority == 0 && (!m8_sent_key || IEEE80211_SKB_CB(skb)->control.hw_key == radio_of(hw)->pairwise_key));
+        IEEE80211_SKB_CB(skb)->flags |= IEEE80211_TX_STAT_ACK;
+        struct ieee80211_tx_status s = { .skb = skb, .info = IEEE80211_SKB_CB(skb) };
+        linuxkpi_ieee80211_tx_status_ext(hw, &s);
+        return;
+    }
     if (skb->protocol != cpu_to_be16(0x888e)) {
         unsigned type = fa_be16(skb->data + header + 6);
         assert(skb->data[1] == 0x41 && IEEE80211_SKB_CB(skb)->control.hw_key == radio_of(hw)->pairwise_key && radio_of(hw)->pairwise_key != NULL && skb->priority == 0 && skb->protocol == cpu_to_be16(type));
@@ -1194,12 +1222,14 @@ static void eapol_sent(struct ieee80211_hw *hw, struct sk_buff *skb) {
         net_heard(copy, n, type);
         return;
     }
-    assert(skb->data[1] == 1 && skb->protocol == cpu_to_be16(0x888e) && skb->len > header + 8 && skb->priority == 7);
+    assert(skb->protocol == cpu_to_be16(0x888e) && skb->len > header + 8 && skb->priority == 7);
+    assert(eapols >= 2 ? skb->data[1] == 0x41 && IEEE80211_SKB_CB(skb)->control.hw_key == radio_of(hw)->pairwise_key && radio_of(hw)->pairwise_key != NULL : skb->data[1] == 1 && IEEE80211_SKB_CB(skb)->control.hw_key == NULL);
     const uint8_t *body = skb->data + header + 8; unsigned n = skb->len - header - 8;
     eapols++;
     if (!wpa.any_reply) {
         if (eapols == 1) assert(n == sizeof(V_M2) && !memcmp(body, V_M2, n));
-        else assert(n == sizeof(V_M4) && !memcmp(body, V_M4, n));
+        else if (eapols == 2) assert(n == sizeof(V_M4) && !memcmp(body, V_M4, n));
+        else assert(wpa.group_reply && n == wpa.group_reply_length && !memcmp(body, wpa.group_reply, n));
     }
     IEEE80211_SKB_CB(skb)->flags |= IEEE80211_TX_STAT_ACK;
     struct ieee80211_tx_status s = { .skb = skb, .info = IEEE80211_SKB_CB(skb) };
@@ -1207,8 +1237,9 @@ static void eapol_sent(struct ieee80211_hw *hw, struct sk_buff *skb) {
 }
 static int op_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd, struct ieee80211_vif *v, struct ieee80211_sta *s, struct ieee80211_key_conf *k) {
     bool pairwise = (k->flags & IEEE80211_KEY_FLAG_PAIRWISE) != 0;
-    assert(hw->wiphy->mtx.locked && k->cipher == WLAN_CIPHER_SUITE_CCMP && k->keylen == 16 && k->iv_len == 8 && k->link_id == -1 && (cmd == DISABLE_KEY ? radio_of(hw)->reached >= IEEE80211_STA_ASSOC : radio_of(hw)->reached == IEEE80211_STA_ASSOC));
+    assert(hw->wiphy->mtx.locked && k->cipher == WLAN_CIPHER_SUITE_CCMP && k->keylen == 16 && k->iv_len == 8 && k->link_id == -1 && (cmd == DISABLE_KEY || radio_of(hw)->ios ? radio_of(hw)->reached >= IEEE80211_STA_ASSOC : radio_of(hw)->reached == IEEE80211_STA_ASSOC));
     if (pairwise) assert(s == radio_of(hw)->sta && k->keyidx == 0 && (cmd != SET_KEY || !memcmp(k->key, V_TK, 16)));
+    else if (radio_of(hw)->ios) assert(s == NULL && (k->keyidx == 1 || k->keyidx == 2));
     else assert(s == NULL && k->keyidx == 1 && (cmd != SET_KEY || !memcmp(k->key, V_GTK, 16)));
     NOTE(cmd == SET_KEY ? (pairwise ? "key_p" : "key_g") : (pairwise ? "off_p" : "off_g"));
     if (cmd == SET_KEY && (int)++key_calls == wpa.fail_key) return -5;
@@ -1224,7 +1255,8 @@ static struct {
     void (*also_heard)(void);
     bool hidden_beacon;
 } ap;
-static unsigned auth_tries, assoc_tries, deauths, scans;
+static unsigned auth_tries, assoc_tries, deauths, scans, scan_channels;
+int lx_os_thread(const char *name, void (*function)(void *), void *argument) { return 0; }
 static uint8_t last_assoc[1024], last_deauth[64], last_auth[64];
 static unsigned last_assoc_length;
 static uint8_t seen_ssid[33]; static int seen_ssid_length;
@@ -1238,6 +1270,7 @@ static void op_remove(struct ieee80211_hw *hw, struct ieee80211_vif *v) { assert
 static void op_cancel(struct ieee80211_hw *hw, struct ieee80211_vif *v) { NOTE("cancel"); }
 static int op_scan(struct ieee80211_hw *hw, struct ieee80211_vif *v, struct ieee80211_scan_request *r) {
     NOTE("scan"); scans++;
+    scan_channels = r->req.n_channels;
     seen_ssid_length = r->req.n_ssids ? r->req.ssids[0].ssid_len : -1;
     if (r->req.n_ssids) memcpy(seen_ssid, r->req.ssids[0].ssid, r->req.ssids[0].ssid_len);
     /* Neighbours, the wanted name as a prefix of another and the other way round, at any strength. */
@@ -1451,6 +1484,8 @@ static void fresh_wpa(const uint8_t *key) {
     memset(&net, 0, sizeof(net));
 }
 static void fresh_net(void) { fresh_wpa(V_PMK); fa_m7_ask(); net.on = true; }
+static void m8_count(const struct fa_heard *h, unsigned *count) { assert(h->age_ms < 200000); (*count)++; }
+static void m8_again(void) { unsigned s = wpa.fail_key = 0; memset(&wpa, 0, sizeof(wpa)); wpa.stayed = true; eapols = key_calls = s; tick = wpa_tick; }
 static const uint8_t *find_in_request(unsigned number) { return fa_element(last_assoc + 28, last_assoc_length - 28, number); }
 /* What was said and done, when an assertion stops the run. */
 static void on_abort(int s) { fprintf(stderr, "calls: %s\nsaid:\n%s\n", calls, said); signal(SIGABRT, SIG_DFL); }
@@ -1816,6 +1851,191 @@ int main(void) {
     fresh_net(); net.no_beyond = true;
     assert(fa_m5_station(the_hw, false) == 0 && SAID("M7 ping router 10.0.0.1 ok") && SAID("M7 ping beyond 1.1.1.1 no answer to 3 tries") && net.releases == 1);
     done();
+
+    /* ---- stage 8 ---- */
+    {
+        static const uint8_t PAYLOAD[46] = "not a real payload";
+        static struct fa_ios_state state;
+        static uint8_t wrong[32]; memset(wrong, 0x5a, 32);
+        static const unsigned short ONLY[1] = { 2412 }, NOWHERE[1] = { 9999 };
+        const uint8_t *name = (const uint8_t *)NAME; unsigned n = sizeof(NAME) - 1;
+        uint8_t eth[1600]; struct fa_radio *radio;
+
+        /* Before the radio: asked, it waits a minute and says so; nothing passes. */
+        fresh_wpa(V_PMK); memset(&m8, 0, sizeof(m8)); wpa.stayed = true; radio = radio_of(the_hw);
+        fa_ios_start(&M8_INPUT);
+        {
+            unsigned long long began = now;
+            assert(fa_ios_power(1) == FA_IOS_NO_ANSWER && now - began >= FA_IOS_READY_NS && now - began < FA_IOS_READY_NS + 1000000000ull);
+        }
+        memset(eth, 0, sizeof(eth)); memcpy(eth, OTHER, 6); memcpy(eth + 6, OWN, 6); eth[12] = 8; eth[13] = 0; memcpy(eth + 14, PAYLOAD, sizeof(PAYLOAD));
+        assert(!fa_ios_tx(eth, 60));
+        fa_ios_state(&state); assert(state.phase == FA_IOS_IDLE);
+
+        /* Up, and staying. */
+        assert(fa_m8_up(the_hw) == 0 && SAID("M8 radio up") && !strcmp(calls, "start,add,") && !m8.ups && !m8.losts);
+        assert(fa_ios_power(1) == FA_IOS_DONE && SAID("M8 power 1, firmware up"));
+
+        /* Scans: every network once with its elements; by name; by channel; the list when joined. */
+        scans = 0;
+        assert(fa_ios_scan(name, 0, ONLY, 0, 0) == FA_IOS_DONE && scans == 1 && radio->ios_table_count == 3 && SAID("M8 scan: 0, 3 networks"));
+        {
+            const struct fa_heard *got = NULL;
+            for (unsigned i = 0; i < radio->ios_table_count; i++) if (!memcmp(radio->ios_table[i].bssid, AP, 6)) got = &radio->ios_table[i];
+            assert(got && got->ssid_length == n && !memcmp(got->ssid, NAME, n) && got->frequency == 2437 && got->rssi == -40 && got->interval == 100);
+            assert(got->capability == ap.cap && got->elements_length == 2 + n + ap.hear_length && fa_element(got->elements, got->elements_length, FA_EID_RSN));
+        }
+        { static unsigned each; static unsigned count; count = 0; fa_ios_heard((void (*)(const struct fa_heard *, void *))m8_count, &count); assert(count == 3); }
+        assert(fa_ios_scan(name, n, ONLY, 0, 0) == FA_IOS_DONE && radio->ios_table_count == 1 && seen_ssid_length == (int)n && !memcmp(seen_ssid, NAME, n));
+        assert(fa_ios_scan(name, 0, ONLY, 1, 1) == FA_IOS_DONE && scan_channels == 1);
+        assert(fa_ios_scan(name, 0, NOWHERE, 1, 0) == FA_IOS_DONE && radio->ios_table_count == 0 && scans == 4 - 1);
+        assert(fa_ios_scan(name, 0, ONLY, 0, 0) == FA_IOS_DONE);
+        log_is_clean();
+
+        /* A join: keys, then the link says so; the same order as stage 6. */
+        calls[0] = 0; auth_tries = deauths = 0; eapols = key_calls = 0;
+        assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_DONE && m8.ups == 1 && !m8.downs);
+        assert(strstr(calls, "add_chanctx,assign,link,sta01,auth,sta12,assoc,sta23,assoc_told,") == calls + strlen("scan,") && strstr(calls, "link,key_p,key_g,sta34,") && SAID("M8 joined 2437 MHz at -40 dBm"));
+        assert(strstr(said, "M6 4-way ok") != NULL);
+        fa_ios_state(&state);
+        assert(state.phase == FA_IOS_JOINED && state.protect && state.bss.ssid_length == n && !memcmp(state.bss.bssid, AP, 6) && fa_element(state.bss.elements, state.bss.elements_length, FA_EID_RSN));
+        assert(!target_key[0] && !target_key[31]);
+
+        /* TX: Ethernet to 802.11, ciphered by the firmware. What is not ours to send is dropped. */
+        m8_sent_count = 0;
+        assert(fa_ios_tx(eth, 60) == 1 && m8_sent_count == 1 && m8_sent_key);
+        assert(m8_sent_length == 26 + 8 + 46 && m8_sent[0] == 0x88 && m8_sent[1] == 0x41 && !memcmp(m8_sent + 4, AP, 6) && !memcmp(m8_sent + 10, OWN, 6) && !memcmp(m8_sent + 16, OTHER, 6));
+        assert(!memcmp(m8_sent + 26, "\xaa\xaa\x03\x00\x00\x00\x08\x00", 8) && !memcmp(m8_sent + 34, PAYLOAD, 46));
+        assert(fa_ios_tx(eth, 1514) == 1 && !fa_ios_tx(eth, 1515) && !fa_ios_tx(eth, 13) && m8_sent_count == 2);
+        eth[12] = 0x88; eth[13] = 0x8e; assert(!fa_ios_tx(eth, 60)); eth[12] = 0; eth[13] = 60; assert(!fa_ios_tx(eth, 60)); eth[12] = 8; eth[13] = 0;
+        eth[6] ^= 2; assert(!fa_ios_tx(eth, 60)); eth[6] ^= 2;
+        radio->ios_said = 0; ios_step(radio); assert(SAID("M8 joined: rx ok 0 dropped unprotected 0"));
+
+        /* RX: deciphered data as Ethernet, outside the lock (m8_rx asserts it). Design W3: unciphered is dropped. */
+        m8.rx = 0;
+        m8_give(false, RX_FLAG_DECRYPTED | RX_FLAG_IV_STRIPPED, false, 0, 0, 0x0800, PAYLOAD, 46);
+        assert(m8.rx == 1 && m8.rx_length == 60 && !memcmp(m8.frame, OWN, 6) && !memcmp(m8.frame + 6, OTHER, 6) && m8.frame[12] == 8 && m8.frame[13] == 0 && !memcmp(m8.frame + 14, PAYLOAD, 46));
+        m8_give(false, 0, false, 0, 0, 0x0800, PAYLOAD, 46);
+        assert(m8.rx == 1 && radio->rx_clear == 1);
+        /* Longer than Ethernet carries. */
+        { static uint8_t big[1501]; m8_give(false, RX_FLAG_DECRYPTED | RX_FLAG_IV_STRIPPED, false, 0, 0, 0x0800, big, 1501); assert(m8.rx == 1 && radio->rx_long == 1); }
+        { static uint8_t big[1500]; m8_give(false, RX_FLAG_DECRYPTED | RX_FLAG_IV_STRIPPED, false, 0, 0, 0x0800, big, 1500); assert(m8.rx == 2 && m8.rx_length == 1514); m8.rx = 1; }
+
+        /* Design W4: frames to everybody, by their number. */
+        m8.rx = 0;
+        m8_give(true, RX_FLAG_DECRYPTED, true, 1, 1, 0x0806, PAYLOAD, 28);
+        assert(m8.rx == 1 && m8.frame[0] == 0xff && m8.frame[12] == 8 && m8.frame[13] == 6);
+        m8_give(true, RX_FLAG_DECRYPTED, true, 1, 1, 0x0806, PAYLOAD, 28);
+        m8_give(true, RX_FLAG_DECRYPTED, true, 0, 1, 0x0806, PAYLOAD, 28);
+        assert(m8.rx == 1 && radio->rx_replay == 2);
+        m8_give(true, RX_FLAG_DECRYPTED, true, 2, 3, 0x0806, PAYLOAD, 28);	/* a key we do not have */
+        m8_give(true, RX_FLAG_DECRYPTED | RX_FLAG_IV_STRIPPED, false, 0, 0, 0x0806, PAYLOAD, 28);	/* no number */
+        assert(m8.rx == 1 && radio->rx_no_key == 2);
+        m8_give(true, RX_FLAG_DECRYPTED, true, 0x10000000002ull, 1, 0x0806, PAYLOAD, 28);
+        assert(m8.rx == 2 && radio->group_pn.last[1] == 0x10000000002ull);
+
+        /* A message 1 after the handshake moves nothing (W1). */
+        give_eapol(V_M1, sizeof(V_M1)); assert(radio->ios_pending == IOS_EAPOL);
+        ios_step(radio);
+        assert(radio->ios_joined && SAID("M8 handshake message after the keys, 99 bytes: not good: message 1 after the handshake is over") && !memcmp(radio->wpa.pairwise, V_TK, 16));
+
+        /* A new group key under another number: answered ciphered, in, then the old one out. */
+        calls[0] = 0; wpa.group_reply = V_G2_REPLY; wpa.group_reply_length = sizeof(V_G2_REPLY);
+        give_eapol(V_G2, sizeof(V_G2)); ios_step(radio);
+        assert(!strcmp(calls, "key_g,off_g,") && SAID("M8 new group key, number 2: 0") && eapols == 3 && !memcmp(radio->group_key->key, V_GTK2, 16) && radio->group_key->keyidx == 2);
+        m8.rx = 0;
+        m8_give(true, RX_FLAG_DECRYPTED, true, 5, 2, 0x0806, PAYLOAD, 28); assert(m8.rx == 0 && radio->rx_replay == 3);	/* its counter said 5 */
+        m8_give(true, RX_FLAG_DECRYPTED, true, 6, 2, 0x0806, PAYLOAD, 28); assert(m8.rx == 1);
+        m8_give(true, RX_FLAG_DECRYPTED, true, 0x20000000000ull, 1, 0x0806, PAYLOAD, 28); assert(m8.rx == 1 && radio->rx_no_key == 3);	/* the old number is gone */
+        /* Refused: the old one stays and frames go on (W10). */
+        calls[0] = 0; wpa.fail_key = key_calls + 1; wpa.group_reply = V_G3_REPLY; wpa.group_reply_length = sizeof(V_G3_REPLY);
+        give_eapol(V_G3, sizeof(V_G3)); ios_step(radio);
+        assert(!strcmp(calls, "key_g,") && SAID("M8 new group key, number 1: -5") && radio->group_key->keyidx == 2 && !memcmp(radio->group_key->key, V_GTK2, 16) && !evidence_count && radio->ios_joined);
+        m8_give(true, RX_FLAG_DECRYPTED, true, 7, 2, 0x0806, PAYLOAD, 28); assert(m8.rx == 2);
+        /* Under the same number: given, and nothing taken back, which would take the new one. */
+        calls[0] = 0; wpa.fail_key = 0; wpa.group_reply = V_G4_REPLY; wpa.group_reply_length = sizeof(V_G4_REPLY);
+        give_eapol(V_G4, sizeof(V_G4)); ios_step(radio);
+        assert(!strcmp(calls, "key_g,") && !memcmp(radio->group_key->key, V_GTK3, 16) && radio->group_slot != 0);
+        log_is_clean();
+
+        /* A scan while joined goes nowhere near the air. */
+        scans = 0; assert(fa_ios_scan(name, 0, ONLY, 0, 0) == FA_IOS_DONE && !scans && SAID("M8 scan while joined: none"));
+
+        /* Left when asked: the goodbye, the keys back, nothing of them left. Then again. */
+        calls[0] = 0; deauths = 0;
+        assert(fa_ios_leave() == FA_IOS_DONE && m8.downs == 1 && deauths == 1 && strstr(calls, "deauth,flush,off_g,off_p,sta43,sta32,sta21,sta10,disassoc_told,unassign,remove_chanctx,"));
+        fa_ios_state(&state); assert(state.phase == FA_IOS_IDLE && !radio->ios_joined && !radio->joining && !radio->wpa.kck[0]);
+        assert(!fa_ios_tx(eth, 60));
+        assert(radio->vif != NULL && radio->started);
+        { void *memory = radio->sta_memory;
+          m8_again();
+          assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_DONE && m8.ups == 2 && radio->sta_memory == memory && radio->group_slot == 1 && SAID("M8 joined")); }
+        assert(fa_ios_tx(eth, 60) == 1);
+
+        /* Lost: the door. Told after the snapshot says so; no goodbye; and it can be joined again. */
+        calls[0] = 0; deauths = 0; m8.losts = 0; m8.downs = 0;
+        give_door(FA_KIND_DEAUTH, 7); assert(radio->ios_pending & IOS_LOSS);
+        ios_step(radio);
+        fa_ios_state(&state);
+        assert(m8.losts == 1 && m8.lost == FA_IOS_GONE && m8.downs == 1 && state.phase == FA_IOS_IDLE && state.last_answer == FA_IOS_GONE && !deauths && !radio->ios_joined && radio->chanctx == NULL);
+        m8_again(); assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_DONE && m8.ups == 3);
+        /* Lost: the driver's word, and a beacon that no longer asks for a key. */
+        m8.losts = 0; linuxkpi_ieee80211_connection_loss(radio->vif); ios_step(radio); assert(m8.losts == 1 && !radio->ios_joined);
+        m8_again(); assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_DONE);
+        m8.losts = 0; hear(FA_KIND_BEACON, AP, NAME, FA_CAP_ESS, OPEN_HT, sizeof(OPEN_HT), 2437, -41); ios_step(radio); assert(m8.losts == 1 && !radio->ios_joined && radio->went_protected);
+
+        /* Power off leaves and keeps the interface; on again gives an idle radio. Nothing happens to the firmware. */
+        m8_again(); assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_DONE);
+        m8.downs = 0; assert(fa_ios_power(0) == FA_IOS_DONE && m8.downs == 1 && radio->vif != NULL && radio->started);
+        fa_ios_state(&state); assert(state.phase == FA_IOS_OFF);
+        assert(fa_ios_power(1) == FA_IOS_DONE); fa_ios_state(&state); assert(state.phase == FA_IOS_IDLE);
+
+        /* The answers wifid reads. */
+        m8_again(); wpa.any_reply = true;
+        {
+            unsigned long long began = now;
+            assert(fa_ios_join(name, n, NULL, wrong) == FA_IOS_NO_AUTH && now - began < FA_HANDSHAKE_NS + 3000000000ull && !radio->ios_joined);
+            fa_ios_state(&state); assert(state.phase == FA_IOS_IDLE && state.last_answer == FA_IOS_NO_AUTH);
+        }
+        m8_again(); wpa.silent = true; assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_NO_ANSWER);
+        m8_again(); ap.not_heard = true; assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_NOT_HEARD); ap.not_heard = false;
+        m8_again(); assert(fa_ios_join(name, n, OTHER, V_PMK) == FA_IOS_NOT_HEARD);
+        m8_again(); assert(fa_ios_join(name, 0, NULL, V_PMK) == FA_IOS_NOT_HEARD);
+        m8_again(); ap.auth_status = 13; assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_REFUSED); ap.auth_status = 0;
+        m8_again(); assert(fa_ios_join(name, n, AP, V_PMK) == FA_IOS_DONE); assert(fa_ios_leave() == FA_IOS_DONE);
+        /* What it asks for and what it is must agree: a key for an open network, none for a protected one, WPA3 alone. */
+        m8_again(); assert(fa_ios_join(name, n, NULL, NULL) == FA_IOS_NOT_BUILT && !radio->ios_joined);
+        { const uint8_t *e = ap.hear_elements; unsigned l = ap.hear_length, c = ap.cap;
+          ap.hear_elements = OPEN_HT; ap.hear_length = sizeof(OPEN_HT); ap.cap = FA_CAP_ESS;
+          m8_again(); assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_NOT_BUILT);
+          /* Open, and joined as such: not ciphered either way. */
+          m8_again(); m8.ups = 0; assert(fa_ios_join(name, n, NULL, NULL) == FA_IOS_DONE && m8.ups == 1 && !strstr(calls + strlen(calls), "key_"));
+          m8_sent_count = 0; assert(fa_ios_tx(eth, 60) == 1 && m8_sent[1] == 0x01 && !m8_sent_key);
+          m8.rx = 0; m8_give(false, 0, false, 0, 0, 0x0800, PAYLOAD, 46); assert(m8.rx == 1);
+          m8_give(true, 0, false, 0, 0, 0x0806, PAYLOAD, 28); assert(m8.rx == 2);
+          assert(fa_ios_leave() == FA_IOS_DONE);
+          ap.hear_elements = e; ap.hear_length = l; ap.cap = c; }
+        { static uint8_t third[sizeof(RSN_ELEMENT)];
+          const uint8_t *e = ap.hear_elements; unsigned l = ap.hear_length;
+          memcpy(third, RSN_ELEMENT, sizeof(third)); third[19] = 8; ap.hear_elements = third; ap.hear_length = sizeof(third);
+          m8_again(); assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_NOT_BUILT && SAID("M6 refused: it does not take a WPA2 passphrase's key"));
+          ap.hear_elements = e; ap.hear_length = l; }
+        log_is_clean();
+
+        /* The firmware goes: once, its account follows, and from then on every answer says so. */
+        m8_again(); assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_DONE);
+        calls[0] = 0; m8.losts = 0; m8.downs = 0; fa_m4_evidence("died"); fa_m8_firmware_gone(); ios_step(radio);
+        assert(m8.losts == 1 && m8.lost == FA_IOS_RADIO_DEAD && m8.downs == 1 && rddm && radio->ios_dead && !radio->ios_joined);
+        assert(strstr(calls, "rddm,") != NULL && strstr(calls, "rddm,") < strstr(calls, "sta43,"));
+        assert(fa_ios_scan(name, 0, ONLY, 0, 0) == FA_IOS_RADIO_DEAD && fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_RADIO_DEAD && !fa_ios_tx(eth, 60));
+        assert(fa_ios_power(1) == FA_IOS_RADIO_DEAD);
+        fa_ios_state(&state); assert(state.phase == FA_IOS_OFF && state.last_answer == FA_IOS_RADIO_DEAD);
+        fa_m8_firmware_gone(); ios_step(radio); assert(m8.losts == 1);
+        log_is_clean();
+        /* The rest of the way down, which no phone takes: only so that the sanitizer sees nothing left. */
+        station_down(radio);
+        done();
+    }
 
     /* The two iterators: only what exists. */
     fresh();
@@ -2318,10 +2538,11 @@ def wpa_vectors(name, own, ap, wrong=False):
     snonce, anonce = bytes(range(32)), bytes(range(32, 64))
     data = min(own, ap) + max(own, ap) + min(snonce, anonce) + max(snonce, anonce)
     ptk = b''.join(hmac.digest(pmk, b'Pairwise key expansion\0' + data + bytes([i]), 'sha1') for i in range(3))[:48]
-    gtk = bytes(range(100, 116))
+    gtk, gtk2, gtk3 = bytes(range(100, 116)), bytes(range(120, 136)), bytes(range(140, 156))
 
-    def message(info, counter, nonce, payload=b'', signed=True):
+    def message(info, counter, nonce, payload=b'', signed=True, rsc=0):
         out = bytearray(99 + len(payload))
+        out[65:71] = rsc.to_bytes(6, 'little')
         out[:4] = bytes([2, 3]) + (len(out) - 4).to_bytes(2, 'big')
         out[4] = 2
         out[5:7] = info.to_bytes(2, 'big')
@@ -2354,6 +2575,13 @@ def wpa_vectors(name, own, ap, wrong=False):
         ('V_M3_OTHER_RSN', message(0x13ca, 2, anonce, wrapped(rsn=ours[:18] + b'\x08' + ours[19:]))),
         ('V_M3_NO_RSN', message(0x13ca, 2, anonce, wrapped(rsn=b''))),
         ('V_G1', message(0x1382, 3, anonce, wrapped(rsn=b''))),
+        ('V_GTK2', gtk2), ('V_GTK3', gtk3),
+        ('V_G2', message(0x1382, 3, anonce, wrapped(rsn=b'', kde=b'\xdd\x16\x00\x0f\xac\x01\x02\x00' + gtk2), rsc=5)),
+        ('V_G2_REPLY', message(0x0302, 3, bytes(32))),
+        ('V_G3', message(0x1382, 4, anonce, wrapped(rsn=b'', kde=b'\xdd\x16\x00\x0f\xac\x01\x01\x00' + gtk3))),
+        ('V_G3_REPLY', message(0x0302, 4, bytes(32))),
+        ('V_G4', message(0x1382, 5, anonce, wrapped(rsn=b'', kde=b'\xdd\x16\x00\x0f\xac\x01\x02\x00' + gtk3), rsc=8)),
+        ('V_G4_REPLY', message(0x0302, 5, bytes(32))),
         ('V_M4', message(0x030a, 2, bytes(32))),
     ])
 
@@ -2442,6 +2670,8 @@ FA_NET_HOST = r"""
 #include "fa_bss.h"
 #include "fa_join.h"
 #include "fa_net.h"
+#include "fa_xnu.h"
+#include "fa_ios.h"
 static const uint8_t OWN[6] = {2, 0x46, 0x55, 0x58, 0x49, 1}, AP[6] = {0x02, 0xa1, 0xb2, 0xc3, 0xd4, 0x55}, SERVER[6] = {0x02, 0, 0, 0, 0, 9};
 static const uint8_t ME[4] = {10, 0, 0, 9}, THEM[4] = {10, 0, 0, 1};
 static uint32_t seed = 0x1234567;
@@ -2510,6 +2740,45 @@ int main(void) {
     memcpy(f + 12, THEM, 4); memcpy(f + 16, ME, 4); f[20] = 0; f[22] = f[23] = 0; fa_put16(f + 22, fa_ip_sum(f + 20, n - 20));
     assert(fa_net_wanted(FA_TYPE_IP, f, n) && fa_echo_read(f, n, THEM, ME, 77, 3) && !fa_echo_read(f, n, THEM, ME, 77, 4) && !fa_echo_read(f, n, ME, THEM, 77, 3));
     f[30] ^= 1; assert(!fa_echo_read(f, n, THEM, ME, 77, 3));
+    /* Stage 8's table and numbers. */
+    {
+        static struct fa_heard table[FA_HEARD_MOST];
+        unsigned count = 0;
+        uint8_t b[300] = {0}, *e = b + 36;
+        b[0] = FA_KIND_BEACON; memset(b + 4, 0xff, 6); memcpy(b + 10, AP, 6); memcpy(b + 16, AP, 6); b[32] = 100; b[34] = 0x11;
+        e[0] = 0; e[1] = 4; memcpy(e + 2, "name", 4); e[6] = 48; e[7] = 2; e[8] = 1; e[9] = 0;
+        unsigned length = 36 + 10;
+        assert(fa_heard_take(table, &count, b, length, 2412, -50, 5, NULL, 0) && count == 1 && table[0].rssi == -50 && table[0].elements_length == 10 && table[0].interval == 100 && table[0].capability == 0x11 && table[0].heard_at == 5);
+        assert(fa_heard_take(table, &count, b, length, 2437, -40, 6, NULL, 0) && count == 1 && table[0].frequency == 2437 && table[0].rssi == -40);
+        assert(fa_heard_take(table, &count, b, length, 2412, -70, 7, NULL, 0) && count == 1 && table[0].frequency == 2437 && table[0].heard_at == 7);
+        assert(fa_heard_take(table, &count, b, length, 2412, -128, 8, NULL, 0) && table[0].rssi == -40);
+        assert(!fa_heard_take(table, &count, b, length, 2412, -60, 9, (const uint8_t *)"nam", 3) && fa_heard_take(table, &count, b, length, 2412, -60, 9, (const uint8_t *)"name", 4));
+        assert(!fa_heard_take(table, &count, b, length, 0, -60, 9, NULL, 0) && !fa_heard_take(table, &count, b, length, 0x10000, -60, 9, NULL, 0));
+        b[1] = 0x40; assert(!fa_heard_take(table, &count, b, length, 2412, -60, 9, NULL, 0)); b[1] = 0;
+        b[16] = 1; assert(!fa_heard_take(table, &count, b, length, 2412, -60, 9, NULL, 0)); b[16] = AP[0];
+        e[1] = 33; assert(!fa_heard_take(table, &count, b, 36 + 2 + 33, 2412, -60, 9, NULL, 0)); e[1] = 4;
+        /* A full table takes no new one, and refuses a name it has room for by another access point only when full. */
+        count = 0;
+        for (unsigned i = 0; i < FA_HEARD_MOST; i++) { b[16] = 2; b[17] = (uint8_t)i; assert(fa_heard_take(table, &count, b, length, 2412, -60, 9, NULL, 0)); }
+        b[17] = 0; b[18] = 1; assert(count == FA_HEARD_MOST && !fa_heard_take(table, &count, b, length, 2412, -60, 9, NULL, 0)); b[18] = AP[2];
+        /* More elements than are kept: cut at a whole one. */
+        { static uint8_t big[2000]; memcpy(big, b, 36); uint8_t *q = big + 36; q[0] = 0; q[1] = 1; q[2] = 'x'; q += 3; for (unsigned i = 0; i < 9; i++) { q[0] = 221; q[1] = 200; q += 202; }
+          count = 0; assert(fa_heard_take(table, &count, big, (unsigned)(q - big), 2412, -60, 9, NULL, 0) && table[0].elements_length == 3 + 202 * 5 && table[0].elements_length <= FA_IOS_ELEMENTS_MOST); }
+        /* Every shorter length, each in memory of exactly its size. */
+        b[16] = AP[0]; b[17] = AP[1];
+        for (unsigned i = 0; i < length; i++) { uint8_t *x = malloc(i ? i : 1); memcpy(x, b, i); count = 0; assert(fa_heard_take(table, &count, x, i, 2412, -60, 9, NULL, 0) == (i >= 36 + 6)); free(x); }
+
+        struct fa_group_pn g; memset(&g, 0, sizeof(g));
+        uint8_t c[8] = {1, 0, 0, 0x20 | 1 << 6, 0, 0, 0, 0}, rsc[8] = {5, 4, 3, 2, 1, 7, 0xee, 0xee};
+        assert(fa_rsc_read(rsc) == 0x070102030405ull);
+        assert(fa_group_check(&g, c) == FA_GROUP_NO_KEY);
+        g.known[1] = true; g.last[1] = 0;
+        assert(fa_group_check(&g, c) == FA_GROUP_FRESH && g.last[1] == 1 && fa_group_check(&g, c) == FA_GROUP_REPLAY);
+        c[3] = 1 << 6; c[0] = 9; assert(fa_group_check(&g, c) == FA_GROUP_NO_KEY);	/* no Extended IV bit: this is no CCMP header */
+        c[3] = 0x20 | 2 << 6; assert(fa_group_check(&g, c) == FA_GROUP_NO_KEY); c[3] = 0x20 | 1 << 6;
+        c[0] = 0; c[1] = 0; c[4] = 0; c[5] = 0; c[6] = 0; c[7] = 1; assert(fa_group_check(&g, c) == FA_GROUP_FRESH && g.last[1] == 0x10000000000ull);
+        c[7] = 0; c[6] = 0xff; assert(fa_group_check(&g, c) == FA_GROUP_REPLAY);
+    }
     /* Frames. */
     n = fa_data_frame(f, sizeof(f), OWN, AP, SERVER, true, FA_TYPE_ARP, (const uint8_t *)"abcd", 4);
     assert(n == 26 + 8 + 4 && f[0] == 0x88 && f[1] == 0x41 && !memcmp(f + 4, AP, 6) && !memcmp(f + 10, OWN, 6) && !memcmp(f + 16, SERVER, 6) && f[32] == 8 && f[33] == 6);
@@ -2541,6 +2810,116 @@ def net_frames_on_malformed_input(tmp):
     subprocess.run([cc, '-std=gnu11', '-Wall', '-Wextra', '-Wno-unused-function', '-g', '-O1', '-fsanitize=address,undefined', '-fno-sanitize-recover=all', f'-I{own}',
                     str(tmp / 'net.c'), '-o', str(program)], check=True)
     subprocess.run([str(program)], check=True)
+
+
+BRIDGE_DRIVER = r"""
+#include <assert.h>
+#include <stdio.h>
+#include "fuxi_ath12k_ios.c"
+static unsigned char seen_name[32], seen_key[32], seen_bssid[6]; static unsigned seen_length, joins; static bool key_given, bssid_given;
+static int answer; static const struct fa_ios_input *driver_input; static unsigned attached, lost_errno, lost_count, rx_length, link_ups, pmks;
+void fa_ios_start(const struct fa_ios_input *i) { driver_input = i; attached++; }
+int fa_ios_power(int on) { return answer; }
+int fa_ios_scan(const unsigned char *s, unsigned l, const unsigned short *f, unsigned c, int p) { assert(l == 4 && !memcmp(s, "name", 4) && c == 1 && f[0] == 2412 && p); return answer; }
+void fa_ios_heard(void (*each)(const struct fa_heard *, void *), void *c) { static struct fa_heard h; memcpy(h.bssid, "abcdef", 6); h.ssid_length = 4; memcpy(h.ssid, "name", 4); h.frequency = 2412; h.rssi = -40; h.interval = 100; h.capability = 0x11; h.age_ms = 9; h.elements_length = 1024; memset(h.elements, 0x77, 1024); each(&h, c); }
+int fa_ios_join(const unsigned char *s, unsigned l, const unsigned char *b, const unsigned char *k) { joins++; memcpy(seen_name, s, l); seen_length = l; bssid_given = b != NULL; if (b) memcpy(seen_bssid, b, 6); key_given = k != NULL; if (k) memcpy(seen_key, k, 32); return answer; }
+int fa_ios_leave(void) { return answer; }
+void fa_ios_state(struct fa_ios_state *s) { memset(s, 0, sizeof(*s)); s->phase = FA_IOS_JOINED; s->protect = 1; s->last_answer = answer; s->bss.frequency = 2412; s->bss.ssid_length = 4; memcpy(s->bss.ssid, "name", 4); s->bss.elements_length = 3; }
+int fa_ios_tx(const unsigned char *f, unsigned long n) { return n == 60; }
+void fuxi_ath12k_station_address(unsigned char *m) { memcpy(m, "\x02\x46\x55\x58\x49\x01", 6); }
+void fuxi_wifi_wpa_pmk(const unsigned char *p, unsigned pl, const unsigned char *n, unsigned nl, unsigned char k[32]) { assert(pl == 13 && !memcmp(p, "the test word", 13) && nl == 4 && !memcmp(n, "name", 4)); memset(k, 0x33, 32); pmks++; }
+void fuxi_wifi_sta_lost(int e) { lost_errno = e; lost_count++; }
+static void in_rx(const uint8_t *f, size_t n) { rx_length = n; }
+static void in_link(bool up) { link_ups += up; }
+static const struct fuxi_wifi_input IN = { in_rx, in_link };
+static unsigned heard_count; static void each_heard(const struct fuxi_wifi_sta_bss *b, void *c) { assert(c == &IN && b->ssid_length == 4 && !memcmp(b->ssid, "name", 4) && !memcmp(b->bssid, "abcdef", 6) && b->frequency == 2412 && b->rssi == -40 && b->beacon_interval == 100 && b->capability == 0x11 && b->age_ms == 9 && b->elements_length == 1024 && b->elements[1023] == 0x77); heard_count++; }
+int main(void) {
+    const struct fuxi_wifi_backend *b = fuxi_ath12k_ios_backend();
+    static const struct { int from, to; } maps[] = { {FA_IOS_DONE, 0}, {FA_IOS_NO_AUTH, EAUTH}, {FA_IOS_NO_ANSWER, ETIMEDOUT}, {FA_IOS_NOT_HEARD, ENOENT}, {FA_IOS_REFUSED, ECONNREFUSED}, {FA_IOS_NOT_BUILT, EOPNOTSUPP}, {FA_IOS_NO_MEMORY, ENOMEM}, {FA_IOS_GONE, ECONNRESET}, {FA_IOS_RADIO_DEAD, ENETDOWN}, {FA_IOS_FAILED, EIO} };
+    static struct fuxi_wifi_sta_join join; static struct fuxi_wifi_sta_scan scan; static struct fuxi_wifi_sta_state state; static struct fuxi_wifi_sta_channel ch[96];
+    assert(!memcmp(b->station.address, "\x02\x46\x55\x58\x49\x01", 6) && b->tx_frame && b->start && !attached);
+    b->start(&IN); assert(attached == 1 && driver_input);
+    for (unsigned i = 0; i < sizeof(maps) / sizeof(maps[0]); i++) {
+        answer = maps[i].from;
+        memcpy(join.ssid, "name", 4); join.ssid_length = 4; join.security = FUXI_WIFI_STA_OPEN;
+        assert(b->station.power(true) == maps[i].to && b->station.leave() == maps[i].to && b->station.join(&join) == maps[i].to);
+        memcpy(scan.ssid, "name", 4); scan.ssid_length = 4; scan.frequencies[0] = 2412; scan.frequency_count = 1; scan.passive = true;
+        assert(b->station.scan(&scan) == maps[i].to);
+        driver_input->lost(answer); assert(lost_errno == (unsigned)maps[i].to);
+        b->station.state(&state); assert(state.last_error == maps[i].to);
+    }
+    answer = FA_IOS_DONE;
+    /* Open: no key crosses. A passphrase: only the key made of it. A key as it is. Another kind: nothing asked. */
+    assert(!key_given && !bssid_given && seen_length == 4 && !memcmp(seen_name, "name", 4));
+    join.security = FUXI_WIFI_STA_WPA2_PSK; memcpy(join.passphrase, "the test word", 13); join.passphrase_length = 13;
+    assert(b->station.join(&join) == 0 && key_given && seen_key[0] == 0x33 && seen_key[31] == 0x33 && pmks == 1);
+    join.passphrase_length = 0; memset(join.passphrase, 0, sizeof(join.passphrase)); memset(join.pmk, 0x44, 32); memcpy(join.bssid, "abcdef", 6);
+    assert(b->station.join(&join) == 0 && seen_key[0] == 0x44 && pmks == 1 && bssid_given && !memcmp(seen_bssid, "abcdef", 6));
+    { unsigned before = joins; join.security = 7; assert(b->station.join(&join) == EOPNOTSUPP && joins == before); }
+    b->station.heard(each_heard, (void *)&IN); assert(heard_count == 1);
+    b->station.state(&state); assert(state.phase == FUXI_WIFI_STA_JOINED && state.security == FUXI_WIFI_STA_WPA2_PSK && state.bss.frequency == 2412 && state.bss.ssid_length == 4 && state.bss.elements_length == 3);
+    unsigned n = b->station.channels(ch, 96); assert(n == 26 && ch[0].frequency == 2412 && ch[25].frequency == 5825 && (ch[17].flags & FUXI_WIFI_STA_CHANNEL_RADAR));
+    assert(b->station.channels(ch, 3) == 3);
+    assert(b->tx_frame((const uint8_t *)"", 60) && !b->tx_frame((const uint8_t *)"", 59));
+    driver_input->rx((const unsigned char *)"", 77); assert(rx_length == 77);
+    driver_input->link(1); assert(link_ups == 1);
+    puts("fuxi_ath12k_ios: answers, keys, the table, channels and frames across the two domains");
+    return 0;
+}
+"""
+
+
+@check
+def ios_bridge_crosses_the_domains(tmp):
+    """os/fuxi_ath12k_ios.c on stub headers, against a fake driver domain: its answers are XNU's errno, and a passphrase ends there. Design M8."""
+    own = ROOT / 'xnu/fuxi-ath12k'
+    ios = ROOT / 'xnu/fuxi-wifi-ios'
+    stubs = tmp / 'bridge'
+    (stubs / 'sys').mkdir(parents=True)
+    (stubs / 'sys/systm.h').write_text('#pragma once\n#include <stdbool.h>\n#include <stdint.h>\n#include <stddef.h>\n#include <string.h>\n#include <strings.h>\n#include <errno.h>\n#ifndef EAUTH\n#define EAUTH 80\n#endif\n')
+    (stubs / 'sys/fuxi_wifi_ios.h').write_text(f'#pragma once\n#define KERNEL 1\n#include "{ios / "fuxi_wifi_ios.h"}"\n#undef KERNEL\n')
+    (stubs / 'sys/fuxi_wifi_sta.h').write_text(f'#pragma once\n#include "{ios / "fuxi_wifi_sta.h"}"\n')
+    (stubs / 'sys/fuxi_wifi_wpa.h').write_text(f'#pragma once\n#include "{ios / "fuxi_wifi_wpa.h"}"\n')
+    (stubs / 'driver.c').write_text(BRIDGE_DRIVER)
+    program = stubs / 'driver'
+    subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Werror', '-Wno-unused-function', '-g', '-fsanitize=address,undefined', '-fno-sanitize-recover=all', '-DFUXI',
+                    f'-I{stubs}', f'-I{own / "src"}', f'-I{own / "os"}', str(stubs / 'driver.c'), '-o', str(program)], check=True)
+    subprocess.run([str(program)], check=True)
+
+
+@check
+def stage_8_is_reached_from_stage_8_alone(tmp):
+    """The stage that does not stop is a path of its own: stages 4 to 7 end as they did, and nothing else makes a radio stay."""
+    own = ROOT / 'xnu/fuxi-ath12k/src'
+    hif = (own / 'fa_hif.c').read_text()
+    text = (own / 'fa_80211.c').read_text()
+    wlan = (ROOT / 'xnu/fuxi-wlan/fuxi_wlan.c').read_text()
+    up = hif[hif.index('\nfa_stage_up(struct ath12k_base *ab)'):hif.index('/* tools/ath12k-edits.json, ath12k-wmi-event-log')]
+    assert up.index('hif.stage == FA_STAGE_IOS') < up.index('return (false);\t\t\t/* it stays') < up.index('fa_m5_station(') < up.index('fa_hif_quiesce();') < up.index('hif.stage_hit = true')
+    ready = hif[hif.index('\nfa_firmware_ready('):hif.index('\nfa_stop(void)')]
+    assert hif.count('fa_m8_up(') == 1 and ready.index('if (stage == FA_STAGE_IOS) {') < ready.index('fa_m8_up(')
+    assert 'hif.ios_up = error == 0;' in ready and hif.count('hif.ios_up') == 2 and hif.count('fa_m8_firmware_gone()') == 1
+    assert text.count('ios_radio = radio;') == 1 and text.index('ios_radio = radio;') > text.index('\nfa_m8_up(struct ieee80211_hw *hw)')
+    assert text.count('radio->ios = true;') == 1 and text.index('radio->ios = true;') > text.index('\nfa_m8_up(struct ieee80211_hw *hw)')
+    assert 'radio->ios_joined = true;' in text[text.index('\nfa_ios_join('):] and text.count('radio->ios_joined = true;') == 1
+    # What was the firmware's end on stages 4 to 7 stays so: only stage 8 may be let off.
+    for word in ('"hw_scan failed"', '"scan aborted by ath12k'):
+        at = text.index(word)
+        assert 'if (!radio->ios)' in text[at - 120:at]
+    # fw_thread: stage 8 returns nowhere, and the stop below it is for all the others.
+    handoff = wlan[wlan.index('\nwl_fa_handoff(void)'):]
+    assert handoff.index('wl_fa_stage == 8') < handoff.index('for (;;) { wl_sleep(60000); }') < handoff.index('fa_stop();')
+    assert wlan.count('wl_fa_stage == 8') == 1
+    # Patch 0117 alone selects it.
+    patch = (ROOT / 'xnu/patches/0117-fuxi-ath12k.patch').read_text()
+    assert '+bsd/dev/fuxi_ath12k_ios.c\t\tstandard' in patch and '+\tif (on == 2 && !enabled) {' in patch and '+\t\tlink.name = "ath12k";' in patch
+    for other in (ROOT / 'xnu/patches').glob('*.patch'):
+        if other.name != '0117-fuxi-ath12k.patch':
+            assert 'fuxi_ath12k_ios' not in other.read_text(errors='surrogateescape'), other.name
+    assert 'on != 1 || enabled' in (ROOT / 'xnu/fuxi-wifi-ios/fuxi_wifi_ios.c').read_text() and 'ath12k' not in (ROOT / 'xnu/fuxi-wifi-ios/fuxi_wifi_ios.c').read_text()
+    # A passphrase never reaches the driver domain.
+    for path in (own / 'fa_80211.c', own / 'fa_ios.h', own / 'fa_xnu.h'):
+        assert 'passphrase' not in code_only(path.read_text()).lower(), path.name
 
 
 FA_BSS_DRIVER = r"""

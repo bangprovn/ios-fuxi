@@ -103,7 +103,8 @@ void fuxi_wlan_init(void);
  *                 after HTC ready, stage 2 after WMI ready, hw_mode and mac registration, stage 4
  *                 after one scan, stage 5 after joining one open network for 20 s, stage 6 after the same
  *                 with WPA2, stage 7 after that with an address by DHCP and two echoes, each then contains.
- *                 Stages 4 to 7 are the only ones that use the radio's RF, and only N exactly 4, 5, 6 or 7
+ *                 Stage 8 does not stop or contain: the radio stays up for fuxiwifiios=2.
+ *                 Stages 4 to 8 are the only ones that use the radio's RF, and only N exactly 4, 5, 6, 7 or 8
  *                 runs them: any other N runs stage 2 at most, and says so. Stage 4 alone logs SSIDs.
  *   fuxiwifissid=NAME  with fuxiath12k=5: the open network to join, 1 to 32 bytes, and it cannot hold a
  *                 space. Logged by length only. Without it stage 5 does no radio work.
@@ -978,8 +979,8 @@ wl_fa_configure(void)
 {
 	int stage = 0;
 	if (PE_parse_boot_argn("fuxiath12k", &stage, sizeof(stage)) && stage > 0) {
-		wl_fa_stage = stage == 1 || stage == 4 || stage == 5 || stage == 6 || stage == 7 ? (unsigned)stage : 2;
-		printf("FUXI ATH12K: fuxiath12k=%d, recipe defaults on, running stage %u; stages built are 1, 2, 4, 5, 6 and 7\n",
+		wl_fa_stage = stage == 1 || stage == 4 || stage == 5 || stage == 6 || stage == 7 || stage == 8 ? (unsigned)stage : 2;
+		printf("FUXI ATH12K: fuxiath12k=%d, recipe defaults on, running stage %u; stages built are 1, 2, 4, 5, 6, 7 and 8\n",
 		    stage, wl_fa_stage);
 	}
 }
@@ -1034,17 +1035,30 @@ wl_fa_mac_parse(const char *text, unsigned char *mac)
 	return text[17] == 0 && any != 0 && !(mac[0] & 1);
 }
 
+static bool
+wl_fa_mac_given(unsigned char *mac, bool *refused)
+{
+	char text[32] = ""; /* a bare fuxiwifimac has no string to copy */
+	bool given = PE_parse_boot_arg_str("fuxiwifimac", text, sizeof(text));
+	*refused = given && !wl_fa_mac_parse(text, mac);
+	if (!given || *refused) { memcpy(mac, wl_fa_default_mac, 6); }
+	return given && !*refused;
+}
+
+/* The same address for fuxiwifiios=2's interface, which is made long before the radio. */
+void
+fuxi_ath12k_station_address(unsigned char *mac)
+{
+	bool refused;
+	(void)wl_fa_mac_given(mac, &refused);
+}
+
 static void
 wl_fa_mac_configure(void)
 {
-	char text[32] = ""; /* a bare fuxiwifimac has no string to copy */
 	unsigned char mac[6];
-	bool given = PE_parse_boot_arg_str("fuxiwifimac", text, sizeof(text));
-	if (given && !wl_fa_mac_parse(text, mac)) {
-		printf("FUXI ATH12K: fuxiwifimac refused; default address\n");
-		given = false;
-	}
-	if (!given) { memcpy(mac, wl_fa_default_mac, sizeof(mac)); }
+	bool refused, given = wl_fa_mac_given(mac, &refused);
+	if (refused) { printf("FUXI ATH12K: fuxiwifimac refused; default address\n"); }
 	printf("FUXI ATH12K: station address from %s\n", given ? "fuxiwifimac" : "the default");
 	fa_set_radio_mac(mac);
 }
@@ -4975,6 +4989,12 @@ wl_fa_handoff(void)
 	wl_fa_ssid_configure();
 	wl_fa_join_configure();
 	int e = fa_firmware_ready(&wl_fa_caps, wl_fa_stage);
+	if (!e && wl_fa_stage == 8) {
+		/* Nothing stops: the poll thread has MHI, the rings and the firmware's fate from here on, and this thread's own
+		 * MHI work below would race it. It has nothing more to do and nothing it may give back. */
+		printf("FUXI ATH12K: stage 8 up; the radio stays, this thread rests\n");
+		for (;;) { wl_sleep(60000); }
+	}
 	/* Poll thread and ath12k's register access end here, before this thread's own MHI work. */
 	fa_stop();
 	wl_keep = false; /* every stage built so far ends in containment */

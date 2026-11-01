@@ -16,15 +16,17 @@ WLAN_C = ROOT / 'xnu/fuxi-wlan/fuxi_wlan.c'
 PATCH_0099 = ROOT / 'xnu/patches/0099-fuxi-wlan.patch'
 PATCH_0117 = ROOT / 'xnu/patches/0117-fuxi-ath12k.patch'
 NEW_FILES = (('xnu/fuxi-ath12k/os/fuxi_ath12k_os.c', 'bsd/dev/fuxi_ath12k_os.c'),
+             ('xnu/fuxi-ath12k/os/fuxi_ath12k_ios.c', 'bsd/dev/fuxi_ath12k_ios.c'),
              ('xnu/fuxi-ath12k/src/fa_xnu.h', 'bsd/dev/fa_xnu.h'),
              ('xnu/fuxi-ath12k/compat/include/lx_os.h', 'bsd/dev/fa_lx_os.h'))
 CONF = '''--- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -115,6 +115,7 @@
+@@ -115,6 +115,8 @@
  bsd/dev/fuxi_perf.c			standard
  bsd/dev/fuxi_keys.c			standard
  bsd/dev/fuxi_wlan.c			standard
 +bsd/dev/fuxi_ath12k_os.c		standard
++bsd/dev/fuxi_ath12k_ios.c		standard
  bsd/dev/fuxi_wifi_ios.c			standard
  bsd/dev/fuxi_wifi_net.c			standard
  bsd/dev/fuxi_wifi_sta.c			standard
@@ -46,13 +48,40 @@ MAKEINC = '''--- a/makedefs/MakeInc.def
 '''
 
 
+# fuxiwifiios=2, as a change to the file 0104 adds: without 0117 the file and every other kernel's inputs stay as they are.
+IOS_SOURCE = ROOT / 'xnu/fuxi-wifi-ios/fuxi_wifi_ios.c'
+IOS_FIND = """	PE_parse_boot_argn("fuxiwifiios", &on, sizeof(on));
+	if (on != 1 || enabled) {
+"""
+IOS_REPLACE = """	PE_parse_boot_argn("fuxiwifiios", &on, sizeof(on));
+	if (on == 2 && !enabled) {
+		extern const struct fuxi_wifi_backend *fuxi_ath12k_ios_backend(void);
+
+		enabled = true;
+		link.name = "ath12k";
+		printf("FUXI WIFI IOS: enabled, ath12k backend; Apple80211 16.7 ABI unverified\\n");
+		(void)fuxi_wifi_ios_attach(fuxi_ath12k_ios_backend());
+		return;
+	}
+	if (on != 1 || enabled) {
+"""
+
+
+def ios_selection():
+    before = IOS_SOURCE.read_text()
+    assert before.count(IOS_FIND) == 1
+    after = before.replace(IOS_FIND, IOS_REPLACE)
+    return ''.join(difflib.unified_diff(before.splitlines(True), after.splitlines(True),
+                                        fromfile='a/bsd/dev/fuxi_wifi_ios.c', tofile='b/bsd/dev/fuxi_wifi_ios.c'))
+
+
 def new_file(source, dest):
     return ''.join(difflib.unified_diff([], (ROOT / source).read_text().splitlines(True),
                                         fromfile='/dev/null', tofile='b/' + dest))
 
 
 def expected_0117():
-    return CONF + MAKEINC + ''.join(new_file(*pair) for pair in NEW_FILES)
+    return CONF + MAKEINC + ''.join(new_file(*pair) for pair in NEW_FILES) + ios_selection()
 
 
 def expected_0099():
