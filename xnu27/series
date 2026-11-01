@@ -75,3 +75,4 @@ fuxi/0007-root27-storage.patch
 fuxi/0008-dada-apfs.patch
 fuxi/0009-cryptex-graft.patch
 fuxi/0010-proc-log.patch
+fuxi/0011-pid1-watch.patch

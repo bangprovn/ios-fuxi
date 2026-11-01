@@ -1,0 +1,122 @@
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index 50c8060..7f2650f 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1030,6 +1030,9 @@ bsd_init(void)
+ 	/* fuxi_root27_cryptex=1: SystemOS/AppOS cryptexes and the dyld cache directory (needs /dev) */
+ 	fuxi_root27_graft();
+ #endif
++#if defined(FUXI)
++	fuxi_proc_watch_start();
++#endif
+ 
+ #if CONFIG_BASESYSTEMROOT
+ #if CONFIG_IMAGEBOOT
+diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
+index c10a08a..b9e20be 100644
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1972,6 +1972,32 @@ fuxi_proc_log(void)
+ 	}
+ 	return on == 1;
+ }
++
++extern void IOSleep(unsigned int milliseconds);
++
++/* With fuxi_proc_log=1: what pid 1's threads are doing, every 20 s for 8 minutes. */
++static void
++fuxi_proc_watch(__unused void *arg, __unused wait_result_t wr)
++{
++	for (int i = 0; i < 24; i++) {
++		IOSleep(i == 0 ? 15000 : 20000);
++		proc_t p = proc_find(1);
++		if (p != PROC_NULL) {
++			fuxi_task_report(proc_task(p), 1);
++			proc_rele(p);
++		}
++	}
++}
++
++void
++fuxi_proc_watch_start(void)
++{
++	thread_t thread;
++
++	if (fuxi_proc_log() && kernel_thread_start(fuxi_proc_watch, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
+ #endif
+ 
+ static void
+diff --git a/bsd/sys/proc_internal.h b/bsd/sys/proc_internal.h
+index 7669c24..fa8a663 100644
+--- a/bsd/sys/proc_internal.h
++++ b/bsd/sys/proc_internal.h
+@@ -1160,6 +1160,8 @@ extern bool no_paging_space_action(uint32_t cause);
+ 
+ #if defined(FUXI)
+ extern bool fuxi_proc_log(void);
++extern void fuxi_proc_watch_start(void);
++extern void fuxi_task_report(task_t task, int pid);
+ #endif
+ 
+ __exported_pop
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index bac41b9..479d41d 100644
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -10881,3 +10881,53 @@ task_set_ast_synthesize_async_fault_mach_exception(task_t task)
+ 
+ 	task_unlock(task);
+ }
++
++#if defined(FUXI) && defined(__arm64__)
++#include <kern/thread_kernel_state.h>
++#include <ptrauth.h>
++
++void fuxi_task_report(task_t task, int pid);
++
++/*
++ * fuxi_proc_log=1 watchdog (bsd kern_exit.c): one line for the task, then one per thread with its
++ * state, wait event, user pc/lr (last trap or interrupt from EL0) and, for a waiting thread, up to
++ * 8 kernel return addresses walked inside its own kernel stack. Kernel addresses are slid.
++ */
++void
++fuxi_task_report(task_t task, int pid)
++{
++	thread_t th;
++
++	if (task == TASK_NULL) {
++		return;
++	}
++	task_lock(task);
++	printf("fuxi: watch pid %d threads %d faults %llu pageins %llu dyld_info 0x%llx kslide 0x%lx\n", pid,
++	    task->thread_count, (unsigned long long)counter_load(&task->faults),
++	    (unsigned long long)counter_load(&task->pageins), (unsigned long long)task->all_image_info_addr,
++	    (unsigned long)vm_kernel_slide);
++	queue_iterate(&task->threads, th, thread_t, task_threads) {
++		struct arm_saved_state *us = th->machine.upcb;
++		uint64_t k[8] = { 0 };
++		int n = 0;
++		vm_offset_t lo = th->kernel_stack, hi = lo + kernel_stack_size;
++
++		if (lo != 0 && (th->state & TH_WAIT) && th->machine.kpcb == NULL) {
++			arm_kernel_saved_state_t *ks = &thread_get_kernel_state(th)->machine.ss;
++			uint64_t fp = (uint64_t)ptrauth_strip((void *)ks->fp, ptrauth_key_frame_pointer);
++
++			k[n++] = (uint64_t)ptrauth_strip((void *)ks->lr, ptrauth_key_return_address);
++			while (n < 8 && fp >= lo && fp + 16 <= hi && (fp & 7) == 0) {
++				k[n++] = (uint64_t)ptrauth_strip((void *)((uint64_t *)fp)[1], ptrauth_key_return_address);
++				fp = (uint64_t)ptrauth_strip((void *)((uint64_t *)fp)[0], ptrauth_key_frame_pointer);
++			}
++		}
++		printf("fuxi:  tid %llu state 0x%x pri %d wait 0x%llx upc 0x%llx ulr 0x%llx k %llx %llx %llx %llx %llx %llx %llx %llx\n",
++		    (unsigned long long)th->thread_id, th->state, th->sched_pri, (unsigned long long)th->wait_event,
++		    us != NULL ? (unsigned long long)get_saved_state_pc(us) : 0ULL,
++		    us != NULL ? (unsigned long long)get_saved_state_lr(us) : 0ULL,
++		    k[0], k[1], k[2], k[3], k[4], k[5], k[6], k[7]);
++	}
++	task_unlock(task);
++}
++#endif /* FUXI && __arm64__ */
