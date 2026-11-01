@@ -29,7 +29,7 @@
  	sweet_sample_start();
 --- a/bsd/dev/fuxi_wlan.c
 +++ b/bsd/dev/fuxi_wlan.c
-@@ -0,0 +1,5823 @@
+@@ -0,0 +1,5826 @@
 +/*
 + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
 + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -145,8 +145,11 @@
 + *                 does no radio work.
 + *   fuxiwifiauto=1  with fuxiath12k=8: also read /chosen fuxi-wifi-join, and join that network once when the radio is up,
 + *                 with nobody on iOS's side asking. Without it stage 8 does not look at that property. iOS's side leaving or
-+ *                 joining wins, and a loss is not followed by another join. With 2 the same, except that the
-+ *                 Apple80211 side gets no event of it: wifid finds out only by asking.
++ *                 joining wins. The access point's deauthentication or the driver's loss is followed by another scan and join,
++ *                 retried every 1 to 30 s, with the key kept until iOS's side leaves, joins or turns the radio off. With 2 the
++ *                 same, except that the Apple80211 side gets no event of a join: wifid finds out only by asking.
++ *   fuxiwifiwide=1  with fuxiath12k=8: the channel as wide as the access point's, 40 or 80 MHz, read by the driver domain. Off
++ *                 by default. Stages 5 to 7 stay at 20 MHz with or without it.
 + *   fuxiath12kq=MASK  with fuxiath12k=4 to 7: 0x1 no idle power save, 0x2 no hw mode command, 0x8 settle
 + *                 after vdev create, 0x10 passive scan, 0x20 stage 7 answers ARP and echoes for 240 s, for a load from the
 + *                 network. Read and logged by the driver domain.

@@ -480,7 +480,7 @@ struct linuxkpi_ieee80211_channel {
     signed char psd; enum nl80211_band band; uint32_t center_freq, flags, orig_flags; int max_power, max_reg_power, max_antenna_gain, orig_mpwr;
 };
 struct ieee80211_rate { int bitrate; };
-enum nl80211_chan_width { NL80211_CHAN_WIDTH_20 = 1 };
+enum nl80211_chan_width { NL80211_CHAN_WIDTH_20 = 1, NL80211_CHAN_WIDTH_40, NL80211_CHAN_WIDTH_80 };
 struct cfg80211_chan_def { struct linuxkpi_ieee80211_channel *chan; enum nl80211_chan_width width; uint32_t center_freq1; };
 struct ieee80211_sta_ht_cap { bool ht_supported; uint8_t ampdu_density, ampdu_factor; uint16_t cap; uint8_t mcs[16]; };
 struct ieee80211_sta_vht_cap { bool vht_supported; uint32_t cap; uint8_t vht_mcs[8]; };
@@ -504,7 +504,7 @@ ieee80211_get_he_iftype_cap(const struct ieee80211_supported_band *band, enum nl
 }
 struct ieee80211_reg_rule {
     uint32_t flags; signed char psd;
-    struct { int start_freq_khz, end_freq_khz; } freq_range;
+    struct { int start_freq_khz, end_freq_khz, max_bandwidth_khz; } freq_range;
     struct { int max_eirp, max_antenna_gain; } power_rule;
 };
 struct linuxkpi_ieee80211_regdomain { uint8_t alpha2[2]; int n_reg_rules; struct ieee80211_reg_rule reg_rules[]; };
@@ -537,7 +537,7 @@ struct cfg80211_scan_request {
 struct ieee80211_vif; struct ieee80211_sta; struct ieee80211_txq; struct ieee80211_chanctx_conf; struct napi_struct;
 struct ieee80211_hw { struct wiphy *wiphy; void *priv; size_t vif_data_size, sta_data_size, chanctx_data_size; unsigned long flags; uint16_t max_rx_aggregation_subframes; struct { uint32_t listen_interval; } conf; };
 enum ieee80211_sta_state { IEEE80211_STA_NOTEXIST, IEEE80211_STA_NONE, IEEE80211_STA_AUTH, IEEE80211_STA_ASSOC, IEEE80211_STA_AUTHORIZED };
-enum { IEEE80211_STA_RX_BW_20 = 1 }; enum { IEEE80211_SMPS_OFF = 1 };
+enum { IEEE80211_STA_RX_BW_20 = 1, IEEE80211_STA_RX_BW_40, IEEE80211_STA_RX_BW_80 }; enum { IEEE80211_SMPS_OFF = 1 };
 enum { IEEE80211_AC_VO, IEEE80211_AC_VI, IEEE80211_AC_BE, IEEE80211_AC_BK };
 enum { BSS_CHANGED_ASSOC = 1, BSS_CHANGED_ERP_PREAMBLE = 8, BSS_CHANGED_ERP_SLOT = 16, BSS_CHANGED_BASIC_RATES = 64, BSS_CHANGED_BEACON_INT = 128,
        BSS_CHANGED_BSSID = 256, BSS_CHANGED_QOS = 512, BSS_CHANGED_BEACON_INFO = 1024 };
@@ -1125,7 +1125,7 @@ static const uint8_t OPEN_HT[] = { 1, 8, 0x82, 0x84, 0x8b, 0x96, 12, 18, 24, 36,
 static const uint8_t WMM_PARAM[] = { 221, 24, 0x00, 0x50, 0xf2, 2, 1, 1, 0, 0, 3, 0xa4, 0, 0, 0x27, 0xa4, 0, 0, 0x42, 0x43, 94, 0, 0x62, 0x32, 47, 0 };
 
 /* ---- the handshake's peer, stage 6 ---- */
-static struct { bool forged_first, any_reply, silent, no_m3, door, die_at_m3, goes_open; int fail_key; bool m1_given, m3_given, forged_given, stayed; const unsigned char *group_reply; unsigned group_reply_length; } wpa;
+static struct { bool forged_first, any_reply, silent, no_m3, door, die_at_m3, goes_open, again_after_leaving; int fail_key; bool m1_given, m3_given, forged_given, stayed; const unsigned char *group_reply; unsigned group_reply_length; } wpa;
 static unsigned eapols, key_calls;
 static bool asked_bss, bss_had_rsn, asked_bss_open;
 static uint8_t WPA_HEARD[sizeof((uint8_t[]){ 0 }) * 22 + 128];
@@ -1293,6 +1293,8 @@ static struct {
     int fail_add, fail_assign, fail_sta_to;
     void (*also_heard)(void);
     bool hidden_beacon;
+    int rssi;					/* 0: -40 */
+    unsigned sibling_auth; bool sibling_silent, sibling_no_start; int sibling_fail_add;	/* what an access point other than AP does */
 } ap;
 static unsigned auth_tries, assoc_tries, deauths, scans, scan_channels;
 int lx_os_thread(const char *name, void (*function)(void *), void *argument) { return 0; }
@@ -1317,16 +1319,23 @@ static int op_scan(struct ieee80211_hw *hw, struct ieee80211_vif *v, struct ieee
     hear(FA_KIND_BEACON, OTHER, "fuxi-test-ne", 0x10, OPEN_HT, sizeof(OPEN_HT), 2437, -10);
     if (!ap.not_heard) {
         if (ap.hidden_beacon) hear(FA_KIND_BEACON, AP, "", ap.cap, ap.hear_elements, ap.hear_length, ap.frequency, -40);
-        hear(ap.hidden_beacon ? FA_KIND_PROBE_RESPONSE : FA_KIND_BEACON, AP, ap.heard_name ? ap.heard_name : NAME, ap.cap, ap.hear_elements, ap.hear_length, ap.frequency, -40);
+        hear(ap.hidden_beacon ? FA_KIND_PROBE_RESPONSE : FA_KIND_BEACON, AP, ap.heard_name ? ap.heard_name : NAME, ap.cap, ap.hear_elements, ap.hear_length, ap.frequency, ap.rssi != 0 ? ap.rssi : -40);
         if (ap.also_heard != NULL) ap.also_heard();
     }
     struct cfg80211_scan_info i = { .aborted = false };
     linuxkpi_ieee80211_scan_completed(hw, &i);
     return 0;
 }
+static struct cfg80211_chan_def last_def;
+static struct { int bandwidth; bool ht, vht, he; uint16_t ht_cap; } sta_seen;
 static int op_add_chanctx(struct ieee80211_hw *hw, struct ieee80211_chanctx_conf *c) {
-    assert(hw->wiphy->mtx.locked && c->def.width == NL80211_CHAN_WIDTH_20 && c->def.center_freq1 == c->def.chan->center_freq);
-    NOTE("add_chanctx"); return ap.fail_add;
+    /* Stages 5 to 7 are 20 MHz, on the primary, whatever the access point says. */
+    assert(hw->wiphy->mtx.locked && (radio_of(hw)->ios || (c->def.width == NL80211_CHAN_WIDTH_20 && c->def.center_freq1 == c->def.chan->center_freq)));
+    assert(!memcmp(&c->min_def, &c->def, sizeof(c->def)));
+    last_def = c->def;
+    NOTE("add_chanctx");
+    if (ap.sibling_fail_add != 0 && memcmp(radio_of(hw)->target.address, AP, 6) != 0) return ap.sibling_fail_add;
+    return ap.fail_add;
 }
 static void op_remove_chanctx(struct ieee80211_hw *hw, struct ieee80211_chanctx_conf *c) { assert(hw->wiphy->mtx.locked); NOTE("remove_chanctx"); }
 static int op_assign(struct ieee80211_hw *hw, struct ieee80211_vif *v, struct ieee80211_bss_conf *l, struct ieee80211_chanctx_conf *c) {
@@ -1336,14 +1345,19 @@ static int op_assign(struct ieee80211_hw *hw, struct ieee80211_vif *v, struct ie
 static void op_unassign(struct ieee80211_hw *hw, struct ieee80211_vif *v, struct ieee80211_bss_conf *l, struct ieee80211_chanctx_conf *c) { assert(hw->wiphy->mtx.locked); NOTE("unassign"); }
 static int op_sta_state(struct ieee80211_hw *hw, struct ieee80211_vif *v, struct ieee80211_sta *s, enum ieee80211_sta_state from, enum ieee80211_sta_state to) {
     char what[16];
-    assert(hw->wiphy->mtx.locked && s == radio_of(hw)->sta && !memcmp(s->addr, AP, 6) && s->link[0] == &s->deflink);
+    assert(hw->wiphy->mtx.locked && s == radio_of(hw)->sta && !memcmp(s->addr, radio_of(hw)->target.address, 6) && s->link[0] == &s->deflink);
     assert(from + 1 == (int)to || from == (int)to + 1);
     /* The way it finds its station: every state it is in, as the driver asks (mac.c, ath12k_bss_assoc()). */
-    assert(linuxkpi_ieee80211_find_sta(v, AP) == s && linuxkpi_ieee80211_find_sta(v, OTHER) == NULL);
+    assert(linuxkpi_ieee80211_find_sta(v, s->addr) == s && linuxkpi_ieee80211_find_sta(v, OTHER) == NULL);
     snprintf(what, sizeof(what), "sta%d%d", from, to); NOTE(what);
+    if (ap.sibling_no_start && to == IEEE80211_STA_NONE && from < to && memcmp(s->addr, AP, 6) != 0) return -110;
+    if (to == IEEE80211_STA_ASSOC && from < to) {
+        sta_seen.bandwidth = s->deflink.bandwidth; sta_seen.ht = s->deflink.ht_cap.ht_supported; sta_seen.vht = s->deflink.vht_cap.vht_supported;
+        sta_seen.he = s->deflink.he_cap.has_he; sta_seen.ht_cap = s->deflink.ht_cap.cap;
+    }
     /* What ath12k asks in the peer's association (mac.c), and what it reads out of the answer. */
     if (to == IEEE80211_STA_ASSOC && from < to) {
-        struct cfg80211_bss *b = linuxkpi_cfg80211_get_bss(hw->wiphy, NULL, AP, NULL, 0, IEEE80211_BSS_TYPE_ANY, IEEE80211_PRIVACY_ANY);
+        struct cfg80211_bss *b = linuxkpi_cfg80211_get_bss(hw->wiphy, NULL, s->addr, NULL, 0, IEEE80211_BSS_TYPE_ANY, IEEE80211_PRIVACY_ANY);
         assert(linuxkpi_cfg80211_get_bss(hw->wiphy, NULL, OTHER, NULL, 0, IEEE80211_BSS_TYPE_ANY, IEEE80211_PRIVACY_ANY) == NULL);
         if (radio_of(hw)->protect) { asked_bss = b != NULL; bss_had_rsn = b != NULL && fa_element(b->ies->data, b->ies->len, FA_EID_RSN) != NULL; linuxkpi_cfg80211_put_bss(hw->wiphy, b); }
         else asked_bss_open = b != NULL;
@@ -1355,12 +1369,12 @@ static void op_link(struct ieee80211_hw *hw, struct ieee80211_vif *v, struct iee
     assert(hw->wiphy->mtx.locked && l == &v->bss_conf);
     he_params_seen = l->he_oper.params;
     NOTE("link"); *(link_changes++ == 0 ? &first_link_change : &second_link_change) = what;
-    if (what & BSS_CHANGED_BSSID) assert(!memcmp(l->bssid, AP, 6));
+    if (what & BSS_CHANGED_BSSID) assert(!memcmp(l->bssid, radio_of(hw)->target.address, 6));
 }
 static void op_vif(struct ieee80211_hw *hw, struct ieee80211_vif *v, u64 what) {
     assert(hw->wiphy->mtx.locked && what == BSS_CHANGED_ASSOC);
     NOTE(v->cfg.assoc ? "assoc_told" : "disassoc_told");
-    if (v->cfg.assoc) assert(!memcmp(v->cfg.ap_addr, AP, 6) && linuxkpi_ieee80211_find_sta(v, v->cfg.ap_addr) != NULL && v->cfg.aid == ap.aid);
+    if (v->cfg.assoc) assert(!memcmp(v->cfg.ap_addr, radio_of(hw)->target.address, 6) && linuxkpi_ieee80211_find_sta(v, v->cfg.ap_addr) != NULL && v->cfg.aid == ap.aid);
 }
 static int op_conf_tx(struct ieee80211_hw *hw, struct ieee80211_vif *v, u32 link, u16 ac, const struct ieee80211_tx_queue_params *p) { assert(hw->wiphy->mtx.locked); NOTE("conf_tx"); return 0; }
 static void op_flush(struct ieee80211_hw *hw, struct ieee80211_vif *v, u32 q, bool drop) { assert(hw->wiphy->mtx.locked && !drop); NOTE("flush"); }
@@ -1368,9 +1382,11 @@ static void op_tx(struct ieee80211_hw *hw, struct ieee80211_tx_control *c, struc
     assert(!locks && !hw->wiphy->mtx.locked && c->sta == radio_of(hw)->sta);
     assert(IEEE80211_SKB_CB(skb)->control.vif == radio_of(hw)->vif && skb->len >= 24);
     uint8_t kind = skb->data[0];
-    assert(!memcmp(skb->data + 4, AP, 6) && !memcmp(skb->data + 10, OWN, 6));
+    const uint8_t *here = radio_of(hw)->target.address;
+    bool sibling = memcmp(here, AP, 6) != 0;
+    assert(!memcmp(skb->data + 4, here, 6) && !memcmp(skb->data + 10, OWN, 6));
     if (kind == 0x88 || kind == 0x08) { eapol_sent(hw, skb); return; }
-    assert(!memcmp(skb->data + 16, AP, 6));
+    assert(!memcmp(skb->data + 16, here, 6));
     if (kind == FA_KIND_AUTH) {
         NOTE("auth"); auth_tries++; assert(skb->len == FA_AUTH_LENGTH); memcpy(last_auth, skb->data, skb->len);
     } else if (kind == FA_KIND_ASSOC_REQUEST) {
@@ -1382,11 +1398,15 @@ static void op_tx(struct ieee80211_hw *hw, struct ieee80211_tx_control *c, struc
     } else {
         abort();
     }
-    if (ap.no_complete) {
+    if (ap.no_complete || (sibling && ap.sibling_silent)) {
         dev_kfree_skb_any(skb);
     } else {
         IEEE80211_SKB_CB(skb)->flags |= IEEE80211_TX_STAT_ACK;
         linuxkpi_ieee80211_tx_status(hw, skb);
+    }
+    if (sibling) {
+        if (kind == FA_KIND_AUTH && !ap.sibling_silent) give_auth(here, OWN, 0, 2, ap.sibling_auth);
+        return;
     }
     if (kind == FA_KIND_AUTH && !ap.silent_auth) {
         if (ap.bad_auth_first) {
@@ -1495,7 +1515,10 @@ static void rsn_sibling(void) { hear(FA_KIND_BEACON, OTHER, NAME, 0, RSN_ELEMENT
 
 static void wpa_tick(void) {
     struct fa_radio *r = radio_of(the_hw);
+    /* A join made while joined leaves first: the handshake that counts is the one after that. */
+    if (wpa.again_after_leaving && r->vif != NULL && !r->vif->cfg.assoc) { memset(&wpa, 0, sizeof(wpa)); wpa.stayed = true; eapols = key_calls = 0; }
     if (r->vif == NULL || !r->vif->cfg.assoc || r->eapol_length != 0 || wpa.silent) return;
+    if (wpa.again_after_leaving) return;
     if (!wpa.m1_given) { wpa.m1_given = true; give_eapol(V_M1, sizeof(V_M1)); return; }
     if (eapols == 1 && !wpa.m3_given) {
         if (wpa.no_m3) return;
@@ -1528,6 +1551,71 @@ static void fresh_wpa(const uint8_t *key) {
 static void fresh_net(void) { fresh_wpa(V_PMK); fa_m7_ask(); net.on = true; memset(&serve, 0, sizeof(serve)); serve_end = 0; tick = serve_tick; }
 static void m8_count(const struct fa_heard *h, unsigned *count) { assert(h->age_ms < 200000); (*count)++; }
 static void m8_again(void) { unsigned s = wpa.fail_key = 0; memset(&wpa, 0, sizeof(wpa)); wpa.stayed = true; eapols = key_calls = s; tick = wpa_tick; }
+/* ---- stage 8: other access points of the name, and what wide channels need ---- */
+static const uint8_t SIBLING[6] = {0x02, 0xa1, 0xb2, 0xc3, 0xd4, 0x70};
+static struct { unsigned frequency, count; int rssi; const uint8_t *elements; unsigned length; } sib;
+static void sibling_heard(void) {
+    for (unsigned i = 0; i < sib.count; i++) {
+        uint8_t a[6]; memcpy(a, SIBLING, 6); a[5] = (uint8_t)(a[5] + i);
+        hear(FA_KIND_BEACON, a, NAME, ap.cap, sib.elements != NULL ? sib.elements : ap.hear_elements, sib.elements != NULL ? sib.length : ap.hear_length, sib.frequency, sib.rssi);
+    }
+}
+static void siblings(unsigned count, unsigned frequency, int rssi) { memset(&sib, 0, sizeof(sib)); sib.count = count; sib.frequency = frequency; sib.rssi = rssi; ap.also_heard = sibling_heard; }
+static struct linuxkpi_ieee80211_channel wide2[3], wide5[5];
+static uint8_t wide_heard[512], wide_answer[512];
+/* A radio with the channels and domain wide channels need, and the domain's limit on each band. */
+static void wide_radio(int most_2, int most_5) {
+    struct fa_radio *radio = radio_of(the_hw);
+    size_t size = sizeof(struct linuxkpi_ieee80211_regdomain) + 2 * sizeof(struct ieee80211_reg_rule);
+    struct linuxkpi_ieee80211_regdomain *regd = calloc(1, size);
+    static const unsigned F2[3] = {2412, 2437, 2457}, F5[5] = {5180, 5200, 5220, 5240, 5260};
+    memset(wide2, 0, sizeof(wide2)); memset(wide5, 0, sizeof(wide5));
+    for (unsigned i = 0; i < 3; i++) { wide2[i].center_freq = F2[i]; wide2[i].band = NL80211_BAND_2GHZ; }
+    for (unsigned i = 0; i < 5; i++) { wide5[i].center_freq = F5[i]; wide5[i].band = NL80211_BAND_5GHZ; }
+    wide5[4].flags = IEEE80211_CHAN_NO_IR | IEEE80211_CHAN_RADAR;
+    b2.channels = wide2; b2.n_channels = 3; b5.channels = wide5; b5.n_channels = 5;
+    regd->n_reg_rules = 2;
+    regd->reg_rules[0].freq_range.start_freq_khz = 2402000; regd->reg_rules[0].freq_range.end_freq_khz = 2482000; regd->reg_rules[0].freq_range.max_bandwidth_khz = most_2 * 1000;
+    regd->reg_rules[1].freq_range.start_freq_khz = 5170000; regd->reg_rules[1].freq_range.end_freq_khz = 5330000; regd->reg_rules[1].freq_range.max_bandwidth_khz = most_5 * 1000;
+    radio->regd = regd;
+}
+/* An access point on this channel: its HT operation's second byte, its VHT operation's width and centre (a width below 0: no VHT at all), and HE or not. */
+static void wide_ap(unsigned frequency, unsigned ht_param, int vht_width, unsigned vht_center, bool he) {
+    static const uint8_t RATES[] = { 1, 8, 12, 18, 24, 36, 48, 72, 96, 108 };
+    uint8_t ht[28] = { 45, 26, 0x7f, 0x02, 0x1b, 0xff, 0xff };
+    uint8_t op[24] = { 61, 22, (uint8_t)(frequency > 5000 ? (frequency - 5000) / 5 : (frequency - 2407) / 5), (uint8_t)ht_param };
+    uint8_t vht[14] = { 191, 12, 0xb2, 0x01, 0x80, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0 };
+    uint8_t vop[7] = { 192, 5, (uint8_t)vht_width, (uint8_t)vht_center, 0, 0, 0 };
+    uint8_t cap[24] = { 255, 22, FA_EXT_HE }; uint8_t common[256]; unsigned n = 0;
+    memcpy(common + n, RATES, sizeof(RATES)); n += sizeof(RATES);
+    memcpy(common + n, ht, sizeof(ht)); n += sizeof(ht);
+    memcpy(common + n, op, sizeof(op)); n += sizeof(op);
+    if (vht_width >= 0) { memcpy(common + n, vht, sizeof(vht)); n += sizeof(vht); memcpy(common + n, vop, sizeof(vop)); n += sizeof(vop); }
+    if (he) { memset(cap + 3, 0x11, 6); cap[20] = 0xfa; cap[21] = 0xff; cap[22] = 0xfa; cap[23] = 0xff; memcpy(common + n, cap, sizeof(cap)); n += sizeof(cap); }
+    memcpy(wide_heard, RSN_ELEMENT, sizeof(RSN_ELEMENT)); memcpy(wide_heard + sizeof(RSN_ELEMENT), common, n);
+    ap.hear_elements = wide_heard; ap.hear_length = sizeof(RSN_ELEMENT) + n;
+    memcpy(wide_answer, common, n); memcpy(wide_answer + n, WMM_PARAM, sizeof(WMM_PARAM));
+    ap.response = wide_answer; ap.response_length = n + sizeof(WMM_PARAM); ap.frequency = frequency;
+}
+static const uint8_t *asked_for(unsigned id) { return fa_element(last_assoc + 28, last_assoc_length - 28, id); }
+/* Stage 8 up with nobody asking, then one join of wifid's on what wide_ap() set. */
+static struct fa_radio *m8_fresh(void) {
+    struct fa_radio *radio;
+    fresh_wpa(V_PMK); memset(&m8, 0, sizeof(m8)); wpa.stayed = true; radio = radio_of(the_hw); fa_ios_start(&M8_INPUT); m8_alones = 0;
+    return radio;
+}
+/* All of it says the same width, or the test says otherwise. */
+static void width_agrees(unsigned mhz, unsigned center, int bandwidth) {
+    assert(last_def.center_freq1 == center && last_def.width == (mhz == 80 ? NL80211_CHAN_WIDTH_80 : mhz == 40 ? NL80211_CHAN_WIDTH_40 : NL80211_CHAN_WIDTH_20));
+    assert(sta_seen.bandwidth == bandwidth && radio_of(the_hw)->width.mhz == mhz && radio_of(the_hw)->width.center == center);
+    assert(sta_seen.ht && ((sta_seen.ht_cap & FA_HT_CAP_40) != 0) == (mhz > 20) && ((sta_seen.ht_cap & FA_HT_CAP_SGI_40) != 0) == (mhz > 20));
+    const uint8_t *ht = asked_for(FA_EID_HT);
+    assert(ht != NULL && ((ht[2] & FA_HT_CAP_40) != 0) == (mhz > 20) && ((ht[2] & FA_HT_CAP_SGI_40) != 0) == (mhz > 20));
+    const uint8_t *vht = asked_for(FA_EID_VHT);
+    assert(sta_seen.vht == (vht != NULL));
+    if (vht != NULL) assert((vht[2] & FA_VHT_CAP_WIDTH) == 0 && (vht[2] & FA_VHT_CAP_SGI_160) == 0);
+    assert(sta_seen.he == (fa_ext_element(last_assoc + 28, last_assoc_length - 28, FA_EXT_HE) != NULL));
+}
 /* The network's side of the load test: what comes, once the join is answering or, without the knob, staying. */
 static bool serve_on;
 static int serve_end;
@@ -2010,10 +2098,12 @@ int main(void) {
         /* Its key is gone from what it read too: only what the join itself keeps for its messages. */
         assert(strstr(said, "M8 auto join: name") < strstr(said, "M8 joined"));
 
-        /* Lost: said, and no other join behind anyone's back. */
-        m8.losts = 0; linuxkpi_ieee80211_connection_loss(radio->vif); ios_step(radio);
-        assert(m8.losts == 1 && !radio->ios_joined && !radio->ios_auto_joined && SAID("M8 auto join: the network is lost, not joining again"));
-        { unsigned ups = m8.ups; now += FA_AUTO_WAIT_NS * 2; ios_auto_step(radio); ios_step(radio); assert(m8.ups == ups && !radio->ios_joined); }
+        /* Now asking for something else: said, the key gone, and no other join behind anyone's back. */
+        { static const uint8_t none[32]; assert(rejoin_name_length == n && !memcmp(rejoin_key, V_PMK, 32));
+          m8.losts = 0; hear(FA_KIND_BEACON, AP, NAME, FA_CAP_ESS, OPEN_HT, sizeof(OPEN_HT), 2437, -41); ios_step(radio);
+          assert(m8.losts == 1 && !radio->ios_joined && !radio->ios_auto_joined && !radio->ios_rejoining && SAID("M8 auto join: the network is lost, not joining again"));
+          assert(rejoin_name_length == 0 && !memcmp(rejoin_key, none, 32)); }
+        { unsigned ups = m8.ups; now += FA_AUTO_WAIT_NS * 2; ios_auto_step(radio); ios_step(radio); ios_rejoin_step(radio); assert(m8.ups == ups && !radio->ios_joined); }
         station_down(radio); done();
 
         /* The radio asked for by nobody: the time ends the wait. */
@@ -2056,6 +2146,323 @@ int main(void) {
         assert(m8_alones == 1 && m8_alone == FA_IOS_NOT_HEARD && !m8.ups && SAID("M8 auto join: answer 3") && !radio->ios_auto_joined);
         ios_auto_step(radio); assert(m8_alones == 1);
         ap.not_heard = false; station_down(radio); done();
+    }
+
+    /* ---- stage 8: joining the auto join's network again ---- */
+    {
+        const uint8_t *name = (const uint8_t *)NAME; unsigned n = sizeof(NAME) - 1;
+        static const uint8_t none[32];
+        static const uint8_t ADDBA[9] = { 3, 0, 1, 0x02 | 5 << 2, 0x10, 0, 0, 0, 0 };
+        static struct fa_ios_state state;
+        struct fa_radio *radio;
+
+        radio = m8_fresh();
+        fa_set_auto_join(name, n, V_PMK);
+        assert(fa_m8_up(the_hw) == 0 && fa_ios_power(1) == FA_IOS_DONE);
+        m8_again(); ios_auto_step(radio);
+        assert(radio->ios_auto_joined && m8.ups == 1 && m8_alones == 1 && !radio->ios_rejoining);
+        /* Kept for as long as it is the auto join's network, out of the one that was given. */
+        assert(rejoin_name_length == n && !memcmp(rejoin_name, NAME, n) && !memcmp(rejoin_key, V_PMK, 32) && auto_name_length == 0 && !memcmp(auto_key, none, 32));
+
+        /* The access point's deauthentication: no goodbye, what is live back, the link down once; then nothing until its time. */
+        give_action(AP, ADDBA, 9); ios_step(radio); assert(radio->ba_live != 0);
+        calls[0] = 0; deauths = 0; scans = 0; m8.downs = m8.losts = 0; said[0] = 0;
+        give_door(FA_KIND_DEAUTH, 3); ios_step(radio);
+        assert(SAID("M8 door: kind 0xc0 reason 3") && SAID("M8 rejoin: lost, the first try in 1000 ms") && !SAID("not joining again"));
+        assert(radio->ios_rejoining && !radio->ios_joined && !radio->ios_auto_joined && radio->chanctx == NULL && radio->sta == NULL && radio->reached == IEEE80211_STA_NOTEXIST && !radio->ba_live && !deauths);
+        assert(m8.downs == 1 && m8.losts == 1 && m8.lost == FA_IOS_GONE && !memcmp(rejoin_key, V_PMK, 32));
+        fa_ios_state(&state); assert(state.phase == FA_IOS_IDLE && state.last_answer == FA_IOS_DONE);
+        ios_rejoin_step(radio); assert(!scans && !radio->rejoin_tries && !SAID("M8 rejoin: try"));
+        assert(radio->rejoin_at - now == 1000000000ull);
+        now = radio->rejoin_at - 1; ios_rejoin_step(radio); assert(!scans && !radio->rejoin_tries);
+
+        /* Gone for a while: every try a line, the wait doubling to 30 s and staying, and of it all iOS's side hears nothing more. */
+        ap.not_heard = true;
+        {
+            static const unsigned WAITS[] = { 2000, 4000, 8000, 16000, 30000, 30000, 30000, 30000, 30000, 30000 };
+            for (unsigned i = 0; i < sizeof(WAITS) / sizeof(WAITS[0]); i++) {
+                char line[96];
+                unsigned before = scans;
+                now = radio->rejoin_at - 1; ios_rejoin_step(radio); assert(scans == before && radio->rejoin_tries == i);
+                now = radio->rejoin_at; m8_again(); ios_rejoin_step(radio);
+                assert(scans == before + FA_JOIN_SCANS && radio->rejoin_tries == i + 1 && radio->ios_rejoining && radio->rejoin_at - now == WAITS[i] * 1000000ull);
+                snprintf(line, sizeof(line), "M8 rejoin: try %u answer %d, the next in %u ms\n", i + 1, FA_IOS_NOT_HEARD, WAITS[i]);
+                assert(SAID(line));
+                assert(m8.ups == 1 && m8_alones == 1 && m8.losts == 1 && m8.downs == 1 && !evidence_count && !memcmp(rejoin_key, V_PMK, 32));
+                fa_ios_state(&state); assert(state.phase == FA_IOS_IDLE && state.last_answer == FA_IOS_DONE);
+            }
+        }
+        assert(fa_rejoin_wait_ms(0xffffffffu) == 30000);
+
+        /* Back: scan first, then all of the join again in the same memory, and only now the link up, once. */
+        {
+            void *memory = radio->sta_memory;
+            unsigned key_slot = radio->group_slot;
+            ap.not_heard = false; calls[0] = 0; m8_again(); now = radio->rejoin_at; ios_rejoin_step(radio);
+            assert(SAID("M8 rejoin: joined at try 11") && radio->ios_joined && radio->ios_auto_joined && !radio->ios_rejoining && !radio->rejoin_tries);
+            assert(m8.ups == 2 && m8_alones == 2 && m8_alone == FA_IOS_DONE && radio->sta_memory == memory && radio->group_slot == key_slot && !radio->ba_live && !radio->ba_want);
+            assert(strstr(calls, "scan,add_chanctx,assign,link,sta01,auth,sta12,assoc,sta23,assoc_told,") && strstr(calls, "key_p,key_g,sta34,") && !memcmp(radio->wpa.pairwise, V_TK, 16));
+            assert(radio->reached == IEEE80211_STA_AUTHORIZED && !memcmp(rejoin_key, V_PMK, 32) && !target_key[0] && !target_key[31]);
+            fa_ios_state(&state); assert(state.phase == FA_IOS_JOINED && !memcmp(state.bss.bssid, AP, 6));
+        }
+        log_is_clean();
+
+        /* A disassociation, and the driver's own word, do the same, from the first wait again. */
+        for (unsigned kind = 0; kind < 2; kind++) {
+            unsigned ups = m8.ups, alones = m8_alones;
+            m8.losts = 0;
+            if (kind == 0) give_door(FA_KIND_DISASSOC, 3); else linuxkpi_ieee80211_connection_loss(radio->vif);
+            ios_step(radio);
+            assert(m8.losts == 1 && radio->ios_rejoining && radio->rejoin_at - now == 1000000000ull);
+            m8_again(); now = radio->rejoin_at; ios_rejoin_step(radio);
+            assert(radio->ios_joined && m8.ups == ups + 1 && m8_alones == alones + 1 && !radio->lost);
+        }
+
+        /* A join that does not come through is one more try, not the end: the access point refuses, or the handshake does not begin. */
+        m8.losts = 0; give_door(FA_KIND_DEAUTH, 3); ios_step(radio);
+        m8_again(); ap.auth_status = 17; now = radio->rejoin_at; ios_rejoin_step(radio);
+        assert(!radio->ios_joined && radio->ios_rejoining && radio->rejoin_tries == 1 && SAID("M8 rejoin: try 1 answer 4, the next in 2000 ms"));
+        m8_again(); ap.auth_status = 0; wpa.silent = true; now = radio->rejoin_at; ios_rejoin_step(radio);
+        assert(!radio->ios_joined && radio->ios_rejoining && radio->rejoin_tries == 2 && SAID("the next in 4000 ms"));
+        assert(radio->chanctx == NULL && radio->sta == NULL && !evidence_count);
+        /* The radio goes meanwhile: the key with it, and no more tries. */
+        fa_m4_evidence("died"); fa_m8_firmware_gone(); ios_step(radio);
+        assert(radio->ios_dead && !radio->ios_rejoining && rejoin_name_length == 0 && !memcmp(rejoin_key, none, 32));
+        { unsigned before = scans; now += 60000000000ull; ios_rejoin_step(radio); assert(scans == before); }
+        station_down(radio); done();
+
+        /* wifid's word wins, whether it comes while waiting or while joined: a leave, its own join, the radio off. The key is gone each time. */
+        for (unsigned kind = 0; kind < 6; kind++) {
+            radio = m8_fresh();
+            fa_set_auto_join(name, n, V_PMK);
+            assert(fa_m8_up(the_hw) == 0 && fa_ios_power(1) == FA_IOS_DONE);
+            m8_again(); ios_auto_step(radio); assert(radio->ios_auto_joined && rejoin_name_length == n);
+            if (kind < 3) { give_door(FA_KIND_DEAUTH, 3); ios_step(radio); assert(radio->ios_rejoining); }
+            m8_again(); wpa.again_after_leaving = true;
+            const char *line = kind % 3 == 0 ? "wifid asked for no network" : kind % 3 == 1 ? "wifid asked for a network" : "wifid asked for the radio off";
+            if (kind % 3 == 0) assert(fa_ios_leave() == FA_IOS_DONE);
+            if (kind % 3 == 1) assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_DONE && radio->ios_joined);
+            if (kind % 3 == 2) assert(fa_ios_power(0) == FA_IOS_DONE);
+            assert(SAID(line) && SAID(kind < 3 ? "M8 rejoin: stopped" : "M8 rejoin: will not happen"));
+            assert(rejoin_name_length == 0 && !memcmp(rejoin_key, none, 32) && !memcmp(rejoin_name, none, FA_SSID_MOST) && !radio->ios_rejoining && !radio->ios_auto_joined);
+            { unsigned before = scans, ups = m8.ups; now += 60000000000ull; ios_rejoin_step(radio); assert(scans == before && m8.ups == ups); }
+            /* A loss of the network wifid joined itself is wifid's to answer. */
+            if (kind % 3 == 1) {
+                unsigned before = scans; give_door(FA_KIND_DEAUTH, 3); ios_step(radio);
+                now += 60000000000ull; ios_rejoin_step(radio);
+                assert(!radio->ios_joined && !radio->ios_rejoining && scans == before);
+            }
+            station_down(radio); done();
+        }
+        /* It speaks just after the step has read the key: the join gives way, the step does not go on, and the leave then wipes it. */
+        radio = m8_fresh();
+        fa_set_auto_join(name, n, V_PMK);
+        assert(fa_m8_up(the_hw) == 0 && fa_ios_power(1) == FA_IOS_DONE);
+        m8_again(); ios_auto_step(radio); give_door(FA_KIND_DEAUTH, 3); ios_step(radio);
+        radio->ios_wifid_asked = true; now = radio->rejoin_at;
+        { unsigned before = scans; unsigned long long at = radio->rejoin_at; ios_rejoin_step(radio); assert(scans == before && radio->rejoin_at == at && SAID("M8 auto join: given up, wifid has spoken")); }
+        assert(fa_ios_leave() == FA_IOS_DONE && rejoin_name_length == 0 && !memcmp(rejoin_key, none, 32));
+        station_down(radio); done();
+        /* A network wifid joined from the start: never kept, never gone after. */
+        radio = m8_fresh();
+        assert(fa_m8_up(the_hw) == 0 && fa_ios_power(1) == FA_IOS_DONE);
+        m8_again(); assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_DONE && rejoin_name_length == 0 && !radio->ios_auto_joined);
+        give_door(FA_KIND_DEAUTH, 3); ios_step(radio);
+        assert(!radio->ios_rejoining && !SAID("M8 rejoin"));
+        station_down(radio); done();
+        /* Told nothing on fuxiwifiauto=2, as the first join. */
+        radio = m8_fresh(); auto_quiet = true;
+        fa_set_auto_join(name, n, V_PMK);
+        assert(fa_m8_up(the_hw) == 0 && fa_ios_power(1) == FA_IOS_DONE);
+        m8_again(); ios_auto_step(radio); give_door(FA_KIND_DEAUTH, 3); ios_step(radio);
+        m8_again(); now = radio->rejoin_at; ios_rejoin_step(radio);
+        assert(radio->ios_joined && m8.ups == 2 && m8_alones == 0);
+        auto_quiet = false; assert(fa_ios_leave() == FA_IOS_DONE);
+        station_down(radio); done();
+    }
+
+    /* ---- stage 8: which access point ---- */
+    {
+        const uint8_t *name = (const uint8_t *)NAME; unsigned n = sizeof(NAME) - 1;
+        struct fa_radio *radio;
+        static uint8_t pmf[sizeof(RSN_ELEMENT)];
+
+        /* 5 GHz with a usable signal beats a stronger 2.4 GHz, with the bonus and not without it. */
+        radio = m8_fresh(); ap.frequency = 5180; ap.rssi = -53; siblings(1, 2412, -37);
+        assert(fa_m8_up(the_hw) == 0);
+        m8_again(); assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_DONE && SAID("M8 joined 5180 MHz at -53 dBm, 20 MHz wide") && SAID("M8 choice: 5180 MHz at -53 dBm, score -33, of 2 heard") && !SAID("falling back"));
+        assert(!memcmp(radio->target.address, AP, 6) && last_def.chan->center_freq == 5180 && b5.band == NL80211_BAND_5GHZ);
+        log_is_clean();
+        assert(fa_ios_leave() == FA_IOS_DONE); station_down(radio); done();
+        /* Below the floor it does not count, while anything else was heard. */
+        radio = m8_fresh(); ap.rssi = -80; siblings(1, 5180, -73);
+        assert(fa_m8_up(the_hw) == 0);
+        m8_again(); assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_DONE && SAID("M8 joined 2437 MHz at -80 dBm"));
+        assert(fa_ios_leave() == FA_IOS_DONE); station_down(radio); done();
+        /* And on its own it is still a network to join. */
+        radio = m8_fresh(); ap.frequency = 5180; ap.rssi = -80;
+        assert(fa_m8_up(the_hw) == 0);
+        m8_again(); assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_DONE && SAID("M8 joined 5180 MHz at -80 dBm"));
+        assert(fa_ios_leave() == FA_IOS_DONE); station_down(radio); done();
+        /* Every one of them goes through the same RSN checks: the better one wants what is not built, and the join goes on to the next. */
+        memcpy(pmf, RSN_ELEMENT, sizeof(pmf)); pmf[20] = FA_RSN_MFP_REQUIRED;
+        radio = m8_fresh(); siblings(1, 5180, -50); sib.elements = pmf; sib.length = sizeof(pmf);
+        assert(fa_m8_up(the_hw) == 0);
+        m8_again(); auth_tries = 0; assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_DONE && SAID("M6 refused: it requires protected management frames") && SAID("M8 joined 2437 MHz"));
+        assert(!memcmp(radio->target.address, AP, 6) && auth_tries == 1);
+        assert(fa_ios_leave() == FA_IOS_DONE); station_down(radio); done();
+        /* All of them so: refused, as one was. */
+        radio = m8_fresh(); ap.hear_elements = pmf; ap.hear_length = sizeof(pmf); siblings(1, 5180, -50);
+        assert(fa_m8_up(the_hw) == 0);
+        m8_again(); auth_tries = 0; assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_NOT_BUILT && !auth_tries && !radio->ios_joined);
+        station_down(radio); done();
+        /* One of the name that is open still refuses the whole join: nobody talks us out of the key. */
+        radio = m8_fresh(); siblings(1, 5180, -50); sib.elements = OPEN_HT; sib.length = sizeof(OPEN_HT);
+        assert(fa_m8_up(the_hw) == 0);
+        m8_again(); auth_tries = 0; assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_NOT_BUILT && !auth_tries && SAID("M8 refused: the target has"));
+        station_down(radio); done();
+
+        /* A radar channel the driver will not start: not the firmware's death, and the next best is said and joined. Each way it can refuse. */
+        for (unsigned way = 0; way < 4; way++) {
+            radio = m8_fresh(); siblings(1, 5260, -50);
+            b5.channels = five; five[1].flags = IEEE80211_CHAN_NO_IR | IEEE80211_CHAN_RADAR;
+            if (way == 0) ap.sibling_no_start = true;
+            if (way == 1) ap.sibling_fail_add = -22;
+            if (way == 2) ap.sibling_silent = true;
+            if (way == 3) ap.sibling_auth = 17;
+            assert(fa_m8_up(the_hw) == 0);
+            m8_again(); calls[0] = 0;
+            assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_DONE && !evidence_count && !radio->ios_dead && radio->ios_joined);
+            assert(SAID("M8 choice: 5260 MHz at -50 dBm, score -30, of 2 heard") && SAID("M8 join at 5260 MHz came to nothing") && SAID("M8 choice, falling back to the next best: 2437 MHz at -40 dBm") && SAID("M8 joined 2437 MHz"));
+            if (way == 0) assert(SAID("M8 the peer or the vdev start not taken on 5260 MHz, a channel with radar rules: -110"));
+            if (way == 1) assert(SAID("M8 the channel not taken on 5260 MHz, a channel with radar rules: -22"));
+            if (way == 2) assert(SAID("M8 the frames not taken on 5260 MHz, a channel with radar rules"));
+            /* Whatever the first left is gone before the next. */
+            assert(strstr(calls, way == 1 ? "add_chanctx,add_chanctx," : "unassign,remove_chanctx,add_chanctx,") && !memcmp(radio->target.address, AP, 6) && radio->reached == IEEE80211_STA_AUTHORIZED);
+            log_is_clean();
+            assert(fa_ios_leave() == FA_IOS_DONE); station_down(radio); done();
+        }
+        /* On a channel without radar rules a driver that will not start is still the firmware's account, as it was. */
+        radio = m8_fresh(); siblings(1, 5180, -50); ap.sibling_no_start = true;
+        assert(fa_m8_up(the_hw) == 0);
+        m8_again(); assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_RADIO_DEAD && evidence_count && radio->ios_dead);
+        station_down(radio); done();
+        /* A wrong key is the same everywhere: the handshake's no ends it, at the first. */
+        radio = m8_fresh(); ap.frequency = 5180; siblings(1, 2412, -37);
+        { static uint8_t wrong[32]; memset(wrong, 0x5a, 32);
+          assert(fa_m8_up(the_hw) == 0);
+          m8_again(); wpa.any_reply = true; auth_tries = 0;
+          assert(fa_ios_join(name, n, NULL, wrong) == FA_IOS_NO_AUTH && auth_tries == 1 && !SAID("falling back")); }
+        station_down(radio); done();
+        /* Bounded: however many there are, a join goes to so many, and its answer is the last one's. */
+        radio = m8_fresh(); siblings(6, 5180, -50); ap.sibling_auth = 17;
+        assert(fa_m8_up(the_hw) == 0);
+        m8_again(); auth_tries = 0; assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_REFUSED && !radio->ios_joined && radio->chanctx == NULL);
+        { unsigned lines = 0; for (const char *at = said; (at = strstr(at, "came to nothing")) != NULL; at++) lines++; assert(lines == FA_JOIN_CANDIDATES); }
+        station_down(radio); done();
+        /* Stage 6 keeps no list and joins the strongest it heard, however good the other. */
+        fresh_wpa(V_PMK); siblings(1, 5180, -45); ap.rssi = -40;
+        assert(fa_m5_station(the_hw, false) == 0 && SAID("M5 target heard 2 times, 2437 MHz at -40 dBm") && !SAID("M8 choice") && !radio_of(the_hw)->target.candidates && last_def.chan->center_freq == 2437);
+        done();
+    }
+
+    /* ---- stage 8: how wide, fuxiwifiwide=1 ---- */
+    {
+        const uint8_t *name = (const uint8_t *)NAME; unsigned n = sizeof(NAME) - 1;
+        struct fa_radio *radio;
+
+        target_wide = true;
+        /* VHT80 and every part of it the same: channel, centre, the station's bandwidth, both sets of capabilities. HE goes, for its offer is 20 MHz. */
+        for (unsigned he = 0; he < 2; he++) {
+            radio = m8_fresh(); wide_radio(40, 80); wide_ap(5180, 4 | 1, 1, 42, he != 0);
+            assert(fa_m8_up(the_hw) == 0);
+            m8_again(); assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_DONE && SAID("M8 joined 5180 MHz at -40 dBm, 80 MHz wide") && SAID("M8 width: 80 MHz around 5210, primary 5180; the access point works at 80; offering VHT 1 HE 0"));
+            width_agrees(80, 5210, IEEE80211_STA_RX_BW_80);
+            assert(asked_for(FA_EID_VHT) != NULL && !sta_seen.he && !evidence_count);
+            /* Again after a loss of it: the same from nothing. */
+            assert(fa_ios_leave() == FA_IOS_DONE); memset(&last_def, 0, sizeof(last_def)); memset(&sta_seen, 0, sizeof(sta_seen));
+            m8_again(); assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_DONE); width_agrees(80, 5210, IEEE80211_STA_RX_BW_80);
+            assert(fa_ios_leave() == FA_IOS_DONE); station_down(radio); done();
+        }
+        /* The primary anywhere in the 80 MHz, the second 20 MHz either side of it as the pairs go; on the wrong side it is worth nothing. */
+        radio = m8_fresh(); wide_radio(40, 80); wide_ap(5220, 4 | 3, 1, 42, false);
+        assert(fa_m8_up(the_hw) == 0);
+        m8_again(); assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_DONE && SAID("M8 width: 20 MHz around 5220, primary 5220; the access point works at 80; offering VHT 0"));
+        width_agrees(20, 5220, IEEE80211_STA_RX_BW_20);
+        assert(fa_ios_leave() == FA_IOS_DONE); station_down(radio); done();
+        radio = m8_fresh(); wide_radio(40, 80); wide_ap(5240, 4 | 3, 1, 42, false);
+        assert(fa_m8_up(the_hw) == 0);
+        m8_again(); assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_DONE); width_agrees(80, 5210, IEEE80211_STA_RX_BW_80);
+        assert(fa_ios_leave() == FA_IOS_DONE); station_down(radio); done();
+        /* HT40 at 5 GHz: its VHT may stay, for the access point itself works at 40. */
+        radio = m8_fresh(); wide_radio(40, 80); wide_ap(5180, 4 | 1, 0, 0, false);
+        assert(fa_m8_up(the_hw) == 0);
+        m8_again(); assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_DONE && SAID("M8 width: 40 MHz around 5190, primary 5180; the access point works at 40; offering VHT 1 HE 0"));
+        width_agrees(40, 5190, IEEE80211_STA_RX_BW_40); assert(asked_for(FA_EID_VHT) != NULL);
+        assert(fa_ios_leave() == FA_IOS_DONE); station_down(radio); done();
+        /* HT40 at 2.4 GHz, when it says so, and 20 MHz when it does not. */
+        radio = m8_fresh(); wide_radio(40, 80); wide_ap(2437, 4 | 1, -1, 0, false);
+        assert(fa_m8_up(the_hw) == 0);
+        m8_again(); assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_DONE); width_agrees(40, 2447, IEEE80211_STA_RX_BW_40);
+        assert(fa_ios_leave() == FA_IOS_DONE); station_down(radio); done();
+        for (unsigned param = 0; param < 3; param++) {
+            static const uint8_t PARAMS[3] = { 0, 1, 4 };	/* nothing; a second 20 MHz, but not for stations; for stations, with no second */
+            radio = m8_fresh(); wide_radio(40, 80); wide_ap(2437, PARAMS[param], -1, 0, true);
+            assert(fa_m8_up(the_hw) == 0);
+            m8_again(); assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_DONE); width_agrees(20, 2437, IEEE80211_STA_RX_BW_20);
+            assert(sta_seen.he);	/* at 20 MHz, HE as it always was */
+            assert(fa_ios_leave() == FA_IOS_DONE); station_down(radio); done();
+        }
+        /* What the domain or the channels do not let it be: the next width down, and the offer says that one. It works wider, so no VHT. */
+        radio = m8_fresh(); wide_radio(40, 40); wide_ap(5180, 4 | 1, 1, 42, false);
+        assert(fa_m8_up(the_hw) == 0);
+        m8_again(); assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_DONE && SAID("M8 width: 80 MHz around 5210 is not allowed here"));
+        width_agrees(40, 5190, IEEE80211_STA_RX_BW_40); assert(asked_for(FA_EID_VHT) == NULL);
+        assert(fa_ios_leave() == FA_IOS_DONE); station_down(radio); done();
+        radio = m8_fresh(); wide_radio(40, 20); wide_ap(5180, 4 | 1, 1, 42, false);
+        assert(fa_m8_up(the_hw) == 0);
+        m8_again(); assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_DONE);
+        width_agrees(20, 5180, IEEE80211_STA_RX_BW_20); assert(asked_for(FA_EID_VHT) == NULL);
+        assert(fa_ios_leave() == FA_IOS_DONE); station_down(radio); done();
+        radio = m8_fresh(); wide_radio(40, 80); wide5[3].flags = IEEE80211_CHAN_DISABLED; wide_ap(5180, 4 | 1, 1, 42, false);
+        assert(fa_m8_up(the_hw) == 0);
+        m8_again(); assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_DONE); width_agrees(40, 5190, IEEE80211_STA_RX_BW_40);
+        assert(fa_ios_leave() == FA_IOS_DONE); station_down(radio); done();
+        /* An answer that shows less than its beacon: the station is told what it showed. */
+        radio = m8_fresh(); wide_radio(40, 80); wide_ap(5180, 4 | 1, 1, 42, false); ap.response = WMM_PARAM; ap.response_length = sizeof(WMM_PARAM);
+        assert(fa_m8_up(the_hw) == 0);
+        m8_again(); assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_DONE && sta_seen.bandwidth == IEEE80211_STA_RX_BW_20 && last_def.width == NL80211_CHAN_WIDTH_80);
+        assert(fa_ios_leave() == FA_IOS_DONE); station_down(radio); done();
+
+        /* Off, the default: 20 MHz at 5 GHz. An access point that works at 80 and has no HE is not told VHT, or it would send 80 MHz at a radio tuned to 20. */
+        target_wide = false;
+        radio = m8_fresh(); wide_radio(40, 80); wide_ap(5180, 4 | 1, 1, 42, false);
+        assert(fa_m8_up(the_hw) == 0);
+        m8_again(); assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_DONE && SAID("offering VHT 0 HE 1; fuxiwifiwide is off"));
+        width_agrees(20, 5180, IEEE80211_STA_RX_BW_20); assert(asked_for(FA_EID_VHT) == NULL);
+        assert(fa_ios_leave() == FA_IOS_DONE); station_down(radio); done();
+        /* With HE its offer says 20 MHz: all stays as it is offered today. */
+        radio = m8_fresh(); wide_radio(40, 80); wide_ap(5180, 4 | 1, 1, 42, true);
+        assert(fa_m8_up(the_hw) == 0);
+        m8_again(); assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_DONE);
+        width_agrees(20, 5180, IEEE80211_STA_RX_BW_20); assert(asked_for(FA_EID_VHT) != NULL && sta_seen.he);
+        { const uint8_t *e = fa_ext_element(last_assoc + 28, last_assoc_length - 28, FA_EXT_HE); assert(e != NULL && (e[3 + FA_HE_MAC] & FA_HE_PHY0_WIDTH) == 0); }
+        assert(fa_ios_leave() == FA_IOS_DONE); station_down(radio); done();
+        /* An access point that itself works at 20: VHT is no danger. */
+        radio = m8_fresh(); wide_radio(40, 80); wide_ap(5180, 0, 0, 0, false);
+        assert(fa_m8_up(the_hw) == 0);
+        m8_again(); assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_DONE);
+        width_agrees(20, 5180, IEEE80211_STA_RX_BW_20); assert(asked_for(FA_EID_VHT) != NULL);
+        assert(fa_ios_leave() == FA_IOS_DONE); station_down(radio); done();
+
+        /* Stages 5 to 7 stay at 20 MHz even with it set, and offer what they always offered. */
+        target_wide = true;
+        fresh_wpa(V_PMK); wide_radio(40, 80); wide_ap(5180, 4 | 1, 1, 42, true);
+        assert(fa_m5_station(the_hw, false) == 0 && SAID("M5 channel 5180 MHz, 20 MHz wide") && !SAID("M8 width"));
+        assert(last_def.width == NL80211_CHAN_WIDTH_20 && last_def.center_freq1 == 5180 && sta_seen.bandwidth == IEEE80211_STA_RX_BW_20 && (sta_seen.ht_cap & FA_HT_CAP_40) == 0 && sta_seen.vht && sta_seen.he);
+        assert(asked_for(FA_EID_VHT) != NULL && (asked_for(FA_EID_HT)[2] & FA_HT_CAP_40) == 0);
+        done();
+        target_wide = false;
     }
 
     /* ---- stage 8 ---- */
@@ -2428,6 +2835,183 @@ static void protection(void) {
     assert(fa_ext_element(e, sizeof(emptyext), 35) == e + 2);
     free(e);
     puts("protection: each kind, what cannot be read counts as one");
+}
+
+static void choosing(void) {
+    static struct fa_target t;
+    static const uint8_t home[] = {0, 4, 'h', 'o', 'm', 'e', 3, 1, 6};
+    static const uint8_t other[] = {0, 4, 'h', 'o', 'm', 'e', 3, 1, 7};
+    static const uint8_t rsn[] = {0, 4, 'h', 'o', 'm', 'e', 48, 2, 1, 0};
+    struct fa_candidate *list = malloc(3 * sizeof(*list));	/* a write past three is the sanitizer's */
+    const uint8_t *name = (const uint8_t *)"home";
+    uint8_t f[2048], a[6];
+    unsigned n = beacon(f, FA_KIND_BEACON, AP, 1, home, sizeof(home));
+
+    assert(fa_band_score(2412, -37) == -37 && fa_band_score(5180, -53) == -33 && fa_band_score(5180, -53) > fa_band_score(2412, -37));
+    assert(fa_band_score(5180, -57) == fa_band_score(2412, -37) && fa_band_score(5180, -58) < fa_band_score(2412, -37));
+    assert(fa_band_score(5180, FA_BAND_5G_FLOOR) == FA_BAND_5G_FLOOR + FA_BAND_5G_BONUS);
+    assert(fa_band_score(5180, FA_BAND_5G_FLOOR - 1) < fa_band_score(2412, -127) && fa_band_score(5825, -73) < fa_band_score(2472, -127));
+    assert(fa_band_score(5180, FA_RSSI_NONE) < fa_band_score(2412, FA_RSSI_NONE));
+    assert(fa_band_score(5955, -20) < fa_band_score(5180, -120));
+
+    /* No list, as on stages 5 to 7: only the strongest, and nothing else is touched. */
+    memset(&t, 0, sizeof(t));
+    assert(fa_target_take(&t, f, n, 5180, -53, name, 4) == FA_TARGET_TAKEN && fa_target_take(&t, f, n, 2412, -37, name, 4) == FA_TARGET_TAKEN);
+    assert(t.frequency == 2412 && t.rssi == -37 && t.candidate_count == 0 && !fa_target_next(&t));
+
+    /* The list: each access point once at its strongest, the target as ever, and the order by score. */
+    memset(&t, 0, sizeof(t)); memset(list, 0xee, 3 * sizeof(*list));
+    t.candidates = list; t.candidates_most = 3;
+    n = beacon(f, FA_KIND_BEACON, AP, 1, home, sizeof(home));
+    assert(fa_target_take(&t, f, n, 2412, -37, name, 4) == FA_TARGET_TAKEN);
+    assert(fa_target_take(&t, f, n, 2417, -60, name, 4) == FA_TARGET_TAKEN && t.candidate_count == 1 && list[0].frequency == 2412 && list[0].rssi == -37);
+    n = beacon(f, FA_KIND_BEACON, OTHER, 0x11, other, sizeof(other));
+    assert(fa_target_take(&t, f, n, 5180, -70, name, 4) == FA_TARGET_PROTECTED && t.candidate_count == 1);	/* what it asks for keeps it out */
+    t.protected_frames = 0;
+    n = beacon(f, FA_KIND_BEACON, OTHER, 1, other, sizeof(other));
+    assert(fa_target_take(&t, f, n, 5180, -70, name, 4) == FA_TARGET_TAKEN && t.candidate_count == 2);
+    assert(fa_target_take(&t, f, n, 5180, -53, name, 4) == FA_TARGET_TAKEN && t.candidate_count == 2 && list[1].rssi == -53);
+    assert(t.frequency == 2412 && t.rssi == -37 && !memcmp(t.address, AP, 6));	/* the target is the strongest until asked */
+    assert(fa_target_take(&t, f, n, 5180, -53, (const uint8_t *)"hom", 3) == FA_TARGET_ELSEWHERE && t.candidate_count == 2);
+    assert(fa_target_next(&t) && t.frequency == 5180 && t.rssi == -53 && !memcmp(t.address, OTHER, 6) && t.elements_length == sizeof(other) && !memcmp(t.elements, other, sizeof(other)) && t.interval == 100 && t.capability == 1);
+    assert(fa_target_next(&t) && t.frequency == 2412 && !memcmp(t.address, AP, 6) && t.elements_length == sizeof(home) && !memcmp(t.elements, home, sizeof(home)));
+    assert(!fa_target_next(&t) && !memcmp(t.address, AP, 6));
+
+    /* Full: the better take the worst's place, and what is worse is counted. */
+    memset(&t, 0, sizeof(t)); t.candidates = list; t.candidates_most = 3;
+    for (unsigned i = 0; i < 3; i++) {
+        memcpy(a, AP, 6); a[5] = (uint8_t)i;
+        n = beacon(f, FA_KIND_BEACON, a, 1, home, sizeof(home));
+        assert(fa_target_take(&t, f, n, 2412, -60 - (int)i, name, 4) == FA_TARGET_TAKEN);
+    }
+    assert(t.candidate_count == 3 && !t.candidates_lost);
+    memcpy(a, AP, 6); a[5] = 9; n = beacon(f, FA_KIND_BEACON, a, 1, home, sizeof(home));
+    assert(fa_target_take(&t, f, n, 2412, -90, name, 4) == FA_TARGET_TAKEN && t.candidate_count == 3 && t.candidates_lost == 1);
+    assert(fa_target_take(&t, f, n, 5180, -70, name, 4) == FA_TARGET_TAKEN && t.candidate_count == 3 && t.candidates_lost == 1);
+    assert(fa_target_next(&t) && t.frequency == 5180 && t.rssi == -70 && t.address[5] == 9);
+    assert(fa_target_next(&t) && t.rssi == -60 && fa_target_next(&t) && t.rssi == -61 && !fa_target_next(&t));
+
+    /* A hearing of a longer frame than the list holds: cut at a whole element, as the target's. */
+    {
+        static uint8_t many[FA_TARGET_ELEMENTS_MOST + 300];
+        unsigned at = 0;
+        many[at++] = 0; many[at++] = 4; memcpy(many + at, "home", 4); at += 4;
+        while (at + 102 <= sizeof(many)) { many[at] = 200; many[at + 1] = 100; at += 102; }
+        memset(&t, 0, sizeof(t)); t.candidates = list; t.candidates_most = 3;
+        static uint8_t big[sizeof(many) + 36];
+        n = beacon(big, FA_KIND_BEACON, AP, 1, many, at);
+        assert(fa_target_take(&t, big, n, 5180, -50, name, 4) == FA_TARGET_TAKEN);
+        assert(list[0].elements_length == t.elements_length && list[0].elements_length <= FA_TARGET_ELEMENTS_MOST && fa_elements_whole(list[0].elements, list[0].elements_length));
+    }
+    /* Every cut of a frame: under the sanitizer, and what it keeps is whole. */
+    n = beacon(f, FA_KIND_BEACON, AP, 1, rsn, sizeof(rsn));
+    for (unsigned cut = 0; cut <= n; cut++) {
+        uint8_t *e = exactly(f, cut);
+        memset(&t, 0, sizeof(t)); t.candidates = list; t.candidates_most = 3; t.wanted = FA_PROTECT_RSN;
+        (void)fa_target_take(&t, e, cut, 5180, -50, name, 4);
+        assert(t.candidate_count == (t.found ? 1u : 0u));
+        free(e);
+    }
+    free(list);
+    puts("choosing: 5 GHz by its bonus and floor, the list, every cut");
+}
+
+/* What the access point says: a beacon's elements with that HT operation's second byte and VHT operation's width and centre. */
+static unsigned said(uint8_t *e, unsigned channel, unsigned param, int width, unsigned center, bool he) {
+    unsigned at = 0;
+    e[at++] = FA_EID_HT; e[at++] = FA_HT_BODY; memset(e + at, 0, FA_HT_BODY); e[at] = FA_HT_CAP_40; at += FA_HT_BODY;
+    e[at++] = FA_EID_HT_OPERATION; e[at++] = 22; memset(e + at, 0, 22); e[at] = (uint8_t)channel; e[at + 1] = (uint8_t)param; at += 22;
+    if (width >= 0) {
+        e[at++] = FA_EID_VHT; e[at++] = FA_VHT_BODY; memset(e + at, 0, FA_VHT_BODY); at += FA_VHT_BODY;
+        e[at++] = FA_EID_VHT_OPERATION; e[at++] = 3; e[at++] = (uint8_t)width; e[at++] = (uint8_t)center; e[at++] = 0;
+    }
+    if (he) { e[at++] = FA_EID_EXTENSION; e[at++] = 1; e[at++] = FA_EXT_HE; }
+    return at;
+}
+
+static void widths(void) {
+    static const struct { unsigned primary, channel, param; int vht; unsigned center; bool he; unsigned most, mhz, at, works; bool offer_vht, offer_he; } CASES[] = {
+        /* VHT80: every primary of the first block, with the second 20 MHz its pair */
+        { 5180, 36, 5, 1, 42, false, 80, 80, 5210, 80, true, false }, { 5200, 40, 7, 1, 42, false, 80, 80, 5210, 80, true, false },
+        { 5220, 44, 5, 1, 42, false, 80, 80, 5210, 80, true, false }, { 5240, 48, 7, 1, 42, false, 80, 80, 5210, 80, true, false },
+        { 5745, 149, 5, 1, 155, false, 80, 80, 5775, 80, true, false }, { 5805, 161, 7, 1, 155, false, 80, 80, 5775, 80, true, false },
+        { 5260, 52, 5, 1, 58, true, 80, 80, 5290, 80, true, false },
+        /* the same with less asked */
+        { 5180, 36, 5, 1, 42, false, 40, 40, 5190, 80, false, false }, { 5180, 36, 5, 1, 42, false, 20, 20, 5180, 80, false, true },
+        { 5180, 36, 5, 1, 42, true, 20, 20, 5180, 80, true, true }, { 5180, 36, 5, 1, 42, true, 40, 40, 5190, 80, false, false },
+        /* no VHT: HT40, and at 2.4 GHz only if it says so */
+        { 5180, 36, 5, -1, 0, false, 80, 40, 5190, 40, true, false }, { 5200, 40, 7, -1, 0, false, 80, 40, 5190, 40, true, false },
+        { 2437, 6, 5, -1, 0, false, 80, 40, 2447, 40, true, false }, { 2437, 6, 7, -1, 0, false, 80, 40, 2427, 40, true, false },
+        { 2437, 6, 4, -1, 0, false, 80, 20, 2437, 20, true, true }, { 2437, 6, 1, -1, 0, false, 80, 20, 2437, 20, true, true },
+        { 2412, 1, 7, -1, 0, false, 80, 20, 2412, 20, true, true }, { 2472, 13, 5, -1, 0, false, 80, 20, 2472, 20, true, true },
+        /* a pair the band plan does not have: 165 pairs only above, where the domain decides; 36 has nothing below, 40 nothing above that pairs */
+        { 5825, 165, 5, -1, 0, false, 80, 40, 5835, 40, true, false }, { 5825, 165, 7, -1, 0, false, 80, 20, 5825, 20, true, true },
+        { 5180, 36, 7, -1, 0, false, 80, 20, 5180, 20, true, true }, { 5200, 40, 5, -1, 0, false, 80, 20, 5200, 20, true, true },
+        /* centres that contradict the channel, or are not centres: HT40 stands and VHT does not go up to it */
+        { 5180, 36, 5, 1, 58, false, 80, 40, 5190, 80, false, false }, { 5180, 36, 5, 1, 41, false, 80, 40, 5190, 80, false, false }, { 5180, 36, 5, 1, 0, false, 80, 40, 5190, 80, false, false },
+        /* 160 and 80+80 by the old numbers: no wider than HT40, and not told VHT */
+        { 5180, 36, 5, 2, 50, false, 80, 40, 5190, 160, false, false }, { 5180, 36, 5, 3, 42, false, 80, 40, 5190, 160, false, false },
+        /* VHT operation that says 20 or 40 */
+        { 5180, 36, 5, 0, 0, false, 80, 40, 5190, 40, true, false }, { 5180, 36, 0, 0, 0, false, 80, 20, 5180, 20, true, true },
+        /* an HT operation of another channel is worth nothing */
+        { 5180, 40, 5, 1, 42, false, 80, 20, 5180, 80, false, true },
+        /* VHT at 2.4 GHz says nothing about width */
+        { 2437, 6, 5, 1, 42, false, 80, 40, 2447, 40, true, false },
+    };
+    uint8_t e[256];
+    struct fa_width w;
+
+    for (unsigned i = 0; i < sizeof(CASES) / sizeof(CASES[0]); i++) {
+        unsigned length = said(e, CASES[i].channel, CASES[i].param, CASES[i].vht, CASES[i].center, CASES[i].he);
+        uint8_t *x = exactly(e, length);
+        fa_width_choose(&w, x, length, CASES[i].primary, CASES[i].most, true, true, true);
+        if (w.mhz != CASES[i].mhz || w.center != CASES[i].at || w.said != CASES[i].works || w.vht != CASES[i].offer_vht || w.he != CASES[i].offer_he) {
+            fprintf(stderr, "width case %u: %u around %u, works at %u, vht %d he %d\n", i, w.mhz, w.center, w.said, w.vht, w.he);
+            assert(0);
+        }
+        free(x);
+    }
+    /* What the radio cannot, it does not ask for. */
+    unsigned length = said(e, 36, 5, 1, 42, false);
+    fa_width_choose(&w, e, length, 5180, 80, false, true, true); assert(w.mhz == 20 && w.center == 5180 && !w.vht && w.he);
+    fa_width_choose(&w, e, length, 5180, 80, true, false, true); assert(w.mhz == 40 && w.center == 5190 && !w.vht);
+    /* An access point whose own capabilities have no 40 MHz. */
+    e[2] = 0; fa_width_choose(&w, e, length, 5180, 80, true, true, true); assert(w.mhz == 20 && !w.vht);
+    /* Nothing said at all: what stages 5 to 7 do, by another way. */
+    fa_width_choose(&w, e, 0, 5180, 80, true, true, true); assert(w.mhz == 20 && w.center == 5180 && w.said == 20 && w.vht && w.he);
+    fa_width_narrow(&w, 2437); assert(w.mhz == 20 && w.center == 2437 && w.vht && w.he);
+    /* The peer never wider than the channel, nor than what its answer showed. */
+    w.mhz = 80; assert(fa_width_peer(&w, true, true) == 80 && fa_width_peer(&w, true, false) == 40 && fa_width_peer(&w, false, true) == 20 && fa_width_peer(&w, false, false) == 20);
+    w.mhz = 40; assert(fa_width_peer(&w, true, true) == 40 && fa_width_peer(&w, false, true) == 20);
+    w.mhz = 20; assert(fa_width_peer(&w, true, true) == 20);
+    /* The pairs, and every 20 MHz of a block of 80. */
+    assert(fa_width_pair(5180, 5200) && fa_width_pair(5200, 5180) && !fa_width_pair(5200, 5220) && !fa_width_pair(5180, 5220) && fa_width_pair(5500, 5520) && fa_width_pair(5745, 5765) && !fa_width_pair(5765, 5785));
+    assert(fa_width_pair(2412, 2432) && !fa_width_pair(2472, 2492) && !fa_width_pair(2392, 2412));
+    assert(fa_width_in_80(5210, 5180) && fa_width_in_80(5210, 5240) && !fa_width_in_80(5210, 5260) && !fa_width_in_80(5210, 5210) && !fa_width_in_80(5200, 5180) && fa_width_in_80(5775, 5745) && fa_width_in_80(5855, 5885));
+    /* Under the sanitizer: every cut of what it says, and noise. */
+    length = said(e, 36, 5, 1, 42, true);
+    for (unsigned cut = 0; cut <= length; cut++) {
+        uint8_t *x = exactly(e, cut);
+        fa_width_choose(&w, x, cut, 5180, 80, true, true, true);
+        assert(w.mhz == 20 || w.mhz == 40 || w.mhz == 80);
+        free(x);
+    }
+    for (unsigned round = 0; round < 20000; round++) {
+        unsigned n = next() % 80;
+        uint8_t *x = malloc(n ? n : 1);
+        for (unsigned i = 0; i < n; i++) x[i] = next() % 4 == 0 ? (uint8_t)next() : (uint8_t)(next() % 2 ? FA_EID_HT_OPERATION : 22);
+        fa_width_choose(&w, x, n, next() % 2 ? 5180 : 2437, next() % 2 ? 80 : 40, true, true, true);
+        assert(w.mhz == 20 || w.center != 0);
+        free(x);
+    }
+    puts("widths: what the elements say, what contradicts them, every cut");
+}
+
+static void backoff(void) {
+    static const unsigned WAITS[] = { 1000, 2000, 4000, 8000, 16000, 30000, 30000 };
+    for (unsigned i = 0; i < sizeof(WAITS) / sizeof(WAITS[0]); i++) assert(fa_rejoin_wait_ms(i) == WAITS[i]);
+    assert(fa_rejoin_wait_ms(1000) == 30000 && fa_rejoin_wait_ms(0xffffffffu) == 30000);
+    puts("backoff: from a second to half a minute, however many");
 }
 
 static void target(void) {
@@ -2817,6 +3401,9 @@ static void noise(void) {
 
 int main(void) {
     protection();
+    choosing();
+    widths();
+    backoff();
     target();
     reply();
     builders();
@@ -2880,7 +3467,7 @@ def the_key_stays_in_its_place(tmp):
     assert 'printf' not in code_only((own / 'fa_wpa.c').read_text()) and 'lx_tell' not in (own / 'fa_wpa.c').read_text()
     # No line of the log is given anything of a key.
     for call in re.findall(r'lx_tell\(.*?\);', (own / 'fa_80211.c').read_text(), flags=re.S):
-        for word in ('target_key', '.pmk', 'wpa.pairwise', 'wpa.group,', 'wpa.group)', '.kck', '.kek', 'nonce', 'radio->eapol,', '->key', 'target_name,', 'target_name)'):
+        for word in ('target_key', '.pmk', 'wpa.pairwise', 'wpa.group,', 'wpa.group)', '.kck', '.kek', 'nonce', 'radio->eapol,', '->key', 'target_name,', 'target_name)', 'rejoin_key', 'rejoin_name', 'auto_key'):
             assert word not in call, call
     block = wlan[wlan.index('static void\nwl_fa_join_configure(void)'):]
     block = block[:block.index('\n}\n')]
@@ -2901,9 +3488,25 @@ def the_key_stays_in_its_place(tmp):
     assert text.count('radio->say_names = true') == 1 and text.index('radio->say_names = true') > text.index('\nfa_m4_station(')
     hif = (own / 'fa_hif.c').read_text()
     assert 'hif.stage == FA_STAGE_JOIN || hif.stage == FA_STAGE_WPA || hif.stage == FA_STAGE_ADDRESS ? fa_m5_station(' in hif and hif.count('fa_m5_station(') == 1
-    # 20 MHz and no EHT: the join sets one width, and no element 108 is built.
+    # 20 MHz on stages 5 to 7, no 160 and no EHT: more than 20 MHz is named once, and only station_width() at stage 8 can come to it.
     join = (own / 'fa_join.h').read_text()
-    assert 'NL80211_CHAN_WIDTH_20' in text and 'NL80211_CHAN_WIDTH_40' not in text and 'NL80211_CHAN_WIDTH_80' not in text
+    assert 'NL80211_CHAN_WIDTH_20' in text
+    for word in ('NL80211_CHAN_WIDTH_40', 'NL80211_CHAN_WIDTH_80', 'NL80211_CHAN_WIDTH_160', 'IEEE80211_STA_RX_BW_160'):
+        assert text.count(word) == (0 if '160' in word else 1), word
+    named = text[text.index('\nwidth_of_channel('):]
+    named = named[:named.index('\n}\n')]
+    assert 'NL80211_CHAN_WIDTH_40' in named and 'NL80211_CHAN_WIDTH_80' in named
+    chosen = text[text.index('\nstation_width('):]
+    chosen = chosen[:chosen.index('\n}\n')]
+    assert chosen.index('fa_width_narrow(width, channel->center_freq);') < chosen.index('if (!radio->ios) {') < chosen.index('fa_width_choose(')
+    assert code_only(text).count('fa_width_choose(') == 1 and text.count('station_width(radio, channel);') == 1
+    assert 'radio->width.mhz = ' not in text and 'width->mhz = ' not in text and code_only(text).count('.center = ') == 0
+    assert 'target_wide = true;' in text and text.count('target_wide = true;') == 1 and text.index('target_wide = true;') > text.index('\nfa_m8_wide(void)')
+    hif = (own / 'fa_hif.c').read_text()
+    gate = hif[hif.index('if (stage == FA_STAGE_IOS) {\n\t\t\tfa_m8_tx_filter'):]
+    gate = gate[:gate.index('\n\t\t}\n')]
+    assert hif.count('fa_m8_wide()') == 1 and 'if (lx_os_option("fuxiwifiwide") == 1) {' in gate and 'fa_m8_wide();' in gate
+    assert 'fuxiwifiwide' not in wlan.replace(' *   fuxiwifiwide=1  with fuxiath12k=8', '') and wlan.count('fuxiwifiwide') == 1
     assert 'eht' not in code_only(join).lower()
 
 
@@ -3412,6 +4015,15 @@ def auto_join_is_off_by_default_and_says_no_key(tmp):
     assert wlan.count('"fuxiwifiauto"') == 1
     text = (ROOT / 'xnu/fuxi-ath12k/src/fa_80211.c').read_text()
     assert text.count('ios_auto_step(radio);') == 1 and text.index('ios_auto_step(radio);') > text.index('ios_runs(void *argument)')
+    assert text.count('ios_rejoin_step(radio);') == 1 and text.index('ios_auto_step(radio);') < text.index('ios_rejoin_step(radio);') < text.index('static int ios_join_run(')
+    # The key of a rejoin comes only from what the auto join was given, and goes wherever the auto join's own went.
+    assert text.count('memcpy(rejoin_key, key, sizeof(rejoin_key));') == 1 and 'alone && key != NULL' in text[text.index('memcpy(rejoin_key') - 400:text.index('memcpy(rejoin_key')]
+    for function in ('\nauto_gives_way(', '\nios_dies('):
+        body = text[text.index(function):]
+        assert 'rejoin_forget(radio);' in body[:body.index('\n}\n')], function
+    for caller in ('\nfa_ios_leave(void)', '\nfa_ios_power(int on)', '\nios_join_run('):
+        body = text[text.index(caller):]
+        assert 'auto_gives_way(radio,' in body[:body.index('\n}\n')], caller
     for word in ('fa_set_auto_join', 'auto_key', 'auto_name'):
         assert word not in text[:text.index('/* ---- stage 8: the radio for iOS') - 1].replace('static uint8_t auto_name[FA_SSID_MOST], auto_key[32];', '').replace('static unsigned auto_name_length;', ''), word
     for call in re.findall(r'lx_tell\(.*?\);', text, flags=re.S):

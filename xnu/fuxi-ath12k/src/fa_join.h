@@ -41,6 +41,7 @@
 #define FA_EID_HT_OPERATION	61
 #define FA_EID_WAPI		68
 #define FA_EID_VHT		191
+#define FA_EID_VHT_OPERATION	192
 #define FA_EID_VENDOR		221
 #define FA_EID_EXTENSION	255
 #define FA_EXT_HE		35
@@ -240,6 +241,22 @@ fa_rsn_read(const uint8_t *elements, unsigned length, struct fa_rsn *rsn)
 
 /* ---- the network that is wanted, from what a scan hears ------------------------------------------------- */
 
+/*
+ * Stage 8: one access point of the wanted name, at its strongest in this join's scans. The scan's table for iOS does not do for
+ * this: it lives across scans, keeps the strongest of all of them and cuts elements shorter, and an RSN element past the cut
+ * would read as none. Stages 5 to 7 keep no list and take the strongest hearing, as they always have.
+ */
+struct fa_candidate {
+	uint8_t		address[6];
+	uint16_t	frequency, capability, interval;
+	int8_t		rssi;
+	bool		tried;
+	unsigned	elements_length;
+	uint8_t		elements[FA_TARGET_ELEMENTS_MOST];
+};
+
+#define FA_CANDIDATES_MOST	16
+
 struct fa_target {
 	bool		found;
 	bool		fixed;			/* the join has chosen: only this access point's frames count now */
@@ -255,6 +272,8 @@ struct fa_target {
 	enum fa_protection why;			/* the first of them */
 	unsigned	elements_length;
 	uint8_t		elements[FA_TARGET_ELEMENTS_MOST];
+	struct fa_candidate *candidates;	/* stage 8: where they go, room for candidates_most; NULL: no list is kept */
+	unsigned	candidates_most, candidate_count, candidates_lost;
 };
 
 enum fa_target_result { FA_TARGET_OTHER, FA_TARGET_ELSEWHERE, FA_TARGET_MALFORMED, FA_TARGET_TAKEN, FA_TARGET_PROTECTED };
@@ -269,6 +288,102 @@ fa_elements_cut(const uint8_t *elements, unsigned length, unsigned most)
 		at += 2u + elements[at + 1];
 	}
 	return (at);
+}
+
+/* ---- which access point: stage 8 prefers 5 GHz, as a phone does ---------------------------------------------- */
+
+#define FA_BAND_5G_BONUS	20		/* 2.4 GHz at -37 dBm loses to 5 GHz at -53 dBm */
+#define FA_BAND_5G_FLOOR	(-72)		/* below this 5 GHz is not chosen while anything else was heard */
+#define FA_SCORE_LAST		256		/* more than any two signals can differ */
+
+/*
+ * What a hearing of an access point is worth: its signal, with the bonus at 5 GHz when the signal there is usable. One below the
+ * floor comes after every other, as a last resort, for a weak link is better than none: no signal value counts as below it. 6 GHz
+ * is not built, and comes after those.
+ */
+static inline int
+fa_band_score(unsigned frequency, int rssi)
+{
+	if (frequency >= 5925) {
+		return (rssi - 2 * FA_SCORE_LAST);
+	}
+	if (frequency < 5000) {
+		return (rssi);
+	}
+	return (rssi >= FA_BAND_5G_FLOOR ? rssi + FA_BAND_5G_BONUS : rssi - FA_SCORE_LAST);
+}
+
+/* A hearing into the list: an access point once, at its strongest. A full list gives up its worst for a better one. */
+static inline void
+fa_candidate_note(struct fa_target *t, const uint8_t *bssid, unsigned frequency, int rssi, unsigned interval, unsigned capability,
+    const uint8_t *elements, unsigned length)
+{
+	struct fa_candidate *c = NULL;
+
+	for (unsigned i = 0; i < t->candidate_count && c == NULL; i++) {
+		if (memcmp(t->candidates[i].address, bssid, 6) == 0) {
+			if (rssi <= t->candidates[i].rssi) {
+				return;
+			}
+			c = &t->candidates[i];
+		}
+	}
+	if (c == NULL && t->candidate_count < t->candidates_most) {
+		c = &t->candidates[t->candidate_count++];
+	}
+	if (c == NULL) {
+		struct fa_candidate *worst = NULL;
+
+		for (unsigned i = 0; i < t->candidate_count; i++) {
+			if (worst == NULL || fa_band_score(t->candidates[i].frequency, t->candidates[i].rssi) < fa_band_score(worst->frequency, worst->rssi)) {
+				worst = &t->candidates[i];
+			}
+		}
+		if (worst == NULL || fa_band_score(frequency, rssi) <= fa_band_score(worst->frequency, worst->rssi)) {
+			t->candidates_lost++;
+			return;
+		}
+		c = worst;
+	}
+	memcpy(c->address, bssid, 6);
+	c->frequency = (uint16_t)frequency;
+	c->rssi = (int8_t)rssi;
+	c->tried = false;
+	c->interval = (uint16_t)interval;
+	c->capability = (uint16_t)capability;
+	c->elements_length = fa_elements_cut(elements, length, sizeof(c->elements));
+	memcpy(c->elements, elements, c->elements_length);
+}
+
+/*
+ * The best not yet tried becomes the target, for the join to go on as for any other: the same RSN checks read its elements. False
+ * when there is none left. Before the join has begun or after it has left: nothing may be reading the target.
+ */
+static inline bool
+fa_target_next(struct fa_target *t)
+{
+	struct fa_candidate *best = NULL;
+
+	for (unsigned i = 0; i < t->candidate_count; i++) {
+		struct fa_candidate *c = &t->candidates[i];
+
+		if (!c->tried && (best == NULL || fa_band_score(c->frequency, c->rssi) > fa_band_score(best->frequency, best->rssi))) {
+			best = c;
+		}
+	}
+	if (best == NULL) {
+		return (false);
+	}
+	best->tried = true;
+	t->fixed = false;
+	memcpy(t->address, best->address, 6);
+	t->frequency = best->frequency;
+	t->rssi = best->rssi;
+	t->interval = best->interval;
+	t->capability = best->capability;
+	t->elements_length = best->elements_length;
+	memcpy(t->elements, best->elements, best->elements_length);
+	return (true);
 }
 
 /*
@@ -337,7 +452,147 @@ fa_target_take(struct fa_target *t, const uint8_t *frame, unsigned length, unsig
 		t->elements_length = fa_elements_cut(elements, elements_length, sizeof(t->elements));
 		memcpy(t->elements, elements, t->elements_length);
 	}
+	if (t->candidates != NULL) {
+		fa_candidate_note(t, bssid, frequency, rssi, (unsigned)(frame[header + 8] | frame[header + 9] << 8), capability, elements, elements_length);
+	}
 	return (FA_TARGET_TAKEN);
+}
+
+/* ---- how wide: fuxiwifiwide=1, stage 8 alone. No 160 MHz --------------------------------------------------- */
+
+#define FA_HT_OP_SECOND		0x03		/* HT operation, its second byte: the second 20 MHz, 1 above and 3 below */
+#define FA_HT_OP_ANY_WIDTH	0x04		/* ... and stations may use more than 20 MHz */
+#define FA_VHT_OP_80		1		/* VHT operation, its first byte: 80 MHz or more around the second byte's centre */
+
+/*
+ * The one account of the channel: chanctx's width and centre, the station's bandwidth and both sets of capabilities all read
+ * this, so that they cannot differ. An access point told of more than the radio is tuned to sends what is never heard, and a
+ * mismatch costs frames rather than a refusal. `vht` and `he` say whether those may be offered at all: the two sides must still have them.
+ */
+struct fa_width {
+	unsigned	mhz, center;		/* 20, 40 or 80 MHz around this */
+	unsigned	said;			/* what the access point works at; 160 for anything above 80 */
+	bool		vht, he;
+};
+
+/* Stages 5 to 7: 20 MHz, whatever the access point says, and the offer as both sides have it. */
+static inline void
+fa_width_narrow(struct fa_width *width, unsigned primary)
+{
+	width->mhz = 20;
+	width->center = primary;
+	width->said = 20;
+	width->vht = true;
+	width->he = true;
+}
+
+/* Whether two neighbouring channels may make 40 MHz: anywhere at 2.4 GHz, and at 5 GHz only in the pairs of the band plan. */
+static inline bool
+fa_width_pair(unsigned primary, unsigned second)
+{
+	unsigned low = primary < second ? primary : second, high = primary < second ? second : primary;
+
+	if (high - low != 20) {
+		return (false);
+	}
+	if (high <= 2472) {
+		return (low >= 2412);
+	}
+	if (low >= 5180 && high <= 5320) {
+		return ((low - 5180) % 40 == 0);
+	}
+	if (low >= 5500 && high <= 5720) {
+		return ((low - 5500) % 40 == 0);
+	}
+	return (low >= 5745 && high <= 5885 && (low - 5745) % 40 == 0);
+}
+
+/* Whether this is a centre of the band plan's 80 MHz with that 20 MHz inside it. */
+static inline bool
+fa_width_in_80(unsigned center, unsigned channel)
+{
+	static const uint16_t centers[7] = { 5210, 5290, 5530, 5610, 5690, 5775, 5855 };
+	unsigned apart = center > channel ? center - channel : channel - center;
+
+	for (unsigned i = 0; i < 7; i++) {
+		if (centers[i] == center) {
+			return (apart == 10 || apart == 30);
+		}
+	}
+	return (false);
+}
+
+/*
+ * How wide to be, from what the access point says in its beacon: at most `most` MHz, and only what the radio can. An element that
+ * contradicts itself or the channel is worth 20 MHz, never a guess. At 20 MHz HE stays as it is offered today, with no width in it;
+ * above that HE goes, for its offer says 20 MHz and the driver would take the peer at the channel's. VHT is offered only where the
+ * access point cannot send wider than the channel: VHT means 80 MHz to it, unless HE has said otherwise.
+ */
+static inline void
+fa_width_choose(struct fa_width *width, const uint8_t *elements, unsigned length, unsigned primary, unsigned most, bool own_40, bool own_vht, bool own_he)
+{
+	const uint8_t *ht = fa_element(elements, length, FA_EID_HT);
+	const uint8_t *op = fa_element(elements, length, FA_EID_HT_OPERATION);
+	const uint8_t *vht = fa_element(elements, length, FA_EID_VHT);
+	const uint8_t *vht_op = fa_element(elements, length, FA_EID_VHT_OPERATION);
+	bool five = primary >= 5000 && primary < 5925;
+	unsigned channel = five ? (primary - 5000) / 5 : (primary - 2407) / 5;
+	unsigned second = 0, center_40 = 0, center_80 = 0;
+
+	fa_width_narrow(width, primary);
+	if (op != NULL && op[1] >= 22 && op[2] == channel && (op[3] & FA_HT_OP_ANY_WIDTH) != 0 && ht != NULL && ht[1] >= FA_HT_BODY && (ht[2] & FA_HT_CAP_40) != 0) {
+		second = (op[3] & FA_HT_OP_SECOND) == 1 ? primary + 20 : (op[3] & FA_HT_OP_SECOND) == 3 ? primary - 20 : 0;
+		if (second != 0 && fa_width_pair(primary, second)) {
+			width->said = 40;
+			center_40 = (primary + second) / 2;
+		} else {
+			second = 0;
+		}
+	}
+	if (five && vht_op != NULL && vht_op[1] >= 3 && vht_op[2] != 0) {
+		unsigned center = 5000 + 5u * vht_op[3];
+
+		width->said = vht_op[2] == FA_VHT_OP_80 ? 80 : 160;
+		if (vht_op[2] == FA_VHT_OP_80 && second != 0 && fa_width_in_80(center, primary) && fa_width_in_80(center, second) && vht != NULL && vht[1] >= FA_VHT_BODY) {
+			center_80 = center;
+		}
+	}
+	if (most >= 80 && own_40 && own_vht && center_80 != 0) {
+		width->mhz = 80;
+		width->center = center_80;
+	} else if (most >= 40 && own_40 && center_40 != 0) {
+		width->mhz = 40;
+		width->center = center_40;
+	}
+	width->he = width->mhz == 20;
+	width->vht = width->mhz == 80 || width->said <= width->mhz || (width->mhz == 20 && own_he && fa_ext_element(elements, length, FA_EXT_HE) != NULL);
+}
+
+/* The width of the peer as the driver is told it: no more than the channel, and no more than what its answer showed. */
+static inline unsigned
+fa_width_peer(const struct fa_width *width, bool peer_40, bool peer_vht)
+{
+	unsigned mhz = width->mhz;
+
+	mhz = mhz == 80 && !peer_vht ? 40 : mhz;
+	return (mhz >= 40 && !peer_40 ? 20 : mhz);
+}
+
+/* ---- joining again: the auto join's network, on this stage's own thread ---------------------------------------- */
+
+#define FA_REJOIN_FIRST_MS	1000
+#define FA_REJOIN_MOST_MS	30000
+
+/* How long after that many tries have failed: from about a second, doubling, up to half a minute, however many there were. */
+static inline unsigned
+fa_rejoin_wait_ms(unsigned tries)
+{
+	unsigned wait = FA_REJOIN_FIRST_MS;
+
+	for (unsigned i = 0; i < tries && wait < FA_REJOIN_MOST_MS; i++) {
+		wait *= 2;
+	}
+	return (wait < FA_REJOIN_MOST_MS ? wait : FA_REJOIN_MOST_MS);
 }
 
 /* ---- what we send ---------------------------------------------------------------------------------------- */

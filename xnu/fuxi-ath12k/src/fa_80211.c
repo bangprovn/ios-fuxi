@@ -85,6 +85,7 @@ struct fa_radio {
 	bool say_names;				/* stage 4 alone logs the networks it hears */
 	/* the join of stage 5 */
 	struct fa_target target;
+	struct fa_width width;			/* of the channel of this join: everything about its width reads this */
 	volatile bool joining;			/* received frames go to join_rx() */
 	struct ieee80211_chanctx_conf *chanctx;	/* set for as long as the join has one */
 	bool chanctx_added;			/* the driver took it */
@@ -145,6 +146,10 @@ struct fa_radio {
 	volatile bool ios_powered;		/* iOS's side has asked for the radio */
 	volatile bool ios_wifid_asked;		/* it has left or joined: an auto join gives way for good */
 	bool ios_auto_joined;			/* the network now joined is the auto join's */
+	bool ios_rejoining;			/* it was lost, and ios_rejoin_step() goes after it. Under the gate */
+	unsigned rejoin_tries;
+	unsigned long long rejoin_at;
+	struct fa_candidate *ios_candidates;	/* the access points of the name this join's scans heard */
 	unsigned long long ios_up_at;
 	volatile bool ios_gate;			/* one of station thread and ios_step() at a time */
 	volatile unsigned ios_tx_busy;
@@ -252,6 +257,10 @@ static unsigned tx_filter;			/* stage 8, fuxiath12kq: FA_TX_DROP_ bits, none unl
 /* Stage 8, fuxiwifiauto=1: a network to join with nobody asking, once. The key is wiped when it is used or given up. */
 static uint8_t auto_name[FA_SSID_MOST], auto_key[32];
 static unsigned auto_name_length;
+/* The network the auto join has joined, for joining it again. Kept while that is so, under the gate, and never said. */
+static uint8_t rejoin_name[FA_SSID_MOST], rejoin_key[32];
+static unsigned rejoin_name_length;
+static bool target_wide;			/* stage 8, fuxiwifiwide=1 */
 
 /* find_sta has only the interface to go by, and there is one radio. */
 static struct fa_radio *the_radio;
@@ -318,6 +327,14 @@ fa_m8_tx_filter(bool ip6, bool tcp, bool udp, bool group)
 {
 	tx_filter = (ip6 ? FA_TX_DROP_IP6 : 0) | (tcp ? FA_TX_DROP_TCP : 0) | (udp ? FA_TX_DROP_UDP : 0) | (group ? FA_TX_DROP_GROUP : 0);
 	lx_tell("FUXI ATH12K: M8 tx filter: ipv6 %d tcp %d udp %d multicast %d\n", ip6, tcp, udp, group);
+}
+
+/* From fa_hif.c on stage 8 alone, before the radio, fuxiwifiwide=1: the channel may be as wide as the access point's. */
+void
+fa_m8_wide(void)
+{
+	target_wide = true;
+	lx_tell("FUXI ATH12K: M8 wide channels are asked for\n");
 }
 
 /* tools/ath12k-edits.json, ath12k-mac-override. mac.c has no device-address fallback. */
@@ -492,6 +509,7 @@ linuxkpi_wiphy_free(struct wiphy *wiphy)
 	kfree(radio->key_memory[1]);
 	kfree(radio->key_memory[2]);
 	kfree(radio->ios_table);
+	kfree(radio->ios_candidates);
 	kfree(radio->sta_memory);
 	if (the_radio == radio) {
 		the_radio = NULL;
@@ -1532,8 +1550,8 @@ station_he(const struct ieee80211_supported_band *band)
 
 /*
  * What the access point says it can do, into the form the driver reads when it tells the firmware of the peer: rates,
- * HT, VHT, HE as far as both sides have them, and WMM. The channel is 20 MHz wide, so its width says so. `elements`
- * are the association response's, or the beacon's before that. EHT stays out (design section 9).
+ * HT, VHT, HE as far as both sides have them and radio->width lets them, and WMM. Its width is the channel's, as far as it says it
+ * can. `elements` are the association response's, or the beacon's before that. EHT stays out (design section 9).
  */
 static void
 station_abilities(struct fa_radio *radio, const uint8_t *elements, unsigned length)
@@ -1561,7 +1579,6 @@ station_abilities(struct fa_radio *radio, const uint8_t *elements, unsigned leng
 		link->supp_rates[band->band] = rates;
 		conf->basic_rates = basic;
 	}
-	link->bandwidth = IEEE80211_STA_RX_BW_20;
 	link->smps_mode = IEEE80211_SMPS_OFF;
 	radio->sta->wme = fa_wmm_element(elements, length) != NULL;
 	conf->qos = radio->sta->wme;
@@ -1570,21 +1587,32 @@ station_abilities(struct fa_radio *radio, const uint8_t *elements, unsigned leng
 	memset(&link->he_cap, 0, sizeof(link->he_cap));
 	if (ht != NULL && ht[1] >= FA_HT_BODY && band->ht_cap.ht_supported) {
 		link->ht_cap.ht_supported = true;
-		link->ht_cap.cap = (uint16_t)((ht[2] | ht[3] << 8) & ~(FA_HT_CAP_40 | FA_HT_CAP_SGI_40));
+		link->ht_cap.cap = (uint16_t)((ht[2] | ht[3] << 8) & (radio->width.mhz > 20 ? 0xffffu : ~(unsigned)(FA_HT_CAP_40 | FA_HT_CAP_SGI_40)));
 		link->ht_cap.ampdu_factor = ht[4] & 3;
 		link->ht_cap.ampdu_density = (ht[4] >> 2) & 7;
 		memcpy(&link->ht_cap.mcs, ht + 5, sizeof(link->ht_cap.mcs));
 	} else {
 		ht = NULL;
 	}
-	if (vht != NULL && vht[1] >= FA_VHT_BODY && band->vht_cap.vht_supported) {
+	if (vht != NULL && vht[1] >= FA_VHT_BODY && band->vht_cap.vht_supported && radio->width.vht) {
 		link->vht_cap.vht_supported = true;
 		link->vht_cap.cap = (uint32_t)vht[2] | (uint32_t)vht[3] << 8 | (uint32_t)vht[4] << 16 | (uint32_t)vht[5] << 24;
 		memcpy(&link->vht_cap.vht_mcs, vht + 6, sizeof(link->vht_cap.vht_mcs));
 	} else {
 		vht = NULL;
 	}
-	if (he_element != NULL && own_he != NULL && fa_he_read(he_element, &he)) {
+	switch (fa_width_peer(&radio->width, ht != NULL && (ht[2] & FA_HT_CAP_40) != 0, vht != NULL)) {
+	case 80:
+		link->bandwidth = IEEE80211_STA_RX_BW_80;
+		break;
+	case 40:
+		link->bandwidth = IEEE80211_STA_RX_BW_40;
+		break;
+	default:
+		link->bandwidth = IEEE80211_STA_RX_BW_20;
+		break;
+	}
+	if (he_element != NULL && own_he != NULL && radio->width.he && fa_he_read(he_element, &he)) {
 		has_he = true;
 		link->he_cap.has_he = true;
 		memcpy(link->he_cap.he_cap_elem.mac_cap_info, he.mac, FA_HE_MAC);
@@ -1611,7 +1639,7 @@ station_abilities(struct fa_radio *radio, const uint8_t *elements, unsigned leng
 	}
 }
 
-/* Our association request, as far as both sides have what it offers, at 20 MHz. Its length, 0 when it does not fit. */
+/* Our association request, as far as both sides have what it offers, at the width of radio->width. Its length, 0 when it does not fit. */
 static unsigned
 request_build(struct fa_radio *radio, uint8_t *frame, unsigned size)
 {
@@ -1640,7 +1668,7 @@ request_build(struct fa_radio *radio, uint8_t *frame, unsigned size)
 		offer.channel = (uint8_t)linuxkpi_ieee80211_frequency_to_channel(channel->center_freq, 0);
 	}
 	if (fa_element(target->elements, target->elements_length, FA_EID_HT) != NULL && band->ht_cap.ht_supported) {
-		unsigned cap = band->ht_cap.cap & ~(unsigned)(FA_HT_CAP_40 | FA_HT_CAP_SGI_40);
+		unsigned cap = band->ht_cap.cap & (radio->width.mhz > 20 ? 0xffffu : ~(unsigned)(FA_HT_CAP_40 | FA_HT_CAP_SGI_40));
 
 		offer.has_ht = true;
 		offer.ht[0] = (uint8_t)cap;
@@ -1648,7 +1676,7 @@ request_build(struct fa_radio *radio, uint8_t *frame, unsigned size)
 		offer.ht[2] = (uint8_t)(band->ht_cap.ampdu_factor | band->ht_cap.ampdu_density << 2);
 		memcpy(offer.ht + 3, &band->ht_cap.mcs, sizeof(band->ht_cap.mcs));
 	}
-	if (fa_element(target->elements, target->elements_length, FA_EID_VHT) != NULL && band->vht_cap.vht_supported) {
+	if (fa_element(target->elements, target->elements_length, FA_EID_VHT) != NULL && band->vht_cap.vht_supported && radio->width.vht) {
 		uint32_t cap = band->vht_cap.cap & ~(FA_VHT_CAP_WIDTH | FA_VHT_CAP_SGI_160);
 
 		offer.has_vht = true;
@@ -1658,7 +1686,7 @@ request_build(struct fa_radio *radio, uint8_t *frame, unsigned size)
 		offer.vht[3] = (uint8_t)(cap >> 24);
 		memcpy(offer.vht + 4, &band->vht_cap.vht_mcs, sizeof(band->vht_cap.vht_mcs));
 	}
-	if (fa_ext_element(target->elements, target->elements_length, FA_EXT_HE) != NULL && own_he != NULL) {
+	if (fa_ext_element(target->elements, target->elements_length, FA_EXT_HE) != NULL && own_he != NULL && radio->width.he) {
 		offer.he_length = fa_he_offer(offer.he, sizeof(offer.he), own_he->he_cap_elem.mac_cap_info, own_he->he_cap_elem.phy_cap_info,
 		    own_he->he_mcs_nss_supp.rx_mcs_80, own_he->he_mcs_nss_supp.tx_mcs_80);
 	}
@@ -1910,6 +1938,22 @@ station_keys(struct fa_radio *radio)
 }
 
 /*
+ * Stage 8: on a channel with radar rules, what will not start there is that channel's answer and not the firmware's death, and another
+ * access point may still be tried. True, and said, when that is so. What really is the firmware's shows in fa_m4_trouble() by its own ways.
+ */
+static bool
+join_radar_refused(struct fa_radio *radio, const char *what, int error)
+{
+	const struct linuxkpi_ieee80211_channel *channel = radio->chanctx->def.chan;
+
+	if (!radio->ios || (channel->flags & (IEEE80211_CHAN_RADAR | IEEE80211_CHAN_NO_IR)) == 0 || fa_m4_trouble()) {
+		return (false);
+	}
+	lx_tell("FUXI ATH12K: M8 %s not taken on %u MHz, a channel with radar rules: %d. Not the firmware's doing\n", what, channel->center_freq, error);
+	return (true);
+}
+
+/*
  * No answer is either the air's doing or the firmware's. When frames went to the firmware and none of them came back, it is
  * the firmware's: that goes the way of any other death. Otherwise it is only a join that did not happen.
  */
@@ -1917,7 +1961,7 @@ static int
 no_answer(struct fa_radio *radio, const char *what)
 {
 	lx_tell("FUXI ATH12K: M5 not proven: no answer to %s\n", what);
-	if (radio->tx_sent != radio->tx_sent_before && radio->tx_done == radio->tx_done_before && !fa_m4_trouble()) {
+	if (radio->tx_sent != radio->tx_sent_before && radio->tx_done == radio->tx_done_before && !fa_m4_trouble() && !join_radar_refused(radio, "the frames", -ETIMEDOUT)) {
 		fa_m4_evidence("management frames never came back from the firmware");
 		return (-EIO);
 	}
@@ -2008,6 +2052,73 @@ target_channel(struct fa_radio *radio)
 	return (channel != NULL && (channel->flags & IEEE80211_CHAN_DISABLED) == 0 && channel->band != NL80211_BAND_6GHZ ? channel : NULL);
 }
 
+/*
+ * Whether the radio may tune to all of this: every 20 MHz of it allowed here, on the primary's band, and under a rule of the domain that
+ * lets it be that wide. mac80211 has cfg80211 work this out; the domain here is read in regd_apply() alone.
+ */
+static bool
+width_allowed(struct fa_radio *radio, const struct linuxkpi_ieee80211_channel *primary, unsigned center, unsigned mhz)
+{
+	const struct linuxkpi_ieee80211_regdomain *regd = radio->regd;
+
+	if (regd == NULL) {
+		return (false);
+	}
+	for (unsigned frequency = center - mhz / 2 + 10; frequency < center + mhz / 2; frequency += 20) {
+		const struct linuxkpi_ieee80211_channel *channel = linuxkpi_ieee80211_get_channel(radio->wiphy, frequency);
+		bool covered = false;
+
+		if (channel == NULL || channel->band != primary->band || (channel->flags & IEEE80211_CHAN_DISABLED) != 0) {
+			return (false);
+		}
+		for (int r = 0; r < regd->n_reg_rules && !covered; r++) {
+			covered = regd->reg_rules[r].freq_range.start_freq_khz <= ((int)frequency - 10) * 1000 &&
+			    regd->reg_rules[r].freq_range.end_freq_khz >= ((int)frequency + 10) * 1000 &&
+			    regd->reg_rules[r].freq_range.max_bandwidth_khz >= (int)mhz * 1000;
+		}
+		if (!covered) {
+			return (false);
+		}
+	}
+	return (true);
+}
+
+/*
+ * How wide this join's channel is. Stages 5 to 7 are 20 MHz whatever is said, and so is stage 8 unless fuxiwifiwide=1 asks; but stage 8
+ * alone can come to 5 GHz by its own choice, so it reads what the access point says even at 20 MHz: see fa_width_choose().
+ */
+static void
+station_width(struct fa_radio *radio, const struct linuxkpi_ieee80211_channel *channel)
+{
+	const struct fa_target *target = &radio->target;
+	const struct ieee80211_supported_band *band = radio->wiphy->bands[channel->band];
+	struct fa_width *width = &radio->width;
+	unsigned most = target_wide ? 80 : 20;
+
+	fa_width_narrow(width, channel->center_freq);
+	if (!radio->ios) {
+		return;
+	}
+	for (;;) {
+		fa_width_choose(width, target->elements, target->elements_length, channel->center_freq, most, band->ht_cap.ht_supported && (band->ht_cap.cap & FA_HT_CAP_40) != 0,
+		    band->vht_cap.vht_supported, station_he(band) != NULL);
+		if (width->mhz == 20 || width_allowed(radio, channel, width->center, width->mhz)) {
+			break;
+		}
+		lx_tell("FUXI ATH12K: M8 width: %u MHz around %u is not allowed here\n", width->mhz, width->center);
+		most = width->mhz == 80 ? 40 : 20;
+	}
+	lx_tell("FUXI ATH12K: M8 width: %u MHz around %u, primary %u; the access point works at %u; offering VHT %d HE %d%s\n", width->mhz, width->center, channel->center_freq,
+	    width->said, width->vht, width->he, target_wide ? "" : "; fuxiwifiwide is off");
+}
+
+/* The width as the driver's channel has it. Only station_width() at stage 8 makes it more than 20 MHz. */
+static enum nl80211_chan_width
+width_of_channel(const struct fa_width *width)
+{
+	return (width->mhz == 80 ? NL80211_CHAN_WIDTH_80 : width->mhz == 40 ? NL80211_CHAN_WIDTH_40 : NL80211_CHAN_WIDTH_20);
+}
+
 /* WMM's parameters, for each of the four classes how long to wait and how long to hold the air. */
 static void
 wmm_parameters(struct fa_radio *radio)
@@ -2087,10 +2198,11 @@ station_join(struct fa_radio *radio, bool *joined)
 	radio->answer = FA_ANSWER_NONE;
 	lx_os_unlock();
 
-	/* the channel, 20 MHz wide */
+	/* the channel, as wide as station_width() said: 20 MHz, on every stage but 8 */
+	station_width(radio, channel);
 	radio->chanctx->def.chan = channel;
-	radio->chanctx->def.width = NL80211_CHAN_WIDTH_20;
-	radio->chanctx->def.center_freq1 = channel->center_freq;
+	radio->chanctx->def.width = width_of_channel(&radio->width);
+	radio->chanctx->def.center_freq1 = radio->width.center;
 	radio->chanctx->min_def = radio->chanctx->def;
 	radio->chanctx->rx_chains_static = 2;
 	radio->chanctx->rx_chains_dynamic = 2;
@@ -2106,14 +2218,19 @@ station_join(struct fa_radio *radio, bool *joined)
 		}
 	}
 	wiphy_unlock(hw->wiphy);
-	lx_tell("FUXI ATH12K: M5 channel %u MHz, 20 MHz wide, chanctx %d\n", channel->center_freq, error);
+	lx_tell("FUXI ATH12K: M5 channel %u MHz, %u MHz wide, chanctx %d\n", channel->center_freq, radio->width.mhz, error);
 	if (error != 0) {
+		if (join_radar_refused(radio, "the channel", error)) {
+			return (0);
+		}
 		fa_m4_evidence("channel context refused");
 		return (error);
 	}
 
 	/* the access point, to the link */
 	vif->bss_conf.bssid = target->address;
+	vif->bss_conf.ht_operation_mode = 0;	/* a stage 8 join after another: not what the last access point said */
+	vif->bss_conf.he_oper.params = 0;
 	vif->bss_conf.beacon_int = target->interval;
 	vif->bss_conf.assoc_capability = target->capability;
 	vif->bss_conf.dtim_period = 1;
@@ -2137,6 +2254,9 @@ station_join(struct fa_radio *radio, bool *joined)
 	fa_m4_credits("after the peer and vdev start");
 	if (error != 0) {
 		radio->sta = NULL;		/* the driver has taken its station away again */
+		if (join_radar_refused(radio, "the peer or the vdev start", error)) {
+			return (0);
+		}
 		fa_m4_evidence("peer create or vdev start failed");
 		return (error);
 	}
@@ -2666,6 +2786,7 @@ fa_m5_station(struct ieee80211_hw *hw, bool passive)
 #define FA_AUTO_WAIT_NS		(30 * 1000000000ull)
 #define FA_IOS_TX_DONE_NS	(1000 * 1000000ull)
 #define FA_IOS_SAY_EVERY_NS	(60 * 1000000000ull)
+#define FA_JOIN_CANDIDATES	4		/* access points one join goes to: each can take seconds, under the gate */
 
 void
 fa_ios_start(const struct fa_ios_input *input)
@@ -2697,6 +2818,18 @@ auto_forget(void)
 	auto_name_length = 0;
 }
 
+/* Nothing kept for joining again, and nothing going after it. Holding the gate. */
+static void
+rejoin_forget(struct fa_radio *radio)
+{
+	fa_wipe(rejoin_key, sizeof(rejoin_key));
+	fa_wipe(rejoin_name, sizeof(rejoin_name));
+	rejoin_name_length = 0;
+	radio->ios_rejoining = false;
+	radio->rejoin_tries = 0;
+	radio->rejoin_at = 0;
+}
+
 /* iOS's side has said what it wants: from here its word is the only one. Holding the gate. */
 static void
 auto_gives_way(struct fa_radio *radio, const char *what)
@@ -2705,6 +2838,10 @@ auto_gives_way(struct fa_radio *radio, const char *what)
 	if (auto_name_length != 0) {
 		auto_forget();
 		lx_tell("FUXI ATH12K: M8 auto join: given up, wifid asked for %s\n", what);
+	}
+	if (rejoin_name_length != 0) {
+		lx_tell("FUXI ATH12K: M8 rejoin: %s, wifid asked for %s\n", radio->ios_rejoining ? "stopped" : "will not happen", what);
+		rejoin_forget(radio);
 	}
 }
 
@@ -2799,6 +2936,8 @@ ios_dies(struct fa_radio *radio)
 {
 	lx_tell("FUXI ATH12K: M8 the firmware is gone\n");
 	radio->ios_dead = true;
+	auto_forget();
+	rejoin_forget(radio);
 	ios_frames_stop(radio);
 	ios_phase(radio, FA_IOS_OFF, FA_IOS_RADIO_DEAD);
 	ios_input.lost(FA_IOS_RADIO_DEAD);
@@ -3035,17 +3174,27 @@ ios_step(struct fa_radio *radio)
 		ios_dies(radio);
 	} else if ((pending & IOS_LOSS) != 0 && radio->ios_joined) {
 		int answer = FA_IOS_GONE;
+		bool again = radio->ios_auto_joined && (radio->answer == FA_ANSWER_GONE || radio->lost);
 
-		if (radio->ios_auto_joined) {
+		if (radio->ios_auto_joined && !again) {
+			/* It asks for something else now: nobody joins that behind anyone's back. */
 			radio->ios_auto_joined = false;
+			rejoin_forget(radio);
 			lx_tell("FUXI ATH12K: M8 auto join: the network is lost, not joining again\n");
 		}
 		lx_tell("FUXI ATH12K: M8 the network is lost: door %d, reason %u, connection %d, changed %d\n", radio->answer == FA_ANSWER_GONE, radio->reason, radio->lost, radio->went_protected);
 		ios_loss_say(radio);
 		ios_frames_stop(radio);
-		ios_phase(radio, FA_IOS_IDLE, answer);
+		ios_phase(radio, FA_IOS_IDLE, again ? FA_IOS_DONE : answer);
 		ios_input.lost(answer);
 		ios_clean(radio);
+		if (again) {
+			radio->ios_auto_joined = false;
+			radio->ios_rejoining = true;
+			radio->rejoin_tries = 0;
+			radio->rejoin_at = lx_os_nanoseconds() + fa_rejoin_wait_ms(0) * 1000000ull;
+			lx_tell("FUXI ATH12K: M8 rejoin: lost, the first try in %u ms\n", fa_rejoin_wait_ms(0));
+		}
 	} else if ((pending & IOS_EAPOL) != 0 && radio->ios_joined) {
 		ios_eapol(radio);
 	}
@@ -3063,19 +3212,29 @@ ios_step(struct fa_radio *radio)
 	ios_gate_out(radio);
 }
 
+static void ios_rejoin_step(struct fa_radio *radio);
+
 static void
 ios_runs(void *argument)
 {
 	struct fa_radio *radio = argument;
 
 	for (;;) {
+		unsigned long long rest = 10 * FA_IOS_LOOK_NS;
+
 		lx_os_lock();
+		if (radio->ios_rejoining) {
+			unsigned long long clock = lx_os_nanoseconds();
+
+			rest = radio->rejoin_at <= clock ? 1 : radio->rejoin_at - clock < rest ? radio->rejoin_at - clock : rest;
+		}
 		if (radio->ios_pending == 0) {
-			lx_os_sleep(&radio->ios_pending, 10 * FA_IOS_LOOK_NS);
+			lx_os_sleep(&radio->ios_pending, rest);
 		}
 		lx_os_unlock();
 		ios_step(radio);
 		ios_auto_step(radio);
+		ios_rejoin_step(radio);
 	}
 }
 
@@ -3103,14 +3262,57 @@ ios_auto_step(struct fa_radio *radio)
 	answer = ios_join_run(radio, name, length, NULL, key, true);
 	fa_wipe(key, sizeof(key));
 	lx_tell("FUXI ATH12K: M8 auto join: answer %d\n", answer);
-	if (answer == FA_IOS_DONE) {
-		radio->ios_auto_joined = true;
-	}
 	if (auto_quiet) {
 		lx_tell("FUXI ATH12K: M8 auto join: not told to the Apple80211 side, fuxiwifiauto=2\n");
 	} else {
 		ios_input.joined_alone(answer);
 	}
+}
+
+/*
+ * The network the auto join had, lost by the access point's word or the driver's: scan and join again, on this thread with nothing else
+ * held, for as long as nobody says otherwise. iOS's side saw the link go down once and sees it come up once, and of the tries in
+ * between only a line in the log: no answer of a join that it did not ask for, which it could take for its own.
+ */
+static void
+ios_rejoin_step(struct fa_radio *radio)
+{
+	uint8_t name[FA_SSID_MOST], key[32];
+	unsigned length, tries;
+	int answer;
+
+	ios_gate_in(radio);
+	if (!radio->ios_rejoining || radio->ios_dead || lx_os_nanoseconds() < radio->rejoin_at) {
+		ios_gate_out(radio);
+		return;
+	}
+	length = rejoin_name_length;
+	memcpy(name, rejoin_name, length);
+	memcpy(key, rejoin_key, sizeof(key));
+	tries = ++radio->rejoin_tries;
+	ios_gate_out(radio);
+	lx_tell("FUXI ATH12K: M8 rejoin: try %u\n", tries);
+	answer = ios_join_run(radio, name, length, NULL, key, true);
+	fa_wipe(key, sizeof(key));
+	fa_wipe(name, sizeof(name));
+	if (answer == FA_IOS_DONE) {
+		lx_tell("FUXI ATH12K: M8 rejoin: joined at try %u\n", tries);
+		if (auto_quiet) {
+			lx_tell("FUXI ATH12K: M8 auto join: not told to the Apple80211 side, fuxiwifiauto=2\n");
+		} else if (radio->ios_auto_joined) {
+			ios_input.joined_alone(answer);
+		}
+		return;
+	}
+	ios_gate_in(radio);
+	if (answer == FA_IOS_RADIO_DEAD) {
+		lx_tell("FUXI ATH12K: M8 rejoin: try %u answer %d, the firmware is gone: no more\n", tries, answer);
+		rejoin_forget(radio);
+	} else if (radio->ios_rejoining && !radio->ios_wifid_asked) {
+		radio->rejoin_at = lx_os_nanoseconds() + fa_rejoin_wait_ms(tries) * 1000000ull;
+		lx_tell("FUXI ATH12K: M8 rejoin: try %u answer %d, the next in %u ms\n", tries, answer, fa_rejoin_wait_ms(tries));
+	}
+	ios_gate_out(radio);
 }
 
 /* From the poll thread, which may not wait for the firmware's dump: it notes it. */
@@ -3142,7 +3344,8 @@ fa_m8_up(struct ieee80211_hw *hw)
 	radio->ios = true;
 	radio->ios_phase = FA_IOS_IDLE;
 	radio->ios_table = kzalloc(FA_HEARD_MOST * sizeof(*radio->ios_table), GFP_KERNEL);
-	if (radio->ios_table == NULL) {
+	radio->ios_candidates = kzalloc(FA_CANDIDATES_MOST * sizeof(*radio->ios_candidates), GFP_KERNEL);
+	if (radio->ios_table == NULL || radio->ios_candidates == NULL) {
 		return (-ENOMEM);
 	}
 	error = station_up(radio);
@@ -3282,12 +3485,78 @@ ios_why(struct fa_radio *radio)
 	return (FA_IOS_REFUSED);
 }
 
+/* What one try at one access point leaves behind, so that the next starts from nothing. The name and the key of the join stay. */
+static void
+ios_join_counts_fresh(struct fa_radio *radio)
+{
+	lx_os_lock();
+	radio->answer = FA_ANSWER_NONE;
+	radio->answer_code = radio->reason = 0;
+	radio->lost = radio->went_protected = false;
+	radio->eapol_length = radio->eapol_heard = radio->eapol_lost = 0;
+	radio->eapol_sent = radio->data_done = radio->data_acked = 0;
+	radio->ba_want = 0;
+	radio->ba_live = 0;
+	radio->ios_pending &= IOS_DEAD;
+	lx_os_unlock();
+}
+
+/*
+ * The access points the scans heard, the best first, each checked as any other: its RSN element by handshake_prepare(). One that does not
+ * come to anything is left as a join is left, and the next is tried: a channel with radar rules must not trap the join. Not after the
+ * handshake has said no, for that is the key and it is the same key everywhere, nor when iOS's side has begun to wait for us.
+ */
+static int
+ios_join_best(struct fa_radio *radio, bool protect, bool alone)
+{
+	struct fa_target *target = &radio->target;
+	unsigned tries = 0;
+	int answer = FA_IOS_NOT_BUILT;
+	bool more;
+
+	while (tries < FA_JOIN_CANDIDATES) {
+		bool joined = false;
+		int error;
+
+		lx_os_lock();
+		more = fa_target_next(target);
+		lx_os_unlock();
+		if (!more) {
+			break;
+		}
+		lx_tell("FUXI ATH12K: M8 choice%s: %u MHz at %d dBm, score %d, of %u heard\n", tries != 0 ? ", falling back to the next best" : "", target->frequency, target->rssi,
+		    fa_band_score(target->frequency, target->rssi), target->candidate_count);
+		if (protect && !handshake_prepare(radio)) {
+			continue;
+		}
+		tries++;
+		error = station_join(radio, &joined);
+		if (fa_m4_trouble() || error != 0) {
+			return (FA_IOS_RADIO_DEAD);
+		}
+		if (joined) {
+			return (FA_IOS_DONE);
+		}
+		answer = ios_why(radio);
+		lx_tell("FUXI ATH12K: M8 join at %u MHz came to nothing: answer %d\n", target->frequency, answer);
+		if (answer == FA_IOS_NO_AUTH || (alone && radio->ios_wifid_asked)) {
+			break;
+		}
+		if (radio->chanctx != NULL) {
+			station_leave(radio);
+		}
+		ios_join_counts_fresh(radio);
+		fa_wipe(&radio->wpa, sizeof(radio->wpa));
+		fa_wipe(radio->eapol, sizeof(radio->eapol));
+	}
+	return (answer);
+}
+
 /* A join, from iOS's side or from the auto join, which gives way if iOS's side has spoken in the meantime. */
 static int
 ios_join_run(struct fa_radio *radio, const unsigned char *ssid, unsigned ssid_length, const unsigned char *bssid, const unsigned char *key, bool alone)
 {
 	struct fa_target *target;
-	bool joined = false;
 	int error = 0, answer = FA_IOS_DONE;
 
 	ios_gate_in(radio);
@@ -3309,17 +3578,14 @@ ios_join_run(struct fa_radio *radio, const unsigned char *ssid, unsigned ssid_le
 	target = &radio->target;
 	lx_os_lock();
 	memset(target, 0, sizeof(*target));
+	target->candidates = radio->ios_candidates;
+	target->candidates_most = FA_CANDIDATES_MOST;
 	target->wanted = key != NULL ? FA_PROTECT_RSN : FA_OPEN;
 	if (bssid != NULL) {
 		target->only_one = true;
 		memcpy(target->only, bssid, sizeof(target->only));
 	}
 	radio->protect = key != NULL;
-	radio->answer = FA_ANSWER_NONE;
-	radio->answer_code = radio->reason = 0;
-	radio->lost = radio->went_protected = false;
-	radio->eapol_length = radio->eapol_heard = radio->eapol_lost = 0;
-	radio->eapol_sent = radio->data_done = radio->data_acked = 0;
 	radio->rx_ok = radio->rx_clear = radio->rx_replay = radio->rx_no_key = radio->rx_long = radio->net_sent = 0;
 	radio->link_data = radio->link_beacons = radio->link_others = 0;
 	radio->beacon_losses = 0;
@@ -3331,6 +3597,7 @@ ios_join_run(struct fa_radio *radio, const unsigned char *ssid, unsigned ssid_le
 	memset(radio->tx_then, 0, sizeof(radio->tx_then));
 	memset(radio->tx_then_at, 0, sizeof(radio->tx_then_at));
 	lx_os_unlock();
+	ios_join_counts_fresh(radio);
 	memset(&radio->heard, 0, sizeof(radio->heard));
 	fa_set_target_ssid(ssid, ssid_length);
 	if (target_name_length == 0) {
@@ -3360,25 +3627,17 @@ ios_join_run(struct fa_radio *radio, const unsigned char *ssid, unsigned ssid_le
 	} else if (!target->found) {
 		lx_tell("FUXI ATH12K: M8 not heard in %u scans: %d\n", FA_JOIN_SCANS, error);
 		answer = FA_IOS_NOT_HEARD;
-	} else if (key != NULL && !handshake_prepare(radio)) {
-		answer = FA_IOS_NOT_BUILT;
+	} else {
+		answer = ios_join_best(radio, key != NULL, alone);
 	}
 	fa_wipe(target_key, sizeof(target_key));
-	if (answer == FA_IOS_DONE) {
-		error = station_join(radio, &joined);
-		if (fa_m4_trouble() || error != 0) {
-			answer = FA_IOS_RADIO_DEAD;
-		} else if (!joined) {
-			answer = ios_why(radio);
-		}
-	}
 	if (answer != FA_IOS_DONE) {
 		lx_tell("FUXI ATH12K: M8 join over: answer %d\n", answer);
 		if (answer == FA_IOS_RADIO_DEAD) {
 			ios_dies(radio);
 		} else {
 			ios_clean(radio);
-			ios_phase(radio, FA_IOS_IDLE, answer);
+			ios_phase(radio, FA_IOS_IDLE, radio->ios_rejoining ? FA_IOS_DONE : answer);
 		}
 		ios_gate_out(radio);
 		return (answer);
@@ -3403,8 +3662,22 @@ ios_join_run(struct fa_radio *radio, const unsigned char *ssid, unsigned ssid_le
 	radio->ios_joined = true;		/* the keys are in: station_keys() said so */
 	radio->ios_said = lx_os_nanoseconds();
 	radio->ios_joined_at = radio->ios_said;
+	radio->rssi = target->rssi;
+	if (radio->answer == FA_ANSWER_GONE || radio->lost) {
+		/* Its word came before frames passed, and nothing else would hear of it. */
+		radio->ios_pending |= IOS_LOSS;
+		lx_os_wakeup(&radio->ios_pending);
+	}
 	lx_os_unlock();
-	lx_tell("FUXI ATH12K: M8 joined %u MHz at %d dBm\n", target->frequency, target->rssi);
+	if (alone && key != NULL) {
+		radio->ios_auto_joined = true;
+		radio->ios_rejoining = false;
+		radio->rejoin_tries = 0;
+		memmove(rejoin_name, ssid, ssid_length);
+		rejoin_name_length = ssid_length;
+		memcpy(rejoin_key, key, sizeof(rejoin_key));
+	}
+	lx_tell("FUXI ATH12K: M8 joined %u MHz at %d dBm, %u MHz wide\n", target->frequency, target->rssi, radio->width.mhz);
 	ios_gate_out(radio);
 	ios_input.link(1);
 	return (FA_IOS_DONE);
