@@ -67,6 +67,14 @@ ios_lost(int answer)
 	fuxi_wifi_sta_lost(ios_errno(answer));
 }
 
+/* From bsd/dev/fuxi_wifi_apple80211.c, by patch 0117: what wifid has just set, kept for the account of a loss. */
+void fuxi_ath12k_note_request(int number, int value);
+void
+fuxi_ath12k_note_request(int number, int value)
+{
+	fa_ios_note_request(number, value);
+}
+
 /* The Apple80211 side hears of it as of any other link: it did not ask, and what it then does is for a run to show. */
 static void
 ios_joined_alone(int answer)

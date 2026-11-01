@@ -9,6 +9,7 @@ int	lx_base_init(void);		/* lx_base.c: the thread that counts the ticks and runs
 int	lx_pool_init(void);		/* lx_base.c: the memory the radio reads and writes; 0, or an errno */
 long	lx_stub(const char *name);	/* lx_base.c: logs that a function has no real work yet */
 void	lx_tell(const char *format, ...) __printflike(1, 2);	/* lx_base.c: a line that is always said */
+void	fa_rx_msdu_note(bool came_up);	/* fa_80211.c: from fa_hif.c: a buffer that was not done, and whether it was 20 us on */
 void	lx_memory_say(void);		/* lx_base.c: what the layer holds of memory */
 void	lx_pool_peaks(unsigned *rings_kb, unsigned *slots);	/* lx_base.c: the most of the radio's memory out so far */
 void	lx_pause_ms(unsigned ms);	/* lx_base.c: sleep */

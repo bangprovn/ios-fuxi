@@ -38,6 +38,7 @@
 #include "hif.h"
 #include "wifi7/core.h"
 #include "wifi7/hw.h"
+#include "wifi7/hal_rx_desc.h"
 
 /* Design R2: the 512-entry cookie table pages are this size. Silent corruption otherwise. */
 _Static_assert(ATH12K_PAGE_SIZE == 4096, "fuxi-ath12k R2: ATH12K_PAGE_SIZE must be 4096");
@@ -624,6 +625,30 @@ fa_peer_mapped(u32 vdev, u32 peer_id, u32 ast_hash, u32 hw_peer_id)
 		said++;
 		lx_tell("FUXI ATH12K: peer map: vdev %u id %u ast hash %u hw %u\n", vdev, peer_id, ast_hash, hw_peer_id);
 	}
+}
+
+/*
+ * tools/ath12k-edits.json, ath12k-rx-buffer-fresh. A slot of the pool is not cleared when it comes round again, so a buffer
+ * the hardware never wrote can show the msdu_done of the frame before it. The one word goes, while the host still owns the buffer.
+ */
+void
+fa_rx_buffer_fresh(void *data)
+{
+	((struct hal_rx_desc *)data)->u.wcn7850.msdu_end.info14 = 0;
+}
+
+/* tools/ath12k-edits.json, ath12k-rx-msdu-not-done-count: only looks. The frame is dropped as before, and the warning stays. */
+void
+fa_rx_msdu_not_done(const void *desc)
+{
+	const volatile __le32 *word = &((const struct hal_rx_desc *)desc)->u.wcn7850.msdu_end.info14;
+	unsigned long long began = lx_os_nanoseconds();
+	bool up = false;
+
+	while (!up && lx_os_nanoseconds() - began < 20000) {
+		up = (le32_to_cpu(*word) & RX_MSDU_END_INFO14_MSDU_DONE) != 0;
+	}
+	fa_rx_msdu_note(up);
 }
 
 /* tools/ath12k-edits.json, ath12k-wmi-event-log. Nothing else shows how far a silent firmware got. */

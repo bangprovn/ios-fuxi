@@ -64,6 +64,37 @@ fa_ip_sum(const uint8_t *at, unsigned length)
 	return (~sum & 0xffff);
 }
 
+/* ---- what goes out, counted ---------------------------------------------------------------------------------- */
+
+struct fa_tx_counts {
+	unsigned	arp, ip6, tcp, udp, icmp, ip_other, eapol, other;
+};
+
+/* One frame of this type going out, with what follows its Ethernet header. Reads nothing past `length`. */
+static inline void
+fa_tx_note(struct fa_tx_counts *counts, unsigned type, const uint8_t *body, unsigned length)
+{
+	if (type == FA_TYPE_ARP) {
+		counts->arp++;
+	} else if (type == 0x86dd) {
+		counts->ip6++;
+	} else if (type == 0x888e) {
+		counts->eapol++;
+	} else if (type != FA_TYPE_IP) {
+		counts->other++;
+	} else if (length < FA_IP_HEADER) {
+		counts->ip_other++;
+	} else if (body[9] == FA_PROTO_UDP) {
+		counts->udp++;
+	} else if (body[9] == 6) {
+		counts->tcp++;
+	} else if (body[9] == FA_PROTO_ICMP) {
+		counts->icmp++;
+	} else {
+		counts->ip_other++;
+	}
+}
+
 /* ---- data frames ------------------------------------------------------------------------------------------- */
 
 struct fa_data {

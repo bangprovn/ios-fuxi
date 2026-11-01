@@ -210,6 +210,26 @@ STACK_START = """	    (unsigned) IOService::getServiceRoot()->getBusyState());
 """
 
 
+APPLE80211_SOURCE = ROOT / 'xnu/fuxi-wifi-ios/fuxi_wifi_apple80211.c'
+APPLE80211_FIND = """	note(request, is_set, error);
+"""
+APPLE80211_NOTE = """	note(request, is_set, error);
+	if (is_set) {
+		extern void fuxi_ath12k_note_request(int number, int value);
+
+		fuxi_ath12k_note_request(request->req_type, request->req_val);
+	}
+"""
+
+
+def apple80211_note():
+    before = APPLE80211_SOURCE.read_text()
+    assert before.count(APPLE80211_FIND) == 1
+    after = before.replace(APPLE80211_FIND, APPLE80211_NOTE)
+    return ''.join(difflib.unified_diff(before.splitlines(True), after.splitlines(True),
+                                        fromfile='a/bsd/dev/fuxi_wifi_apple80211.c', tofile='b/bsd/dev/fuxi_wifi_apple80211.c'))
+
+
 def stack_watch():
     before = STACK_SOURCE.read_text()
     assert before.count(STACK_HELPER_FIND) == 1 and before.count(STACK_START_FIND) == 1
@@ -438,7 +458,7 @@ def new_file(source, dest):
 
 
 def expected_0117():
-    return CONF + MAKEINC + ''.join(new_file(*pair) for pair in NEW_FILES) + remote_keys() + ios_selection() + stack_watch() + keystore()
+    return CONF + MAKEINC + ''.join(new_file(*pair) for pair in NEW_FILES) + remote_keys() + apple80211_note() + ios_selection() + stack_watch() + keystore()
 
 
 def expected_0099():

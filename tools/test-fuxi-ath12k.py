@@ -610,6 +610,7 @@ static unsigned long long now = 1;
 static uint8_t notified_alpha2[2];
 void lx_tell(const char *f, ...) { va_list l; va_start(l, f); vsnprintf(said + strlen(said), sizeof(said) - strlen(said), f, l); va_end(l); }
 long lx_stub(const char *n) { return 0; }
+void lx_pool_peaks(unsigned *rings, unsigned *slots) { *rings = 0; *slots = 7; }
 void lx_os_lock(void) { assert(!locks); locks++; }
 void lx_os_unlock(void) { assert(locks); locks--; }
 void lx_os_sleep(const void *a, unsigned long long n) { abort(); }
@@ -753,6 +754,7 @@ static uint8_t seen_ie[64];
 static unsigned seen_freqs[64];
 void lx_tell(const char *f, ...) { va_list l; va_start(l, f); vsnprintf(said + strlen(said), sizeof(said) - strlen(said), f, l); va_end(l); }
 long lx_stub(const char *n) { return 0; }
+void lx_pool_peaks(unsigned *rings, unsigned *slots) { *rings = 0; *slots = 7; }
 void lx_os_lock(void) { assert(!locks); locks++; }
 void lx_os_unlock(void) { assert(locks); locks--; }
 void lx_os_sleep(const void *a, unsigned long long n) { assert(locks); now += n; }
@@ -1041,6 +1043,7 @@ static unsigned trouble_asks, evidence_count, r6_count;
 static char first_evidence[96];
 void lx_tell(const char *f, ...) { va_list l; va_start(l, f); vsnprintf(said + strlen(said), sizeof(said) - strlen(said), f, l); va_end(l); }
 long lx_stub(const char *n) { return 0; }
+void lx_pool_peaks(unsigned *rings, unsigned *slots) { *rings = 0; *slots = 7; }
 void lx_os_lock(void) { assert(!locks); locks++; }
 void lx_os_unlock(void) { assert(locks); locks--; }
 void lx_os_sleep(const void *a, unsigned long long n) { assert(locks); now += n; }
@@ -2141,8 +2144,8 @@ int main(void) {
             calls[0] = 0; give_action(AP, DELBA_OURS, 6); give_action(OTHER, ADDBA, 9); give_action(AP, ADDBA, 8);
             assert(!(radio->ios_pending & IOS_BA)); ios_step(radio); assert(!calls[0]);
             /* What the run reads: the counts in the joined line, and a limit on the stale lines. */
-            radio->ios_said = 0; fa_rx_stale("reo", 3, 64); fa_rx_msdu_not_done(); ios_step(radio);
-            assert(SAID("rx descriptor with no buffer, reo, ring 3 tp 64, number 1") && SAID("block-ack 4 refused 2 stopped 2") && SAID("stale 1, msdu not done 1\n"));
+            radio->ios_said = 0; fa_rx_stale("reo", 3, 64); fa_rx_msdu_note(false); fa_rx_msdu_note(true); ios_step(radio);
+            assert(SAID("rx descriptor with no buffer, reo, ring 3 tp 64, number 1") && SAID("block-ack 4 refused 2 stopped 2") && SAID("stale 1, msdu not done 2\n") && SAID("slots peak 7, msdu done later 1"));
             for (int i = 0; i < 40; i++) fa_rx_stale("wbm", -1, 0);
             { unsigned lines = 0; for (const char *at = said; (at = strstr(at, "rx descriptor with no buffer")) != NULL; at++) lines++; assert(lines == FA_RX_STALE_SAID); }
             /* What is live goes back before the keys and the peer, without a word to the access point. */
@@ -2153,7 +2156,23 @@ int main(void) {
             assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_DONE && !radio->ba_live);
             /* Loss: no goodbye, and live classes back. */
             give_action(AP, ADDBA, 9); ios_step(radio); assert(radio->ba_live == 1u << 5);
+            {
+                /* What a run reads at a loss: the door's numbers, what went out, wifid's last sets. No name and no address. */
+                static const uint8_t ACTION_RM[] = { 5, 1, 2 };
+                uint8_t ip[60] = {0}; ip[0] = 0x45; ip[9] = 17; memcpy(eth + 14, ip, 20); eth[12] = 8; eth[13] = 0;
+                give_action(AP, ACTION_RM, 3);
+                assert(fa_ios_tx(eth, 60) == 1);
+                for (int i = 0; i < 20; i++) fa_ios_note_request(i < 19 ? 383 : 365, i);
+                said[0] = 0;
+                uint8_t f[64]; unsigned at = answer_frame(f, FA_KIND_ACTION, AP, OTHER);
+                f[at] = 3; f[at + 1] = 2; deliver(f, at + 2, 2412, -40, 0, false);	/* a stranger's: moves nothing */
+                at = answer_frame(f, FA_KIND_DEAUTH, OTHER, OWN); f[at] = 1; f[at + 1] = 0; deliver(f, at + 2, 2412, -50, 0, false);
+                assert(radio->door_other == 1 && !radio->door_seen);
+            }
             calls[0] = 0; deauths = 0; m8.losts = 0; m8.downs = 0; give_door(FA_KIND_DEAUTH, 7); ios_step(radio);
+            assert(SAID("M8 door: kind 0xc0 reason 7 seq 0 retry 0 protected 0, 26 bytes, rssi -40") && SAID("door others 1") && SAID("M8 the last ") && SAID("udp 1"));
+            assert(SAID("by category: 3:1 5:1 ") && SAID("M8 before the loss: wifid set 383 value 4,") && SAID("M8 before the loss: wifid set 365 value 19,") && !SAID("value 3,"));
+            assert(!SAID("fuxi-test") && !SAID("d4:") && !SAID("a1:b2"));
             assert(strstr(calls, "ba_stop,off_g,off_p,") && !strstr(calls, "action") && !deauths && m8.losts == 1 && !radio->ba_live);
             m8_again();
             assert(fa_ios_join(name, n, NULL, V_PMK) == FA_IOS_DONE);
@@ -2612,6 +2631,33 @@ static void kinds(void) {
           assert(fa_addba_response(f, sizeof(f), OWN, AP, &a, 0, 32) == 33 && f[0] == FA_KIND_ACTION && !memcmp(f + 4, AP, 6) && !memcmp(f + 10, OWN, 6) && !memcmp(f + 16, AP, 6) && !memcmp(f + 24, WANT, 9));
           assert(fa_addba_response(f, sizeof(f), OWN, AP, &a, 37, 32) == 33 && f[27] == 37 && f[28] == 0); }
     }
+    /* What a lost link's account reads: numbers only, and nothing past a frame's end. */
+    {
+        struct fa_door door; char line[64];
+        uint8_t f[64] = {0};
+        f[0] = FA_KIND_DEAUTH; f[1] = 0x08; f[22] = 0x50; f[23] = 0x01; f[24] = 3; f[25] = 0;
+        assert(fa_door_read(f, 26, &door) && door.kind == FA_KIND_DEAUTH && door.reason == 3 && door.seq == 0x15 && door.retry && !door.protect && door.length == 26);
+        assert(fa_door_read(f, 24, &door) && door.reason == 0 && !fa_door_read(f, 23, &door));
+        f[1] = 0x40; assert(fa_door_read(f, 26, &door) && door.protect && door.reason == 0);
+        f[0] = FA_KIND_DISASSOC; f[1] = 0; assert(fa_door_read(f, 26, &door) && door.kind == FA_KIND_DISASSOC);
+        f[0] = FA_KIND_AUTH; assert(!fa_door_read(f, 26, &door));
+        f[0] = FA_KIND_ACTION; f[24] = 0xfd;
+        assert(fa_action_category(f, 25) == 0x7d && fa_action_category(f, 24) == -1);
+        f[1] = 0x40; assert(fa_action_category(f, 25) == -1); f[1] = 0x80; f[28] = 3; assert(fa_action_category(f, 29) == 3 && fa_action_category(f, 28) == -1); f[1] = 0;
+        f[0] = FA_KIND_AUTH; assert(fa_action_category(f, 25) == -1);
+        assert(fa_frame_seq(f, 23) == 0);
+        static const uint8_t E[] = { 1, 2, 9, 9, 90, 3, 1, 1, 1, 221, 0 };
+        assert(fa_say_elements(line, sizeof(line), E, sizeof(E)) == 3 && !strcmp(line, "1:2 90:3 221:0 "));
+        static const uint8_t L[] = { 1, 200, 9 };
+        assert(fa_say_elements(line, sizeof(line), L, sizeof(L)) == 0 && !line[0]);
+        assert(fa_say_elements(line, 7, E, sizeof(E)) == 1 && !strcmp(line, "1:2 "));
+        for (unsigned i = 0; i < 200; i++) {	/* any bytes, in memory of exactly their size */
+            unsigned n = next() % 60; uint8_t *x = malloc(n ? n : 1); for (unsigned k = 0; k < n; k++) x[k] = (uint8_t)next();
+            char out[32]; (void)fa_say_elements(out, sizeof(out), x, n); (void)fa_door_read(x, n, &door); (void)fa_action_category(x, n); (void)fa_frame_seq(x, n);
+            free(x);
+        }
+        unsigned at = fa_say_number(line, sizeof(line), 0, 0, ':'); at = fa_say_number(line, sizeof(line), at, 1234567890u, ' '); assert(!strcmp(line, "0:1234567890 "));
+    }
     /* Stage 6's frames: the wanted protection, what an RSN element offers, the handshake's frames. */
     {
         static const uint8_t GOOD[] = { 48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 2, 0, 0 };
@@ -3012,6 +3058,14 @@ int main(void) {
         (void)fa_data_read(x, size, next() & 1, next() & 1, OWN, AP, &d);
         free(x);
     }
+    /* What goes out, counted, reading nothing past the length. */
+    {
+        struct fa_tx_counts c; memset(&c, 0, sizeof(c)); uint8_t b[20] = {0};
+        fa_tx_note(&c, FA_TYPE_ARP, b, 0); fa_tx_note(&c, 0x86dd, b, 0); fa_tx_note(&c, 0x888e, b, 0); fa_tx_note(&c, 0x88b5, b, 0);
+        fa_tx_note(&c, FA_TYPE_IP, b, 19);
+        b[9] = 17; fa_tx_note(&c, FA_TYPE_IP, b, 20); b[9] = 6; fa_tx_note(&c, FA_TYPE_IP, b, 20); b[9] = 1; fa_tx_note(&c, FA_TYPE_IP, b, 20); b[9] = 47; fa_tx_note(&c, FA_TYPE_IP, b, 20);
+        assert(c.arp == 1 && c.ip6 == 1 && c.eapol == 1 && c.other == 1 && c.udp == 1 && c.tcp == 1 && c.icmp == 1 && c.ip_other == 2);
+    }
     /* ARP and the echo. */
     assert(fa_arp_request(f, 27, OWN, ME, THEM) == 0 && fa_arp_request(f, 28, OWN, ME, THEM) == 28 && f[7] == 1 && !memcmp(f + 8, OWN, 6) && !memcmp(f + 14, ME, 4) && !memcmp(f + 24, THEM, 4));
     { uint8_t a[28]; memcpy(a, "\0\1\10\0\6\4\0\2", 8); memcpy(a + 8, SERVER, 6); memcpy(a + 14, THEM, 4); memcpy(a + 18, OWN, 6); memcpy(a + 24, ME, 4);
@@ -3152,6 +3206,7 @@ int fa_ios_join(const unsigned char *s, unsigned l, const unsigned char *b, cons
 int fa_ios_leave(void) { return answer; }
 void fa_ios_state(struct fa_ios_state *s) { memset(s, 0, sizeof(*s)); s->phase = FA_IOS_JOINED; s->protect = 1; s->last_answer = answer; s->bss.frequency = 2412; s->bss.ssid_length = 4; memcpy(s->bss.ssid, "name", 4); s->bss.elements_length = 3; }
 int fa_ios_tx(const unsigned char *f, unsigned long n) { return n == 60; }
+void fa_ios_note_request(int number, int value) {}
 void fuxi_ath12k_station_address(unsigned char *m) { memcpy(m, "\x02\x46\x55\x58\x49\x01", 6); }
 void fuxi_wifi_wpa_pmk(const unsigned char *p, unsigned pl, const unsigned char *n, unsigned nl, unsigned char k[32]) { assert(pl == 13 && !memcmp(p, "the test word", 13) && nl == 4 && !memcmp(n, "name", 4)); memset(k, 0x33, 32); pmks++; }
 void fuxi_wifi_sta_lost(int e) { lost_errno = e; lost_count++; }
@@ -3222,7 +3277,7 @@ def auto_join_is_off_by_default_and_says_no_key(tmp):
     block = wlan[wlan.index('static void\nwl_fa_join_configure(void)'):]
     block = block[:block.index('\n}\n')]
     gate = block[:block.index('SecureDTLookupEntry')]
-    assert 'wl_fa_stage == 8' in gate and 'PE_parse_boot_argn("fuxiwifiauto"' in gate and 'wants_auto != 1) { return; }' in gate
+    assert 'wl_fa_stage == 8' in gate and 'PE_parse_boot_argn("fuxiwifiauto"' in gate and '(wants_auto != 1 && wants_auto != 2)) { return; }' in gate
     assert block.count('fa_set_auto_join(') == 1 and wlan.count('fa_set_auto_join(') == 1
     assert wlan.count('"fuxiwifiauto"') == 1
     text = (ROOT / 'xnu/fuxi-ath12k/src/fa_80211.c').read_text()
@@ -3281,7 +3336,12 @@ def rx_ring_order_and_stale_buffers_are_edited_in(tmp):
         edit = edits['ath12k-rx-stale-' + name]
         assert edit['file'] == 'wifi7/dp_rx.c' and edit['replace'].index('fa_rx_stale(') < edit['replace'].index('desc_info->skb = NULL')
     done = edits['ath12k-rx-msdu-not-done-count']
-    assert 'fa_rx_msdu_not_done();' in done['replace'] and done['find'].strip() in done['replace']
+    assert 'fa_rx_msdu_not_done(lrx_desc);' in done['replace'] and done['find'].strip() in done['replace']
+    fresh = edits['ath12k-rx-buffer-fresh']
+    assert fresh['file'] == 'dp_rx.c' and fresh['replace'].index('fa_rx_buffer_fresh(skb->data);') < fresh['replace'].index('dma_map_single')
+    hif = (ROOT / 'xnu/fuxi-ath12k/src/fa_hif.c').read_text()
+    not_done = hif[hif.index('fa_rx_msdu_not_done(const void *desc)'):]
+    assert 'msdu_end.info14' in not_done[:300] and 'fa_rx_msdu_note(up);' in not_done[:600] and 'return (true)' not in not_done[:600]
     # No retry and nothing that hides the cause.
     for edit in edits.values():
         if edit['id'].startswith('ath12k-rx-'):

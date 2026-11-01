@@ -395,11 +395,19 @@
     },
     {
       "id": "ath12k-rx-msdu-not-done-count",
-      "why": "w-ios1 said this about nine times before the panic. Counted beside the stale count, so the next run shows whether they go together. The warning stays.",
+      "why": "w-ios1 said this about nine times before the panic, r-2 19 times with the ring barriers in and none stale. Counted, and read again 20 us on, to tell a late write from one that never comes. The warning stays and the frame is dropped as before.",
       "tree": "ath12k",
       "file": "wifi7/dp_rx.c",
       "find": "\t\tath12k_warn(dp->ab, \"msdu_done bit in msdu_end is not set\\n\");\n",
-      "replace": "\t\tfa_rx_msdu_not_done();\n\t\tath12k_warn(dp->ab, \"msdu_done bit in msdu_end is not set\\n\");\n"
+      "replace": "\t\tfa_rx_msdu_not_done(lrx_desc);\n\t\tath12k_warn(dp->ab, \"msdu_done bit in msdu_end is not set\\n\");\n"
+    },
+    {
+      "id": "ath12k-rx-buffer-fresh",
+      "why": "A slot of the pool is reused uncleared, so a buffer the hardware never wrote can show the old msdu_done: r-2 had 19 failures in its first run and none in the next 240,000 frames, which that could hide. Cleared while the host owns it, before the address goes to the ring.",
+      "tree": "ath12k",
+      "file": "dp_rx.c",
+      "find": "\t\tpaddr = dma_map_single(dp->dev, skb->data,\n\t\t\t\t       skb->len + skb_tailroom(skb),\n\t\t\t\t       DMA_FROM_DEVICE);\n\t\tif (dma_mapping_error(dp->dev, paddr))\n\t\t\tgoto fail_free_skb;\n",
+      "replace": "\t\tfa_rx_buffer_fresh(skb->data);\n\t\tpaddr = dma_map_single(dp->dev, skb->data,\n\t\t\t\t       skb->len + skb_tailroom(skb),\n\t\t\t\t       DMA_FROM_DEVICE);\n\t\tif (dma_mapping_error(dp->dev, paddr))\n\t\t\tgoto fail_free_skb;\n"
     },
     {
       "id": "ath12k-peer-id-zero",

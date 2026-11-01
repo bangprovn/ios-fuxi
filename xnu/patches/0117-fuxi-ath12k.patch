@@ -193,7 +193,7 @@
 +#endif /* FUXI && FUXI_ATH12K */
 --- /dev/null
 +++ b/bsd/dev/fuxi_ath12k_ios.c
-@@ -0,0 +1,220 @@
+@@ -0,0 +1,228 @@
 +/*
 + * The ath12k radio as iOS's Wi-Fi backend (fuxiwifiios=2), in XNU's domain: struct fuxi_wifi_backend, whose types the
 + * driver domain does not know, forwarded to fa_xnu.h's plain C. A passphrase ends here: the key is made of it, it is wiped, and
@@ -261,6 +261,14 @@
 +ios_lost(int answer)
 +{
 +	fuxi_wifi_sta_lost(ios_errno(answer));
++}
++
++/* From bsd/dev/fuxi_wifi_apple80211.c, by patch 0117: what wifid has just set, kept for the account of a loss. */
++void fuxi_ath12k_note_request(int number, int value);
++void
++fuxi_ath12k_note_request(int number, int value)
++{
++	fa_ios_note_request(number, value);
 +}
 +
 +/* The Apple80211 side hears of it as of any other link: it did not ask, and what it then does is for a run to show. */
@@ -593,7 +601,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/fa_xnu.h
-@@ -0,0 +1,112 @@
+@@ -0,0 +1,114 @@
 +/*
 + * The boundary between the driver domain (this object) and the XNU domain (fuxi_wlan.c and
 + * bsd/dev/fuxi_ath12k_os.c), plain C on both sides so that no Linux or FreeBSD type crosses it.
@@ -687,6 +695,8 @@
 +FA_PUBLIC int	fa_ios_leave(void);
 +/* Any thread. */
 +FA_PUBLIC void	fa_ios_state(struct fa_ios_state *state);
++FA_PUBLIC void	fa_ios_note_request(int number, int value);	/* a set from the Apple80211 side, for the account of a loss */
++FA_PUBLIC void	fa_set_auto_quiet(void);	/* before it, fuxiwifiauto=2: the join is not told to the Apple80211 side */
 +FA_PUBLIC int	fa_ios_tx(const unsigned char *frame, unsigned long length);	/* an Ethernet frame: 1 sent to the driver, 0 dropped */
 +
 +/* fuxi_wlan.c (FUXI_ATH12K) owes these. */
@@ -850,6 +860,20 @@
  		}
  	}
  	unsigned human = 0;
+--- a/bsd/dev/fuxi_wifi_apple80211.c
++++ b/bsd/dev/fuxi_wifi_apple80211.c
+@@ -631,6 +631,11 @@
+ 	proc_selfname(who, sizeof(who));
+ 	error = is_set ? set(request, what, sizeof(what)) : get(request);
+ 	note(request, is_set, error);
++	if (is_set) {
++		extern void fuxi_ath12k_note_request(int number, int value);
++
++		fuxi_ath12k_note_request(request->req_type, request->req_val);
++	}
+ 	/* (a request that is repeated for ever is said a few hundred times) */
+ 	if (said < 800) {
+ 		said++;
 --- a/bsd/dev/fuxi_wifi_ios.c
 +++ b/bsd/dev/fuxi_wifi_ios.c
 @@ -193,6 +193,15 @@

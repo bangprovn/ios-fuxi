@@ -113,7 +113,8 @@ void fuxi_wlan_init(void);
  *                 does no radio work.
  *   fuxiwifiauto=1  with fuxiath12k=8: also read /chosen fuxi-wifi-join, and join that network once when the radio is up,
  *                 with nobody on iOS's side asking. Without it stage 8 does not look at that property. iOS's side leaving or
- *                 joining wins, and a loss is not followed by another join.
+ *                 joining wins, and a loss is not followed by another join. With 2 the same, except that the
+ *                 Apple80211 side gets no event of it: wifid finds out only by asking.
  *   fuxiath12kq=MASK  with fuxiath12k=4 to 7: 0x1 no idle power save, 0x2 no hw mode command, 0x8 settle
  *                 after vdev create, 0x10 passive scan, 0x20 stage 7 answers ARP and echoes for 240 s, for a load from the
  *                 network. Read and logged by the driver domain.
@@ -1093,7 +1094,7 @@ wl_fa_join_configure(void)
 	const unsigned char *bytes;
 	int wants_auto = 0;
 	if (wl_fa_stage == 8) {
-		if (!PE_parse_boot_argn("fuxiwifiauto", &wants_auto, sizeof(wants_auto)) || wants_auto != 1) { return; }
+		if (!PE_parse_boot_argn("fuxiwifiauto", &wants_auto, sizeof(wants_auto)) || (wants_auto != 1 && wants_auto != 2)) { return; }
 	} else if (wl_fa_stage != 6 && wl_fa_stage != 7) { return; }
 	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
 	    SecureDTGetProperty(chosen, "fuxi-wifi-join", &value, &size) != kSuccess) {
@@ -1107,7 +1108,8 @@ wl_fa_join_configure(void)
 	}
 	printf("FUXI ATH12K: network name length %u, key given\n", bytes[0]);
 	if (wl_fa_stage == 8) {
-		fa_set_auto_join(bytes + 1, bytes[0], bytes + 1 + bytes[0]);
+		if (wants_auto == 2) { fa_set_auto_quiet(); }
+	fa_set_auto_join(bytes + 1, bytes[0], bytes + 1 + bytes[0]);
 		return;
 	}
 	fa_set_target_join(bytes + 1, bytes[0], bytes + 1 + bytes[0]);

@@ -52,6 +52,11 @@ int linuxkpi_debug_80211 = D80211_TODO;
 
 #define FA_INBOX		4
 
+/* The account of a lost link, stage 8 only. */
+#define FA_ASKS_MOST		16		/* the Apple80211 side's last sets */
+#define FA_TX_STEP_NS		(5 * 1000000000ull)
+#define FA_TX_STEPS		3		/* so that the last stands at least 10 s back */
+
 struct fa_radio {
 	struct ieee80211_hw hw;			/* what the driver knows of */
 	void *memory;
@@ -109,6 +114,18 @@ struct fa_radio {
 	unsigned data_done, data_acked;
 	struct ieee80211_key_conf *pairwise_key, *group_key;	/* set for as long as the driver has them */
 	void *key_memory[3];			/* kept until used again or the wiphy goes, wiped: the driver's peer may still name them. 0 pairwise, 1 and 2 by turns the group's */
+	bool door_seen;				/* what the last deauthentication or disassociation for us said, and how it came */
+	struct fa_door door;
+	int door_rssi, door_beacon_rssi;
+	unsigned door_beacon_seq, door_other;	/* the beacon's number before it, and such frames with other addresses */
+	unsigned long long door_at;
+	unsigned beacon_seq;
+	unsigned short action[128];		/* action frames from the access point, by category */
+	unsigned action_ciphered;
+	struct fa_tx_counts tx, tx_then[FA_TX_STEPS];
+	unsigned long long tx_then_at[FA_TX_STEPS], ios_joined_at;
+	struct { int number, value; unsigned long long at; } asks[FA_ASKS_MOST];
+	unsigned asks_count;
 	unsigned rx_ok, rx_clear;		/* with the keys in: data the radio deciphered, and data it did not */
 	/* the address of stage 7 */
 	volatile bool net_on;			/* the poll thread keeps what fa_net_wanted() wants, once it was deciphered */
@@ -152,7 +169,7 @@ struct fa_radio {
 enum { IOS_EAPOL = 1, IOS_LOSS = 2, IOS_DEAD = 4, IOS_BA = 8 };
 
 /* What wifi7/dp_rx.c saw (tools/ath12k-edits.json): a descriptor with no buffer behind it, and a buffer that is not done. */
-static volatile unsigned rx_stale, rx_not_done;
+static volatile unsigned rx_stale, rx_not_done, rx_done_later;
 #define FA_RX_STALE_SAID	16
 
 void
@@ -166,9 +183,12 @@ fa_rx_stale(const char *where, int ring, u32 tp)
 }
 
 void
-fa_rx_msdu_not_done(void)
+fa_rx_msdu_note(bool came_up)
 {
 	__sync_add_and_fetch(&rx_not_done, 1);
+	if (came_up) {
+		__sync_add_and_fetch(&rx_done_later, 1);
+	}
 }
 
 enum { SCAN_NONE, SCAN_RUNNING, SCAN_OVER, SCAN_ABORTED };
@@ -224,6 +244,7 @@ static uint8_t target_name[FA_SSID_MOST];
 static unsigned target_name_length;
 static uint8_t target_key[32];			/* stage 6: wiped when the join is over */
 static bool target_protected;
+static bool auto_quiet;				/* fuxiwifiauto=2 */
 static bool target_address;			/* stage 7 */
 static bool target_serve;			/* stage 7, fuxiath12kq=0x20 */
 /* Stage 8, fuxiwifiauto=1: a network to join with nobody asking, once. The key is wiped when it is used or given up. */
@@ -980,6 +1001,7 @@ join_rx(struct fa_radio *radio, struct sk_buff *skb, const struct ieee80211_rx_s
 		break;
 	case FA_RX_BEACON:
 		radio->link_beacons++;
+		radio->beacon_seq = fa_frame_seq(skb->data, skb->len);
 		if ((status->flag & RX_FLAG_NO_SIGNAL_VAL) == 0) {
 			radio->rssi = status->signal;
 		}
@@ -996,7 +1018,15 @@ join_rx(struct fa_radio *radio, struct sk_buff *skb, const struct ieee80211_rx_s
 	case FA_RX_MANAGEMENT:
 		if (radio->ios && skb->data[0] == FA_KIND_ACTION) {
 			struct fa_ba_ask ask;
+			int category = fa_action_category(skb->data, skb->len);
 
+			if (skb->len >= FA_FRAME_HEADER && memcmp(skb->data + 4, radio->vif->addr, ETH_ALEN) == 0 && memcmp(skb->data + 10, radio->target.address, ETH_ALEN) == 0) {
+				if (category < 0) {
+					radio->action_ciphered++;
+				} else if (radio->action[category] != 0xffff) {
+					radio->action[category]++;
+				}
+			}
 			if (radio->sta != NULL && fa_ba_read(skb->data, skb->len, radio->vif->addr, radio->target.address, &ask)) {
 				radio->ba_asked[ask.tid] = ask;
 				radio->ba_want |= (unsigned char)(1u << ask.tid);
@@ -1009,10 +1039,20 @@ join_rx(struct fa_radio *radio, struct sk_buff *skb, const struct ieee80211_rx_s
 		}
 		fa_reply_read(&reply, skb->data, skb->len, radio->vif->addr, radio->target.address);
 		if (reply.answer == FA_ANSWER_NONE) {
+			struct fa_door other;
+
 			radio->link_others++;
+			radio->door_other += radio->ios && fa_door_read(skb->data, skb->len, &other);
 		} else if (reply.answer == FA_ANSWER_GONE) {
 			radio->answer = FA_ANSWER_GONE;
 			radio->reason = reply.code;
+			if (radio->ios && fa_door_read(skb->data, skb->len, &radio->door)) {
+				radio->door_seen = true;
+				radio->door_rssi = (status->flag & RX_FLAG_NO_SIGNAL_VAL) == 0 ? status->signal : FA_RSSI_UNKNOWN;
+				radio->door_beacon_rssi = radio->rssi;
+				radio->door_beacon_seq = radio->beacon_seq;
+				radio->door_at = lx_os_nanoseconds();
+			}
 			lx_os_wakeup(&radio->answer);
 			if (radio->ios_joined) {
 				radio->ios_pending |= IOS_LOSS;
@@ -2118,6 +2158,12 @@ station_join(struct fa_radio *radio, bool *joined)
 		return (0);
 	}
 	lx_tell("FUXI ATH12K: M5 association response: aid %u, %u bytes of elements\n", radio->aid, radio->answer_length);
+	if (radio->ios) {
+		static char elements[512];
+
+		(void)fa_say_elements(elements, sizeof(elements), radio->answer_elements, radio->answer_length);
+		lx_tell("FUXI ATH12K: M8 association elements: %s\n", elements);
+	}
 	fa_m4_credits("after the association response");
 
 	station_abilities(radio, radio->answer_elements, radio->answer_length);
@@ -2619,6 +2665,12 @@ fa_ios_start(const struct fa_ios_input *input)
 
 /* Before fa_firmware_ready(), fuxiwifiauto=1 only. Anything but 1 to 32 bytes of name is no network. */
 void
+fa_set_auto_quiet(void)
+{
+	auto_quiet = true;
+}
+
+void
 fa_set_auto_join(const unsigned char *name, unsigned length, const unsigned char *key)
 {
 	auto_name_length = length >= 1 && length <= FA_SSID_MOST ? length : 0;
@@ -2862,6 +2914,100 @@ ios_ba(struct fa_radio *radio)
 
 static void ios_auto_step(struct fa_radio *radio);
 
+/* The account of what went out, then and now. */
+static void
+ios_tx_say(const char *what, const struct fa_tx_counts *now, const struct fa_tx_counts *then)
+{
+	lx_tell("FUXI ATH12K: M8 %s: tx arp %u ip6 %u tcp %u udp %u icmp %u ip other %u eapol %u other %u\n", what, now->arp - then->arp, now->ip6 - then->ip6,
+	    now->tcp - then->tcp, now->udp - then->udp, now->icmp - then->icmp, now->ip_other - then->ip_other, now->eapol - then->eapol, now->other - then->other);
+}
+
+/* What was heard in numbers: next to the joined line, and once more at a loss. */
+static void
+ios_heard_say(struct fa_radio *radio)
+{
+	static const struct fa_tx_counts none;
+	static char actions[256];
+	unsigned rings, slots, at = 0;
+
+	actions[0] = 0;
+	for (unsigned category = 0; category < 128; category++) {
+		if (radio->action[category] != 0) {
+			at = fa_say_number(actions, sizeof(actions), at, category, ':');
+			at = fa_say_number(actions, sizeof(actions), at, radio->action[category], ' ');
+		}
+	}
+	lx_pool_peaks(&rings, &slots);
+	lx_tell("FUXI ATH12K: M8 heard: eapol %u lost %u others %u, door others %u, slots peak %u, msdu done later %u; action ciphered %u, by category: %s\n", radio->eapol_heard,
+	    radio->eapol_lost, radio->link_others, radio->door_other, slots, rx_done_later, radio->action_ciphered, actions);
+	ios_tx_say("since the join", &radio->tx, &none);
+}
+
+/* A loss's account, on the thread, before the link's state goes. Numbers alone. */
+static void
+ios_loss_say(struct fa_radio *radio)
+{
+	unsigned long long now = lx_os_nanoseconds();
+	struct fa_tx_counts then = radio->tx_then[FA_TX_STEPS - 1];
+	unsigned long long then_at = radio->tx_then_at[FA_TX_STEPS - 1];
+	unsigned first = radio->asks_count > FA_ASKS_MOST ? radio->asks_count - FA_ASKS_MOST : 0;
+
+	if (radio->door_seen) {
+		lx_tell("FUXI ATH12K: M8 door: kind %#x reason %u seq %u retry %d protected %d, %u bytes, rssi %d, beacons rssi %d seq %u, %llu ms after the join\n", radio->door.kind,
+		    radio->door.reason, radio->door.seq, radio->door.retry, radio->door.protect, radio->door.length, radio->door_rssi, radio->door_beacon_rssi, radio->door_beacon_seq,
+		    (radio->door_at - radio->ios_joined_at) / 1000000ull);
+	}
+	ios_heard_say(radio);
+	if (then_at == 0) {
+		then_at = radio->ios_joined_at;
+		memset(&then, 0, sizeof(then));
+	}
+	lx_tell("FUXI ATH12K: M8 the last %llu s:\n", (now - then_at) / 1000000000ull);
+	ios_tx_say("then", &radio->tx, &then);
+	for (unsigned i = first; i < radio->asks_count; i++) {
+		unsigned slot = i % FA_ASKS_MOST;
+		unsigned long long at = radio->asks[slot].at;
+
+		lx_tell("FUXI ATH12K: M8 before the loss: wifid set %d value %d, %lld s from the join\n", radio->asks[slot].number, radio->asks[slot].value,
+		    (long long)(at - radio->ios_joined_at) / 1000000000ll);
+	}
+}
+
+/* Every few seconds, what has gone out so far, so that a loss can say what its last seconds were. */
+static void
+ios_tx_step(struct fa_radio *radio)
+{
+	unsigned long long now = lx_os_nanoseconds();
+
+	if (radio->ios_joined && now - radio->tx_then_at[0] >= FA_TX_STEP_NS) {
+		lx_os_lock();
+		for (unsigned i = FA_TX_STEPS - 1; i > 0; i--) {
+			radio->tx_then[i] = radio->tx_then[i - 1];
+			radio->tx_then_at[i] = radio->tx_then_at[i - 1];
+		}
+		radio->tx_then[0] = radio->tx;
+		radio->tx_then_at[0] = now;
+		lx_os_unlock();
+	}
+}
+
+/* From the Apple80211 side, on whatever thread asks: the last few are kept for an account of a loss. */
+void
+fa_ios_note_request(int number, int value)
+{
+	struct fa_radio *radio = ios_radio;
+
+	if (radio == NULL) {
+		return;
+	}
+	lx_os_lock();
+	radio->asks[radio->asks_count % FA_ASKS_MOST].number = number;
+	radio->asks[radio->asks_count % FA_ASKS_MOST].value = value;
+	radio->asks[radio->asks_count % FA_ASKS_MOST].at = lx_os_nanoseconds();
+	radio->asks_count++;
+	lx_os_unlock();
+}
+
 /* What the thread does each time it wakes. Apart from the thread itself so that the host test can run it. */
 static void
 ios_step(struct fa_radio *radio)
@@ -2869,6 +3015,7 @@ ios_step(struct fa_radio *radio)
 	unsigned pending;
 
 	ios_gate_in(radio);
+	ios_tx_step(radio);
 	lx_os_lock();
 	pending = radio->ios_pending;
 	radio->ios_pending = 0;
@@ -2883,6 +3030,7 @@ ios_step(struct fa_radio *radio)
 			lx_tell("FUXI ATH12K: M8 auto join: the network is lost, not joining again\n");
 		}
 		lx_tell("FUXI ATH12K: M8 the network is lost: door %d, reason %u, connection %d, changed %d\n", radio->answer == FA_ANSWER_GONE, radio->reason, radio->lost, radio->went_protected);
+		ios_loss_say(radio);
 		ios_frames_stop(radio);
 		ios_phase(radio, FA_IOS_IDLE, answer);
 		ios_input.lost(answer);
@@ -2898,6 +3046,7 @@ ios_step(struct fa_radio *radio)
 		lx_tell("FUXI ATH12K: M8 joined: rx ok %u dropped unprotected %u, played again %u, no key %u, too long %u; sent %u, done %u acked %u dropped %u; beacons %u losses %u; block-ack %u refused %u stopped %u; stale %u, msdu not done %u\n",
 		    radio->rx_ok, radio->rx_clear, radio->rx_replay, radio->rx_no_key, radio->rx_long, radio->net_sent, radio->data_done, radio->data_acked, radio->tx_dropped,
 		    radio->link_beacons, radio->beacon_losses, radio->ba_started, radio->ba_refused, radio->ba_stopped, rx_stale, rx_not_done);
+		ios_heard_say(radio);
 		fa_m5_rx_ring("while joined");
 	}
 	ios_gate_out(radio);
@@ -2946,7 +3095,11 @@ ios_auto_step(struct fa_radio *radio)
 	if (answer == FA_IOS_DONE) {
 		radio->ios_auto_joined = true;
 	}
-	ios_input.joined_alone(answer);
+	if (auto_quiet) {
+		lx_tell("FUXI ATH12K: M8 auto join: not told to the Apple80211 side, fuxiwifiauto=2\n");
+	} else {
+		ios_input.joined_alone(answer);
+	}
 }
 
 /* From the poll thread, which may not wait for the firmware's dump: it notes it. */
@@ -3159,6 +3312,12 @@ ios_join_run(struct fa_radio *radio, const unsigned char *ssid, unsigned ssid_le
 	radio->rx_ok = radio->rx_clear = radio->rx_replay = radio->rx_no_key = radio->rx_long = radio->net_sent = 0;
 	radio->link_data = radio->link_beacons = radio->link_others = 0;
 	radio->beacon_losses = 0;
+	radio->door_seen = false;
+	radio->door_other = radio->action_ciphered = radio->beacon_seq = 0;
+	memset(radio->action, 0, sizeof(radio->action));
+	memset(&radio->tx, 0, sizeof(radio->tx));
+	memset(radio->tx_then, 0, sizeof(radio->tx_then));
+	memset(radio->tx_then_at, 0, sizeof(radio->tx_then_at));
 	lx_os_unlock();
 	memset(&radio->heard, 0, sizeof(radio->heard));
 	fa_set_target_ssid(ssid, ssid_length);
@@ -3231,6 +3390,7 @@ ios_join_run(struct fa_radio *radio, const unsigned char *ssid, unsigned ssid_le
 	radio->ios_last_answer = FA_IOS_DONE;
 	radio->ios_joined = true;		/* the keys are in: station_keys() said so */
 	radio->ios_said = lx_os_nanoseconds();
+	radio->ios_joined_at = radio->ios_said;
 	lx_os_unlock();
 	lx_tell("FUXI ATH12K: M8 joined %u MHz at %d dBm\n", target->frequency, target->rssi);
 	ios_gate_out(radio);
@@ -3313,6 +3473,7 @@ fa_ios_tx(const unsigned char *frame, unsigned long length)
 		return (0);
 	}
 	radio->ios_tx_busy++;
+	fa_tx_note(&radio->tx, type, frame + 14, (unsigned)length - 14);
 	lx_os_unlock();
 	sent = net_send(radio, frame, type, frame + 14, (unsigned)length - 14);
 	lx_os_lock();

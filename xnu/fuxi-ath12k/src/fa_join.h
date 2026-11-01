@@ -860,6 +860,103 @@ fa_addba_response(uint8_t *out, unsigned size, const uint8_t *own, const uint8_t
 	return (FA_ADDBA_RESPONSE_LENGTH);
 }
 
+/* ---- what a run needs to read about a lost link: only numbers, never an address ------------------------------- */
+
+struct fa_door {
+	uint8_t		kind;			/* deauthentication or disassociation */
+	bool		retry, protect;
+	uint16_t	seq, reason;
+	unsigned	length;
+};
+
+/* A frame's sequence number, 0 when it has none to read. */
+static inline unsigned
+fa_frame_seq(const uint8_t *frame, unsigned length)
+{
+	return (length >= FA_FRAME_HEADER ? (unsigned)(frame[22] | frame[23] << 8) >> 4 : 0);
+}
+
+/* Whatever a deauthentication or disassociation says, for whomever it is: who it is for and from is the caller's to compare. */
+static inline bool
+fa_door_read(const uint8_t *frame, unsigned length, struct fa_door *door)
+{
+	unsigned header = FA_FRAME_HEADER;
+
+	if (length < FA_FRAME_HEADER || (frame[0] != FA_KIND_DEAUTH && frame[0] != FA_KIND_DISASSOC)) {
+		return (false);
+	}
+	header += (frame[1] & 0x80) != 0 ? FA_FRAME_HT_CONTROL : 0;
+	door->kind = frame[0];
+	door->retry = (frame[1] & 0x08) != 0;
+	door->protect = (frame[1] & 0x40) != 0;
+	door->seq = (uint16_t)fa_frame_seq(frame, length);
+	door->reason = length >= header + 2 && !door->protect ? (uint16_t)(frame[header] | frame[header + 1] << 8) : 0;
+	door->length = length;
+	return (true);
+}
+
+/* An action frame's category, -1 when there is none to read: a protected frame's is ciphered. */
+static inline int
+fa_action_category(const uint8_t *frame, unsigned length)
+{
+	unsigned header = FA_FRAME_HEADER;
+
+	if (length < FA_FRAME_HEADER || frame[0] != FA_KIND_ACTION || (frame[1] & 0x40) != 0) {
+		return (-1);
+	}
+	header += (frame[1] & 0x80) != 0 ? FA_FRAME_HT_CONTROL : 0;
+	return (length > header ? frame[header] & 0x7f : -1);
+}
+
+/* A number at the end of a string being built. The new end; a string that would not fit stays as it was. */
+static inline unsigned
+fa_say_number(char *out, unsigned size, unsigned at, unsigned number, char after)
+{
+	char digits[10];
+	unsigned count = 0;
+
+	do {
+		digits[count++] = (char)('0' + number % 10);
+		number /= 10;
+	} while (number != 0);
+	if (at + count + 2 > size) {
+		return (at);
+	}
+	while (count != 0) {
+		out[at++] = digits[--count];
+	}
+	out[at++] = after;
+	out[at] = 0;
+	return (at);
+}
+
+/* Elements as "number:length " pairs: the values are not said. How many were said, and they stop at one that lies or does not fit. */
+static inline unsigned
+fa_say_elements(char *out, unsigned size, const uint8_t *elements, unsigned length)
+{
+	unsigned at = 0, said = 0, end = 0;
+
+	if (size != 0) {
+		out[0] = 0;
+	}
+	while (length - end >= 2 && length - end - 2 >= elements[end + 1]) {
+		unsigned next = fa_say_number(out, size, at, elements[end], ':');
+
+		if (next == at) {
+			break;
+		}
+		at = next;
+		next = fa_say_number(out, size, at, elements[end + 1], ' ');
+		if (next == at) {
+			break;
+		}
+		at = next;
+		said++;
+		end += 2u + elements[end + 1];
+	}
+	return (said);
+}
+
 enum fa_rx_kind { FA_RX_ELSE, FA_RX_BEACON, FA_RX_MANAGEMENT, FA_RX_DATA };
 
 /*

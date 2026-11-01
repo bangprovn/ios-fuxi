@@ -91,6 +91,8 @@ FA_PUBLIC int	fa_ios_join(const unsigned char *ssid, unsigned ssid_length, const
 FA_PUBLIC int	fa_ios_leave(void);
 /* Any thread. */
 FA_PUBLIC void	fa_ios_state(struct fa_ios_state *state);
+FA_PUBLIC void	fa_ios_note_request(int number, int value);	/* a set from the Apple80211 side, for the account of a loss */
+FA_PUBLIC void	fa_set_auto_quiet(void);	/* before it, fuxiwifiauto=2: the join is not told to the Apple80211 side */
 FA_PUBLIC int	fa_ios_tx(const unsigned char *frame, unsigned long length);	/* an Ethernet frame: 1 sent to the driver, 0 dropped */
 
 /* fuxi_wlan.c (FUXI_ATH12K) owes these. */

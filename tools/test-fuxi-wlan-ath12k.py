@@ -128,6 +128,8 @@ int fa_firmware_ready(const struct fa_caps *caps, unsigned stage) {
 void fa_stop(void) { fa_stops++; assert(!mhi_depth); }
 void fa_set_radio_mac(const unsigned char *mac) { memcpy(seen_mac,mac,6); macs_set++; }
 static unsigned autos_set, seen_auto_length;
+static unsigned autos_quiet;
+void fa_set_auto_quiet(void) { autos_quiet++; }
 void fa_set_auto_join(const unsigned char *name, unsigned length, const unsigned char *key) { assert(length<=32 && key!=NULL); seen_auto_length=length; autos_set++; }
 static unsigned joins_set, seen_join_length; static unsigned char seen_join_name[32], seen_join_key[32];
 void fa_set_target_join(const unsigned char *name, unsigned length, const unsigned char *key) { assert(length<=32);memcpy(seen_join_name,name,length);memcpy(seen_join_key,key,32);seen_join_length=length;joins_set++; }
@@ -186,8 +188,9 @@ int main(void) {
         wl_fa_stage=5;wl_fa_join_configure();assert(joins_set==2);	/* no other stage reads it */
         /* Stage 8 does not look at it, unless it is told to with exactly 1; and then it is the auto join's, not a target. */
         wl_fa_stage=8;dt_join=good;dt_join_size=sizeof(good);auto_arg=0;wl_fa_join_configure();assert(!autos_set && joins_set==2);
-        auto_arg=2;wl_fa_join_configure();assert(!autos_set && joins_set==2);
-        auto_arg=1;wl_fa_join_configure();assert(autos_set==1 && seen_auto_length==8 && joins_set==2);
+        auto_arg=3;wl_fa_join_configure();assert(!autos_set && joins_set==2 && !autos_quiet);
+        auto_arg=1;wl_fa_join_configure();assert(autos_set==1 && seen_auto_length==8 && joins_set==2 && !autos_quiet);
+        auto_arg=2;wl_fa_join_configure();assert(autos_set==2 && autos_quiet==1 && joins_set==2);autos_set=1;
         dt_join=NULL;wl_fa_join_configure();assert(autos_set==1);
         auto_arg=0;
         wl_fa_stage=6;dt_join=NULL;joins_set=0;
