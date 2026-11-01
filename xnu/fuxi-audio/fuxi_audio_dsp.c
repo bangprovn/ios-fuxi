@@ -5,6 +5,7 @@
  * samples and comes down after two seconds without any. Whichever: no pin is muxed, no amplifier reached, nothing is heard; what this proves is iOS's samples reaching the DSP.
  * fuxiaudioamp=1, with fuxiaudio=2: the bottom amplifier as well, its pins and up while there are samples, at the lowest level the owner has agreed to in the loader. **Not yet run: the
  * owner has agreed to a second of tone there (a-tone5), not to iOS's sound.** Off without it, and then the two functions it calls do nothing at all.
+ * fuxiaudio=3: as 2, and /dev/fuxiaudiomic gives what the mic hears to whoever has it open: 48 kHz, one channel of 16 bits, never holding the reader. fuxiaudio=4: as 3, with eight seconds of it taken at the start and counted, with nobody reading.
  * The loader has put apps_smmu's streams 0x1001/0x80 and 0x1061 into context bank 4 (poke 2 and 18); this does not touch the SMMU. The buffer is outside the bank XNU owns. */
 #ifdef FUXI
 #include <stdint.h>
@@ -272,7 +273,7 @@ fa_bring_up(void)
 	fa_g.options = AU_GL_ANSWER | AU_GL_GPR | AU_GL_PRM | AU_GL_GRAPH | AU_GL_PLAY;
 	fa_g.log = fa_log;
 	fa_g.log_most = 8;
-	fa_g.graph_steps = 17;
+	fa_g.graph_steps = AU_GL_GRAPH_MOST;
 	if (!au_gl_start(&fa_g)) {
 		printf("FUXI AUDIO: GLINK did not start\n");
 		return false;
@@ -310,18 +311,18 @@ fa_prm_clock(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, uin
 	return fuxi_ar_prm_clock_attr(out, capacity, 2, token, FA_TDM_CLOCK, hz, 4);
 }
 
-/* LPASS's votes on, and the list to the graph's start. How many failed. */
+/* LPASS's votes, held for the speaker and the mic alike: on with the first, off with the last, so nothing of LPASS is touched behind them. How many failed. */
+static unsigned fa_votes;
+
 static uint32_t
-fa_graph_up(void)
+fa_votes_take(void)
 {
 	uint32_t bad = 0;
 
+	if (fa_votes++ != 0) {
+		return 0;
+	}
 	fa_g.prm_sent = 0;
-	fa_g.graph_sent = 0;
-	fa_g.map_handle = 0;
-	fa_g.write_sent = 0;
-	fa_g.write_done = 0;
-	fa_g.write_bad = 0;
 	for (unsigned i = 0; i < 2; i++) {
 		(void)au_gl_prm_step(&fa_g);
 		if (!fa_poll(100)) {
@@ -330,6 +331,37 @@ fa_graph_up(void)
 		printf("FUXI AUDIO: vote %u: status %#x\n", i, fa_g.prm_status[i]);
 		bad += fa_g.prm_status[i] != 0;
 	}
+	return bad;
+}
+
+static void
+fa_votes_drop(void)
+{
+	if (--fa_votes != 0) {
+		return;
+	}
+	fa_g.prm_sent = 2;
+	for (unsigned i = 2; i < 4; i++) {
+		(void)au_gl_prm_step(&fa_g);
+		if (!fa_poll(100)) {
+			break;
+		}
+		printf("FUXI AUDIO: vote %u: status %#x\n", i, fa_g.prm_status[i]);
+	}
+}
+
+/* LPASS's votes on, and the list to the graph's start. How many failed. */
+static uint32_t
+fa_graph_up(void)
+{
+	uint32_t bad = 0;
+
+	fa_g.graph_sent = 0;
+	fa_g.map_handle = 0;
+	fa_g.write_sent = 0;
+	fa_g.write_done = 0;
+	fa_g.write_bad = 0;
+	bad += fa_votes_take();
 	for (unsigned i = 0; i < FA_BUFFER_BYTES / 4; i++) {
 		((volatile uint32_t *)fa_buffer)[i] = 0;
 	}
@@ -362,32 +394,21 @@ fa_graph_down(void)
 	FA_STEP("close device", fuxi_ar_graph_command, FUXI_AR_OP_GRAPH_CLOSE, FUXI_AR_SG_SPEAKER);
 	FA_STEP("unmap", fuxi_ar_unmap, fa_g.map_handle);
 	FA_STEP("TDM clock off", fa_prm_clock, 0u);
-	fa_g.prm_sent = 2;
-	for (unsigned i = 2; i < 4; i++) {
-		(void)au_gl_prm_step(&fa_g);
-		if (!fa_poll(100)) {
-			break;
-		}
-		printf("FUXI AUDIO: vote %u: status %#x\n", i, fa_g.prm_status[i]);
-	}
+	fa_votes_drop();
 	printf("FUXI AUDIO: down, %u steps failed; rx %u tx %u full %u\n", bad, fa_g.rx_msgs, fa_g.tx_msgs, fa_g.tx_full);
 }
 
 /* ---- /dev/fuxiaudio: one writer, mediaserverd's I/O thread, and this file's thread. Packed left, right. Too much is dropped and counted: the writer is never held. ---- */
 static uint32_t fa_ring[FA_RING_FRAMES];
 static uint32_t fa_ring_head, fa_ring_tail, fa_dropped;
+static int fa_dev_read(dev_t dev, struct uio *uio, int flags);
+static int fa_dev_open(dev_t dev, int flags, int mode, proc_t p);
+static int fa_dev_close(dev_t dev, int flags, int mode, proc_t p);
 
 static uint32_t
 fa_ring_count(void)
 {
 	return __atomic_load_n(&fa_ring_head, __ATOMIC_ACQUIRE) - __atomic_load_n(&fa_ring_tail, __ATOMIC_RELAXED);
-}
-
-static int
-fa_dev_open(dev_t dev, int flags, int mode, proc_t p)
-{
-#pragma unused(dev, flags, mode, p)
-	return 0;
 }
 
 static int
@@ -418,8 +439,8 @@ fa_dev_write(dev_t dev, struct uio *uio, int flags)
 
 static const struct cdevsw fa_cdevsw = {
 	.d_open       = fa_dev_open,
-	.d_close      = fa_dev_open,
-	.d_read       = eno_rdwrt,
+	.d_close      = fa_dev_close,
+	.d_read       = fa_dev_read,
 	.d_write      = fa_dev_write,
 	.d_ioctl      = eno_ioctl,
 	.d_stop       = eno_stop,
@@ -583,6 +604,277 @@ fa_amp_watch(void)
 	}
 }
 
+/* ---- the microphone, fuxiaudio=3 and 4: au_mic.h's stage and the capture a-cap1 ran in the loader, while someone has /dev/fuxiaudiomic open. Numbers go to the log, samples only to that reader.
+ * L15B is not voted here: "no other XNU code drives the fuxi apps RSC" (xnu/fuxi-wlan), which votes it on and never off. Without it the codec does not attach, and this stops at step 5, whole. ---- */
+#define FA_MIC_BUFFER   0xd0010000ull   /* as the loader's: past the period buffers */
+#define FA_MIC_PERIOD   960u            /* 10 ms of 48 kHz, one channel of 16 bits */
+#define FA_MIC_SLOTS    4u
+#define FA_MIC_RING     16384u          /* samples, a power of two: about 340 ms */
+#define FA_MIC_LIST     17u             /* the list's places after the speaker's, one list at a time */
+#define FA_MIC_WINDOWS  6u
+static const struct { uint64_t pa; uint32_t size; } fa_mic_windows[FA_MIC_WINDOWS] = {
+	{0x06d44000ull, 0x1000u}, {0x06ae0000ull, 0x1000u}, {0x06d30000ull, 0x10000u}, {0x06e80000ull, 0xf000u}, {0x0725a000ull, 0x1000u}, {0x0f16c000ull, 0x1000u},
+};
+static vm_offset_t fa_mic_va[FA_MIC_WINDOWS], fa_mic_buffer;
+
+static vm_offset_t
+fa_mic_at(uint64_t pa)
+{
+	for (unsigned i = 0; i < FA_MIC_WINDOWS; i++) {
+		if (pa >= fa_mic_windows[i].pa && pa < fa_mic_windows[i].pa + fa_mic_windows[i].size) {
+			return fa_mic_va[i] + (vm_offset_t)(pa - fa_mic_windows[i].pa);
+		}
+	}
+	panic("FUXI AUDIO: no window for %#llx", (unsigned long long)pa);
+}
+static uint32_t
+fa_mic_rd(uint64_t pa, uint32_t *faulted)
+{
+	*faulted = 0;
+	return *(volatile uint32_t *)fa_mic_at(pa);
+}
+static unsigned
+fa_mic_wr(uint64_t pa, uint32_t v)
+{
+	__asm__ volatile ("dmb oshst" ::: "memory");
+	*(volatile uint32_t *)fa_mic_at(pa) = v;
+	__asm__ volatile ("dsb osh" ::: "memory");
+	return 0;
+}
+#define AU_MIC_RD(pa, f) fa_mic_rd((pa), (f))
+#define AU_MIC_WR(pa, v) fa_mic_wr((pa), (v))
+#define AU_MIC_DELAY_US(us) delay_for_interval((us), 1000u)
+#define AU_MIC_CMDDB(name) AU_MIC_L15B
+#define AU_MIC_RPMH(addr, data) 0u
+#include "fuxi_au_mic.h"
+
+static const FuxiArFormat fa_mic_format = {48000, 16, 1};
+static struct au_mic fa_mic;
+static uint32_t fa_mic_rep[128];
+static bool fa_mic_on, fa_mic_up_now, fa_mic_gave_up, fa_mic_muted;
+static volatile bool fa_mic_wanted;
+static uint32_t fa_mic_handle, fa_mic_scanned, fa_mic_since, fa_mic_test_until, fa_mic_said, fa_mic_dropped;
+static uint32_t fa_mic_peak, fa_mic_count;
+static uint64_t fa_mic_abs, fa_mic_total;
+static int16_t fa_mic_ring[FA_MIC_RING];
+static uint32_t fa_mic_head, fa_mic_tail;
+
+/* The TX core's clock, from the PRM: the same shape as the others for FA_STEP; 0 lets it go. */
+static uint32_t
+fa_mic_clock(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, uint32_t hz)
+{
+#pragma unused(port)
+	return fuxi_ar_prm_clock_attr(out, capacity, 2, token, AU_MIC_CLOCK, hz, 1);
+}
+
+static void
+fa_mic_up(void)
+{
+	uint32_t bad = 0, before = fa_g.map_handle, *r = fa_mic_rep;
+
+	if (fa_votes_take() != 0) {
+		printf("FUXI AUDIO: mic: the votes did not come\n");
+		fa_votes_drop();
+		fa_mic_gave_up = true;
+		return;
+	}
+	fa_g.graph_sent = FA_MIC_LIST;
+	FA_STEP("mic clock", fa_mic_clock, 19200000u);
+	if (bad != 0) {
+		fa_votes_drop();
+		fa_mic_gave_up = true;
+		return;
+	}
+	au_mic_begin(&fa_mic, fa_mic_rep);
+	fa_mic.capture = true;
+	fa_mic.port = 3;
+	fa_mic.lane = 1;
+	fa_mic.mic = 5;
+	fa_mic.votes_held = true;
+	fa_mic.clock_held = true;
+	au_mic_run(&fa_mic);
+	printf("FUXI AUDIO: mic: %u of 7 steps, stopped at %u why %u; master %#x, device %u, chip %02x %02x, %u read back, bus %#x; port lane %#x channels %#x\n", r[AU_MIC_R_PASSED], r[AU_MIC_R_STEP], r[AU_MIC_R_WHY],
+	    r[AU_MIC_R_VERSION], r[AU_MIC_R_SLAVES + 2], r[AU_MIC_R_CHIP + 2], r[AU_MIC_R_CHIP + 3], r[AU_MIC_R_BACK_N], r[AU_MIC_R_BUS], r[AU_MIC_R_PORTS], r[AU_MIC_R_PORTS + 1]);
+	if (!fa_mic.held) {
+		fa_g.graph_sent = FA_MIC_LIST;
+		FA_STEP("mic clock off", fa_mic_clock, 0u);
+		fa_votes_drop();
+		fa_mic_gave_up = true;
+		return;
+	}
+	FA_STEP("open mic device", fuxi_ar_open_mic_device);
+	FA_STEP("configure it", fuxi_ar_config_mic_device, &fa_mic_format, 1u);
+	FA_STEP("open capture", fuxi_ar_open_capture_stream);
+	FA_STEP("configure it", fuxi_ar_config_capture_stream, &fa_mic_format);
+	FA_STEP("map the mic's buffers", fuxi_ar_map, FA_MIC_BUFFER | FA_BUFFER_SID << 32, FA_MIC_SLOTS * FA_MIC_PERIOD);
+	/* The speaker's handle stays where its list looks for it. Any handle lets au_gl_read_send() go; the packets say which. */
+	fa_mic_handle = fa_g.map_handle;
+	if (before != 0) {
+		fa_g.map_handle = before;
+	}
+	FA_STEP("prepare mic device", fuxi_ar_graph_command, FUXI_AR_OP_GRAPH_PREPARE, FUXI_AR_SG_MIC);
+	FA_STEP("prepare capture", fuxi_ar_graph_command, FUXI_AR_OP_GRAPH_PREPARE, FUXI_AR_SG_CAPTURE);
+	FA_STEP("start mic device", fuxi_ar_graph_command, FUXI_AR_OP_GRAPH_START, FUXI_AR_SG_MIC);
+	FA_STEP("start capture", fuxi_ar_graph_command, FUXI_AR_OP_GRAPH_START, FUXI_AR_SG_CAPTURE);
+	fa_g.read_sent = 0;
+	fa_g.read_done = 0;
+	fa_g.read_bad = 0;
+	fa_mic_scanned = 0;
+	fa_mic_up_now = true;
+	fa_mic_muted = true;
+	fa_mic_since = fa_g.ms;
+	fa_mic_said = fa_g.ms;
+	fa_mic_peak = 0;
+	fa_mic_abs = 0;
+	fa_mic_count = 0;
+	fa_mic_total = 0;
+	if (bad != 0) {
+		printf("FUXI AUDIO: mic: %u steps of its graph failed\n", bad);
+	}
+}
+
+static void
+fa_mic_down(void)
+{
+	uint32_t bad = 0;
+
+	fa_mic_up_now = false;
+	fa_g.graph_sent = FA_MIC_LIST;
+	FA_STEP("stop capture", fuxi_ar_graph_command, FUXI_AR_OP_GRAPH_STOP, FUXI_AR_SG_CAPTURE);
+	FA_STEP("stop mic device", fuxi_ar_graph_command, FUXI_AR_OP_GRAPH_STOP, FUXI_AR_SG_MIC);
+	FA_STEP("close capture", fuxi_ar_graph_command, FUXI_AR_OP_GRAPH_CLOSE, FUXI_AR_SG_CAPTURE);
+	FA_STEP("close mic device", fuxi_ar_graph_command, FUXI_AR_OP_GRAPH_CLOSE, FUXI_AR_SG_MIC);
+	FA_STEP("unmap the mic's", fuxi_ar_unmap, fa_mic_handle);
+	fa_mic.held = false;
+	au_mic_down(&fa_mic);
+	FA_STEP("mic clock off", fa_mic_clock, 0u);
+	fa_votes_drop();
+	printf("FUXI AUDIO: mic down: %u periods, %u bad, %llu samples, %u dropped, %u steps failed; 0x3022 %#x, gpio108 %#x\n", fa_g.read_done, fa_g.read_bad, (unsigned long long)fa_mic_total, fa_mic_dropped, bad, fa_mic_rep[AU_MIC_R_DOWN], fa_mic_rep[AU_MIC_R_DOWN + 2]);
+}
+
+/* What has come back into the reader's ring, too much dropped and counted; the next empty buffers; the unmute, after the analog side's 300 ms, and Android's digital gain; a line a second. */
+static void
+fa_mic_pump(void)
+{
+	uint32_t head = __atomic_load_n(&fa_mic_head, __ATOMIC_RELAXED), tail = __atomic_load_n(&fa_mic_tail, __ATOMIC_ACQUIRE);
+
+	while (fa_mic_scanned != fa_g.read_done) {
+		volatile uint32_t *in = (volatile uint32_t *)(fa_mic_buffer + (fa_mic_scanned % FA_MIC_SLOTS) * FA_MIC_PERIOD);
+
+		for (uint32_t i = 0; i < FA_MIC_PERIOD / 4; i++) {
+			uint32_t w = in[i];
+
+			for (uint32_t k = 0; k < 2; k++) {
+				int16_t v = (int16_t)(w >> (16 * k));
+				uint32_t a = (uint32_t)(v < 0 ? -(int32_t)v : (int32_t)v);
+
+				fa_mic_peak = a > fa_mic_peak ? a : fa_mic_peak;
+				fa_mic_abs += a;
+				fa_mic_count++;
+				if (head - tail >= FA_MIC_RING) {
+					fa_mic_dropped++;
+				} else {
+					fa_mic_ring[head++ & (FA_MIC_RING - 1)] = v;
+				}
+			}
+		}
+		fa_mic_scanned++;
+		__atomic_store_n(&fa_mic_head, head, __ATOMIC_RELEASE);
+	}
+	if (fa_g.read_sent < fa_g.read_done + 3) {
+		uint32_t bytes = fuxi_ar_read((uint8_t *)(fa_m + 2), AU_GL_GPR_BUFFER, 1, AU_GL_READ_TOKEN + (fa_g.read_sent & 0xffffu), (FA_MIC_BUFFER + (fa_g.read_sent % FA_MIC_SLOTS) * FA_MIC_PERIOD) | FA_BUFFER_SID << 32, fa_mic_handle, FA_MIC_PERIOD);
+
+		if (bytes != 0) {
+			(void)au_gl_read_send(&fa_g, fa_m, bytes);
+		}
+	}
+	if (fa_mic_muted && fa_g.ms - fa_mic_since >= 300) {
+		fa_mic_muted = false;
+		au_mic_set(&fa_mic, AU_MIC_TX + 0x400u, 0x10u, 0u);
+		au_mic_set(&fa_mic, AU_MIC_TX + 0x40cu, 0xffu, 0x12u);
+	}
+	if (fa_g.ms - fa_mic_said >= 1000 && fa_mic_count != 0) {
+		fa_mic_total += fa_mic_count;
+		printf("FUXI AUDIO: mic: %u periods, %u bad, peak %u, mean abs %u, %u dropped\n", fa_g.read_done, fa_g.read_bad, fa_mic_peak, (uint32_t)(fa_mic_abs / fa_mic_count), fa_mic_dropped);
+		fa_mic_said = fa_g.ms;
+		fa_mic_peak = 0;
+		fa_mic_abs = 0;
+		fa_mic_count = 0;
+	}
+}
+
+/* From this file's thread, between everything else: whether anyone wants it, and its buffers while they do. Once it has failed it stays down until the next boot. */
+static void
+fa_mic_tick(void)
+{
+	if (!fa_mic_on) {
+		return;
+	}
+	if (fa_mic_test_until != 0 && fa_g.ms >= fa_mic_test_until) {
+		fa_mic_test_until = 0;
+		fa_mic_wanted = false;
+	}
+	if (fa_mic_wanted && !fa_mic_up_now && !fa_mic_gave_up) {
+		fa_mic_up();
+	} else if (!fa_mic_wanted && fa_mic_up_now) {
+		fa_mic_down();
+	}
+	if (fa_mic_up_now) {
+		fa_mic_pump();
+	}
+}
+
+/* Minor 0 the speaker's, minor 1 the mic's. Only the last close of a node comes here, and the reader of the mic is one. */
+static int
+fa_dev_open(dev_t dev, int flags, int mode, proc_t p)
+{
+#pragma unused(flags, mode, p)
+	if (minor(dev) == 1) {
+		fa_mic_wanted = true;
+	}
+	return 0;
+}
+
+static int
+fa_dev_close(dev_t dev, int flags, int mode, proc_t p)
+{
+#pragma unused(flags, mode, p)
+	if (minor(dev) == 1) {
+		fa_mic_wanted = false;
+	}
+	return 0;
+}
+
+/* What there is, up to what is asked: nothing, if nothing. The reader's next thing is its own I/O cycle. */
+static int
+fa_dev_read(dev_t dev, struct uio *uio, int flags)
+{
+#pragma unused(flags)
+	int16_t chunk[256];
+
+	if (minor(dev) != 1) {
+		return ENXIO;
+	}
+	while (uio_resid(uio) >= 2) {
+		int error;
+		uint32_t tail = __atomic_load_n(&fa_mic_tail, __ATOMIC_RELAXED), have = __atomic_load_n(&fa_mic_head, __ATOMIC_ACQUIRE) - tail;
+		uint32_t n = uio_resid(uio) / 2 > 256 ? 256u : (uint32_t)(uio_resid(uio) / 2);
+
+		n = n < have ? n : have;
+		if (n == 0) {
+			break;
+		}
+		for (uint32_t i = 0; i < n; i++) {
+			chunk[i] = fa_mic_ring[(tail + i) & (FA_MIC_RING - 1)];
+		}
+		__atomic_store_n(&fa_mic_tail, tail + n, __ATOMIC_RELEASE);
+		if ((error = uiomove((caddr_t)chunk, (int)(n * 2), uio)) != 0) {
+			return error;
+		}
+	}
+	return 0;
+}
+
 /* What has come, or silence, into the next of the DSP's periods. The frames taken. */
 static uint32_t
 fa_fill_period(uint32_t index, uint32_t *peak)
@@ -616,7 +908,8 @@ fa_stream(void)
 			if (!fa_poll(0)) {
 				return;
 			}
-			fa_sleep_ms(20);
+			fa_mic_tick();
+			fa_sleep_ms(fa_mic_up_now ? 2 : 20);
 		}
 		printf("FUXI AUDIO: samples are coming\n");
 		if (fa_graph_up() != 0) {
@@ -647,6 +940,7 @@ fa_stream(void)
 			if (!fa_poll(1)) {
 				return;
 			}
+			fa_mic_tick();
 			if (fa_g.write_sent - sent_at_last >= 250) {
 				sent_at_last = fa_g.write_sent;
 				fa_amp_watch();
@@ -698,7 +992,11 @@ fa_thread(void *arg, wait_result_t result)
 {
 #pragma unused(result)
 	if (fa_bring_up()) {
-		if ((uintptr_t)arg == 2) {
+		if ((uintptr_t)arg >= 2) {
+			if ((uintptr_t)arg == 4) {
+				fa_mic_wanted = true;
+				fa_mic_test_until = fa_g.ms + 8000;
+			}
 			fa_stream();
 		} else {
 			fa_self_test();
@@ -717,7 +1015,7 @@ fuxi_audio_dsp_init(void)
 	if (!PE_parse_boot_argn("fuxiaudio", &on, sizeof(on)) || on <= 0) {
 		return;
 	}
-	if (on == 2) {
+	if (on >= 2) {
 		int major = cdevsw_add(-1, &fa_cdevsw), amp = 0;
 
 		if (PE_parse_boot_argn("fuxiaudioamp", &amp, sizeof(amp)) && amp == 1) {
@@ -731,6 +1029,17 @@ fuxi_audio_dsp_init(void)
 		if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "fuxiaudio") == NULL) {
 			printf("FUXI AUDIO: no /dev/fuxiaudio\n");
 			return;
+		}
+		if (on >= 3) {
+			bool mapped = true;
+
+			for (unsigned i = 0; i < FA_MIC_WINDOWS; i++) {
+				fa_mic_va[i] = ml_io_map((vm_offset_t)fa_mic_windows[i].pa, fa_mic_windows[i].size);
+				mapped = mapped && fa_mic_va[i] != 0;
+			}
+			fa_mic_buffer = ml_io_map((vm_offset_t)FA_MIC_BUFFER, FA_MIC_SLOTS * FA_MIC_PERIOD);
+			fa_mic_on = mapped && fa_mic_buffer != 0 && devfs_make_node(makedev(major, 1), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "fuxiaudiomic") != NULL;
+			printf("FUXI AUDIO: the mic can be asked for: %d\n", fa_mic_on);
 		}
 	}
 	if (kernel_thread_start(fa_thread, (void *)(uintptr_t)on, &thread) == KERN_SUCCESS) {

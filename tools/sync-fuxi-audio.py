@@ -12,8 +12,8 @@ import re
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / 'xnu/fuxi-audio'
 PATCH = ROOT / 'xnu/patches/0113-fuxi-audio.patch'
-FILES = ('fuxi_gpr.h', 'fuxi_gpr.c', 'fuxi_audioreach.h', 'fuxi_audioreach.c', 'fuxi_rpmh_arb.h', 'fuxi_audio_dsp.c', 'fuxi_au_glink.h', 'fuxi_au_amp.h', 'fuxi_au_amp_on.h')
-SHARED = {'fuxi_au_glink.h': 'au_glink.h', 'fuxi_au_amp.h': 'au_amp.h', 'fuxi_au_amp_on.h': 'au_amp_on.h'}
+FILES = ('fuxi_gpr.h', 'fuxi_gpr.c', 'fuxi_audioreach.h', 'fuxi_audioreach.c', 'fuxi_rpmh_arb.h', 'fuxi_audio_dsp.c', 'fuxi_au_glink.h', 'fuxi_au_amp.h', 'fuxi_au_amp_on.h', 'fuxi_au_mic.h')
+SHARED = {'fuxi_au_glink.h': 'au_glink.h', 'fuxi_au_amp.h': 'au_amp.h', 'fuxi_au_amp_on.h': 'au_amp_on.h', 'fuxi_au_mic.h': 'au_mic.h'}
 
 
 def expected():

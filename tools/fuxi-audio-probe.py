@@ -271,7 +271,7 @@ def decode_glink_log(words, count):
     return out
 
 
-MIC_STEPS = {1: "the DSP's clock 0x30C", 2: 'LPASS reachable', 3: "macros clocked, the master's version", 4: 'SoundWire frames', 5: 'codec enumerated, its id', 6: "codec's registers", 7: 'init, bias and ADC1 read back'}
+MIC_STEPS = {1: "the DSP's clock 0x30C", 2: 'LPASS reachable', 3: "macros clocked, the master's version", 4: 'SoundWire frames', 5: 'codec enumerated, its id', 6: "codec's registers", 7: 'init, bias and ADC1 read back', 8: 'the data ports, for a capture'}
 MIC_WHY = {1: 'an abort: the hypervisor or a gated block said no', 2: 'the votes were refused or not answered', 3: 'the clock refused all three ways', 4: 'the clock not answered', 5: 'cmd-db does not say 0x40a00 for ldob15: not voted',
            6: 'the RPMh vote failed', 7: 'gpio108 did not take', 8: 'the LPI pads did not take', 9: 'a macro clock bit did not stay', 10: 'the master is not version 2', 11: 'no frames: +0x5064 bit 0 stayed 0', 12: 'nobody attached in a second',
            13: 'not manufacturer 0x0217 part 0x010d', 14: 'a read over the bus did not come back', 15: 'chip id not 0d 01', 16: 'a write refused or lost', 17: 'a register did not read back', 18: 'clash or command error in +0x5000'}
@@ -321,7 +321,28 @@ def decode_mic(r):
         out.append('    ' + ' '.join(f'{reg:04x}={r[77 + i]:02x}' for i, (reg, _, _) in enumerate(MIC_WANT[:r[76]])))
     else:
         out.append(head(7))
+    if r[109:118] != (0,) * 9:
+        out.append(f'  ports: codec lane {r[109]:#x} channels {r[110]:#x}; master CTRL {r[111]:#x} CTRL2 {r[112]:#x} HCTRL {r[113]:#x}; TX +100 {r[114]:#x} +104 {r[115]:#x} +404 {r[116]:#x} +400 {r[117]:#x}')
     out.append(f'  down: 0x3022 {r[104]:#x}; gpio108 {r[105]:#x} {r[106]:#x}; gpio0 pad {r[107]:#x}; TX +8 {r[108]:#x}')
+    return '\n'.join(out)
+
+
+MIC_PHASES = ('muted at the TX macro', 'gain 8, bias on', 'gain 16, bias on', 'gain 16, BIAS OFF', 'gain 16, bias on again')
+
+
+def decode_mic_capture(q, status):
+    """The numbers of a capture, phase by phase; no sample ever comes this way. status: what the list's steps answered."""
+    if q[0] != 0xa0d10008:
+        return f'capture: the stage did not run (word 0 {q[0]:#x})'
+    names = ('tries', 'tries', 'tries', 'open device', 'config device', 'open stream', 'config stream', 'map', 'prepare device', 'prepare stream', 'start device', 'start stream', 'stop stream', 'stop device', 'close stream', 'close device', 'unmap', 'clock off')
+    out = [f'capture: result {q[1]:#x}; master port {q[3]} lane {q[2]} TX mux {q[4]}; reads asked {q[5]} done {q[6]} bad {q[8]} last status {q[7]:#x} bytes {q[9]} offset {q[10]}; at the end 0x3022 {q[12]:#x} 0x300e {q[13]:#x} +5000 {q[14]:#x} sGFSR {q[15]:#x}',
+           '  list: ' + ' '.join(f'{names[i]}={"-" if status[i] == 0xffffffff else hex(status[i])}' for i in range(3, 18))]
+
+    def signed(x):
+        return x - (1 << 32) if x >> 31 else x
+    for p, name in enumerate(MIC_PHASES):
+        s = q[40 + 10 * p:50 + 10 * p]
+        out.append(f'  {name:24}: periods {s[0]:3} samples {s[1]:6} least {signed(s[2]):6} most {signed(s[3]):6} mean {signed(s[4]):6} mean abs {s[5]:6} not zero {s[6]:6} change {s[7]:6} still pattern {s[8]:6} from {s[9]} ms')
     return '\n'.join(out)
 
 
@@ -356,7 +377,7 @@ def fnv(data):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('cmd', choices=['snapshot', 'squash', 'upload', 'boot', 'report', 'decode', 'stop', 'glink', 'smmu', 'poke', 'amp', 'tone', 'mic'])
+    ap.add_argument('cmd', choices=['mic-cap', 'mic-cap2', 'snapshot', 'squash', 'upload', 'boot', 'report', 'decode', 'stop', 'glink', 'smmu', 'poke', 'amp', 'tone', 'mic'])
     ap.add_argument('--monitors', action='store_true', help="tone: also bring the amplifier's voltage and current back, and look for the tone in them")
     ap.add_argument('--owner-agreed', action='store_true', help='tone: the owner has agreed to writes to the amplifier: bottom speaker, lowest level, a second')
     ap.add_argument('--which', type=int, default=3, help='amp: 1 B at 0x40, 2 T at 0x42, 3 both; read only')
@@ -480,8 +501,8 @@ def main():
         if a.save:
             with a.save.open('ab') as f:
                 f.write(page + struct.pack('<128I', *q))
-    elif a.cmd == 'mic':
-        page = req(0x4143, 0x4d31)
+    elif a.cmd in ('mic', 'mic-cap', 'mic-cap2'):
+        page = req(0x4143, {'mic': 0x4d31, 'mic-cap': 0x4d32, 'mic-cap2': 0x4d33}[a.cmd])
         r = struct.unpack('<128I', page)
         if r[0] != 0xa0d10003:
             raise SystemExit(f'no report: {r[0]:#x}')
@@ -489,8 +510,12 @@ def main():
         m = struct.unpack('<128I', req(0x4145))
         print(decode_mic(m))
         q = struct.unpack('<128I', req(0x4149))
-        status = 'no answer' if q[3] == 0xffffffff else f'status {q[3]:#x}'
-        print(f'  the clock let go: {status}, heard at {q[51]} ms (the list sent {r[126]} steps: 4 means it was asked)')
+        if a.cmd == 'mic':
+            status = 'no answer' if q[3] == 0xffffffff else f'status {q[3]:#x}'
+            print(f'  the clock let go: {status}, heard at {q[51]} ms (the list sent {r[126]} steps: 4 means it was asked)')
+        else:
+            print(decode_mic_capture(struct.unpack('<128I', req(0x4146)), q))
+            print(f'  the clock let go: {"no answer" if q[17] == 0xffffffff else hex(q[17])}, heard at {q[48 + 17]} ms (the list sent {r[126]} steps: 18 means it was asked)')
         count = min(r[27], 96)
         words = []
         for p_ in range((count * 12 + 127) // 128):

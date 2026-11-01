@@ -27,6 +27,7 @@
  *      first tone (au_tone_stage()). Returns the summary as 'AG' does. 'AJ' (0x414a): what it said of itself. 'AV' (0x4156) wIndex: page of 512 bytes of what came back.
  *  IN  0x5a 'AC' (0x4143) wIndex 0x4d31, once, after a stage 2 that reached ready: the mic as far as the codec answering, with its bias and ADC1 on and read back, between the votes
  *      and the TX core clock, all let go at the end (au_mic.h). No capture graph, no amplifier, no apps_smmu. Returns the summary as 'AG' does. 'AE' (0x4145): its report.
+ *      wIndex 0x4d32, 0x4d33: that and then a capture of a few seconds through the DSP, and apps_smmu's route as --play's: no amplifier, nothing played. 'AF' (0x4146): its numbers, never its samples.
  *  IN  0x5a 'AH' (0x4148) wIndex: page of the log. 'AI' (0x4149): what the last list's steps answered.
  *  IN  0x5a 'AH' (0x4148) wIndex=page: its log, 128 words a page.
  *  OUT 0x5b wValue=chunk[15:0], wIndex[11:0]=chunk[27:16], wIndex bit15 =
@@ -684,7 +685,12 @@ static uint32_t au_mic_rpmh(uint32_t addr, uint32_t data)
 #define AU_MIC_RPMH(addr, data) au_mic_rpmh((addr), (data))
 #include "au_mic.h"
 static struct au_mic au_mic_state;
-static uint32_t au_mic_rep[128];
+static uint32_t au_mic_rep[128], au_mic_cap[128];
+/* A capture: 48 kHz, 16 bits, one channel, 10 ms a period, read into a ring of four after the four periods au_glink_run() keeps clear. */
+#define AU_MIC_PERIOD_BYTES 960u
+#define AU_MIC_RING 4u
+static const FuxiArFormat au_mic_format = {48000, 16, 1};
+static uint32_t au_mic_cap_stage(struct au_gl *g, uint32_t *q, uint64_t t0, uint64_t hz);
 #define AU_GL_RECORDS 96u
 #define AU_GL_LOG_WORDS (AU_GL_RECORDS * AU_GL_REC_WORDS)
 static uint32_t au_gl_rep[128], au_gl_rep2[128], au_gl_rep3[128], au_gl_log[AU_GL_LOG_WORDS];
@@ -772,7 +778,13 @@ static uint32_t au_glink_run(uint32_t *r, unsigned seconds, uint32_t options)
  uint32_t bits = 0, next_ask = 2000, graph_until = 0, writes_until = 0, second_old[2] = {0, 0};
  int second_slot = -1;
  bool tone_done = false;
- g.graph_steps = (options & AU_GL_MIC) != 0 ? AU_MIC_STEPS : (options & AU_GL_TONE) != 0 ? (au_tone_vi ? AU_TONE_VI_STEPS : AU_TONE_STEPS) : (options & AU_GL_PLAY) != 0 ? AU_PLAY_STEPS : AU_GRAPH_STEPS;
+ const bool cap = (options & AU_GL_MIC) != 0 && au_mic_state.capture;
+ bool cap_done = false;
+ g.graph_steps = cap ? AU_MIC_CAP_STEPS : (options & AU_GL_MIC) != 0 ? AU_MIC_STEPS : (options & AU_GL_TONE) != 0 ? (au_tone_vi ? AU_TONE_VI_STEPS : AU_TONE_STEPS) : (options & AU_GL_PLAY) != 0 ? AU_PLAY_STEPS : AU_GRAPH_STEPS;
+ if (cap) {
+  au_period_bytes = AU_MIC_PERIOD_BYTES;
+  au_map_bytes = 0x10000u + AU_MIC_RING * AU_MIC_PERIOD_BYTES;
+ }
  if ((options & AU_GL_TONE) != 0) {
   au_format.channels = 4;
   au_tdm.slot_mask = 0xf;
@@ -787,6 +799,7 @@ static uint32_t au_glink_run(uint32_t *r, unsigned seconds, uint32_t options)
   for (uint32_t i = 0; i < au_period_bytes; i++) au_wr(AU_PLAY_PA + 4 * i, 0);
   /* a-tone3 read back what looked like untouched DRAM: a pattern over the way back's buffers says whether the DSP writes there at all. */
   if (au_tone_vi) for (uint32_t i = 0; i < AU_VI_PERIODS * au_period_bytes / 4; i++) au_wr(AU_VI_PA + 4 * i, 0x5a5a5a5au);
+  if (cap) for (uint32_t i = 0; i < AU_MIC_RING * AU_MIC_PERIOD_BYTES / 4; i++) au_wr(AU_VI_PA + 4 * i, 0x5a5a5a5au);
   au_gl_rep2[40] = au_rd(AU_SMMU + 0x48);
   au_smmu_bypass(0x1061, 0, false);
   if (au_smmu_slot < 0) return 0x206;
@@ -822,7 +835,16 @@ static uint32_t au_glink_run(uint32_t *r, unsigned seconds, uint32_t options)
      au_gl_rep3[72] = g.map_handle != 0 ? au_tone_stage(&g, au_gl_rep3, t0, hz) : 0x400;
      next_ask = g.ms + 20;
     }
-    else if (!tone && play && g.graph_sent == AU_PLAY_WRITES_AFTER && g.map_handle != 0 && (g.write_sent < AU_PLAY_BUFFERS || (g.write_done < AU_PLAY_BUFFERS && g.ms < writes_until))) {
+    else if (cap && g.graph_sent == AU_MIC_CAP_RUN && !cap_done) {
+     cap_done = true;
+     au_mic_cap[1] = g.map_handle != 0 ? au_mic_cap_stage(&g, au_mic_cap, t0, hz) : 0x500;
+     next_ask = g.ms + 20;
+    }
+    else if (cap && g.graph_sent == AU_MIC_CAP_RELEASE && au_mic_state.held) {
+     au_mic_state.held = false;
+     au_mic_down(&au_mic_state);
+    }
+    else if (!tone && !mic && play && g.graph_sent == AU_PLAY_WRITES_AFTER && g.map_handle != 0 && (g.write_sent < AU_PLAY_BUFFERS || (g.write_done < AU_PLAY_BUFFERS && g.ms < writes_until))) {
      /* Two buffers ahead of what it has played, so that it does not run dry and neither does the wait stretch. */
      next_ask = g.ms + 2;
      if (g.write_sent < AU_PLAY_BUFFERS && g.write_sent < g.write_done + 2) {
@@ -833,7 +855,7 @@ static uint32_t au_glink_run(uint32_t *r, unsigned seconds, uint32_t options)
     }
     else if (!g.big_have) { (void)au_gl_big_ask(&g); next_ask = g.ms + 100; }
     else {
-     uint32_t bytes = mic ? au_mic_build(g.graph_sent, m, AU_GL_GPR_BUFFER) : tone ? au_tone_build(g.graph_sent, m, AU_GL_GPR_BUFFER, g.map_handle) :
+     uint32_t bytes = cap ? au_mic_cap_build(g.graph_sent, m, AU_GL_GPR_BUFFER, &au_mic_format, AU_PLAY_PA | AU_PLAY_SID << 32, au_map_bytes, g.map_handle) : mic ? au_mic_build(g.graph_sent, m, AU_GL_GPR_BUFFER) : tone ? au_tone_build(g.graph_sent, m, AU_GL_GPR_BUFFER, g.map_handle) :
                       play ? au_play_build(g.graph_sent, AU_GL_GRAPH_TOKEN + g.graph_sent, m, AU_GL_GPR_BUFFER, g.map_handle) : au_graph_build(g.graph_sent, m, AU_GL_GPR_BUFFER);
      if (bytes != 0 && au_gl_graph_send(&g, m, bytes)) next_ask = g.ms + (play ? 300 : 1500);
      else if (bytes == 0) graph_until = 0;
@@ -842,6 +864,8 @@ static uint32_t au_glink_run(uint32_t *r, unsigned seconds, uint32_t options)
    else if (au_gl_prm_step(&g)) { next_ask = g.ms + 1500; graph_until = g.ms + ((options & (AU_GL_PLAY | AU_GL_MIC)) != 0 ? 25000 : 8000); }
   }
  }
+ /* Should the list not have got that far. */
+ if (au_mic_state.held) { au_mic_state.held = false; au_mic_down(&au_mic_state); }
  r[18] = g.rx_msgs; r[19] = g.tx_msgs; r[20] = g.tx_full; r[21] = g.stuck; r[22] = g.version_seen; r[23] = g.version_acked;
  r[24] = g.features; r[25] = g.opened; r[26] = g.acked_by_dsp; r[27] = g.log_n; r[28] = g.log_lost; r[29] = g.ms;
  for (unsigned i = 0; i < 4; i++) r[30 + i] = au_rd(desc + 4 * i);
@@ -1114,6 +1138,90 @@ static uint32_t au_tone_stage(struct au_gl *g, uint32_t *q, uint64_t t0, uint64_
  { uint64_t cb4 = AU_SMMU + 0x80000 + 4 * 0x1000; q[121] = au_rd(cb4 + 0x58); q[122] = au_rd(cb4 + 0x60); q[123] = au_rd(cb4 + 0x68); }
  return result;
 }
+/*
+ * A capture's statistics, phase by phase. Only these numbers leave the phone: nothing asks for the samples, and the ring keeps the last 40 ms of them, gone at the reset that follows.
+ * Words of a phase: periods, samples, least, most, mean, mean of the absolute, not zero, mean of the absolute change from the sample before, still the pattern au_glink_run() filled the ring with, ms at its start.
+ * a-cap1: the bias's slow step fills the mean and the most for seconds; the change from sample to sample is what it leaves alone, and is the mic's and the ADC's noise.
+ */
+#define AU_MIC_CAP_PHASE 40u
+#define AU_MIC_CAP_WORDS 10u
+#define AU_MIC_PHASES 5u
+static void au_mic_scan(uint32_t ring_index, uint32_t *s)
+{
+ int64_t sum = 0;
+ uint64_t sum_abs = 0, sum_change = 0;
+ int32_t least = (int32_t)s[2], most = (int32_t)s[3], last = 0;
+ for (uint32_t i = 0; i < AU_MIC_PERIOD_BYTES / 4; i++) {
+  uint32_t w = au_rd(AU_VI_PA + ring_index * AU_MIC_PERIOD_BYTES + 4 * i);
+  if (w == 0x5a5a5a5au) s[8] += 2;
+  for (uint32_t k = 0; k < 2; k++) {
+   int32_t v = (int16_t)(w >> (16 * k));
+   if (s[1] == 0) { least = v; most = v; }
+   if (i != 0 || k != 0) sum_change += (uint32_t)(v < last ? last - v : v - last);
+   if (v < least) least = v;
+   if (v > most) most = v;
+   if (v != 0) s[6]++;
+   sum += v;
+   sum_abs += (uint32_t)(v < 0 ? -v : v);
+   last = v;
+   s[1]++;
+  }
+ }
+ s[0]++; s[2] = (uint32_t)least; s[3] = (uint32_t)most;
+ /* Words 4 and 5 hold running sums here, the mean at the end of the phase: a phase is at most a few hundred thousand samples of 16 bits, and this holds them. */
+ s[4] += (uint32_t)(int32_t)(sum / 16); s[5] += (uint32_t)(sum_abs / 16); s[7] += (uint32_t)(sum_change / 16);
+}
+static void au_mic_pump(struct au_gl *g, uint64_t t0, uint64_t hz, uint32_t ms, uint32_t *scanned, uint32_t *s)
+{
+ static uint32_t m[2 + AU_GL_GPR_BUFFER / 4 + 2];
+ uint32_t until = g->ms + ms;
+ while (g->ms < until && !g->stuck) {
+  g->ms = (uint32_t)((rsr("cntpct_el0") - t0) * 1000 / hz);
+  while (au_gl_step(g)) { }
+  if (g->read_sent < g->read_done + 3) {
+   uint32_t bytes = fuxi_ar_read((uint8_t *)(m + 2), AU_GL_GPR_BUFFER, 1, AU_GL_READ_TOKEN + g->read_sent, (AU_VI_PA + (g->read_sent % AU_MIC_RING) * AU_MIC_PERIOD_BYTES) | AU_PLAY_SID << 32, g->map_handle, AU_MIC_PERIOD_BYTES);
+   if (bytes != 0) (void)au_gl_read_send(g, m, bytes);
+  }
+  while (*scanned < g->read_done) {
+   if (s != 0) au_mic_scan(*scanned % AU_MIC_RING, s);
+   ++*scanned;
+  }
+  delay(200);
+ }
+}
+static uint32_t au_mic_cap_stage(struct au_gl *g, uint32_t *q, uint64_t t0, uint64_t hz)
+{
+ struct au_mic *m = &au_mic_state;
+ uint32_t scanned = 0, v = 0, *s;
+ q[0] = 0xa0d10008u; q[2] = m->lane; q[3] = m->port; q[4] = m->mic;
+ /* The list so far said yes, the clock's tries aside, or there is nothing to read. */
+ au_mic_pump(g, t0, hz, 100, &scanned, 0);
+ for (uint32_t i = AU_MIC_TRIES; i < AU_MIC_CAP_RUN; i++) { if (g->graph_status[i] != 0) return 0x501 + (i << 8); }
+ /* Muted at the TX macro: what the stream gives with nothing let through. */
+ s = q + AU_MIC_CAP_PHASE; s[9] = g->ms;
+ au_mic_pump(g, t0, hz, 300, &scanned, s);
+ au_mic_set(m, AU_MIC_TX + 0x400u, 0x10u, 0u);
+ /* As Android's amic1, then gain 16, then the same with the bias off, then on again: what comes through the mic changes with these and little else does. */
+ static const struct { uint8_t gain, bias; } steps[AU_MIC_PHASES - 1] = {{8, 0x40}, {16, 0x40}, {16, 0}, {16, 0x40}};
+ for (uint32_t p = 0; p < AU_MIC_PHASES - 1 && !g->stuck; p++) {
+  (void)au_mic_codec_update(m, 0x300eu, 0x1fu, steps[p].gain);
+  (void)au_mic_codec_update(m, AU_MIC_MICB1, 0xc0u, steps[p].bias);
+  au_mic_pump(g, t0, hz, 2000, &scanned, 0);    /* the filter and the bias settling */
+  s = q + AU_MIC_CAP_PHASE + AU_MIC_CAP_WORDS * (p + 1);
+  s[9] = g->ms;
+  au_mic_pump(g, t0, hz, 2000, &scanned, s);
+ }
+ for (uint32_t p = 0; p < AU_MIC_PHASES; p++) {
+  s = q + AU_MIC_CAP_PHASE + AU_MIC_CAP_WORDS * p;
+  if (s[1] != 0) { s[4] = (uint32_t)(int32_t)((int64_t)(int32_t)s[4] * 16 / (int64_t)s[1]); s[5] = (uint32_t)((uint64_t)s[5] * 16 / s[1]); s[7] = (uint32_t)((uint64_t)s[7] * 16 / s[1]); }
+ }
+ q[5] = g->read_sent; q[6] = g->read_done; q[7] = g->read_status; q[8] = g->read_bad; q[9] = g->read_bytes; q[10] = g->read_offset; q[11] = g->ms;
+ if (au_mic_codec_read(m, AU_MIC_MICB1, &v)) q[12] = v;
+ if (au_mic_codec_read(m, 0x300eu, &v)) q[13] = v;
+ q[14] = au_mic_rd(m, AU_MIC_SWR + 0x5000u, 0);
+ q[15] = au_rd(AU_SMMU + 0x48);
+ return g->read_done != 0 ? 1 : 0x510;
+}
 /* USB entry: returns bytes placed in out (0 = stall). */
 static uint32_t audio_request(uint16_t value, uint16_t index, uint8_t *out)
 {
@@ -1208,6 +1316,21 @@ static uint32_t audio_request(uint16_t value, uint16_t index, uint8_t *out)
   au_gl_rep[4] = au_faults;
   memcpy(out, au_gl_rep, sizeof(au_gl_rep)); return sizeof(au_gl_rep);
  }
+ /* 0x4d32, 0x4d33: the same and then a capture, master's port 3 lane 1 as Android's amic1, or port 2 lane 2 as sheng's. No amplifier: nothing is played. */
+ if (value == 0x4143 && (index == 0x4d32 || index == 0x4d33) && !monitor_report[MON_LAUNCH] && au_boot[1] == 1 && !au_gl_rep[0]) {
+  au_mic_begin(&au_mic_state, au_mic_rep);
+  au_mic_state.capture = true;
+  au_mic_state.port = index == 0x4d32 ? 3 : 2;
+  au_mic_state.lane = index == 0x4d32 ? 1 : 2;
+  au_mic_state.mic = index == 0x4d32 ? 5 : 1;
+  au_gl_rep[0] = 0xa0d10003;
+  au_gl_rep[2] = 45;
+  au_gl_rep[3] = 31 | 64;
+  au_gl_rep[1] = au_glink_run(au_gl_rep, 45, AU_GL_ANSWER | AU_GL_GPR | AU_GL_PRM | AU_GL_GRAPH | AU_GL_PLAY | AU_GL_MIC);
+  au_gl_rep[4] = au_faults;
+  memcpy(out, au_gl_rep, sizeof(au_gl_rep)); return sizeof(au_gl_rep);
+ }
+ if (value == 0x4146 && au_mic_cap[0]) { memcpy(out, au_mic_cap, sizeof(au_mic_cap)); return sizeof(au_mic_cap); }
  if (value == 0x4145 && au_mic_rep[0]) { memcpy(out, au_mic_rep, sizeof(au_mic_rep)); return sizeof(au_mic_rep); }
  if (value == 0x4149 && au_gl_rep[0]) { memcpy(out, au_gl_rep2, sizeof(au_gl_rep2)); return sizeof(au_gl_rep2); }
  if (value == 0x4148 && au_gl_rep[0] && index < AU_GL_LOG_WORDS / 128) {

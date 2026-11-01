@@ -46,7 +46,7 @@
  *   "Codec"     one input of one channel with the data source 'imic': the built-in microphone
  *
  * What is mixed for the speaker goes to /dev/fuxiaudio when the kernel has it (fuxiaudio=2, xnu/fuxi-audio/fuxi_audio_dsp.c),
- * which feeds the ADSP, and is otherwise counted and dropped; inputs are silence. HackiOS's other kernel sinks (-mic, -haptic)
+ * which feeds the ADSP, and is otherwise counted and dropped; the microphone comes from /dev/fuxiaudiomic when the kernel has it (fuxiaudio=3), and other inputs are silence. HackiOS's other kernel sinks (-mic, -haptic)
  * and the volume ioctl are left out. The device's clock is the system's: it claims
  * to play exactly FUXI_AUDIO_RATE frames a second of mach_absolute_time(), and the HAL's I/O thread
  * paces itself by that. Installed only by tools/fuxi-sys-root.py --audio-plugin (off by default).
@@ -821,29 +821,40 @@ set_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
 }
 
 /*
- * The microphone (the device "Codec"): there is no capture path on this phone yet, so its input
- * is silence. Said when it starts and stops, with how long it ran.
+ * The microphone (the device "Codec"): what the kernel has, without ever waiting for it, and silence for the rest.
+ * Said when it starts and stops, with how long it ran and how much of that was the mic's.
  */
-static UInt64 mic_frames;
+static UInt64 mic_frames, mic_heard;
+static int mic_fd = -1;
 
 static void
 codec_open(void)
 {
 	mic_frames = 0;
-	say("fuxi: audio: the microphone is listened to (silence: no capture path)\n");
+	mic_heard = 0;
+	mic_fd = open("/dev/fuxiaudiomic", O_RDONLY);
+	say("fuxi: audio: the microphone is listened to (%s)\n", mic_fd >= 0 ? "kernel capture" : "silence: no capture path");
 }
 
 static void
 codec_close(void)
 {
-	say("fuxi: audio: the microphone stops: %llu.%02llu s of silence given\n", mic_frames / FUXI_AUDIO_RATE,
-	    mic_frames % FUXI_AUDIO_RATE * 100 / FUXI_AUDIO_RATE);
+	say("fuxi: audio: the microphone stops: %llu.%02llu s given, %llu.%02llu s of them heard\n", mic_frames / FUXI_AUDIO_RATE,
+	    mic_frames % FUXI_AUDIO_RATE * 100 / FUXI_AUDIO_RATE, mic_heard / FUXI_AUDIO_RATE, mic_heard % FUXI_AUDIO_RATE * 100 / FUXI_AUDIO_RATE);
+	if (mic_fd >= 0) {
+		close(mic_fd);
+		mic_fd = -1;
+	}
 }
 
 static void
 codec_read(int16_t *samples, UInt32 frames)
 {
-	memset(samples, 0, (size_t)frames * 2);
+	ssize_t got = mic_fd >= 0 ? read(mic_fd, samples, (size_t)frames * 2) : 0;
+	UInt32 heard = got > 0 ? (UInt32)got / 2 : 0;
+
+	memset(samples + heard, 0, (size_t)(frames - heard) * 2);
+	mic_heard += heard;
 	mic_frames += frames;
 }
 

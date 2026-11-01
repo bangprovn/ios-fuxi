@@ -28,6 +28,7 @@ DRIVER = r"""
 static uint32_t va[0x400], txm[0x400], lpi[4], slew = 0x10000, pad[2] = {0x10, 0};
 static uint32_t swr_regs[0x5100 / 4];
 static uint8_t codec[0x600];		/* 0x3000.. */
+static uint8_t dp[0x40];			/* 0x100.., its first data port */
 static uint8_t scp[6] = {0x23, 0x02, 0x17, 0x01, 0x0d, 0x00};
 static unsigned delays, votes_ok, writes_codec, reads_codec;
 static uint32_t rx_fifo[8], rx_n;
@@ -108,7 +109,8 @@ static int fake_wr(uint64_t pa, uint32_t v)
 			assert(((v >> 20) & 0xf) == 1);
 			/* The fake's own allow-list, so that the source's cannot grow unseen: no efuse, no HPH, MICB1 alone, VOUT at most 0x23. */
 			static const uint16_t ok[] = {0x3001, 0x300e, 0x300f, 0x3022, 0x3029, 0x306b, 0x306e, 0x3071, 0x3074, 0x308f, 0x3103, 0x312a, 0x31df, 0x31e1,
-						      0x3408, 0x3409, 0x3410, 0x3417, 0x3457, 0x345b, 0x34d0, 0x34d1, 0x34d2, 0x34d3, 0x34d4};
+						      0x3408, 0x3409, 0x3410, 0x3417, 0x3457, 0x345b, 0x34d0, 0x34d1, 0x34d2, 0x34d3, 0x34d4,
+						      0x102, 0x103, 0x105, 0x120, 0x122, 0x123, 0x124, 0x125, 0x126, 0x128, 0x130, 0x132, 0x133, 0x134, 0x135, 0x136, 0x138};
 			bool found = false;
 
 			for (unsigned i = 0; i < sizeof(ok) / sizeof(ok[0]); i++) found = found || ok[i] == reg;
@@ -117,6 +119,7 @@ static int fake_wr(uint64_t pa, uint32_t v)
 			if (codec_writes_seen < 256) codec_write_log[codec_writes_seen] = (uint16_t)reg;
 			codec_writes_seen++;
 			writes_codec++;
+			if (reg < 0x140) { dp[reg - 0x100] = (uint8_t)data; return 0; }
 			if ((int)reg != sticky_reg) codec[reg - 0x3000] = (uint8_t)data;
 			return 0;
 		}
@@ -126,7 +129,7 @@ static int fake_wr(uint64_t pa, uint32_t v)
 			assert(((v >> 20) & 0xf) == 1 && (v >> 24) == 1);
 			reads_codec++;
 			if (read_silent) return 0;
-			uint32_t value = reg >= 0x50 && reg <= 0x55 ? scp[reg - 0x50] : codec[reg - 0x3000];
+			uint32_t value = reg >= 0x50 && reg <= 0x55 ? scp[reg - 0x50] : reg < 0x140 ? dp[reg - 0x100] : codec[reg - 0x3000];
 
 			rx_fifo[0] = (stale_id ? (id + 1) & 0xf : id) << 8 | value;
 			rx_n = 1;
@@ -184,7 +187,7 @@ static struct au_gl g;
 
 static void fresh(void)
 {
-	memset(va, 0, sizeof(va)); memset(txm, 0, sizeof(txm)); memset(swr_regs, 0, sizeof(swr_regs)); memset(codec, 0, sizeof(codec));
+	memset(dp, 0, sizeof(dp)); memset(va, 0, sizeof(va)); memset(txm, 0, sizeof(txm)); memset(swr_regs, 0, sizeof(swr_regs)); memset(codec, 0, sizeof(codec));
 	for (unsigned i = 0; i < 4; i++) lpi[i] = 0x3c + i;
 	slew = 0x10000; pad[0] = 0x10; pad[1] = 0;
 	codec[0x3403 - 0x3000] = 0x0d; codec[0x3404 - 0x3000] = 0x01; codec[0x3022 - 0x3000] = 0x10; codec[0x3029 - 0x3000] = 0x55; codec[0x3103 - 0x3000] = 0x16;
@@ -372,6 +375,51 @@ int main(void)
 	g.graph_sent = 2; g.graph_status[1] = 0;
 	assert(!au_mic_turn(&g, &m) && m.over && g.graph_sent == AU_MIC_TRIES && rep[AU_MIC_R_TAKEN] == 2 && rep[AU_MIC_R_PASSED] == 7);
 	{ uint32_t seen = writes_codec; assert(!au_mic_turn(&g, &m) && writes_codec == seen); }
+	/* A capture: the stage stays up, the ports as Android's amic1 and sheng's, nothing of them without one. */
+	fresh(); m.capture = true; m.port = 3; m.lane = 1; m.mic = 5; au_mic_run(&m);
+	assert(m.held && !m.going_down && rep[AU_MIC_R_STEP] == 0 && rep[AU_MIC_R_PASSED] == 7);
+	assert(rep[AU_MIC_R_PORTS] == 1 && rep[AU_MIC_R_PORTS + 1] == 1 && rep[AU_MIC_R_PORTS + 2] == 0x01000001u && rep[AU_MIC_R_PORTS + 3] == 1 && rep[AU_MIC_R_PORTS + 4] == 0xf0);
+	assert(swr_regs[0x1324 / 4] == 0x01000001u && swr_regs[0x1364 / 4] == 0x01000001u && swr_regs[0x1368 / 4] == 1 && swr_regs[0x1374 / 4] == 0xf0);
+	assert(dp[0x28] == 1 && dp[0x38] == 1 && dp[0x20] == 1 && dp[0x30] == 1 && dp[0x05] == 1 && dp[0x22] == 1 && dp[0x26] == 0xff);
+	assert((txm[0x100 / 4] & 0xf) == 5 && (txm[0x104 / 4] & 3) == 1 && (txm[0x404 / 4] & 0xe6) == 0x40 && (txm[0x400 / 4] & 0x3f) == 0x34);
+	au_mic_down(&m); assert_down();
+	assert((codec[0x3022 - 0x3000] & 0xc0) == 0);
+	/* Sheng's: its port, lane 2, its mux for this channel. */
+	fresh(); m.capture = true; m.port = 2; m.lane = 2; m.mic = 1; au_mic_run(&m);
+	assert(m.held && swr_regs[0x1224 / 4] == 0x02000001u && swr_regs[0x1268 / 4] == 1 && dp[0x28] == 2 && (txm[0x100 / 4] & 0xf) == 1);
+	au_mic_down(&m);
+	/* A stage that fails does not stay up for a graph: down, and the list goes to letting go. */
+	fresh(); m.capture = true; m.port = 3; m.lane = 1; m.mic = 5; wrong_version = 1;
+	g.graph_sent = 1; g.graph_status[0] = 0; assert(!au_mic_turn(&g, &m));
+	assert(m.over && !m.held && m.going_down && g.graph_sent == AU_MIC_CAP_RELEASE);
+	/* It passes: on to the graph; refused three times, past the list. */
+	fresh(); m.capture = true; m.port = 3; m.lane = 1; m.mic = 5;
+	g.graph_sent = 1; g.graph_status[0] = 0; assert(!au_mic_turn(&g, &m));
+	assert(m.over && m.held && g.graph_sent == AU_MIC_TRIES);
+	au_mic_down(&m);
+	fresh(); au_mic_begin(&m, rep); m.capture = true; votes_ok = 0;
+	g.graph_sent = 1; g.graph_status[0] = 1; assert(!au_mic_turn(&g, &m));
+	g.graph_sent = 2; g.graph_status[1] = 1; assert(!au_mic_turn(&g, &m));
+	g.graph_sent = 3; g.graph_status[2] = 1; assert(!au_mic_turn(&g, &m) && g.graph_sent == AU_MIC_CAP_STEPS && !m.held);
+	/* The capture's list: each packet's opcode in its place, the token its step's, the clock let go at the end, nothing past it. */
+	{
+		static uint32_t p[2 + AU_GL_GPR_BUFFER / 4 + 2];
+		static const FuxiArFormat f = {48000, 16, 1};
+		uint8_t *b = (uint8_t *)(p + 2);
+		uint32_t w[8];
+		static const uint32_t want[18] = {0, 0, 0, FUXI_AR_OP_GRAPH_OPEN, FUXI_AR_OP_SET_CFG, FUXI_AR_OP_GRAPH_OPEN, FUXI_AR_OP_SET_CFG, FUXI_AR_OP_MEM_MAP,
+						  FUXI_AR_OP_GRAPH_PREPARE, FUXI_AR_OP_GRAPH_PREPARE, FUXI_AR_OP_GRAPH_START, FUXI_AR_OP_GRAPH_START,
+						  FUXI_AR_OP_GRAPH_STOP, FUXI_AR_OP_GRAPH_STOP, FUXI_AR_OP_GRAPH_CLOSE, FUXI_AR_OP_GRAPH_CLOSE, FUXI_AR_OP_MEM_UNMAP, 0x01001010u};
+
+		for (uint32_t i = 3; i < AU_MIC_CAP_STEPS; i++) {
+			uint32_t n = au_mic_cap_build(i, p, AU_GL_GPR_BUFFER, &f, 0xd0000000ull | 1ull << 32, 0x10000u + 3840u, 7);
+
+			assert(n >= 24); memcpy(w, b, 24);
+			assert(w[4] == AU_GL_GRAPH_TOKEN + i && w[5] == want[i]);
+		}
+		{ uint32_t n = au_mic_cap_build(AU_MIC_CAP_RELEASE, p, AU_GL_GPR_BUFFER, &f, 0, 0, 0); assert(n >= 24); memcpy(w, b, 24); assert(w[2] == 2 && w[3] == 2); }
+		assert(au_mic_cap_build(AU_MIC_CAP_STEPS, p, AU_GL_GPR_BUFFER, &f, 0, 0, 0) == 0);
+	}
 	puts("au_mic: all seven steps, each stopping where it fails and coming back down; the clock's tries; only the allow-list and VOUT 0x23 reach the codec; L15B only on, and only at 0x40a00");
 	return 0;
 }
@@ -427,14 +475,15 @@ def main():
     rows = re.findall(r'\{(0x[0-9a-f]+), (0x[0-9a-f]+), (0x[0-9a-f]+)\}', want)
     assert [(int(a, 16), int(b, 16), int(c, 16)) for a, b, c in rows] == tool.MIC_WANT
 
+    ports_allowed = {0x102, 0x103, 0x105, 0x120, 0x122, 0x123, 0x124, 0x125, 0x126, 0x128, 0x130, 0x132, 0x133, 0x134, 0x135, 0x136, 0x138}    # the first data port's, for a capture
     # Codec writes: this exact list, so no efuse (0x3460, 0x3461, 0x3490-0x34c6), no HPH (0x3008-0x300d and 0x3100s' HPH), no other bias; and what is written is all allowed.
     allowed = {int(x, 16) for x in re.findall(r'0x[0-9a-f]+', re.search(r'au_mic_allowed\[\] = \{(.*?)\};', code, re.S).group(1))}
-    assert allowed == {0x3001, 0x300e, 0x300f, 0x3022, 0x3029, 0x306b, 0x306e, 0x3071, 0x3074, 0x308f, 0x3103, 0x312a, 0x31df, 0x31e1, 0x3408, 0x3409, 0x3410, 0x3417, 0x3457, 0x345b, 0x34d0, 0x34d1, 0x34d2, 0x34d3, 0x34d4}
+    assert allowed == {0x3001, 0x300e, 0x300f, 0x3022, 0x3029, 0x306b, 0x306e, 0x3071, 0x3074, 0x308f, 0x3103, 0x312a, 0x31df, 0x31e1, 0x3408, 0x3409, 0x3410, 0x3417, 0x3457, 0x345b, 0x34d0, 0x34d1, 0x34d2, 0x34d3, 0x34d4} | ports_allowed
     forbidden = {0x3460, 0x3461} | set(range(0x3490, 0x34d0)) | set(range(0x3008, 0x300e)) | {0x3023, 0x3024, 0x3025, 0x3026}
     assert not allowed & forbidden
     writes = re.search(r'au_mic_writes\[\] = \{(.*?)\n\};', code, re.S).group(1).replace('AU_MIC_MICB1', '0x3022')
     written = {int(a, 16) for a in re.findall(r'\{(0x[0-9a-f]+),', writes)}
-    assert written == allowed
+    assert written | ports_allowed == allowed and not written & ports_allowed
     # The bias: VOUT's bound is 0x23, it is the only value given for VOUT, and the check stands in the one function that sends.
     assert re.search(r'#define AU_MIC_VOUT_MAX 0x23u', code) and 'reg == AU_MIC_MICB1 && (value & 0x3fu) > AU_MIC_VOUT_MAX' in code
     bias_writes = re.findall(r'\{AU_MIC_MICB1, ([^}]*)\}', re.search(r'au_mic_writes\[\] = \{(.*?)\n\};', code, re.S).group(1))
@@ -443,7 +492,10 @@ def main():
     assert code.count('AU_MIC_SWR + 0x5020u') == 1
     send = code[code.index('static inline bool au_mic_codec_write'):code.index('static inline bool au_mic_codec_update')]
     assert 'AU_MIC_SWR + 0x5020u' in send and 'allowed' in send
-    assert 'au_mic_codec_write(m, reg,' in code and code.count('au_mic_codec_write(') == 2
+    ports = code[code.index('static inline bool au_mic_ports'):code.index('static inline void au_mic_run')]
+    assert 'au_mic_codec_write(m, reg,' in code and code.replace(ports, '').count('au_mic_codec_write(') == 2
+    assert {int(x, 16) for x in re.findall(r'au_mic_codec_write\(m, (0x[0-9a-f]+)u', ports)} == {0x102, 0x103, 0x105, 0x120, 0x122, 0x123, 0x124, 0x125, 0x126, 0x128}
+    assert 'bias' not in ports and 'AU_MIC_MICB1' not in ports
     assert re.findall(r'au_mic_codec_update\(m, ([^,]+),', code) == ['w->reg', 'AU_MIC_MICB1']
     # L15B: three votes, all on, all to its constant, in the function that checked cmd-db; BOB1 nowhere.
     votes = re.findall(r'AU_MIC_RPMH\(([^)]*)\)', code)
@@ -469,9 +521,16 @@ def main():
     audio = (ROOT / 'shim/fuxi-probe/audio.c').read_text()
     assert '#define AU_MIC_RD(pa, f) probe_safe_rd32((pa), (f))' in audio and '#define AU_MIC_WR(pa, v) probe_safe_wr32((pa), (v))' in audio
     assert 'return rh_send(0, addr, data);' in audio and audio.count('au_mic_rpmh(') == 2
-    hook = audio[audio.index("if (value == 0x4143"):audio.index("if (value == 0x4149")]
+    hook = audio[audio.index("if (value == 0x4143"):audio.index("if (value == 0x4143 && (index == 0x4d32")]
     assert "au_boot[1] == 1" in hook and '!monitor_report[MON_LAUNCH]' in hook and '!au_gl_rep[0]' in hook and 'index == 0x4d31' in hook
     assert 'AU_GL_ANSWER | AU_GL_GPR | AU_GL_PRM | AU_GL_GRAPH | AU_GL_MIC' in hook and 'AU_GL_PLAY' not in hook and 'AU_GL_TONE' not in hook
+    # The capture: the same, with --play's apps_smmu; no tone, and in its stage no amplifier, no pad, no other codec register than the gain and the bias, whose values are 0x40 and 0. Only numbers go out.
+    cap_hook = audio[audio.index("if (value == 0x4143 && (index == 0x4d32"):audio.index("if (value == 0x4149")]
+    assert "au_boot[1] == 1" in cap_hook and '!monitor_report[MON_LAUNCH]' in cap_hook and '!au_gl_rep[0]' in cap_hook and 'AU_GL_PLAY | AU_GL_MIC' in cap_hook and 'AU_GL_TONE' not in cap_hook
+    stage = audio[audio.index('static void au_mic_scan'):audio.index('static uint32_t audio_request')]
+    for bad in ('au_on', 'AU_AMP', 'au_pin', 'au_tone', 'AU_TLMM', 'AU_SE0', 'memcpy', 'au_mic_rep'):
+        assert bad not in stage, bad
+    assert re.findall(r'au_mic_codec_update\(m, ([^,]+),', stage) == ['0x300eu', 'AU_MIC_MICB1'] and '{{8, 0x40}, {16, 0x40}, {16, 0}, {16, 0x40}}' in stage
     # Run inside the list, between the votes (prm_sent == 2): the clock let go after it by the list's last step, the votes then by au_gl_prm_step()'s last two.
     assert audio.count('au_mic_turn(') == 1 and audio.count('au_mic_run(') == 0
     run_branch = audio[audio.index('g.prm_sent == 2 && g.graph_sent < g.graph_steps'):audio.index('else if (au_gl_prm_step(&g))')]
@@ -479,10 +538,12 @@ def main():
     glink = (ROOT / 'shim/fuxi-probe/au_glink.h').read_text()
     assert 'block[AU_GL_PRM_STEPS] = {1, 2, 2, 1}' in glink and '#define AU_GL_PRM_STEPS 4u' in glink
     # A capture graph or a buffer does not come with this: au_mic.h's list names only the clock.
-    list_code = code[code.index('static inline uint32_t au_mic_build'):code.index('static inline bool au_mic_turn')]
+    list_code = code[code.index('static inline uint32_t au_mic_build'):code.index('static inline uint32_t au_mic_cap_build')]
     assert list_code.count('fuxi_ar_') == 2 and 'fuxi_ar_prm_clock_attr' in list_code
+    cap_list = code[code.index('static inline uint32_t au_mic_cap_build'):code.index('static inline bool au_mic_turn')]
     for bad in ('fuxi_ar_open', 'fuxi_ar_graph', 'fuxi_ar_map', 'fuxi_ar_read', 'fuxi_ar_write'):
-        assert bad not in code
+        assert bad not in code.replace(cap_list, ''), bad
+    assert 'fuxi_ar_write' not in cap_list and 'speaker' not in cap_list and 'playback' not in cap_list and 'FUXI_AR_SG_PLAY' not in cap_list and 'FUXI_AR_SG_SPEAKER' not in cap_list
     # Licence: comments here say where it came from; nothing is marked as lifted from Linux code.
     assert 'BSD-2-Clause-Patent' in header
     # CI runs it.

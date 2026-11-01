@@ -40,6 +40,8 @@ struct cdevsw { void *d_open, *d_close, *d_read, *d_write, *d_ioctl, *d_stop, *d
 int cdevsw_add(int, const struct cdevsw *);
 void *devfs_make_node(dev_t, int, int, int, int, const char *);
 #define makedev(a, b) ((a) << 24 | (b))
+#define minor(d) ((d) & 0xff)
+#define ENXIO 6
 #define DEVFS_CHAR 1
 #define UID_ROOT 0
 #define GID_WHEEL 0
@@ -54,7 +56,7 @@ def main():
             (stubs / header).parent.mkdir(parents=True, exist_ok=True)
             (stubs / header).write_text('#include "stub.h"\n')
         (stubs / 'stub.h').write_text('#pragma once\n' + STUB)
-        for name, source in (('fuxi_au_glink.h', 'au_glink.h'), ('fuxi_au_amp.h', 'au_amp.h'), ('fuxi_au_amp_on.h', 'au_amp_on.h')):
+        for name, source in (('fuxi_au_glink.h', 'au_glink.h'), ('fuxi_au_amp.h', 'au_amp.h'), ('fuxi_au_amp_on.h', 'au_amp_on.h'), ('fuxi_au_mic.h', 'au_mic.h')):
             (stubs / name).write_text((ROOT / 'shim/fuxi-probe' / source).read_text())
         subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-Wno-unknown-pragmas', '-Wno-unused-function', '-Wno-unused-parameter', '-Wno-incompatible-pointer-types', '-DFUXI=1', '-fsyntax-only',
                         f'-I{stubs}', f'-I{ROOT / "xnu/fuxi-audio"}', str(ROOT / 'xnu/fuxi-audio/fuxi_audio_dsp.c')], check=True)
@@ -68,7 +70,17 @@ def main():
     assert amp.count('au_on_unmute(') == 1 and 'au_on_unmute(&fa_amp, 0)' in amp and 'fa_amp.address = 0x40;' in amp and '0x42' not in amp
     assert 'fa_amp_pin(182, 1u | 1u << 9, 0);' in amp and 'fa_amp_pin(182, 1u | 1u << 9, 1)' not in amp and ', 68' not in amp and 'fa_amp_pin(68' not in amp
     assert 'if (!fa_amp_wanted ||' in amp and 'PE_parse_boot_argn("fuxiaudioamp", &amp, sizeof(amp)) && amp == 1' in text
-    assert text.count('ml_io_map(') == 7 and 'PE_parse_boot_argn("fuxiaudio"' in text
+    assert text.count('ml_io_map(') == 9 and 'PE_parse_boot_argn("fuxiaudio"' in text
+    # The mic: behind fuxiaudio=3 or 4, its registers behind the votes, and no vote of a rail: the driver of the RSC is Wi-Fi's alone. Nothing in it reaches the amplifier.
+    mic = text[text.index('/* ---- the microphone, fuxiaudio=3'):text.index('/* Minor 0 the speaker')]
+    assert '#define AU_MIC_RPMH(addr, data) 0u' in mic and 'if (on >= 3) {' in text and 'if (!fa_mic_on) {' in mic
+    for word in ('fa_amp', 'au_on_', '0x17a2', 'fuxi_ar_write'):
+        assert word not in mic, word
+    up = mic[mic.index('fa_mic_up(void)'):mic.index('fa_mic_down(void)')]
+    assert up.index('fa_votes_take()') < up.index('au_mic_run(&fa_mic)') and up.index('"mic clock"') < up.index('au_mic_run(&fa_mic)')
+    down = mic[mic.index('fa_mic_down(void)'):mic.index('fa_mic_pump(void)')]
+    assert down.index('au_mic_down(&fa_mic)') < down.index('fa_votes_drop()') and down.index('au_mic_down(&fa_mic)') < down.index('"mic clock off"')
+    assert 'fa_votes++ != 0' in text and '--fa_votes != 0' in text and text.count('au_gl_prm_step(') == 2
     subprocess.run(['python3', str(ROOT / 'tools/sync-fuxi-audio.py'), '--check'], check=True, capture_output=True)
     hook = (ROOT / 'xnu/patches/0118-fuxi-audio-dsp.patch').read_text()
     assert 'fuxi_audio_dsp_init();' in hook and 'bsd/dev/fuxi_audio_dsp.c' in hook and 'bsd/dev/fuxi_audioreach.c' in hook

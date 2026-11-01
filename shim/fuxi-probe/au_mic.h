@@ -67,11 +67,14 @@ enum { AU_MIC_DID_RESET = 1u, AU_MIC_DID_PADS = 2u, AU_MIC_DID_GATES = 4u, AU_MI
 #define AU_MIC_R_BACK_N 76
 #define AU_MIC_R_BACK   77  /* 25 words, au_mic_want[] */
 #define AU_MIC_R_DOWN   104 /* MICB1 after off, gpio108 CTL, IO, gpio0's pad, TX +8 */
+#define AU_MIC_R_PORTS  109 /* with a capture: codec 0x128, 0x120; the master's port CTRL, CTRL2, HCTRL; TX +0x100, +0x104, +0x404, +0x400 */
 
 struct au_mic {
 	uint32_t *r;
 	uint32_t did, step, faults, read_fails, dev;
 	bool votes_held, clock_held, going_down, over, asked;
+	bool capture, held;    /* capture: the list goes on with a graph, and a stage that passes stays up for it; held: it is up now */
+	uint32_t port, lane, mic;    /* master's data port, its lane, the TX macro's SWR_MIC number + 1 */
 	uint32_t asked_ms;
 	uint8_t id;
 	uint32_t found_pad[2], found_lpi[4], found_slew, found_va[3];
@@ -81,7 +84,9 @@ static const uint8_t au_mic_lpi_pins[4] = {0, 1, 2, 14};    /* clock, data 0 to 
 
 /* Everything a codec write can reach: wcd938x_io_init()'s capture lines, MICB1, and ADC1. */
 static const uint16_t au_mic_allowed[] = {0x3001, 0x300e, 0x300f, 0x3022, 0x3029, 0x306b, 0x306e, 0x3071, 0x3074, 0x308f, 0x3103, 0x312a, 0x31df, 0x31e1,
-					  0x3408, 0x3409, 0x3410, 0x3417, 0x3457, 0x345b, 0x34d0, 0x34d1, 0x34d2, 0x34d3, 0x34d4};
+					  0x3408, 0x3409, 0x3410, 0x3417, 0x3457, 0x345b, 0x34d0, 0x34d1, 0x34d2, 0x34d3, 0x34d4,
+					  /* Its first data port, in both banks: capture only. */
+					  0x102, 0x103, 0x105, 0x120, 0x122, 0x123, 0x124, 0x125, 0x126, 0x128, 0x130, 0x132, 0x133, 0x134, 0x135, 0x136, 0x138};
 
 struct au_mic_write { uint16_t reg; uint8_t mask, value; uint16_t wait_us; };
 static const struct au_mic_write au_mic_writes[] = {
@@ -484,7 +489,48 @@ static inline void au_mic_down(struct au_mic *m)
 	m->r[AU_MIC_R_DID] = m->did;
 }
 
-/* Steps 2 to 7, stopping at the first that fails, and the way down. Touches nothing at all unless the votes and the clock are held. */
+/*
+ * For a capture: the codec's first data port, ADC1 on its first channel, 1 bit per sample, an interval of 2, as sheng's; the master's port m->port on m->lane; TX decimator 0 from SWR_MIC,
+ * 48 kHz, 150 Hz high-pass, clocked and muted. Numbers: sheng's micStream(), with the channel, port and lane of research_notes/mic-research.md. Each read back is reported; the bus's complaints stop it.
+ */
+static inline bool au_mic_ports(struct au_mic *m)
+{
+	const uint64_t master = AU_MIC_SWR + 0x1124u + 0x100u * (m->port - 1u);
+	bool ok = true;
+	uint32_t v = 0, st;
+
+	for (uint32_t bank = 0; bank <= 0x10u && ok; bank += 0x10u)
+		ok = au_mic_codec_write(m, 0x122u + bank, 1u) && au_mic_codec_write(m, 0x123u + bank, 0u) && au_mic_codec_write(m, 0x124u + bank, 0u) &&
+		     au_mic_codec_write(m, 0x125u + bank, 0u) && au_mic_codec_write(m, 0x126u + bank, 0xffu) && au_mic_codec_write(m, 0x128u + bank, m->lane);
+	ok = ok && au_mic_codec_write(m, 0x102u, 0u) && au_mic_codec_write(m, 0x103u, 0u) && au_mic_codec_write(m, 0x105u, 1u);
+	for (uint32_t bank = 0; bank <= 0x10u && ok; bank += 0x10u) ok = au_mic_codec_write(m, 0x120u + bank, 1u);
+	if (!ok) return au_mic_fail(m, 8, m->faults != 0u ? AU_MIC_WHY_ABORT : AU_MIC_WHY_WRITE);
+	for (uint32_t bank = 0; bank < 2u; bank++) {
+		au_mic_wr(m, master + 0x40u * bank, 1u | m->lane << 24);
+		au_mic_wr(m, master + 4u + 0x40u * bank, 1u);
+		au_mic_wr(m, master + 0x10u + 0x40u * bank, 0xf0u);
+	}
+	au_mic_wr(m, master + 8u, 0u);
+	au_mic_set(m, AU_MIC_TX + 0x100u, 0xfu, m->mic);
+	au_mic_set(m, AU_MIC_TX + 0x104u, 3u, 1u);
+	au_mic_set(m, AU_MIC_TX + 0x404u, 1u << 7 | 3u << 5 | 3u << 1, 2u << 5);
+	au_mic_set(m, AU_MIC_TX + 0x400u, 0x3fu, 4u | 0x10u);
+	au_mic_set(m, AU_MIC_TX + 0x400u, 0u, 0x20u);
+	if (au_mic_codec_read(m, 0x128u, &v)) m->r[AU_MIC_R_PORTS] = v;
+	if (au_mic_codec_read(m, 0x120u, &v)) m->r[AU_MIC_R_PORTS + 1] = v;
+	m->r[AU_MIC_R_PORTS + 2] = au_mic_rd(m, master, 0);
+	m->r[AU_MIC_R_PORTS + 3] = au_mic_rd(m, master + 4u, 0);
+	m->r[AU_MIC_R_PORTS + 4] = au_mic_rd(m, master + 0x10u, 0);
+	m->r[AU_MIC_R_PORTS + 5] = au_mic_rd(m, AU_MIC_TX + 0x100u, 0);
+	m->r[AU_MIC_R_PORTS + 6] = au_mic_rd(m, AU_MIC_TX + 0x104u, 0);
+	m->r[AU_MIC_R_PORTS + 7] = au_mic_rd(m, AU_MIC_TX + 0x404u, 0);
+	m->r[AU_MIC_R_PORTS + 8] = au_mic_rd(m, AU_MIC_TX + 0x400u, 0);
+	st = au_mic_rd(m, AU_MIC_SWR + 0x5000u, 0);
+	if (m->faults != 0u) return au_mic_fail(m, 8, AU_MIC_WHY_ABORT);
+	return (st & (1u << 3 | 1u << 7)) != 0u ? au_mic_fail(m, 8, AU_MIC_WHY_BUS) : true;
+}
+
+/* Steps 2 to 7, stopping at the first that fails, and the way down: unless a capture is to follow, which comes down by au_mic_down() when it is over. Touches nothing at all unless the votes and the clock are held. */
 static inline void au_mic_run(struct au_mic *m)
 {
 	if (!m->votes_held || !m->clock_held) { au_mic_fail(m, 1, AU_MIC_WHY_VOTES); return; }
@@ -505,8 +551,15 @@ static inline void au_mic_run(struct au_mic *m)
 			}
 		}
 	}
+	if (m->capture && m->r[AU_MIC_R_PASSED] == 7u && au_mic_ports(m)) { m->held = true; return; }
 	au_mic_down(m);
 }
+
+/* The list with a capture: the clock's tries, the graph as sheng's, the stage after the twelfth, the graph's way down, and letting go of the clock. `ring` is the map's address with its stream. */
+#define AU_MIC_CAP_STEPS 18u
+#define AU_MIC_CAP_RUN 12u
+#define AU_MIC_CAP_RELEASE 17u
+static inline uint32_t au_mic_release_step(const struct au_mic *m) { return m->capture ? AU_MIC_CAP_RELEASE : AU_MIC_TRIES; }
 
 /* The list on the PRM: its packets, as au_tone_build(), from the PRM's own port; `m` as for au_gl_graph_send(). 19.2 MHz with attribute 1, couple no, is what the macros ask. Nothing past the end. */
 static inline uint32_t au_mic_build(uint32_t step, uint32_t *m, uint32_t capacity)
@@ -518,6 +571,32 @@ static inline uint32_t au_mic_build(uint32_t step, uint32_t *m, uint32_t capacit
 	if (step < AU_MIC_TRIES) return fuxi_ar_prm_clock_attr(out, capacity, 2, t, AU_MIC_CLOCK, tries[step].hz, tries[step].attribute);
 	if (step == AU_MIC_TRIES) return fuxi_ar_prm_clock_attr(out, capacity, 2, t, AU_MIC_CLOCK, 0, 1);
 	return 0;
+}
+
+static inline uint32_t au_mic_cap_build(uint32_t step, uint32_t *m, uint32_t capacity, const FuxiArFormat *f, uint64_t ring, uint32_t ring_bytes, uint32_t handle)
+{
+	uint8_t *out = (uint8_t *)(m + 2);
+	uint32_t t = AU_GL_GRAPH_TOKEN + step;
+
+	switch (step) {
+	case 0: case 1: case 2: return au_mic_build(step, m, capacity);
+	case 3: return fuxi_ar_open_mic_device(out, capacity, 1, t);
+	case 4: return fuxi_ar_config_mic_device(out, capacity, 1, t, f, 1u);
+	case 5: return fuxi_ar_open_capture_stream(out, capacity, 1, t);
+	case 6: return fuxi_ar_config_capture_stream(out, capacity, 1, t, f);
+	case 7: return fuxi_ar_map(out, capacity, 1, t, ring, ring_bytes);
+	case 8: return fuxi_ar_graph_command(out, capacity, 1, t, FUXI_AR_OP_GRAPH_PREPARE, FUXI_AR_SG_MIC);
+	case 9: return fuxi_ar_graph_command(out, capacity, 1, t, FUXI_AR_OP_GRAPH_PREPARE, FUXI_AR_SG_CAPTURE);
+	case 10: return fuxi_ar_graph_command(out, capacity, 1, t, FUXI_AR_OP_GRAPH_START, FUXI_AR_SG_MIC);
+	case 11: return fuxi_ar_graph_command(out, capacity, 1, t, FUXI_AR_OP_GRAPH_START, FUXI_AR_SG_CAPTURE);
+	case 12: return fuxi_ar_graph_command(out, capacity, 1, t, FUXI_AR_OP_GRAPH_STOP, FUXI_AR_SG_CAPTURE);
+	case 13: return fuxi_ar_graph_command(out, capacity, 1, t, FUXI_AR_OP_GRAPH_STOP, FUXI_AR_SG_MIC);
+	case 14: return fuxi_ar_graph_command(out, capacity, 1, t, FUXI_AR_OP_GRAPH_CLOSE, FUXI_AR_SG_CAPTURE);
+	case 15: return fuxi_ar_graph_command(out, capacity, 1, t, FUXI_AR_OP_GRAPH_CLOSE, FUXI_AR_SG_MIC);
+	case 16: return fuxi_ar_unmap(out, capacity, 1, t, handle);
+	case AU_MIC_CAP_RELEASE: return fuxi_ar_prm_clock_attr(out, capacity, 2, t, AU_MIC_CLOCK, 0, 1);
+	default: return 0;
+	}
 }
 
 /*
@@ -534,7 +613,7 @@ static inline bool au_mic_turn(struct au_gl *g, struct au_mic *m)
 		if (g->prm_status[0] == 0u && g->prm_status[1] == 0u) return false;
 		au_mic_fail(m, 1, AU_MIC_WHY_VOTES);
 		m->over = true;
-		g->graph_sent = AU_MIC_STEPS;
+		g->graph_sent = au_mic_release_step(m) + 1u;
 		return false;
 	}
 	last = g->graph_sent - 1u;
@@ -545,7 +624,7 @@ static inline bool au_mic_turn(struct au_gl *g, struct au_mic *m)
 		if (g->ms - m->asked_ms < 5000u) return true;
 		au_mic_fail(m, 1, AU_MIC_WHY_NO_ANSWER);
 		m->over = true;
-		g->graph_sent = AU_MIC_TRIES;    /* it may yet have taken it: let go */
+		g->graph_sent = au_mic_release_step(m);    /* it may yet have taken it: let go */
 		return false;
 	}
 	m->asked = false;
@@ -553,7 +632,7 @@ static inline bool au_mic_turn(struct au_gl *g, struct au_mic *m)
 		if (last + 1u < AU_MIC_TRIES) return false;
 		au_mic_fail(m, 1, AU_MIC_WHY_REFUSED);
 		m->over = true;
-		g->graph_sent = AU_MIC_STEPS;
+		g->graph_sent = au_mic_release_step(m) + 1u;
 		return false;
 	}
 	m->r[AU_MIC_R_TAKEN] = last + 1u;
@@ -561,7 +640,7 @@ static inline bool au_mic_turn(struct au_gl *g, struct au_mic *m)
 	m->clock_held = true;
 	au_mic_run(m);
 	m->over = true;
-	g->graph_sent = AU_MIC_TRIES;
+	g->graph_sent = m->held ? AU_MIC_TRIES : au_mic_release_step(m);
 	return false;
 }
 
