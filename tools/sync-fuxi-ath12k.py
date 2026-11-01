@@ -17,6 +17,7 @@ PATCH_0099 = ROOT / 'xnu/patches/0099-fuxi-wlan.patch'
 PATCH_0117 = ROOT / 'xnu/patches/0117-fuxi-ath12k.patch'
 NEW_FILES = (('xnu/fuxi-ath12k/os/fuxi_ath12k_os.c', 'bsd/dev/fuxi_ath12k_os.c'),
              ('xnu/fuxi-ath12k/os/fuxi_ath12k_ios.c', 'bsd/dev/fuxi_ath12k_ios.c'),
+             ('xnu/fuxi-ath12k/os/fuxi_aks_wrap.h', 'iokit/Kernel/arm/fuxi_aks_wrap.h'),
              ('xnu/fuxi-ath12k/src/fa_xnu.h', 'bsd/dev/fa_xnu.h'),
              ('xnu/fuxi-ath12k/compat/include/lx_os.h', 'bsd/dev/fa_lx_os.h'))
 CONF = '''--- a/bsd/conf/files
@@ -216,13 +217,121 @@ def stack_watch():
                                         fromfile='a/iokit/Kernel/arm/FuxiNetworkStack.cpp', tofile='b/iokit/Kernel/arm/FuxiNetworkStack.cpp'))
 
 
+# The keychain's writes, as a change to what patches 0038, 0043 and 0055 leave: other kernels' inputs stay as they are.
+KEYSTORE = 'iokit/Kernel/arm/SweetKeyStore.cpp'
+KEYSTORE_INCLUDE_FIND = """#include <sys/proc.h>
+"""
+KEYSTORE_INCLUDE = """#include <sys/proc.h>
+#include "fuxi_aks_wrap.h"
+"""
+KEYSTORE_HELPER_FIND = """IOReturn
+AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+"""
+KEYSTORE_HELPER = """/*
+ * Selectors 10 and 11: scalars in are the bag's handle and the key's class, the key comes in as a structure. No hardware
+ * protects it: see fuxi_aks_wrap.h. Sizes are checked here and logged by the caller; the key itself never is.
+ */
+static IOReturn
+sweet_aks_crypt(IOExternalMethodArguments *args, bool wrap)
+{
+	uint8_t in[FUXI_AKS_WRAPPED_MOST], out[FUXI_AKS_WRAPPED_MOST];
+	uint32_t in_size = args->structureInputDescriptor != NULL ?
+	    (uint32_t)args->structureInputDescriptor->getLength() : args->structureInputSize;
+	uint32_t room = sweet_aks_struct_out_size(args);
+	uint32_t key_class, length;
+	IOReturn ret;
+
+	if (args->scalarInputCount < 2 || in_size == 0 || in_size > sizeof(in)) {
+		return kIOReturnBadArgument;
+	}
+	if (args->structureInputDescriptor != NULL) {
+		if (args->structureInputDescriptor->readBytes(0, in, in_size) != in_size) {
+			return kIOReturnBadArgument;
+		}
+	} else {
+		if (args->structureInput == NULL) {
+			return kIOReturnBadArgument;
+		}
+		memcpy(in, args->structureInput, in_size);
+	}
+	key_class = (uint32_t)args->scalarInput[1];
+	room = room < sizeof(out) ? room : (uint32_t)sizeof(out);
+	length = wrap ? fuxi_aks_wrap(in, in_size, key_class, out, room) : fuxi_aks_unwrap(in, in_size, key_class, out, room);
+	if (length == 0) {
+		ret = kIOReturnBadArgument;
+	} else {
+		ret = sweet_aks_struct_out(args, out, length);
+	}
+	if (wrap && ret == kIOReturnSuccess && args->scalarOutputCount >= 1) {
+		args->scalarOutput[0] = key_class;
+		args->scalarOutputCount = 1;
+	} else {
+		args->scalarOutputCount = 0;
+	}
+	bzero(in, sizeof(in));
+	bzero(out, sizeof(out));
+	return ret;
+}
+
+"""
+KEYSTORE_CASE_FIND = """	case kAKSGetDeviceState:
+	case kAKSGetExtDeviceState:
+		args->scalarOutputCount = 0;
+		ret = sweet_aks_device_state(args);
+		break;
+"""
+KEYSTORE_CASE = """	case kAKSWrapKey:
+		ret = sweet_aks_crypt(args, true);
+		break;
+	case kAKSUnwrapKey:
+		ret = sweet_aks_crypt(args, false);
+		break;
+""" + KEYSTORE_CASE_FIND
+
+
+def keystore_base():
+    """SweetKeyStore.cpp as patches 0038, 0043 and 0055 leave it."""
+    lines = None
+    for name in ('0038-sweet-applekeystore.patch', '0043-sweet-console-crash-log.patch', '0055-sweet-aks-ext-state-sampler-depth.patch'):
+        patch = (PATCH_0117.parent / name).read_text(errors='surrogateescape').splitlines(True)
+        at = next(i for i, line in enumerate(patch) if line.rstrip('\n') == '+++ b/' + KEYSTORE) + 1
+        hunks = []
+        while at < len(patch) and patch[at].startswith('@@'):
+            at += 1
+            body = []
+            while at < len(patch) and patch[at][:1] in (' ', '+', '-') and not patch[at].startswith(('--- ', '+++ ')):
+                body.append(patch[at])
+                at += 1
+            hunks.append(body)
+        if lines is None:
+            assert len(hunks) == 1
+            lines = [line[1:] for line in hunks[0]]
+            continue
+        cursor = 0
+        for body in hunks:
+            old = [line[1:] for line in body if line[0] in ' -']
+            new = [line[1:] for line in body if line[0] in ' +']
+            found = next(i for i in range(cursor, len(lines) - len(old) + 1) if lines[i:i + len(old)] == old)
+            lines[found:found + len(old)] = new
+            cursor = found + len(new)
+    return ''.join(lines)
+
+
+def keystore():
+    before = keystore_base()
+    for find in (KEYSTORE_INCLUDE_FIND, KEYSTORE_HELPER_FIND, KEYSTORE_CASE_FIND):
+        assert before.count(find) == 1, find
+    after = before.replace(KEYSTORE_INCLUDE_FIND, KEYSTORE_INCLUDE).replace(KEYSTORE_HELPER_FIND, KEYSTORE_HELPER + KEYSTORE_HELPER_FIND).replace(KEYSTORE_CASE_FIND, KEYSTORE_CASE)
+    return ''.join(difflib.unified_diff(before.splitlines(True), after.splitlines(True), fromfile='a/' + KEYSTORE, tofile='b/' + KEYSTORE))
+
+
 def new_file(source, dest):
     return ''.join(difflib.unified_diff([], (ROOT / source).read_text().splitlines(True),
                                         fromfile='/dev/null', tofile='b/' + dest))
 
 
 def expected_0117():
-    return CONF + MAKEINC + ''.join(new_file(*pair) for pair in NEW_FILES) + ios_selection() + stack_watch()
+    return CONF + MAKEINC + ''.join(new_file(*pair) for pair in NEW_FILES) + ios_selection() + stack_watch() + keystore()
 
 
 def expected_0099():

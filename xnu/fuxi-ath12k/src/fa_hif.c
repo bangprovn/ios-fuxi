@@ -614,6 +614,18 @@ fa_stage_up(struct ath12k_base *ab)
 	return (true);
 }
 
+/* tools/ath12k-edits.json, ath12k-peer-map-log. Numbers only, on the poll thread, and not under the driver's lock. */
+void
+fa_peer_mapped(u32 vdev, u32 peer_id, u32 ast_hash, u32 hw_peer_id)
+{
+	static unsigned said;			/* (one poll thread) */
+
+	if (FA_STAGE_USES_RF(hif.stage) && said < 64) {
+		said++;
+		lx_tell("FUXI ATH12K: peer map: vdev %u id %u ast hash %u hw %u\n", vdev, peer_id, ast_hash, hw_peer_id);
+	}
+}
+
 /* tools/ath12k-edits.json, ath12k-wmi-event-log. Nothing else shows how far a silent firmware got. */
 void
 fa_wmi_event(u32 id, u32 length)

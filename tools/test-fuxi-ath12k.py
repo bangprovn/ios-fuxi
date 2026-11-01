@@ -3336,6 +3336,100 @@ def load_test_is_stage_7s_alone(tmp):
 
 
 
+FA_AKS_HOST = r"""
+#include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "fuxi_aks_wrap.h"
+/* In memory of exactly its size, each way, so that the sanitizer sees a step past the end. */
+static unsigned wrap(const unsigned char *k, unsigned n, unsigned c, unsigned char **out, unsigned room) {
+    unsigned char *in = malloc(n ? n : 1); memcpy(in, k, n);
+    *out = malloc(room ? room : 1);
+    unsigned r = fuxi_aks_wrap(in, n, c, *out, room);
+    free(in);
+    return r;
+}
+static unsigned unwrap(const unsigned char *w, unsigned n, unsigned c, unsigned char **out, unsigned room) {
+    unsigned char *in = malloc(n ? n : 1); memcpy(in, w, n);
+    *out = malloc(room ? room : 1);
+    unsigned r = fuxi_aks_unwrap(in, n, c, *out, room);
+    free(in);
+    return r;
+}
+int main(void) {
+    unsigned char key[FUXI_AKS_KEY_MOST + 1], *w, *k;
+    for (unsigned i = 0; i < sizeof(key); i++) key[i] = (unsigned char)(i * 7 + 3);
+    /* What securityd asks: 32 bytes in, room for 40, the class back. Layout by hand. */
+    unsigned n = wrap(key, 32, 6, &w, 40);
+    assert(n == 40 && !memcmp(w, "FXAK", 4) && w[4] == 6 && w[5] == 0 && w[6] == 0 && w[7] == 0);
+    assert(w[8] == (key[0] ^ 0x5a) && w[9] == (unsigned char)(key[1] ^ (0x5a ^ 0x1f)));
+    assert(memcmp(w + 8, key, 32) != 0);
+    unsigned r = unwrap(w, 40, 6, &k, 32);
+    assert(r == 32 && !memcmp(k, key, 32));
+    free(k);
+    /* Another class is refused, and so is a class that differs only high up; too little room; a changed mark. */
+    assert(unwrap(w, 40, 7, &k, 32) == 0); free(k);
+    assert(unwrap(w, 40, 6 | 1u << 24, &k, 32) == 0); free(k);
+    assert(unwrap(w, 40, 6, &k, 31) == 0); free(k);
+    w[0] ^= 1; assert(unwrap(w, 40, 6, &k, 32) == 0); free(k); w[0] ^= 1;
+    /* Every length that is too short: never a key of no size, no read past the end. */
+    for (unsigned i = 0; i <= 8; i++) { assert(unwrap(w, i, 6, &k, 32) == 0); free(k); }
+    free(w);
+    /* Every size that may be wrapped comes back, GSSCred's 64 too; each class. */
+    for (unsigned size = 1; size <= FUXI_AKS_KEY_MOST; size++) {
+        unsigned c = size * 0x01010101u;
+        assert(wrap(key, size, c, &w, size + 8) == size + 8);
+        assert(unwrap(w, size + 8, c, &k, size) == size && !memcmp(k, key, size));
+        free(k); free(w);
+        assert(wrap(key, size, c, &w, size + 7) == 0); free(w);
+    }
+    assert(wrap(key, 0, 1, &w, 64) == 0); free(w);
+    assert(wrap(key, FUXI_AKS_KEY_MOST + 1, 1, &w, FUXI_AKS_WRAPPED_MOST + 8) == 0); free(w);
+    /* Over the limit on the way back as well. */
+    unsigned char big[FUXI_AKS_WRAPPED_MOST + 1] = "FXAK";
+    assert(unwrap(big, sizeof(big), 0, &k, sizeof(big)) == 0); free(k);
+    puts("fuxi_aks_wrap: layout, round trip at every size, refusals");
+    return 0;
+}
+"""
+
+
+@check
+def keychain_wrap_round_trip_and_refusals(tmp):
+    """os/fuxi_aks_wrap.h under the sanitizers, and it says what it is not. In patch 0117 alone."""
+    own = ROOT / 'xnu/fuxi-ath12k/os'
+    (tmp / 'aks.c').write_text(FA_AKS_HOST)
+    cc = os.environ.get('CC', 'cc')
+    program = tmp / 'aks'
+    subprocess.run([cc, '-std=gnu11', '-Wall', '-Wextra', '-g', '-O1', '-fsanitize=address,undefined', '-fno-sanitize-recover=all', f'-I{own}',
+                    str(tmp / 'aks.c'), '-o', str(program)], check=True)
+    subprocess.run([str(program)], check=True)
+    assert 'NOT ENCRYPTION' in (own / 'fuxi_aks_wrap.h').read_text()
+    for patch in sorted((ROOT / 'xnu/patches').glob('*.patch')):
+        if patch.name != '0117-fuxi-ath12k.patch':
+            assert 'sweet_aks_crypt' not in patch.read_text(errors='surrogateescape'), patch.name
+    patch = (ROOT / 'xnu/patches/0117-fuxi-ath12k.patch').read_text()
+    hunk = patch[patch.index('--- a/iokit/Kernel/arm/SweetKeyStore.cpp'):]
+    assert '+\tcase kAKSWrapKey:' in hunk and '+\tcase kAKSUnwrapKey:' in hunk and '+#include "fuxi_aks_wrap.h"' in hunk
+    added = '\n'.join(line[1:] for line in hunk.splitlines() if line.startswith('+') and not line.startswith('+++'))
+    assert 'IOLog' not in added and 'bzero(out' in added and 'bzero(in' in added
+
+
+@check
+def peer_id_zero_is_a_peer(tmp):
+    """w-ios5: the lookups that refused id 0, and the line that shows what the firmware gave. Numbers only."""
+    edits = {e['id']: e for e in json.loads((ROOT / 'tools/ath12k-edits.json').read_text())['edits']}
+    assert '!peer_id' in edits['ath12k-peer-id-zero']['find'] and '!peer_id' not in edits['ath12k-peer-id-zero']['replace']
+    assert 'ATH12K_DP_PEER_ID_INVALID' in edits['ath12k-peer-id-zero']['replace']
+    assert 'if (rxcb->peer_id)' in edits['ath12k-rx-peer-id-zero']['find'] and 'if (' not in edits['ath12k-rx-peer-id-zero']['replace']
+    log = edits['ath12k-peer-map-log']['replace']
+    assert log.index('fa_peer_mapped(') < log.index('spin_lock_bh') and 'mac_addr)' in log and 'mac_addr, ' not in log[:log.index('spin_lock_bh')]
+    text = (ROOT / 'xnu/fuxi-ath12k/src/fa_hif.c').read_text()
+    body = text[text.index('fa_peer_mapped(u32 vdev'):]
+    assert 'said < 64' in body[:body.index('\n}\n')] and 'mac' not in body[:body.index('\n}\n')].lower()
+
+
 FA_BSS_DRIVER = r"""
 #include <assert.h>
 #include <stdbool.h>

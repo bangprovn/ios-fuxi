@@ -400,6 +400,30 @@
       "file": "wifi7/dp_rx.c",
       "find": "\t\tath12k_warn(dp->ab, \"msdu_done bit in msdu_end is not set\\n\");\n",
       "replace": "\t\tfa_rx_msdu_not_done();\n\t\tath12k_warn(dp->ab, \"msdu_done bit in msdu_end is not set\\n\");\n"
+    },
+    {
+      "id": "ath12k-peer-id-zero",
+      "why": "w-ios5: every TX completion said peer id 0, and RX found no peer, so frames counted as dropped and unciphered. This lookup answers NULL for id 0 although the table holds whatever the map event gave it. A slot with no peer still answers NULL.",
+      "tree": "ath12k",
+      "file": "dp_peer.c",
+      "find": "\tif (!peer_id || peer_id >= ATH12K_DP_PEER_ID_INVALID)\n\t\treturn NULL;\n\n\tindex = ath12k_dp_peer_get_peerid_index(dp, peer_id);\n",
+      "replace": "\tif (peer_id >= ATH12K_DP_PEER_ID_INVALID)\n\t\treturn NULL;\n\n\tindex = ath12k_dp_peer_get_peerid_index(dp, peer_id);\n"
+    },
+    {
+      "id": "ath12k-rx-peer-id-zero",
+      "why": "The same for id 0 on the way that falls back to the address, which the native Wi-Fi path does not have.",
+      "tree": "ath12k",
+      "file": "dp_rx.c",
+      "find": "\tif (rxcb->peer_id)\n\t\tpeer = ath12k_dp_link_peer_find_by_peerid(dp_pdev, rxcb->peer_id);\n",
+      "replace": "\tpeer = ath12k_dp_link_peer_find_by_peerid(dp_pdev, rxcb->peer_id);\n"
+    },
+    {
+      "id": "ath12k-peer-map-log",
+      "why": "What the firmware gave each peer, which the logs could not show: w-ios5 is only inferred to have been given id 0.",
+      "tree": "ath12k",
+      "file": "dp_peer.c",
+      "find": "\tstruct ath12k *ar;\n\n\tspin_lock_bh(&dp->dp_lock);\n\tpeer = ath12k_dp_link_peer_find_by_vdev_and_addr(dp, vdev_id, mac_addr);\n",
+      "replace": "\tstruct ath12k *ar;\n\n\tfa_peer_mapped(vdev_id, peer_id, ast_hash, hw_peer_id);\n\tspin_lock_bh(&dp->dp_lock);\n\tpeer = ath12k_dp_link_peer_find_by_vdev_and_addr(dp, vdev_id, mac_addr);\n"
     }
   ]
 }

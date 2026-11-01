@@ -26,7 +26,7 @@ GCC = ['vote52010', 'm_ahb', 's_ahb', 'core', 'core2x', 's0_cbcr', 's0_rcg_cmd',
 SCM_Q = ['init_image', 'mem_setup', 'auth_reset', 'shutdown', 'is_supported']
 STEPS = {1: 'prechecks', 2: 'dtb init/load', 3: 'AOSS load_state', 4: 'LCX/LMX votes',
          5: 'dtb auth_and_reset', 6: 'adsp init/load', 7: 'adsp auth_and_reset',
-         8: 'wait smp2p ready', 9: 'handover', 10: 'done'}
+         8: 'wait smp2p ready', 9: 'handover', 10: 'done', 11: 'outbound item 429'}
 ERR = {0x100: 'firmware not staged', 0x1ff: 'ADSP already ready', 0x101: 'not ELF32 LE',
        0x102: 'bad phdr table', 0x103: 'bad header segment', 0x104: 'segment beyond staged bytes',
        0x105: 'filesz > memsz', 0x106: 'no load/hash or metadata too big',
@@ -36,7 +36,8 @@ ERR = {0x100: 'firmware not staged', 0x1ff: 'ADSP already ready', 0x101: 'not EL
        0x124: 'QMP channel ack timeout', 0x125: 'QMP message pending', 0x126: 'QMP message not consumed',
        0x130: 'RSC DRV id/cfg', 0x131: 'LCX vote', 0x132: 'LMX vote', 0x140: 'dtb auth_and_reset',
        0x150: 'adsp auth_and_reset', 0x160: 'ready timeout (shutdown issued)',
-       0x161: 'ADSP fatal bit (shutdown issued)', 1: 'OK'}
+       0x161: 'ADSP fatal bit (shutdown issued)', 0x170: 'TCSR mutex 3 not taken', 0x171: 'no AP-ADSP partition',
+       0x172: 'no room for item 429', 1: 'OK'}
 
 
 def on(cbcr):
@@ -131,6 +132,10 @@ def decode_boot(r):
     out.append(f'  auth dtb x0={r[6]:#x} x1={r[7]:#x}  auth adsp x0={r[8]:#x} x1={r[9]:#x}')
     out.append(f'  wait: bits {ready_text(r[10])} after {r[11]} ms; shutdown x0={r[12]:#x} x1={r[13]:#x}')
     out.append(f'  handover bits {ready_text(r[14])}')
+    if r[64]:
+        out.append(f'  options {r[64]:#x}: outbound 429 @{r[67]:#x} was there {r[66]}; free_uncached {r[65]:#x} -> {r[68]:#x}; '
+                   f'rang first {r[69]}, on the DSP item at loop {r[70]}')
+        out += decode_smp2p(r[72:104], 'inbound 443 before the shutdown')
     return '\n'.join(out)
 
 
@@ -165,7 +170,10 @@ def fnv(data):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('cmd', choices=['snapshot', 'squash', 'upload', 'boot', 'report', 'decode'])
+    ap.add_argument('cmd', choices=['snapshot', 'squash', 'upload', 'boot', 'report', 'decode', 'stop'])
+    ap.add_argument('--outbound', action='store_true', help='boot: create the AP outbound SMP2P item 429 first')
+    ap.add_argument('--doorbell', action='store_true', help='boot: with --outbound, also ring LPASS SMP2P')
+    ap.add_argument('--wait', type=int, default=0, help='boot: seconds to wait for ready, at most 45')
     ap.add_argument('args', nargs='*')
     ap.add_argument('--groups', default='0,1,2,3')
     ap.add_argument('--dtb', type=Path)
@@ -230,7 +238,17 @@ def main():
             if got_len != len(data) or got_hash != want:
                 raise SystemExit('staging mismatch')
     elif a.cmd == 'boot':
-        show(req(0x4142))
+        if a.outbound or a.doorbell or a.wait:
+            if a.doorbell and not a.outbound:
+                ap.error('--doorbell needs --outbound')
+            if not 0 <= a.wait <= 45:
+                ap.error('--wait is at most 45')
+            show(req(0x4158, int(a.outbound) | int(a.doorbell) << 1 | a.wait << 8))
+        else:
+            show(req(0x4142))
+    elif a.cmd == 'stop':
+        x0, x1 = struct.unpack('<2I', req(0x415a, 0, 8))
+        print(f'pas shutdown x0={x0:#x} x1={x1:#x}')
     elif a.cmd == 'report':
         show(req(0x4152))
     return 0

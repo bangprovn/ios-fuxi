@@ -8,6 +8,10 @@
  *  IN  0x5a 'AU' (0x4155): firmware staging status.
  *  IN  0x5a 'AB' (0x4142): stage 2, boot the ADSP from staged firmware (once).
  *  IN  0x5a 'AR' (0x4152): re-read the stage-2 report without running it.
+ *  IN  0x5a 'AX' (0x4158) wIndex: stage 2 with options, and only then: bit 0 creates the AP's outbound SMP2P item 429
+ *      with entry master-kernel before anything starts, bit 1 also rings LPASS's SMP2P doorbell, bits 15:8 are the
+ *      seconds to wait for ready (0 is the usual 5, at most 45). 'AB' is what it always was.
+ *  IN  0x5a 'AZ' (0x415a): PAS shutdown of the ADSP, after a stage 2 that reached ready. Nothing else.
  *  OUT 0x5b wValue=chunk[15:0], wIndex[11:0]=chunk[27:16], wIndex bit15 =
  *      image (0 adsp_dtb, 1 adsp), bit14 = restart that image at chunk 0.
  *      Sequential 512-byte chunks of a squashed (single-file) MBN; a short
@@ -24,6 +28,8 @@
 #define AU_IPCC     0x00408000ULL  /* qcom,ipcc@408000; AOSS mbox = client 0 signal 0 */
 #define AU_SMEM     0x81d00000ULL  /* smem_region@81d00000 */
 #define AU_SMEM_SZ  0x00200000u
+#define AU_MUTEX    0x01f43000ULL  /* tcsr_mutex@1f40000, lock 3 is SMEM's, stride 0x1000 (Linux, sheng) */
+#define AU_IPCC_SMP2P ((3u << 16) | 2u) /* client LPASS, signal SMP2P (sm8550.dtsi) */
 #define AU_DTB_PA   0x9e980000ULL  /* q6_adsp_dtb_region, 0x80000, no-map */
 #define AU_DTB_SZ   0x00080000u
 #define AU_FW_PA    0x9ea00000ULL  /* adspslpi_region, 0x4680000, no-map */
@@ -423,6 +429,66 @@ static uint32_t au_vote(uint32_t lcx, uint32_t lmx, uint32_t *d)
  d[1] = rh_send(0, AU_LMX_ADDR, lmx);
  return d[1] ? 0x132 : 0;
 }
+/*
+ * Options of 'AX'. Each processor makes its own outgoing item: Linux smp2p.c does at probe, before the DSP starts, and
+ * sheng's AdspProbe.cpp does it with a comment that the DSP looks for it at boot. a-adsp showed the DSP's item 443 appear
+ * with no slave-kernel entry, and 429 never existed. That this is what the DSP waits for is an inference; this finds out.
+ */
+static uint32_t au_opts, au_wait_s = 5;
+static bool au_smem_lock(void)
+{
+ for (unsigned i = 0; i < 10000; i++) {
+  au_wr(AU_MUTEX, 1);
+  if (au_rd(AU_MUTEX) == 1) return true;
+  delay(10);
+ }
+ return false;
+}
+/* Linux qcom_smem_alloc_private(): a zeroed uncached item at the free offset, then the offset moves. Under the lock. */
+static uint64_t au_smem_new(const struct au_part *p, unsigned item, uint32_t size)
+{
+ uint32_t rounded = (size + 7) & ~7u, room = 16 + rounded;
+ uint32_t free_unc = au_rd(p->pa + 12), free_cached = au_rd(p->pa + 16);
+ if (free_unc > free_cached || free_cached - free_unc < room) return 0;
+ uint64_t e = p->pa + free_unc, data = e + 16;
+ for (uint32_t i = 0; i < rounded; i += 4) au_wr(data + i, 0);
+ au_wr(e, 0xa5a5u | item << 16);
+ au_wr(e + 4, rounded);
+ au_wr(e + 8, rounded - size);    /* padding_data; padding_hdr 0 */
+ au_wr(e + 12, 0);
+ au_wr(p->pa + 12, free_unc + room);
+ return data;
+}
+/* Linux qcom_smp2p_alloc_outbound_item(): the version last, once the rest is there. Then one entry, as sheng adds. */
+static uint32_t au_outbound(uint32_t *d)
+{
+ struct au_part p;
+ d[0] = au_opts;
+ if (!au_smem_part(0, 2, &p, 0)) return 0x171;
+ d[1] = au_rd(p.pa + 12);
+ if (!au_smem_lock()) return 0x170;
+ uint32_t sz = 0;
+ uint64_t it = au_smem_item(&p, 429, &sz);
+ d[2] = it ? 1 : 0;               /* it was there already: an earlier owner's */
+ if (!it) it = au_smem_new(&p, 429, 20 + 16 * 20);
+ au_wr(AU_MUTEX, 0);
+ if (!it) return 0x172;
+ d[3] = (uint32_t)it;
+ d[4] = au_rd(p.pa + 12);
+ if (d[2]) return 0;
+ au_wr(it, 0x504d5324);           /* "$SMP" */
+ au_wr(it + 8, 0u | 2u << 16);    /* local pid 0, remote pid 2 */
+ au_wr(it + 12, 16u);             /* total entries; valid 0 */
+ au_wr(it + 16, 0);               /* flags */
+ au_wr(it + 4, 1u << 8);          /* features: SSR ack; version still 0 */
+ au_wr(it + 4, 1u | 1u << 8);     /* version 1 */
+ static const uint32_t name[4] = {0x7473616d, 0x6b2d7265, 0x656e7265, 0x0000006c}; /* "master-kernel" */
+ for (unsigned i = 0; i < 4; i++) au_wr(it + 20 + 4 * i, name[i]);
+ au_wr(it + 36, 0);
+ au_wr(it + 12, 16u | 1u << 16);  /* valid 1 */
+ if (au_opts & 2) { au_wr(AU_IPCC + 0xc, AU_IPCC_SMP2P); d[5] = 1; }
+ return 0;
+}
 static uint32_t au_boot_run(uint32_t *r)
 {
  uint64_t x0, x1;
@@ -434,6 +500,11 @@ static uint32_t au_boot_run(uint32_t *r)
  r[4] = au_ready_bits();
  if (!(r[4] & 0xf0000000u) && (r[4] & 2)) return 0x1ff; /* already running */
  if (au_faults) return 0x113;
+ if (au_opts & 1) {
+  r[3] = 11; /* the AP's outbound item, before anything starts */
+  uint32_t out = au_outbound(r + 64);
+  if (out) return out;
+ }
  r[3] = 2; /* dtb init_image / mem_setup / load (adsp_load) */
  uint32_t err = au_pas_load(r + 16, &dtb, AU_PAS_DTB, AU_DTB_PA, AU_DTB_SZ, AU_META);
  if (err) return err;
@@ -458,13 +529,20 @@ static uint32_t au_boot_run(uint32_t *r)
  r[3] = 8; /* qcom_q6v5_wait_for_start: 5 s */
  uint64_t t0 = rsr("cntpct_el0"), hz = rsr("cntfrq_el0");
  uint32_t bits = 0;
- for (unsigned i = 0; i < 50000; i++) {
+ bool rang = false;
+ for (unsigned i = 0; i < 10000 * au_wait_s; i++) {
   bits = au_ready_bits();
   if (!(bits & 0xf0000000u) && (bits & 3)) break;
-  if (rsr("cntpct_el0") - t0 > 5 * hz) break;
+  if (rsr("cntpct_el0") - t0 > au_wait_s * hz) break;
+  /* The DSP's item has appeared: Linux's interrupt handler would negotiate and kick here. */
+  if ((au_opts & 2) && !rang && bits == 0x10000000u) { au_wr(AU_IPCC + 0xc, AU_IPCC_SMP2P); rang = true; r[70] = i; }
   delay(100);
  }
  r[10] = bits; r[11] = (uint32_t)((rsr("cntpct_el0") - t0) * 1000 / hz);
+ if (au_opts) {           /* what the DSP had said, before a shutdown changes it */
+  struct au_part p; uint64_t in;
+  if (au_smem_part(0, 2, &p, 0) && (in = au_smem_item(&p, 443, 0)) != 0) au_smp2p(r + 72, in);
+ }
  if ((bits & 0xf0000000u) || !(bits & 2) || (bits & 1)) {
   x0 = au_scm(AU_SMC(6), 1, AU_PAS_ADSP, 0, 0, &x1); /* Linux: shutdown on timeout */
   r[12] = (uint32_t)x0; r[13] = (uint32_t)x1;
@@ -497,5 +575,17 @@ static uint32_t audio_request(uint16_t value, uint16_t index, uint8_t *out)
   memcpy(out, au_boot, sizeof(au_boot)); return sizeof(au_boot);
  }
  if (value == 0x4152 && au_boot[0]) { memcpy(out, au_boot, sizeof(au_boot)); return sizeof(au_boot); }
+ if (value == 0x4158 && !monitor_report[MON_LAUNCH]) {
+  unsigned wait = index >> 8;
+  au_opts = index & 3;
+  au_wait_s = wait == 0 ? 5 : wait > 45 ? 45 : wait;
+  au_boot_stage();
+  memcpy(out, au_boot, sizeof(au_boot)); return sizeof(au_boot);
+ }
+ if (value == 0x415a && !monitor_report[MON_LAUNCH] && au_boot[1] == 1) {
+  uint64_t x1, x0 = au_scm(AU_SMC(6), 1, AU_PAS_ADSP, 0, 0, &x1);
+  uint32_t r[2] = {(uint32_t)x0, (uint32_t)x1};
+  memcpy(out, r, sizeof(r)); return sizeof(r);
+ }
  return 0;
 }
