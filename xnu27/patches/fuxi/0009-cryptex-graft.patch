@@ -1,0 +1,348 @@
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index b62aa0c..50c8060 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1026,6 +1026,11 @@ bsd_init(void)
+ 	}
+ #endif /* DEVFS */
+ 
++#if defined(FUXI) && APFS
++	/* fuxi_root27_cryptex=1: SystemOS/AppOS cryptexes and the dyld cache directory (needs /dev) */
++	fuxi_root27_graft();
++#endif
++
+ #if CONFIG_BASESYSTEMROOT
+ #if CONFIG_IMAGEBOOT
+ 	if (bsdmgroot_bootable()) {
+diff --git a/bsd/miscfs/apfs/apfs_vfsops.c b/bsd/miscfs/apfs/apfs_vfsops.c
+index 5c9ed2e..fe626b6 100644
+--- a/bsd/miscfs/apfs/apfs_vfsops.c
++++ b/bsd/miscfs/apfs/apfs_vfsops.c
+@@ -653,6 +653,22 @@ apfs_synth_find(struct apfs_mount *am, uint64_t parent, const char *name, size_t
+  * PATH=TARGET: at PATH, another name for the directory TARGET of the same volume.  Root
+  * only; nothing ever takes one away again but unmounting.
+  */
++#if defined(FUXI)
++/* The sysctl's work, also called by fuxi_root27_graft(); path is MAXPATHLEN bytes and is changed. */
++static int
++apfs_synthetic_make(char *path)
++{
++	char name[APFS_SYNTH_NAMELEN], *target;
++	vnode_t dvp = NULLVP, vp = NULLVP, tvp = NULLVP;
++	struct apfs_mount *am;
++	struct apfs_node *dn;
++	uint64_t target_id = 0;
++	const char *slash;
++	size_t len;
++	int error;
++
++	target = strchr(path, '=');
++#else
+ static int
+ apfs_sysctl_synthetic SYSCTL_HANDLER_ARGS
+ {
+@@ -681,6 +697,7 @@ apfs_sysctl_synthetic SYSCTL_HANDLER_ARGS
+ 	}
+ 	path[req->newlen] = '\0';
+ 	target = strchr(path, '=');
++#endif
+ 	if (target != NULL) {
+ 		*target++ = '\0';
+ 		error = vnode_lookup(target, 0, &tvp, vfs_context_current());
+@@ -774,6 +791,32 @@ out:
+ 	return error;
+ }
+ 
++#if defined(FUXI)
++static int
++apfs_sysctl_synthetic SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char path[MAXPATHLEN];
++	int error;
++
++	if (req->newptr == USER_ADDR_NULL) {
++		return SYSCTL_OUT(req, "", 1);          /* reading it says nothing */
++	}
++	if ((error = suser(kauth_cred_get(), NULL)) != 0) {
++		return error;
++	}
++	if (req->newlen == 0 || req->newlen >= sizeof(path)) {
++		return EINVAL;
++	}
++	error = SYSCTL_IN(req, path, req->newlen);
++	if (error) {
++		return error;
++	}
++	path[req->newlen] = '\0';
++	return apfs_synthetic_make(path);
++}
++#endif
++
+ SYSCTL_PROC(_kern, OID_AUTO, apfs_synthetic, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED,
+     NULL, 0, apfs_sysctl_synthetic, "A",
+     "write PATH: an empty synthetic directory on an APFS volume (a mount point)");
+@@ -1226,6 +1269,10 @@ apfs_mountroot(mount_t mp, vnode_t devvp, vfs_context_t ctx)
+  * filesystem marked VFC_VFSLOCALARGS -- see the note in vfs_conf.c for why this one is
+  * not -- so it is looked up and opened here, and closed again in apfs_unmount().
+  */
++#if defined(FUXI)
++static int apfs_unmount(mount_t mp, int mntflags, vfs_context_t ctx);
++#endif
++
+ static int
+ apfs_mount(mount_t mp, vnode_t devvp, user_addr_t data, vfs_context_t ctx)
+ {
+@@ -1235,6 +1282,9 @@ apfs_mount(mount_t mp, vnode_t devvp, user_addr_t data, vfs_context_t ctx)
+ 	uint32_t container = 0;
+ 	int volume = -1;
+ 	int error;
++#if defined(FUXI)
++	const char *sub = NULL;
++#endif
+ 
+ 	if (vfs_isupdate(mp)) {
+ 		/* nothing about a mounted volume can change, least of all to read-write */
+@@ -1270,6 +1320,12 @@ apfs_mount(mount_t mp, vnode_t devvp, user_addr_t data, vfs_context_t ctx)
+ 				container = (uint32_t)strtoul(opt + 3, NULL, 10);
+ 			} else if (strncmp(opt + 1, "v=", 2) == 0) {
+ 				volume = (int)strtoul(opt + 3, NULL, 10);
++#if defined(FUXI)
++			} else if (strncmp(opt + 1, "sub=", 4) == 0) {
++				/* sub=DIR: the mount's root is that directory of the volume (last option) */
++				sub = opt + 5;
++				next = NULL;
++#endif
+ 			} else {
+ 				error = EINVAL;
+ 			}
+@@ -1301,6 +1357,26 @@ apfs_mount(mount_t mp, vnode_t devvp, user_addr_t data, vfs_context_t ctx)
+ 			 * mounted; apfs_unmount() closes and drops it.
+ 			 */
+ 			error = apfs_mount_common(mp, vp, ctx, container, volume);
++#if defined(FUXI)
++			if (error == 0 && sub != NULL) {
++				struct apfs_mount *am = APFS_MP(mp);
++				uint64_t id = 0;
++				uint8_t dt = 0;
++
++				apfs_lock(am);
++				error = apfs_path_lookup(&am->am_vol, sub, &id, &dt);
++				apfs_unlock(am);
++				if (error == 0 && dt != APFS_DT_DIR) {
++					error = ENOTDIR;
++				}
++				if (error == 0) {
++					am->am_root_id = id;
++				} else {
++					printf("apfs: sub=%s: %d\n", sub, error);
++					(void)apfs_unmount(mp, MNT_FORCE, ctx);     /* not yet owning vp: closed below */
++				}
++			}
++#endif
+ 			if (error == 0) {
+ 				APFS_MP(mp)->am_owns_devvp = true;
+ 				APFS_MP(mp)->am_shares_devvp = shared;
+@@ -1469,3 +1545,82 @@ struct vfsops apfs_vfsops = {
+ 	.vfs_vget = apfs_vget,
+ 	.vfs_init = apfs_init,
+ };
++
++#if defined(FUXI)
++/*
++ * Boot-arg fuxi_root27_cryptex=1: the IPSW OS volume keeps the dyld shared cache in the
++ * SystemOS cryptex (and Safari's pieces in AppOS), which libignition grafts on a real boot.
++ * With ignition skipped (dyld_flags=8) the kernel mounts them before launchd: SystemOS at
++ * /private/preboot/Cryptexes/OS (where /System/Cryptexes/OS points), AppOS at .../App, and the
++ * cache directory of SystemOS once more at /System/Library/Caches/com.apple.dyld, the only
++ * place dyld looks without ignition. Mount points are synthetic directories of the root.
++ */
++extern int fuxi_root27_bsdname(const char *window, char *out, size_t len, uint32_t timeout_ms);
++
++static int
++fuxi_graft_dir(char *buf, const char *path)
++{
++	int error;
++
++	strlcpy(buf, path, MAXPATHLEN);
++	error = apfs_synthetic_make(buf);
++	return error == EEXIST ? 0 : error;
++}
++
++static int
++fuxi_graft_one(const char *window, const char *sub, const char *at, mount_t *mpp)
++{
++	char dev[32] = "";
++	char *buf = kalloc_data(MAXPATHLEN, Z_WAITOK | Z_ZERO);
++	vnode_t vp = NULLVP;
++	int error;
++
++	if (buf == NULL) {
++		return ENOMEM;
++	}
++	error = fuxi_root27_bsdname(window, dev, sizeof(dev), 10000);
++	if (error == 0) {
++		error = fuxi_graft_dir(buf, at);
++	}
++	if (error == 0) {
++		snprintf(buf, MAXPATHLEN, "/dev/%s%s%s", dev, sub != NULL ? ",sub=" : "", sub != NULL ? sub : "");
++		error = kernel_mount("apfs", NULLVP, NULLVP, at, buf, strlen(buf) + 1, MNT_RDONLY,
++		    KERNEL_MOUNT_NOAUTH, vfs_context_kernel());
++	}
++	if (error == 0 && (error = vnode_lookup(at, 0, &vp, vfs_context_kernel())) == 0) {
++		*mpp = vnode_mount(vp);
++		vnode_put(vp);
++	}
++	printf("fuxi: cryptex %s (%s%s%s) at %s: %d\n", window, dev, sub != NULL ? " " : "",
++	    sub != NULL ? sub : "", at, error);
++	kfree_data(buf, MAXPATHLEN);
++	return error;
++}
++
++void
++fuxi_root27_graft(void)
++{
++	char *buf;
++	uint32_t on = 0;
++
++	if (!PE_parse_boot_argn("fuxi_root27_cryptex", &on, sizeof(on)) || on != 1) {
++		return;
++	}
++	if (rootvnode == NULLVP || strcmp(vfs_statfs(vnode_mount(rootvnode))->f_fstypename, "apfs") != 0) {
++		printf("fuxi: cryptex graft needs the built-in APFS as root\n");
++		return;
++	}
++	buf = kalloc_data(MAXPATHLEN, Z_WAITOK | Z_ZERO);
++	if (buf == NULL || fuxi_graft_dir(buf, "/private/preboot/Cryptexes") != 0) {
++		printf("fuxi: cannot make /private/preboot/Cryptexes\n");
++	} else {
++		(void)fuxi_graft_one("SystemOS", NULL, "/private/preboot/Cryptexes/OS", &fuxi_root27_cryptex_mp[0]);
++		(void)fuxi_graft_one("SystemOS", "/System/Library/Caches/com.apple.dyld",
++		    "/System/Library/Caches/com.apple.dyld", &fuxi_root27_cryptex_mp[1]);
++		(void)fuxi_graft_one("AppOS", NULL, "/private/preboot/Cryptexes/App", &fuxi_root27_cryptex_mp[2]);
++	}
++	if (buf != NULL) {
++		kfree_data(buf, MAXPATHLEN);
++	}
++}
++#endif /* FUXI */
+diff --git a/bsd/sys/mount_internal.h b/bsd/sys/mount_internal.h
+index 21456ac..f580c17 100644
+--- a/bsd/sys/mount_internal.h
++++ b/bsd/sys/mount_internal.h
+@@ -500,6 +500,12 @@ void mount_iterreset(mount_t);
+  * mounting credentials, as the mount(2) system call does.
+  */
+ int kernel_mount(const char *, vnode_t, vnode_t, const char *, void *, size_t, int, uint32_t, vfs_context_t);
++#if defined(FUXI)
++/* The cryptex mounts fuxi_root27_graft() made (built-in APFS); vm_unix.c lets the shared cache come from them. */
++#define FUXI_ROOT27_CRYPTEX_MOUNTS 3
++extern mount_t fuxi_root27_cryptex_mp[FUXI_ROOT27_CRYPTEX_MOUNTS];
++void fuxi_root27_graft(void);
++#endif
+ 
+ /* Throttled I/O API.  KPI/SPI is in systm.h. */
+ 
+diff --git a/bsd/vm/vm_unix.c b/bsd/vm/vm_unix.c
+index 963c750..0f66d0a 100644
+--- a/bsd/vm/vm_unix.c
++++ b/bsd/vm/vm_unix.c
+@@ -66,6 +66,9 @@
+ #include <sys/file.h>
+ #include <sys/vnode_internal.h>
+ #include <sys/mount.h>
++#if defined(FUXI)
++#include <sys/mount_internal.h>
++#endif
+ #include <sys/xattr.h>
+ #include <sys/trace.h>
+ #include <sys/kernel.h>
+@@ -768,6 +771,10 @@ static char *scdir_path[] = {
+ 
+ #else /* XNU_TARGET_OS_OSX */
+ 
++#if defined(FUXI)
++mount_t fuxi_root27_cryptex_mp[FUXI_ROOT27_CRYPTEX_MOUNTS];
++#endif
++
+ static int scdir_enforce = 0;
+ static char *scdir_path[] = {
+ 	"/System/Library/Caches/com.apple.dyld/",
+@@ -1716,7 +1723,18 @@ after_root_check:
+ 		 * is either on the root volume or in the preboot cryptex volume.
+ 		 */
+ 		assert(rdir_vp != NULL);
++#if defined(FUXI)
++		/* the kernel's own cryptex mounts (fuxi_root27_graft) count as the preboot volume */
++		bool fuxi_cryptex = false;
++		for (int fi = 0; fi < FUXI_ROOT27_CRYPTEX_MOUNTS; fi++) {
++			if (fuxi_root27_cryptex_mp[fi] != NULL && srfmp->vp->v_mount == fuxi_root27_cryptex_mp[fi]) {
++				fuxi_cryptex = true;
++			}
++		}
++		if (!fuxi_cryptex && srfmp->vp->v_mount != rdir_vp->v_mount) {
++#else
+ 		if (srfmp->vp->v_mount != rdir_vp->v_mount) {
++#endif
+ 			vnode_t preboot_vp = NULL;
+ #if XNU_TARGET_OS_OSX
+ #define PREBOOT_CRYPTEX_PATH "/System/Volumes/Preboot/Cryptexes"
+diff --git a/iokit/Kernel/arm/FuxiRoot27.cpp b/iokit/Kernel/arm/FuxiRoot27.cpp
+index 242dd87..84db622 100644
+--- a/iokit/Kernel/arm/FuxiRoot27.cpp
++++ b/iokit/Kernel/arm/FuxiRoot27.cpp
+@@ -36,6 +36,7 @@
+ #include <libkern/crypto/sha2.h>
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
++#include <sys/errno.h>
+ #include "fuxi_root27.h"
+ #include "fuxi_storage_abi.h"
+ 
+@@ -670,6 +671,46 @@ fuxi_root27_thread(void *, wait_result_t)
+ 	meta->releaseMetaClass();
+ }
+ 
++/*
++ * The BSD name ("diskNsM") of a window's partition, for fuxi_root27_graft() in the built-in
++ * APFS: matched on the UUID publish() gave it, waiting up to timeout_ms for the media and
++ * for its BSD client to name it. 0 or an errno.
++ */
++extern "C" int
++fuxi_root27_bsdname(const char *window, char *out, size_t len, uint32_t timeout_ms)
++{
++	char uuid[37];
++	unsigned i;
++	for (i = 0; i < fr.nwin && strncmp(fr.win[i].name, window, sizeof(fr.win[i].name)); i++) {
++	}
++	if (i == fr.nwin) {
++		return ENOENT;
++	}
++	fx27_window_uuid(fr.win[i].sha256, uuid);
++	const OSSymbol *key = OSSymbol::withCString(kIOMediaUUIDKey);
++	OSString *value = OSString::withCString(uuid);
++	OSDictionary *match = IOService::serviceMatching("IOMedia");
++	IOService *media = NULL;
++	int error = ENOMEM;
++	if (key && value && match && IOService::propertyMatching(key, value, match)) {
++		media = IOService::waitForMatchingService(match, (uint64_t)timeout_ms * kMillisecondScale);
++		error = ETIMEDOUT;
++	}
++	for (uint32_t t = 0; media && t <= timeout_ms; t += 10) {
++		OSString *name = OSDynamicCast(OSString, media->getProperty("BSD Name"));
++		if (name) {
++			error = strlcpy(out, name->getCStringNoCopy(), len) < len ? 0 : ENAMETOOLONG;
++			break;
++		}
++		IOSleep(10);
++	}
++	OSSafeReleaseNULL(media);
++	OSSafeReleaseNULL(match);
++	OSSafeReleaseNULL(value);
++	OSSafeReleaseNULL(key);
++	return error;
++}
++
+ void
+ fuxi_root27_start(void)
+ {

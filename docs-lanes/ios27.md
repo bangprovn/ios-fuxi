@@ -346,6 +346,29 @@ restore's `SystemVolume` IM4P; never committed) in `/chosen system-volume-auth-b
 carry. Fallback if APFS keeps refusing `mountroot`: mount the OS volume as an ordinary read-only mount and
 `vfs_switch_root` into it, as `imageboot_pivot_image` does.
 
+**Boot K5a (OBSERVED):** the built-in apfs mounts the OS volume as root (`BSD root: disk0s1`, volume 0
+`Rave24A446.D421D431OS`, 226505 files), root authentication is skipped, and `/sbin/launchd` pages in and runs
+(`apfs: pagein asks for 32768 bytes at a time`). dyld then stops at `Library not loaded: /usr/lib/libSystem.B.dylib
+... (no such file, no dyld cache)` and pid 1 exits. The UPL abort of boots L/M is gone.
+
+### Cryptex graft (fuxi/0009)
+
+dyld-1378 `CacheFinder`: with ignition skipped (`dyld_flags=8`) and no `DYLD_SHARED_CACHE_DIR`, dyld opens only
+`/System/Library/Caches/com.apple.dyld/` on the root. On iOS 27 that directory exists only in the SystemOS cryptex;
+the OS volume has `/System/Cryptexes/OS -> ../../private/preboot/Cryptexes/OS` and an empty `/private/preboot`.
+`fuxi/0009-cryptex-graft.patch` (boot-arg `fuxi_root27_cryptex=1`, DEVELOPMENT with the built-in apfs) makes the
+kernel do the graft right after devfs is mounted:
+
+- synthetic directories (dada's `kern.apfs_synthetic`, now callable from the kernel) for the mount points;
+- SystemOS at `/private/preboot/Cryptexes/OS`, AppOS at `/private/preboot/Cryptexes/App`;
+- SystemOS once more at `/System/Library/Caches/com.apple.dyld` with the new apfs mount option `sub=DIR` (the
+  mount's root is that directory of the volume);
+- the window's BSD name comes from `fuxi_root27_bsdname()` (FuxiRoot27 matches the partition IOMedia by its UUID);
+- `vm_unix.c` accepts shared cache files from these mounts, as it does for the preboot volume (iOS has no CSR, so
+  without this only the root and `/private/preboot/Cryptexes` mounts qualify; `scdir_enforce` is 0 on iOS).
+
+Each mount logs `fuxi: cryptex WINDOW (diskN...) at PATH: ERR`.
+
 Out of scope for K4a, next: the Data volume (writable, `/private/var`), the SystemOS/AppOS cryptex grafts (union with
 the OS volume), the sealed-volume root snapshot (`root-snapshot-name`/ APFS seal checks), launchd changes, and a
 writable path (extent-guarded WRITE(10) as on the 8796 lane).

@@ -61,10 +61,17 @@ def layout():
     listed = series()
     files = sorted(p.relative_to(X27 / 'patches').as_posix() for p in (X27 / 'patches').rglob('*.patch'))
     assert sorted(listed) == files and len(set(listed)) == len(listed), 'series and patches/ differ'
-    assert listed[-8:] == ['fuxi/0001-machine-config.patch', 'fuxi/0002-builtin-crypto.patch',
+    assert listed[-9:] == ['fuxi/0001-machine-config.patch', 'fuxi/0002-builtin-crypto.patch',
                            'fuxi/0003-console.patch', 'fuxi/0004-components.patch', 'fuxi/0005-crypto-kext-handoff.patch',
                            'fuxi/0006-log-ring-fileset.patch', 'fuxi/0007-root27-storage.patch',
-                           'fuxi/0008-dada-apfs.patch']
+                           'fuxi/0008-dada-apfs.patch', 'fuxi/0009-cryptex-graft.patch']
+    # 0009: the kernel grafts the SystemOS/AppOS cryptexes and the dyld cache directory when ignition is skipped.
+    graft = (X27 / 'patches/fuxi/0009-cryptex-graft.patch').read_text()
+    for need in ('+fuxi_root27_graft(void)', 'PE_parse_boot_argn("fuxi_root27_cryptex"', '"/private/preboot/Cryptexes/OS"',
+                 '"/System/Library/Caches/com.apple.dyld"', '+fuxi_root27_bsdname(const char *window',
+                 '+#if defined(FUXI) && APFS\n+\t/* fuxi_root27_cryptex=1', 'strncmp(opt + 1, "sub=", 4)',
+                 '+mount_t fuxi_root27_cryptex_mp[FUXI_ROOT27_CRYPTEX_MOUNTS];'):
+        assert need in graft, need
     # 0008: hakios-dada's APFS and ramfs; the HakiOS-only hooks are behind FUXI, and the options are DEVELOPMENT only.
     dada = (X27 / 'patches/fuxi/0008-dada-apfs.patch').read_text()
     assert '+#if !defined(FUXI)\n+#include <sys/redwood_input.h>' in dada and '+\t\tam->am_nx.cheap_requests = false;' in dada
