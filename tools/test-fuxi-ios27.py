@@ -61,9 +61,15 @@ def layout():
     listed = series()
     files = sorted(p.relative_to(X27 / 'patches').as_posix() for p in (X27 / 'patches').rglob('*.patch'))
     assert sorted(listed) == files and len(set(listed)) == len(listed), 'series and patches/ differ'
-    assert listed[-7:] == ['fuxi/0001-machine-config.patch', 'fuxi/0002-builtin-crypto.patch',
+    assert listed[-8:] == ['fuxi/0001-machine-config.patch', 'fuxi/0002-builtin-crypto.patch',
                            'fuxi/0003-console.patch', 'fuxi/0004-components.patch', 'fuxi/0005-crypto-kext-handoff.patch',
-                           'fuxi/0006-log-ring-fileset.patch', 'fuxi/0007-root27-storage.patch']
+                           'fuxi/0006-log-ring-fileset.patch', 'fuxi/0007-root27-storage.patch',
+                           'fuxi/0008-dada-apfs.patch']
+    # 0008: hakios-dada's APFS and ramfs; the HakiOS-only hooks are behind FUXI, and the options are DEVELOPMENT only.
+    dada = (X27 / 'patches/fuxi/0008-dada-apfs.patch').read_text()
+    assert '+#if !defined(FUXI)\n+#include <sys/redwood_input.h>' in dada and '+\t\tam->am_nx.cheap_requests = false;' in dada
+    assert '[ FILESYS_BASE fdesc config_union_mounts mockfs apfs ramfs ]' in dada
+    assert 'GPL-2.0+ OR MIT (taken here under MIT)' in dada and 'Copyright 2016 Eric Biggers' in dada
     assert listed[0] == 'unixnu/bcm2837-machine-config.patch' and len([p for p in listed if p.startswith('unixnu/')]) == 51
     for bad in ('source-corecrypto14-bootstrap', 'zzz-boot-progress', 'offline-', 'zzw', 'zzy'):
         assert not any(bad in p for p in listed), bad

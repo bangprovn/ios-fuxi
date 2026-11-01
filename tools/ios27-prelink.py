@@ -16,7 +16,8 @@ default: AMFI, AppleImage4, sandbox, corecrypto, apfs and their families need
 the platform kexts they link against, and their dependency closure pulls most of
 them in anyway). --drop-soc removes the nine SoC hardware roots (ApplePMGR,
 scaler, AV/HDCP/CEC, IIS, audio, clocking); no trouble from keeping them has
-been shown yet. AMFI's original policy initializer runs before lockdown through
+been shown yet. --drop-apfs leaves out Apple's APFS kext when the kernel's own
+apfs (xnu27 fuxi/0008, from hakios-arm64e-dada) mounts the root. AMFI's original policy initializer runs before lockdown through
 native-security-init (--early-security-init, the profile's address).
 
 Outputs in DIR (refused if kernel.prelinked exists, unless --force):
@@ -425,6 +426,8 @@ def main():
     ap.add_argument('--reference', type=Path, help='symbol-bearing RELEASE comparison kernel (mach.release.fuxi.unstripped)')
     ap.add_argument('--root', action='append', help='replace the profile roots (repeat)')
     ap.add_argument('--drop-soc', action='store_true', help='leave out the nine SoC hardware roots')
+    ap.add_argument('--drop-apfs', action='store_true',
+                    help="leave out Apple's APFS kext (the kernel's own apfs, xnu27 fuxi/0008, mounts the root)")
     ap.add_argument('--early-security-init', action='append', metavar='BUNDLE=ORIGINAL_VA',
                     help=f'default: {EARLY_SECURITY_INIT} (24A446 j820 only)')
     ap.add_argument('--allow-missing', action='store_true',
@@ -441,6 +444,8 @@ def main():
     roots = list(a.root or ROOTS)
     if a.drop_soc:
         roots = [r for r in roots if r not in SOC_ROOTS]
+    if a.drop_apfs:
+        roots = [r for r in roots if r != 'com.apple.filesystems.apfs']
     initializers = parse_initializers(a.early_security_init or [EARLY_SECURITY_INIT])
     out = a.out
     output = out / 'kernel.prelinked'

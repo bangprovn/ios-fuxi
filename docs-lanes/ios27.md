@@ -319,6 +319,16 @@ an unrelated address. `tools/ios27-prelink-pairs.json` now pairs it with `_kerne
 | L | + `fuxi_root27_norootauth=1` | root kept; `load_init_program` reaches `/sbin/launchd`; kernel data abort in `upl_page_present(pl, 0x7fff)` called from APFS (two-entry page list, 0x8000-byte range) |
 | M | + `PAGE_SHIFT_CONST` pair (APFS's last unbound kernel data reference) | same abort, same registers |
 
+### K5: the kernel's own APFS (hakios-arm64e-dada)
+
+Apple's APFS kext reads `/sbin/launchd` through a kernel UPL interface it was not built against (boots L, M).
+`xnu27/patches/fuxi/0008-dada-apfs.patch` builds hakios-arm64e-dada's read-only APFS and its ramfs into the
+DEVELOPMENT kernel instead (the `apfs` and `ramfs` options; RELEASE, the prelink reference, is unchanged). The
+prelink then runs with `--drop-apfs`, and `/chosen` root-matching names the OS window's partition IOMedia
+(`mkadt-fuxi27.py --root-uuid` with the UUID FuxiRoot27 logs for window `OS`), which the built-in apfs mounts as a
+container: its first volume with a root directory, or `apfs_root_c`/`apfs_root_v`. `fuxi_root27_norootauth=1` stays,
+since this apfs has no root hash to check.
+
 Boot G makes the refusal a global APFS gate: it does not depend on the device, the volume or the DT root
 properties. `ios27-prelink.py` now writes `targets.json` (every kernel reference of each root kext with the native
 symbol and the match method) to audit what APFS calls; 427 of APFS's 856 kernel references are bound by

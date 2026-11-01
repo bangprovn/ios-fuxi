@@ -118,3 +118,15 @@ IOStorage and IOMedia class declarations (virtual method order, names and
 argument types only, no code) from Apple's IOStorageFamily-337.100.1
 IOStorage.h and IOMedia.h (https://github.com/apple-oss-distributions/IOStorageFamily,
 APSL 2.0) and keeps their APSL header; nothing from Apple binaries is in it.
+
+patches/fuxi/0008-dada-apfs.patch adds bsd/miscfs/apfs/ (a read-only APFS
+filesystem) and bsd/miscfs/ramfs/ramfs.c (a filesystem in memory) from
+hakios-arm64e-dada, https://github.com/superboyyy/hakios-arm64e-dada, commit
+f1ae906 (kernel/xnu-12377.121.6-dada.patch, APSL 2.0, built on HakiOS,
+https://github.com/oosexgang/hakios-xnu-kernel), with their vfs_conf.c
+registration. The files are unchanged except FUXI-gated stand-ins for the
+HakiOS-only redwood devices, the kern.redwood_memory sysctl and the per-thread
+run clocks. Inside it, bsd/miscfs/apfs/libdeflate/ is libdeflate (MIT, Eric
+Biggers and Google LLC; COPYING kept) and bsd/miscfs/apfs/libzbitmap/ with
+apfs_zbitmap.c is libzbitmap (GPL-2.0+ OR MIT, Corellium LLC), taken under MIT
+as in hakios-arm64e-dada.
