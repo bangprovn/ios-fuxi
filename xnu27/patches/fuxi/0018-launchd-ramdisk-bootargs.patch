@@ -1,0 +1,26 @@
+diff --git a/bsd/kern/kern_sysctl.c b/bsd/kern/kern_sysctl.c
+index 94a949b..9ae8a44 100644
+--- a/bsd/kern/kern_sysctl.c
++++ b/bsd/kern/kern_sysctl.c
+@@ -2361,6 +2361,21 @@ sysctl_sysctl_bootargs
+ 	char buf[BOOT_LINE_LENGTH];
+ 
+ 	strlcpy(buf, PE_boot_args(), BOOT_LINE_LENGTH);
++#if defined(FUXI)
++	{
++		/*
++		 * fuxi_launchd_ramdisk=1: user space is told the boot-args of a RAM disk boot. launchd
++		 * reads rd=md0 here and leaves out the boot tasks of a real device (fsck of the boot
++		 * container, mount phases, data protection) that cannot succeed without Apple's APFS and
++		 * SEP. The kernel itself never sees rd=, so the root still comes from fuxi_root27.
++		 */
++		uint32_t ramdisk = 0;
++
++		if (PE_parse_boot_argn("fuxi_launchd_ramdisk", &ramdisk, sizeof(ramdisk)) && ramdisk) {
++			strlcat(buf, " rd=md0", BOOT_LINE_LENGTH);
++		}
++	}
++#endif
+ 	error = sysctl_io_string(req, buf, BOOT_LINE_LENGTH, 0, NULL);
+ 	return error;
+ }

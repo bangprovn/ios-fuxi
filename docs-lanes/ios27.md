@@ -396,6 +396,14 @@ is 0 without paravirtualized PAC, and the slide code signs only when `jop_key !=
 `fuxi/0017-native-pac-default-jop-pid.patch` returns 1 under `HAS_NATIVE_PAC`. The kernel and every process share
 one key set there, so the value selects nothing. It only has to be nonzero.
 
+K5j: launchd runs ("hello, launchd", ondemand mode) and starts its boot tasks. They are compiled into launchd's
+embedded plist, not launchd.plist, and `fsck`, `mount-phase-1/2`, `fips`, `data-protection` and others are
+`RequireSuccess`. `fsck -qL` fails: "failed to get boot device" (libAPFS `APFSContainerGetBootDevice`; dada's apfs
+has none of Apple's APFS IOKit objects). launchd panics on that. `os_env_type` does not help, because the lookup
+comes first. launchd leaves out a real device's boot tasks when the boot-args contain `rd=md0` (as hakios-dada
+boots). `fuxi/0018-launchd-ramdisk-bootargs.patch`: with `fuxi_launchd_ramdisk=1`, the `kern.bootargs` sysctl
+appends ` rd=md0`. The kernel's own boot-arg parsing never sees it, so the root still comes from `fuxi_root27`.
+
 Out of scope for K4a, next: the Data volume (writable, `/private/var`), the SystemOS/AppOS cryptex grafts (union with
 the OS volume), the sealed-volume root snapshot (`root-snapshot-name`/ APFS seal checks), launchd changes, and a
 writable path (extent-guarded WRITE(10) as on the 8796 lane).
