@@ -25,6 +25,8 @@
  *      their OTP boot. Writes nothing to them. Their reset lines and the I2C pins go back as they were. Returns the report.
  *  IN  0x5a 'AO' (0x414f) wIndex 0x4231 or, with the amplifier's own monitors coming back, 0x4232, once, after a stage 2 that reached ready, because the owner said so: the
  *      first tone (au_tone_stage()). Returns the summary as 'AG' does. 'AJ' (0x414a): what it said of itself. 'AV' (0x4156) wIndex: page of 512 bytes of what came back.
+ *  IN  0x5a 'AC' (0x4143) wIndex 0x4d31, once, after a stage 2 that reached ready: the mic as far as the codec answering, with its bias and ADC1 on and read back, between the votes
+ *      and the TX core clock, all let go at the end (au_mic.h). No capture graph, no amplifier, no apps_smmu. Returns the summary as 'AG' does. 'AE' (0x4145): its report.
  *  IN  0x5a 'AH' (0x4148) wIndex: page of the log. 'AI' (0x4149): what the last list's steps answered.
  *  IN  0x5a 'AH' (0x4148) wIndex=page: its log, 128 words a page.
  *  OUT 0x5b wValue=chunk[15:0], wIndex[11:0]=chunk[27:16], wIndex bit15 =
@@ -666,6 +668,23 @@ static uint32_t au_tone_build(uint32_t step, uint32_t *m, uint32_t capacity, uin
  }
 }
 static uint32_t au_tone_stage(struct au_gl *g, uint32_t *q, uint64_t t0, uint64_t hz);
+/* ---- the mic, to proof step 7 (au_mic.h). Everything of LPASS by the safe accessors: a raw write the hypervisor refused reset this phone three times. ---- */
+static uint32_t wl_cmddb_addr(const char *name);
+/* The RSC checked as au_vote() does, then TCS 0 as every lane's rh_send() here. */
+static uint32_t au_mic_rpmh(uint32_t addr, uint32_t data)
+{
+ uint32_t id = usb_rd(RH_DRV_PA, 0), cfg = usb_rd(RH_DRV_PA, 0xc);
+ if (((id >> 16) & 0xff) != 3 || ((cfg >> 12) & 0x3f) < 3) return 0x130;
+ return rh_send(0, addr, data);
+}
+#define AU_MIC_RD(pa, f) probe_safe_rd32((pa), (f))
+#define AU_MIC_WR(pa, v) probe_safe_wr32((pa), (v))
+#define AU_MIC_DELAY_US(us) delay(us)
+#define AU_MIC_CMDDB(name) wl_cmddb_addr(name)
+#define AU_MIC_RPMH(addr, data) au_mic_rpmh((addr), (data))
+#include "au_mic.h"
+static struct au_mic au_mic_state;
+static uint32_t au_mic_rep[128];
 #define AU_GL_RECORDS 96u
 #define AU_GL_LOG_WORDS (AU_GL_RECORDS * AU_GL_REC_WORDS)
 static uint32_t au_gl_rep[128], au_gl_rep2[128], au_gl_rep3[128], au_gl_log[AU_GL_LOG_WORDS];
@@ -753,7 +772,7 @@ static uint32_t au_glink_run(uint32_t *r, unsigned seconds, uint32_t options)
  uint32_t bits = 0, next_ask = 2000, graph_until = 0, writes_until = 0, second_old[2] = {0, 0};
  int second_slot = -1;
  bool tone_done = false;
- g.graph_steps = (options & AU_GL_TONE) != 0 ? (au_tone_vi ? AU_TONE_VI_STEPS : AU_TONE_STEPS) : (options & AU_GL_PLAY) != 0 ? AU_PLAY_STEPS : AU_GRAPH_STEPS;
+ g.graph_steps = (options & AU_GL_MIC) != 0 ? AU_MIC_STEPS : (options & AU_GL_TONE) != 0 ? (au_tone_vi ? AU_TONE_VI_STEPS : AU_TONE_STEPS) : (options & AU_GL_PLAY) != 0 ? AU_PLAY_STEPS : AU_GRAPH_STEPS;
  if ((options & AU_GL_TONE) != 0) {
   au_format.channels = 4;
   au_tdm.slot_mask = 0xf;
@@ -796,8 +815,9 @@ static uint32_t au_glink_run(uint32_t *r, unsigned seconds, uint32_t options)
    else if ((options & AU_GL_GRAPH) != 0 && g.prm_sent == 2 && g.graph_sent < g.graph_steps && g.ms < graph_until) {
     /* Each packet into the long buffer; if the DSP gives none, on to the votes coming off. */
     static uint32_t m[2 + AU_GL_GPR_BUFFER / 4 + 2];
-    const bool play = (options & AU_GL_PLAY) != 0, tone = (options & AU_GL_TONE) != 0;
-    if (tone && g.graph_sent == (au_tone_vi ? AU_TONE_VI_WRITES_AFTER : AU_TONE_WRITES_AFTER) && !tone_done) {
+    const bool play = (options & AU_GL_PLAY) != 0, tone = (options & AU_GL_TONE) != 0, mic = (options & AU_GL_MIC) != 0;
+    if (mic && au_mic_turn(&g, &au_mic_state)) next_ask = g.ms + 20;
+    else if (tone && g.graph_sent == (au_tone_vi ? AU_TONE_VI_WRITES_AFTER : AU_TONE_WRITES_AFTER) && !tone_done) {
      tone_done = true;
      au_gl_rep3[72] = g.map_handle != 0 ? au_tone_stage(&g, au_gl_rep3, t0, hz) : 0x400;
      next_ask = g.ms + 20;
@@ -813,13 +833,13 @@ static uint32_t au_glink_run(uint32_t *r, unsigned seconds, uint32_t options)
     }
     else if (!g.big_have) { (void)au_gl_big_ask(&g); next_ask = g.ms + 100; }
     else {
-     uint32_t bytes = tone ? au_tone_build(g.graph_sent, m, AU_GL_GPR_BUFFER, g.map_handle) :
+     uint32_t bytes = mic ? au_mic_build(g.graph_sent, m, AU_GL_GPR_BUFFER) : tone ? au_tone_build(g.graph_sent, m, AU_GL_GPR_BUFFER, g.map_handle) :
                       play ? au_play_build(g.graph_sent, AU_GL_GRAPH_TOKEN + g.graph_sent, m, AU_GL_GPR_BUFFER, g.map_handle) : au_graph_build(g.graph_sent, m, AU_GL_GPR_BUFFER);
      if (bytes != 0 && au_gl_graph_send(&g, m, bytes)) next_ask = g.ms + (play ? 300 : 1500);
      else if (bytes == 0) graph_until = 0;
     }
    }
-   else if (au_gl_prm_step(&g)) { next_ask = g.ms + 1500; graph_until = g.ms + ((options & AU_GL_PLAY) != 0 ? 25000 : 8000); }
+   else if (au_gl_prm_step(&g)) { next_ask = g.ms + 1500; graph_until = g.ms + ((options & (AU_GL_PLAY | AU_GL_MIC)) != 0 ? 25000 : 8000); }
   }
  }
  r[18] = g.rx_msgs; r[19] = g.tx_msgs; r[20] = g.tx_full; r[21] = g.stuck; r[22] = g.version_seen; r[23] = g.version_acked;
@@ -1179,6 +1199,16 @@ static uint32_t audio_request(uint16_t value, uint16_t index, uint8_t *out)
   au_gl_rep[4] = au_faults;
   memcpy(out, au_gl_rep, sizeof(au_gl_rep)); return sizeof(au_gl_rep);
  }
+ if (value == 0x4143 && index == 0x4d31 && !monitor_report[MON_LAUNCH] && au_boot[1] == 1 && !au_gl_rep[0]) {
+  au_mic_begin(&au_mic_state, au_mic_rep);
+  au_gl_rep[0] = 0xa0d10003;
+  au_gl_rep[2] = 40;
+  au_gl_rep[3] = 15 | 64;
+  au_gl_rep[1] = au_glink_run(au_gl_rep, 40, AU_GL_ANSWER | AU_GL_GPR | AU_GL_PRM | AU_GL_GRAPH | AU_GL_MIC);
+  au_gl_rep[4] = au_faults;
+  memcpy(out, au_gl_rep, sizeof(au_gl_rep)); return sizeof(au_gl_rep);
+ }
+ if (value == 0x4145 && au_mic_rep[0]) { memcpy(out, au_mic_rep, sizeof(au_mic_rep)); return sizeof(au_mic_rep); }
  if (value == 0x4149 && au_gl_rep[0]) { memcpy(out, au_gl_rep2, sizeof(au_gl_rep2)); return sizeof(au_gl_rep2); }
  if (value == 0x4148 && au_gl_rep[0] && index < AU_GL_LOG_WORDS / 128) {
   memcpy(out, au_gl_log + 128u * index, 512); return 512;

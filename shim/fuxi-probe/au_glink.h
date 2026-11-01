@@ -45,6 +45,7 @@ enum { AU_GL_VERSION = 0, AU_GL_VERSION_ACK = 1, AU_GL_OPEN = 2, AU_GL_CLOSE = 3
 #define AU_GL_PLAY 16u         /* options: with AU_GL_GRAPH, the buffers of au_gl_data_send() */
 #define AU_GL_WRITE_TOKEN 0x1000u
 #define AU_GL_TONE 32u         /* options: audio.c's first tone, on the owner's word. For its list and au_tone_stage(); nothing here reads it */
+#define AU_GL_MIC 64u          /* options: audio.c's mic, au_mic.h, between the votes. For its list and au_mic_turn(); nothing here reads it */
 #define AU_GL_OP_MEM_MAP_DONE 0x02001001u  /* payload {handle} */
 #define AU_GL_OP_WRITE_DONE 0x05001004u    /* payload {address, address, handle, status} */
 #define AU_GL_OP_READ_DONE 0x05001005u     /* payload {status, address, address, handle, bytes, offset} */

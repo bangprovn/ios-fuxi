@@ -229,6 +229,7 @@ kernel() {
     python3 tools/test-fuxi-audio.py
     python3 tools/test-fuxi-audio-glink.py
     python3 tools/test-fuxi-audio-amp.py
+    python3 tools/test-fuxi-audio-mic.py
     python3 tools/test-fuxi-audio-dsp.py
     python3 tools/test-fuxi-audio-amp-on.py
     python3 tools/sync-fuxi-audio.py --check

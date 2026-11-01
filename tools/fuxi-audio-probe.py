@@ -7,6 +7,7 @@
   boot                         stage 2: PAS-boot the ADSP once, then decode
   report                       re-read the frozen stage-2 report
   glink [--seconds N] [--answer] [--gpr] [--prm]  after a boot that reached ready: GLINK with the DSP, polled; no data is sent unless --gpr asks the APM its state; --prm then votes LPASS on and off; --graph between them opens, configures and closes the TDM graph, never starting it; --play also starts it and gives it a second of zeros, no pin muxed
+  mic                          after a boot that reached ready: the DSP's clock, LPASS, SoundWire, the codec's id, bias and ADC1 read back (au_mic.h); stops at the first proof step that fails; no capture
   decode FILE                  decode a saved raw page offline
 Raw pages can be saved with --save. See docs-lanes/audio.md.
 """
@@ -270,6 +271,60 @@ def decode_glink_log(words, count):
     return out
 
 
+MIC_STEPS = {1: "the DSP's clock 0x30C", 2: 'LPASS reachable', 3: "macros clocked, the master's version", 4: 'SoundWire frames', 5: 'codec enumerated, its id', 6: "codec's registers", 7: 'init, bias and ADC1 read back'}
+MIC_WHY = {1: 'an abort: the hypervisor or a gated block said no', 2: 'the votes were refused or not answered', 3: 'the clock refused all three ways', 4: 'the clock not answered', 5: 'cmd-db does not say 0x40a00 for ldob15: not voted',
+           6: 'the RPMh vote failed', 7: 'gpio108 did not take', 8: 'the LPI pads did not take', 9: 'a macro clock bit did not stay', 10: 'the master is not version 2', 11: 'no frames: +0x5064 bit 0 stayed 0', 12: 'nobody attached in a second',
+           13: 'not manufacturer 0x0217 part 0x010d', 14: 'a read over the bus did not come back', 15: 'chip id not 0d 01', 16: 'a write refused or lost', 17: 'a register did not read back', 18: 'clash or command error in +0x5000'}
+MIC_WANT = [(0x3103, 0xce, 0xce), (0x312a, 0x10, 0), (0x3029, 0xf0, 0x80), (0x3001, 0xc0, 0x80), (0x345b, 2, 2), (0x31e1, 0xff, 0x14), (0x31df, 0x1f, 8), (0x34d0, 0xff, 0x55), (0x34d1, 0xff, 0x44), (0x34d2, 0xff, 0x11), (0x34d3, 0xff, 0), (0x34d4, 0xff, 0),
+            (0x306b, 0xe0, 0xe0), (0x306e, 0xe0, 0xe0), (0x3071, 0xe0, 0xe0), (0x3074, 0xe0, 0xe0), (0x308f, 1, 0), (0x3022, 0xff, 0x63), (0x3409, 0xf0, 0xf0), (0x3408, 0x18, 0x18), (0x3417, 1, 1), (0x3457, 3, 2), (0x300f, 0x40, 0), (0x3410, 0xf, 3), (0x300e, 0x1f, 8)]
+
+
+def decode_mic(r):
+    """Every proof step, in order: passed, failed with why, or not reached. Word numbers are AU_MIC_R_* of au_mic.h; the test holds them together."""
+    if r[0] != 0xa0d10007:
+        return f'mic: bad magic {r[0]:#x}'
+    passed, failed, why = r[1], r[2], r[3]
+    out = [f'mic: {passed} of 7 proof steps passed' + (f'; stopped at {failed}, {MIC_STEPS.get(failed, "?")}: {MIC_WHY.get(why, why)}' if failed else ('' if passed == 7 else '; the stage did not run')),
+           f'  faults {r[4]}, first at {r[5]:#x}; undid {r[6]:#x}; faults on the way down {r[7]}']
+
+    def head(step):
+        return f'  {step} {MIC_STEPS[step]}: ' + ('FAILED' if failed == step else 'ok' if passed >= step else 'not reached')
+    tries = ' '.join('not tried' if x == 0xfffffffe else 'no answer' if x == 0xffffffff else f'{x:#x}' for x in r[10:13])
+    out += [head(1), f'    votes macro {r[8]:#x} dcodec {r[9]:#x}; clock 19.2 MHz, 9.6 MHz, attribute 0: {tries}; took try {r[13]}']
+    if passed >= 2 or failed == 2:
+        out += [head(2), f'    VA CORE_ID {r[14]:#x} {r[15]:#x} {r[16]:#x} {r[17]:#x}']
+    else:
+        out.append(head(2))
+    if passed >= 3 or failed == 3:
+        out += [head(3), f'    cmd-db ldob15 {r[19]:#x}; votes mode {r[20]:#x} volts {r[21]:#x} enable {r[22]:#x}; gpio108 found {r[23]:#x} {r[24]:#x}, set {r[25]:#x} {r[26]:#x}',
+                f'    LPI found {r[27]:#x} {r[28]:#x} {r[29]:#x} {r[30]:#x}, set {r[31]:#x} {r[32]:#x} {r[33]:#x} {r[34]:#x}; slew {r[35]:#x} -> {r[36]:#x}',
+                f'    VA +0 {r[37]:#x} +4 {r[38]:#x} +8 {r[39]:#x} +80 {r[40]:#x}; TX +0 {r[41]:#x} +4 {r[42]:#x} +8 {r[43]:#x} +90 {r[44]:#x}; master version ' + (f'{r[45]:#x}' if why != 9 else 'not read')]
+    else:
+        out.append(head(3))
+    if passed >= 4 or failed == 4:
+        out += [head(4), f'    +5064 {r[46]:#x} after {r[47]} ms; +5000 {r[48]:#x} (bit 1 a new device); +100 {r[49]:#x}; +104c {r[50]:#x}']
+    else:
+        out.append(head(4))
+    if passed >= 5 or failed == 5:
+        ident = ' '.join(f'{x:02x}' for x in r[56:62])
+        out += [head(5), f'    +1090 {r[51]:#x} after {r[52]} ms; device {r[53]}; enumerator {r[54]:#x} {r[55]:#x}; SCP id {ident}' + (' -- as live DT' if ident == '23 02 17 01 0d 00' else '') + f'; failed reads {r[62]}']
+    else:
+        out.append(head(5))
+    if passed >= 6 or failed == 6:
+        variant = (r[70] >> 1) & 0xf
+        name = {0: 'WCD9380', 5: 'WCD9385'}.get(variant, 'unknown')
+        out += [head(6), f'    chip id {r[63]:02x} {r[64]:02x} {r[65]:02x} {r[66]:02x}; 0x3022 {r[67]:#x} 0x3029 {r[68]:#x} 0x3103 {r[69]:#x}; 0x34b0 {r[70]:#x} variant {variant} ({name}); differ from the driver table {r[71]:#x}']
+    else:
+        out.append(head(6))
+    if passed >= 7 or failed == 7:
+        out += [head(7), f'    read back {r[76]} of {len(MIC_WANT)}; +5000 {r[75]:#x}' + (f'; first wrong {r[72]:#x}, want {r[73]:#x}, got {r[74]:#x}' if r[72] else '')]
+        out.append('    ' + ' '.join(f'{reg:04x}={r[77 + i]:02x}' for i, (reg, _, _) in enumerate(MIC_WANT[:r[76]])))
+    else:
+        out.append(head(7))
+    out.append(f'  down: 0x3022 {r[104]:#x}; gpio108 {r[105]:#x} {r[106]:#x}; gpio0 pad {r[107]:#x}; TX +8 {r[108]:#x}')
+    return '\n'.join(out)
+
+
 def squash(directory, name, dest):
     """pil-squasher: place every split .bNN segment at its p_offset."""
     mdt = (Path(directory) / f'{name}.mdt').read_bytes()
@@ -301,7 +356,7 @@ def fnv(data):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('cmd', choices=['snapshot', 'squash', 'upload', 'boot', 'report', 'decode', 'stop', 'glink', 'smmu', 'poke', 'amp', 'tone'])
+    ap.add_argument('cmd', choices=['snapshot', 'squash', 'upload', 'boot', 'report', 'decode', 'stop', 'glink', 'smmu', 'poke', 'amp', 'tone', 'mic'])
     ap.add_argument('--monitors', action='store_true', help="tone: also bring the amplifier's voltage and current back, and look for the tone in them")
     ap.add_argument('--owner-agreed', action='store_true', help='tone: the owner has agreed to writes to the amplifier: bottom speaker, lowest level, a second')
     ap.add_argument('--which', type=int, default=3, help='amp: 1 B at 0x40, 2 T at 0x42, 3 both; read only')
@@ -425,6 +480,25 @@ def main():
         if a.save:
             with a.save.open('ab') as f:
                 f.write(page + struct.pack('<128I', *q))
+    elif a.cmd == 'mic':
+        page = req(0x4143, 0x4d31)
+        r = struct.unpack('<128I', page)
+        if r[0] != 0xa0d10003:
+            raise SystemExit(f'no report: {r[0]:#x}')
+        print('\n'.join(decode_glink(r)))
+        m = struct.unpack('<128I', req(0x4145))
+        print(decode_mic(m))
+        q = struct.unpack('<128I', req(0x4149))
+        status = 'no answer' if q[3] == 0xffffffff else f'status {q[3]:#x}'
+        print(f'  the clock let go: {status}, heard at {q[51]} ms (the list sent {r[126]} steps: 4 means it was asked)')
+        count = min(r[27], 96)
+        words = []
+        for p_ in range((count * 12 + 127) // 128):
+            words += struct.unpack('<128I', req(0x4148, p_))
+        print('\n'.join(decode_glink_log(words, count)))
+        if a.save:
+            with a.save.open('ab') as f:
+                f.write(page + struct.pack('<128I', *m))
     elif a.cmd == 'amp':
         r = struct.unpack('<128I', req(0x4141, a.which, 512))
         results = {1: 'done', 0x301: 'the vote faulted', 0x302: 'wrapper clocks did not come', 0x303: 'the engine could not be read',
