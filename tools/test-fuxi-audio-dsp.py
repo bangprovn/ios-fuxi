@@ -29,18 +29,32 @@ thread_t current_thread(void);
 void thread_deallocate(thread_t);
 kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
 int PE_parse_boot_argn(const char *, void *, int);
+typedef int dev_t;
+typedef void *proc_t;
+typedef char *caddr_t;
+struct uio;
+long uio_resid(struct uio *);
+int uiomove(caddr_t, int, struct uio *);
+struct cdevsw { void *d_open, *d_close, *d_read, *d_write, *d_ioctl, *d_stop, *d_reset, *d_ttys, *d_select, *d_mmap, *d_strategy, *d_reserved_1, *d_reserved_2; int d_type; };
+int cdevsw_add(int, const struct cdevsw *);
+void *devfs_make_node(dev_t, int, int, int, int, const char *);
+#define makedev(a, b) ((a) << 24 | (b))
+#define DEVFS_CHAR 1
+#define UID_ROOT 0
+#define GID_WHEEL 0
+int eno_rdwrt(void), eno_ioctl(void), eno_stop(void), eno_reset(void), eno_select(void), eno_mmap(void), eno_strat(void), eno_getc(void), eno_putc(void);
 """
 
 
 def main():
     with tempfile.TemporaryDirectory(prefix='fuxi-dsp-') as tmp:
         stubs = Path(tmp)
-        for header in ('sys/param.h', 'sys/systm.h', 'kern/clock.h', 'kern/thread.h', 'kern/sched_prim.h', 'machine/machine_routines.h', 'pexpert/pexpert.h'):
+        for header in ('sys/param.h', 'sys/systm.h', 'kern/clock.h', 'kern/thread.h', 'kern/sched_prim.h', 'machine/machine_routines.h', 'pexpert/pexpert.h', 'sys/conf.h', 'sys/errno.h', 'sys/proc.h', 'sys/uio.h', 'miscfs/devfs/devfs.h'):
             (stubs / header).parent.mkdir(parents=True, exist_ok=True)
             (stubs / header).write_text('#include "stub.h"\n')
         (stubs / 'stub.h').write_text('#pragma once\n' + STUB)
         (stubs / 'fuxi_au_glink.h').write_text((ROOT / 'shim/fuxi-probe/au_glink.h').read_text())
-        subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-Wno-unknown-pragmas', '-Wno-unused-function', '-Wno-unused-parameter', '-DFUXI=1', '-fsyntax-only',
+        subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-Wno-unknown-pragmas', '-Wno-unused-function', '-Wno-unused-parameter', '-Wno-incompatible-pointer-types', '-DFUXI=1', '-fsyntax-only',
                         f'-I{stubs}', f'-I{ROOT / "xnu/fuxi-audio"}', str(ROOT / 'xnu/fuxi-audio/fuxi_audio_dsp.c')], check=True)
     text = (ROOT / 'xnu/fuxi-audio/fuxi_audio_dsp.c').read_text()
     lower = text.lower()

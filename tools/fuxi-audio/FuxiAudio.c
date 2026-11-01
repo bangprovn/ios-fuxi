@@ -45,15 +45,15 @@
  *               waveforms (only with /product/haptics closed-loop)
  *   "Codec"     one input of one channel with the data source 'imic': the built-in microphone
  *
- * Fuxi has no audio output path yet (docs-lanes/audio.md): what is mixed for an output is counted
- * and dropped, inputs are silence. The point is a routing graph that settles, so that
- * mediaserverd/audiomxd stop retrying, not sound. HackiOS's kernel sinks (/dev/redwood-audio,
- * -mic, -haptic) and the volume ioctl are left out. The device's clock is the system's: it claims
+ * What is mixed for the speaker goes to /dev/fuxiaudio when the kernel has it (fuxiaudio=2, xnu/fuxi-audio/fuxi_audio_dsp.c),
+ * which feeds the ADSP, and is otherwise counted and dropped; inputs are silence. HackiOS's other kernel sinks (-mic, -haptic)
+ * and the volume ioctl are left out. The device's clock is the system's: it claims
  * to play exactly FUXI_AUDIO_RATE frames a second of mach_absolute_time(), and the HAL's I/O thread
  * paces itself by that. Installed only by tools/fuxi-sys-root.py --audio-plugin (off by default).
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreFoundation/CFPlugInCOM.h>
+#include <fcntl.h>
 #include <CoreAudioTypes/CoreAudioTypes.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
@@ -211,6 +211,8 @@ struct device {
 	UInt64 anchor;                  /* mach_absolute_time() when the first of them did */
 	UInt64 periods;                 /* whole timestamp periods since */
 };
+
+static int speaker_fd = -1;
 
 static struct device devices[] = {
 	{ .object = OBJECT_SPEAKER, .uid = CFSTR("Speaker"), .output = OBJECT_SPEAKER_OUTPUT, .input = OBJECT_SPEAKER_INPUT,
@@ -859,7 +861,10 @@ start_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unu
 		d->periods = 0;
 		if (d->output != 0) {
 			written = 0;
-			say("fuxi: audio: %s playing\n", CFStringGetCStringPtr(d->uid, kCFStringEncodingUTF8));
+			if (d->object == OBJECT_SPEAKER && speaker_fd < 0) {
+				speaker_fd = open("/dev/fuxiaudio", O_WRONLY);
+			}
+			say("fuxi: audio: %s playing, kernel sink %s\n", CFStringGetCStringPtr(d->uid, kCFStringEncodingUTF8), speaker_fd >= 0 ? "open" : "absent");
 		}
 		if (d->object == OBJECT_CODEC) {
 			codec_open();
@@ -882,8 +887,12 @@ stop_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unus
 		if (d->object == OBJECT_CODEC) {
 			codec_close();
 		} else if (d->output != 0) {
-			say("fuxi: audio: %s stopped after %llu.%02llu s (discarded)\n", CFStringGetCStringPtr(d->uid,
+			say("fuxi: audio: %s stopped after %llu.%02llu s\n", CFStringGetCStringPtr(d->uid,
 			    kCFStringEncodingUTF8), written / FUXI_AUDIO_RATE, written % FUXI_AUDIO_RATE * 100 / FUXI_AUDIO_RATE);
+			if (d->object == OBJECT_SPEAKER && speaker_fd >= 0) {
+				close(speaker_fd);
+				speaker_fd = -1;
+			}
 		}
 	}
 	pthread_mutex_unlock(&lock);
@@ -972,8 +981,11 @@ do_io_operation(__unused AudioServerPlugInDriverRef driver, __unused AudioObject
 	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == OBJECT_ACTUATOR_OUTPUT) {
 		actuator_write(buffer, frames);
 	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == d->output) {
-		/* nothing plays it yet: the mix is counted and dropped, never waited on */
+		/* to the kernel's ring, which takes it at once and is never waited on; the 16 bit stereo of this file's one format */
 		written += frames;
+		if (stream == OBJECT_SPEAKER_OUTPUT && speaker_fd >= 0) {
+			(void)write(speaker_fd, buffer, (size_t)frames * 2 * FUXI_AUDIO_CHANNELS);
+		}
 	}
 	return 0;
 }
