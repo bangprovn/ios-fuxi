@@ -34,7 +34,7 @@ inline void applyBootOptions(const char *args) {
  static const struct {const char *name,*value;} bits[]={{"FUXI_MTL_ORDER_FETCH_ONLY","1"},{"FUXI_MTL_NOFETCH_RP","1"},{"FUXI_MTL_OCCLUDE","1"},{"FUXI_MTL_DRAW_AREA","1"},
   {"FUXI_MTL_EARLY_RELEASE","1"},{"FUXI_MTL_SAMPLE_SHADOW","1"},{"FUXI_MTL_SPIRV_UNROLL","1"},{"FUXI_MTL_SPIRV_UNROLL","2"},{"FUXI_MTL_HALF_ROUND","1"},{"FUXI_MTL_HALF_ROUND","2"},
   {"FUXI_MTL_HALF_ROUND","3"},{"FUXI_MTL_SUBMIT_LEAN","1"},{"FUXI_MTL_SUBMIT_LEAN","2"},{"FUXI_MTL_SPLIT_SUBMIT","1"},{"FUXI_MTL_FETCH_SPLIT","1"},{"FUXI_MTL_BUFFER_CACHED","1"},
-  {"FUXI_MTL_GPU_PASS_TIMES","1"},{"FUXI_MTL_GPU_DRAW_TIMES","1"},{"FUXI_MTL_RT_SHADOW","1"}};
+  {"FUXI_MTL_GPU_PASS_TIMES","1"},{"FUXI_MTL_GPU_DRAW_TIMES","1"},{"FUXI_MTL_RT_SHADOW","1"},{"FUXI_MTL_RT_SHADOW_REUSE","1"},{"FUXI_MTL_RT_RENAME","1"}};
  for(const char *p=args;*p;){
   p+=strspn(p," \t\r\n");size_t n=strcspn(p," \t\r\n");
   if(n>5 && !strncmp(p,"fmtl=",5)){

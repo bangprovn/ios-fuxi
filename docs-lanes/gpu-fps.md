@@ -333,6 +333,12 @@ IOSurface or other imports (the rest are textures over an `MTLBuffer`), and how
 many of those samples are of a million pixels or more.
 
 `fmtl` (hex, on the boot line) gains bit 16 `FUXI_MTL_GPU_PASS_TIMES`, bit 17
-`FUXI_MTL_GPU_DRAW_TIMES` and bit 18 `FUXI_MTL_RT_SHADOW`, so each can be tried
-without a root write. `RT_SHADOW` has not run on the phone yet. Test:
+`FUXI_MTL_GPU_DRAW_TIMES`, bit 18 `FUXI_MTL_RT_SHADOW`, bit 19
+`FUXI_MTL_RT_SHADOW_REUSE` and bit 20 `FUXI_MTL_RT_RENAME`, so each can be tried
+without a root write. On the phone (root v10, scripted, alternated with `fmtl=1`)
+`RT_SHADOW` (`fmtl=40001`) gave 91.6-92.0 % one-period frames against
+78.5-83.9 %, and GPU p90 about 5.8 ms against 8.4 ms; per-pass times had put
+77 % of GPU time in passes drawing into the linear 1125x2436 drawable. Not yet
+checked by eye. With it on, the copy into the shadow each frame is about 0.4 ms,
+which `RT_SHADOW_REUSE` is meant to skip. Test:
 `tools/test-fuxi-metal-frametrace.py` checks `applyBootOptions` sets these.
