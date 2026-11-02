@@ -10,6 +10,7 @@ boot-arg, ADT option or root-edit option, the kernel, ADT and root are unchanged
 | --- | --- | --- | --- |
 | Privileges by entitlement | `xnu/fuxi-sys/fuxi_sys.h`, patch 0107 | boot-arg `fuxiprivs=1` | `hackios-xnu-kernel xnu/files/bsd/kern/kern_minimac.c` (APSL 2.0) |
 | Container path for an uncontained process | same | boot-arg `fuxisbpath=1` | same |
+| Sandbox extensions issued and consumed | same | boot-arg `fuxisbext=1` | Fuxi; HackiOS only returns success |
 | HAL devices Speaker/Hawking/Actuator/Codec | `tools/fuxi-audio/` | `fuxi-sys-root.py --audio-plugin` (+ `--restore-virtualaudio`) | `hackios-xnu-userland userland/src/audio_plugin.c`, `audio_plugin.plist` (MIT) |
 | `/product/haptics`, `/product/camera` | `tools/mkadt-fuxi.py` | `--product-haptics`, `--product-camera` | `hackios-xnu-userland` loader/identity notes (MIT); values from the local D22AP tree |
 | App snapshots as JPEG/PNG, not ATX | `tools/fuxi-sb/` | `fuxi-sys-root.py --sb-snapshots`; boot-arg `fuxisbjpeg=0` turns it off again | `hackios-xnu-userland userland/src/inject_sb.c` (MIT) |
@@ -24,7 +25,7 @@ The **Observed** notes come from Fuxi console logs (`research/device/ios-0098-m9
 logs, local only). The **HackiOS** notes are what HackiOS reports for its phone. **Guess** marks
 expectations that no device run has confirmed.
 
-### Kernel: patch 0107 (`fuxiprivs`, `fuxisbpath`)
+### Kernel: patch 0107 (`fuxiprivs`, `fuxisbpath`, `fuxisbext`)
 
 0107 replaces `bsd/kern/sweet_amfi.c` (the H1 version from 0103 plus three hooks) and adds
 `bsd/kern/fuxi_sys.h`. The canonical sources are in `xnu/fuxi-sys/`. Regenerate or check the patch with
@@ -50,6 +51,15 @@ must apply on top of 0103.
     ("Failed to create work interval") killed SpringBoard on its first swipe, and Fuxi already grants it.
   - Guess: fewer retries in rapportd, identityservicesd, symptomsd and dasd. Entitlement checks keep this
     narrower than a blanket grant.
+- **`fuxisbext=1`, Sandbox requests 5 and 6 (extensions).** Both returned `ENOENT`. Measured in `a-v8b`
+  (the phone's unified log, read back from the root): tccd logs "Granting ... via entitlement
+  'com.apple.private.tcc.allow'", then "Failed to issue Sandbox Extension for kTCCServiceMicrophone", and
+  Safari gets `kTCCErrorDomain` 6 and denies `getUserMedia` with no prompt. In that boot and the one before
+  it the failure appears 3318 times: TCC for Contacts and Photos (tccd, PeopleWidget, searchd, assetsd),
+  and cloudd, mobileassetd, linkd, nsurlsessiond. With the switch, request 5 writes a token into the buffer
+  libsystem_sandbox allocated, and request 6 returns a handle counting from 1. The argument layouts come from
+  disassembling `libsystem_sandbox.dylib` in 20H392's shared cache. HackiOS returns success without writing,
+  which leaves a client holding whatever malloc returned.
 - **`fuxisbpath=1`, Sandbox request 4 (container path).** H1 answers from `CFFIXED_USER_HOME` and gives
   `ENOENT` to a process without a container. HackiOS returns success with an untouched buffer
   ("success and an untouched buffer", what every process got before). The ENOENT choice was deliberate

@@ -44,12 +44,16 @@
  *                 (no container) succeeds with the caller's buffer untouched,
  *                 as on HackiOS, instead of H1's ENOENT. Only while H1's
  *                 container answer itself is enabled (fuxiamfi, default on).
+ *   fuxisbext=1   Sandbox requests 5 and 6 (issue and consume an extension)
+ *                 succeed. Not from HackiOS, which succeeds without writing the
+ *                 token; see fuxi_sys_extension_issue().
  */
 #ifndef FUXI_SYS_H
 #define FUXI_SYS_H
 
 static TUNABLE(uint32_t, fuxi_sys_privs, "fuxiprivs", 0);
 static TUNABLE(uint32_t, fuxi_sys_sbpath, "fuxisbpath", 0);
+static TUNABLE(uint32_t, fuxi_sys_sbext, "fuxisbext", 0);
 
 struct fuxi_sys_priv_entitlement {
 	int priv;
@@ -161,13 +165,78 @@ fuxi_sys_container_result(int error)
 	return error == ENOENT && fuxi_sys_sbpath ? 0 : error;
 }
 
+/*
+ * Sandbox extensions. There is no sandbox here for a token to open, but iOS
+ * treats a failure to get one as a refusal: tccd grants Safari the microphone
+ * by entitlement and then "Failed to issue Sandbox Extension for
+ * kTCCServiceMicrophone" comes back to Safari as kTCCErrorDomain 6, so
+ * getUserMedia is denied with no prompt (a-v8b). The same line stands in front
+ * of Photos and Contacts, and of mobileassetd, cloudd, linkd and nsurlsessiond
+ * handing files to their clients.
+ *
+ * The arguments are as libsystem_sandbox 20H392 passes them. Its common issue
+ * path mallocs 2048 bytes for the token and returns them when the call
+ * succeeds; consume takes the token and its size with the terminator, and -1 is
+ * its own failure value, so handles start at 1.
+ */
+struct fuxi_sys_extension_issue_args {
+	user_addr_t name;       /* the extension's class */
+	uint64_t type;
+	user_addr_t data;       /* path, service name, or nothing */
+	uint64_t flags;
+	user_addr_t token;
+	int64_t target;
+	uint64_t target_version;
+};
+
+struct fuxi_sys_extension_consume_args {
+	user_addr_t token;
+	uint64_t size;
+	user_addr_t handle;
+};
+
+static uint64_t fuxi_sys_extension_handle;
+
+static int
+fuxi_sys_extension_issue(user_addr_t arg)
+{
+	struct fuxi_sys_extension_issue_args args;
+	char name[128];
+	char token[sizeof(name) + 32];
+	size_t done = 0;
+	int error = copyin(arg, &args, sizeof(args));
+	if (error) {
+		return error;
+	}
+	error = copyinstr(args.name, name, sizeof(name), &done);
+	if (error) {
+		return error;
+	}
+	/* Nobody reads a token but this file, and this file does not: it only has to be a string. */
+	int length = snprintf(token, sizeof(token), "fuxi;%llx;%s", (unsigned long long)args.type, name);
+	return copyout(token, args.token, (size_t)length + 1);
+}
+
+static int
+fuxi_sys_extension_consume(user_addr_t arg)
+{
+	struct fuxi_sys_extension_consume_args args;
+	int error = copyin(arg, &args, sizeof(args));
+	if (error) {
+		return error;
+	}
+	uint64_t handle = os_atomic_inc(&fuxi_sys_extension_handle, relaxed);
+	return copyout(&handle, args.handle, sizeof(handle));
+}
+
 static void
 fuxi_sys_report(void)
 {
-	if (fuxi_sys_privs || fuxi_sys_sbpath) {
-		printf("FUXI SYS: privileges by entitlement %s (%u pairs), uncontained container path %s\n",
+	if (fuxi_sys_privs || fuxi_sys_sbpath || fuxi_sys_sbext) {
+		printf("FUXI SYS: privileges by entitlement %s (%u pairs), uncontained container path %s, extensions %s\n",
 		    fuxi_sys_privs ? "on" : "off", (unsigned)FUXI_SYS_PRIVS,
-		    fuxi_sys_sbpath ? "succeeds untouched" : "ENOENT");
+		    fuxi_sys_sbpath ? "succeeds untouched" : "ENOENT",
+		    fuxi_sys_sbext ? "issued" : "ENOENT");
 	}
 }
 

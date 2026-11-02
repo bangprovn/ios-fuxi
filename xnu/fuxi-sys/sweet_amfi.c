@@ -311,7 +311,9 @@ sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
 	case 4:         /* container path (audit token / pid) */
 		return fuxi_amfi_enabled ? fuxi_sys_container_result(fuxi_sandbox_container(arg)) : ENOENT;
 	case 5:         /* extension issue */
+		return fuxi_sys_sbext ? fuxi_sys_extension_issue(arg) : ENOENT;
 	case 6:         /* extension consume */
+		return fuxi_sys_sbext ? fuxi_sys_extension_consume(arg) : ENOENT;
 	case 0x43:      /* container expected */
 		return ENOENT;
 	default:

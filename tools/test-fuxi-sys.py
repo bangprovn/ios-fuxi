@@ -64,6 +64,16 @@ typedef struct proc *proc_t;
 typedef struct ucred { int uid; } *kauth_cred_t;
 #define TUNABLE(t,n,k,v) t n = v
 #define os_atomic_or_orig(p,v,m) __atomic_fetch_or((p),(v),__ATOMIC_RELAXED)
+#define os_atomic_inc(p,m) __atomic_add_fetch((p),1,__ATOMIC_RELAXED)
+/* user addresses are this process's own */
+static int copyin(user_addr_t u, void *k, size_t n) { if (!u) return EFAULT; memcpy(k, (void *)u, n); return 0; }
+static int copyout(const void *k, user_addr_t u, size_t n) { if (!u) return EFAULT; memcpy((void *)u, k, n); return 0; }
+static int copyinstr(user_addr_t u, void *k, size_t n, size_t *done) {
+ if (!u) return EFAULT;
+ size_t l = strnlen((const char *)u, n);
+ if (l == n) return ENAMETOOLONG;
+ memcpy(k, (void *)u, l + 1); *done = l + 1; return 0;
+}
 #define PRIV_WORK_INTERVAL 1009
 #define PRIV_PROC_UUID_POLICY 1001
 #define PRIV_GLOBAL_PROC_INFO 1002
@@ -191,6 +201,31 @@ int main(void) {
  assert(sweet_sandbox_syscall(&self_proc, 4, 0) == ENOENT && container_calls == calls);
  fuxi_amfi_enabled = 1;
  assert(sweet_sandbox_syscall(&self_proc, 5, 0) == ENOENT && sweet_sandbox_syscall(&self_proc, 1, 0) == 0);
+ /* Extensions, as libsystem_sandbox 20H392 asks: off unless fuxisbext=1, and then never touching what it was not given. */
+ char token[2048];
+ memset(token, 0x55, sizeof(token));
+ struct fuxi_sys_extension_issue_args issue = { (user_addr_t)"com.apple.tcc.kTCCServiceMicrophone", 3, 0, 0, (user_addr_t)token, 0, 0 };
+ assert(sweet_sandbox_syscall(&self_proc, 5, (user_addr_t)&issue) == ENOENT && (unsigned char)token[0] == 0x55);
+ int64_t handle = -1;
+ struct fuxi_sys_extension_consume_args consume = { (user_addr_t)token, sizeof(token), (user_addr_t)&handle };
+ assert(sweet_sandbox_syscall(&self_proc, 6, (user_addr_t)&consume) == ENOENT && handle == -1);
+ fuxi_sys_sbext = 1;
+ assert(sweet_sandbox_syscall(&self_proc, 5, 0) == EFAULT);
+ assert(sweet_sandbox_syscall(&self_proc, 5, (user_addr_t)&issue) == 0);
+ assert(strcmp(token, "fuxi;3;com.apple.tcc.kTCCServiceMicrophone") == 0 && (unsigned char)token[strlen(token) + 1] == 0x55);
+ /* a class too long for the token, and no class: an error, and nothing written */
+ char long_name[200];
+ memset(long_name, 'a', sizeof(long_name) - 1);
+ long_name[sizeof(long_name) - 1] = 0;
+ memset(token, 0x55, sizeof(token));
+ issue.name = (user_addr_t)long_name;
+ assert(sweet_sandbox_syscall(&self_proc, 5, (user_addr_t)&issue) == ENAMETOOLONG && (unsigned char)token[0] == 0x55);
+ issue.name = 0;
+ assert(sweet_sandbox_syscall(&self_proc, 5, (user_addr_t)&issue) == EFAULT && (unsigned char)token[0] == 0x55);
+ assert(sweet_sandbox_syscall(&self_proc, 6, 0) == EFAULT);
+ assert(sweet_sandbox_syscall(&self_proc, 6, (user_addr_t)&consume) == 0 && handle == 1);
+ assert(sweet_sandbox_syscall(&self_proc, 6, (user_addr_t)&consume) == 0 && handle == 2);
+ fuxi_sys_sbext = 0;
  fuxi_sys_privs = 0;
  fuxi_sys_report();
  assert(strstr(last_log, "privileges by entitlement off") && strstr(last_log, "succeeds untouched"));
@@ -213,6 +248,7 @@ def test_kernel(tmp):
     header = (sys_dir / 'fuxi_sys.h').read_text()
     assert 'TUNABLE(uint32_t, fuxi_sys_privs, "fuxiprivs", 0)' in header
     assert 'TUNABLE(uint32_t, fuxi_sys_sbpath, "fuxisbpath", 0)' in header
+    assert 'TUNABLE(uint32_t, fuxi_sys_sbext, "fuxisbext", 0)' in header
     assert 'Ported from HackiOS hackios-xnu-kernel' in header and 'APSL' in header
     print('PASS: 0107 privilege-by-entitlement and container-path switches (model + patch sync)')
 
