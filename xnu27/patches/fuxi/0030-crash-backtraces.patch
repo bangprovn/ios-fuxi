@@ -1,0 +1,24 @@
+diff --git a/bsd/kern/kern_sig.c b/bsd/kern/kern_sig.c
+index 0ec04c4..8c9ca70 100644
+--- a/bsd/kern/kern_sig.c
++++ b/bsd/kern/kern_sig.c
+@@ -3216,8 +3216,17 @@ postsig_locked(int signum)
+ 		    proc_getpid(p), W_EXITCODE(0, signum), 3, 0, 0);
+ 
+ #if defined(FUXI)
+-		if (proc_getpid(p) == 1 && fuxi_proc_log()) {
+-			fuxi_user_backtrace(signum & ~WCOREFLAG);
++		/* pid 1 on every fatal signal, other processes on the first 64 crash signals of the boot */
++		if (fuxi_proc_log()) {
++			static int fuxi_crashes;
++			int sig = signum & ~WCOREFLAG;
++			bool crash = sig == SIGILL || sig == SIGTRAP || sig == SIGABRT || sig == SIGFPE || sig == SIGBUS ||
++			    sig == SIGSEGV || sig == SIGSYS;
++
++			if (proc_getpid(p) == 1 || (crash && fuxi_crashes++ < 64)) {
++				printf("fuxi: crash %s[%d] signal %d\n", p->p_comm, proc_getpid(p), sig);
++				fuxi_user_backtrace(sig);
++			}
+ 		}
+ #endif
+ 		exit_with_reason(p, W_EXITCODE(0, signum), (int *)NULL, TRUE, TRUE, 0, ut_exit_reason);

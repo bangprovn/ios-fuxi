@@ -94,3 +94,4 @@ fuxi/0026-watch-user-stacks.patch
 fuxi/0027-apple-keystore-standin.patch
 fuxi/0028-syscall-trace-aks-verbose.patch
 fuxi/0029-trace-budget.patch
+fuxi/0030-crash-backtraces.patch
