@@ -507,7 +507,7 @@ personas(void)
  * comes up as soon as the task has saved the manifest's first version (the system personas):
  * it then answers every user persona query with ENOENT, containermanagerd has no personas
  * and refuses persona 200 (INVALID_PERSONA), and lsd and SpringBoard never finish starting.
- * When the task is done, the daemon is stopped; launchd starts it again on demand, with the
+ * When the task is done, the daemon is killed; launchd starts it again on demand, with the
  * whole manifest.
  */
 static void
@@ -525,7 +525,7 @@ restart_usermanagerd(void)
 			if (strcmp(procs[i].kp_proc.p_comm, "usermanagerd") == 0) {
 				say("usermanagerd's boot task is done: stopping usermanagerd[%d] to reload the persona manifest",
 				    procs[i].kp_proc.p_pid);
-				(void)kill(procs[i].kp_proc.p_pid, SIGTERM);
+				(void)kill(procs[i].kp_proc.p_pid, SIGKILL);   /* it ignores SIGTERM */
 			}
 		}
 	}
