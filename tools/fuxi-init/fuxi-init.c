@@ -73,6 +73,7 @@ struct kpersona_info {
 _Static_assert(sizeof(struct kpersona_info) == 348, "kpersona_info");
 #define PERSONA_INFO_V2         2
 #define PERSONA_SYSTEM          4
+#define PERSONA_DEFAULT         5
 #define PERSONA_SYSTEM_PROXY    6
 int kpersona_alloc(struct kpersona_info *info, uid_t *id);
 
@@ -439,20 +440,26 @@ cryptex_files(void)
 /*
  * launchd looks up personas for the jobs it spawns: the system domain a system proxy persona
  * (type 6) with no user ("No matching personas of type 6 uid -1"), XPC services of mobile's
- * processes one with uid 501, user/501 a system persona (type 4). usermanagerd creates the personas from a manifest it keeps with AppleKeyStore, which
- * Fuxi has not got, so this program makes them.
+ * processes one with uid 501, user/501 a system persona (type 4). usermanagerd creates them
+ * (its boot task, a minute after launchd has spawned the user domain's jobs), and containermanagerd
+ * answers a process only if usermanagerd knows its persona (else INVALID_PERSONA: lsd aborted at
+ * every start). So these are usermanagerd's own personas, ids and names as it makes them, and the
+ * kernel (fuxi/0036) lets usermanagerd allocate them again.
  */
 static void
 personas(void)
 {
 	static const struct {
+		uid_t id;
 		const char *name;
 		int type;
 		uid_t uid;
 	} proxies[] = {
-		{ "fuxi.proxy", PERSONA_SYSTEM_PROXY, (uid_t)-1 },
-		{ "fuxi.proxy.mobile", PERSONA_SYSTEM_PROXY, 501 },
-		{ "fuxi.system.mobile", PERSONA_SYSTEM, 501 },
+		{ 99, "FEEDEEEE-DDDD-CCCC-BBBB-330000000000", PERSONA_SYSTEM, (uid_t)-1 },
+		{ 199, "FEEDEEEE-DDDD-CCCC-BBBB-550000000000", PERSONA_SYSTEM_PROXY, (uid_t)-1 },
+		{ 100, "FEEDEEEE-DDDD-CCCC-BBBB-3333000001F5", PERSONA_SYSTEM, 501 },
+		{ 200, "FEEDEEEE-DDDD-CCCC-BBBB-5555000001F5", PERSONA_SYSTEM_PROXY, 501 },
+		{ 1000, "FEEDEEEE-DDDD-CCCC-BBBB-0000000001F5", PERSONA_DEFAULT, 501 },
 	};
 
 	for (unsigned i = 0; i < sizeof(proxies) / sizeof(proxies[0]); i++) {
@@ -461,7 +468,7 @@ personas(void)
 
 		memset(&info, 0, sizeof(info));
 		info.persona_info_version = PERSONA_INFO_V2;
-		info.persona_id = (uid_t)-1;
+		info.persona_id = proxies[i].id;
 		info.persona_type = proxies[i].type;
 		info.persona_uid = proxies[i].uid;
 		strlcpy(info.persona_name, proxies[i].name, sizeof(info.persona_name));
