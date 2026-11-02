@@ -250,7 +250,8 @@ copy_tree(const char *rel)
  * /private/var/containers/...), its boot state (MobileContainerManager/System) is never written,
  * and lsd's container_system_group_path_for_identifier() waits until lsd's own timeout aborts it.
  * The daemon containers (InternalDaemon) likewise: installd exited "Failed to get installd daemon
- * container" (ENOENT) at every start, and lsd's database seeding waited on it.
+ * container" (ENOENT) at every start, and lsd's database seeding waited on it. A daemon that is not
+ * mobile has its daemon containers in its own home (installd, _installd: /var/installd).
  * Owners as on a device: root's, except the mobile user's own.
  */
 static void
@@ -289,6 +290,8 @@ var_dirs(void)
 		{ "/private/var/mobile/Containers/Temp/Data/InternalDaemon", 0755, 501 },
 		{ "/private/var/mobile/Containers/Temp/Data/PluginKitPlugin", 0755, 501 },
 		{ "/private/var/mobile/Containers/Temp/Data/XPCService", 0755, 501 },
+		{ "/private/var/installd/Containers/Data/InternalDaemon", 0755, 33 },
+		{ "/private/var/installd/Containers/Temp/Data/InternalDaemon", 0755, 33 },
 		{ "/private/var/mobile/Containers/Shared", 0755, 501 },
 		{ "/private/var/mobile/Containers/Shared/AppGroup", 0755, 501 },
 	};
