@@ -111,3 +111,4 @@ fuxi/0043-spawn-join-label.patch
 fuxi/0044-bank-persona-log.patch
 fuxi/0045-nosugid.patch
 fuxi/0046-msgdump.patch
+fuxi/0047-spawn-persona.patch

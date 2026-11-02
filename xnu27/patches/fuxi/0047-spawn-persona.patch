@@ -1,0 +1,55 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index fd12ee1..b65a271 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -4076,6 +4076,50 @@ spawn_persona_adopt(proc_t p, struct _posix_spawn_persona_info *px_persona, cons
+ 	struct persona *persona = NULL;
+ 
+ #if defined(FUXI)
++	/*
++	 * fuxi_spawn_persona=WORD:ID[,WORD:ID]: a spawn whose argv[1] (xpcproxy's job label) holds a WORD
++	 * goes into persona ID instead of the one launchd asked for (its uid and groups are kept).
++	 * installd lists only the user's personal persona for every built-in app, and SpringBoard,
++	 * in launchd's system proxy persona or in none, gets no LaunchServices record of itself
++	 * ("Got nil for _systemAppInfo.").
++	 */
++	struct _posix_spawn_persona_info fuxi_px;
++	{
++		static char spec[128];
++		static int parsed;
++
++		if (!parsed) {
++			parsed = 1;
++			if (!PE_parse_boot_argn("fuxi_spawn_persona", spec, sizeof(spec))) {
++				spec[0] = '\0';
++			}
++		}
++		for (const char *w = spec; *w != '\0';) {
++			const char *comma = strchr(w, ',');
++			size_t n = comma != NULL ? (size_t)(comma - w) : strlen(w);
++			char one[64];
++			char *colon;
++
++			if (n > 0 && n < sizeof(one)) {
++				memcpy(one, w, n);
++				one[n] = '\0';
++				colon = strchr(one, ':');
++				if (colon != NULL && colon != one) {
++					*colon = '\0';
++					if (strnstr(fuxi_label, one, MAXPATHLEN) != NULL) {
++						fuxi_px = *px_persona;
++						fuxi_px.pspi_id = (uid_t)strtoul(colon + 1, NULL, 10);
++						printf("fuxi: spawn pid %d %s persona %u -> %u\n", proc_getpid(p), fuxi_label,
++						    px_persona->pspi_id, fuxi_px.pspi_id);
++						px_persona = &fuxi_px;
++						goto join;
++					}
++				}
++			}
++			w += n + (comma != NULL);
++		}
++	}
++
+ 	/*
+ 	 * fuxi_spawn_nopersona=1: for a system proxy persona the credential (uid, gid, groups) is applied
+ 	 * and the persona itself is not joined, as in HakiOS (APSL 2.0) where no persona exists. usermanagerd's personas
