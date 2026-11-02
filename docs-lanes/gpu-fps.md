@@ -342,3 +342,23 @@ without a root write. On the phone (root v10, scripted, alternated with `fmtl=1`
 checked by eye. With it on, the copy into the shadow each frame is about 0.4 ms,
 which `RT_SHADOW_REUSE` is meant to skip. Test:
 `tools/test-fuxi-metal-frametrace.py` checks `applyBootOptions` sets these.
+
+### Device results after `RT_SHADOW` (root v11, 2026-11-02, scripted)
+
+All runs below: kernel m8t, `fmtl=40001` base, no `submit FAIL` or gate
+failure. Script runs only compare; a hand decides the limit.
+
+- `RT_SHADOW_REUSE` (`c0001`) removes the copy into the shadow (about one per
+  frame to about zero) but GPU p90 stays 5.3-5.7 ms; `RT_RENAME` (`140001`) and
+  both (`1c0001`) also land in 87-91 %, inside the spread of two plain `40001`
+  runs. `40001` stays the setting.
+- GPU level 7 (615 MHz) and 6 (550 MHz) against 8 (680): 90.2 and 87.7-88.6 %
+  against 91.9-92.0 %, GPU p90 6.3-7.0 against 5.8-6.1 ms. The CPU stays at
+  67-69 C either way, so the touch boost (new boost at or below 60 C, cut at
+  62 C) hardly runs (50-200 ms in five minutes) and gold sits at 1.4 GHz while
+  scrolling. Level 8 stays.
+- Present FIFO off (`fuxiearly=1` against 5, frame log): swap to START drops
+  from about 27 ms to 9-16 ms, but one-period frames fall from 92 % to 82 %,
+  with about 950 copies replaced by a newer one per run. Copies finish in pairs
+  within one period (CA swap interval p10 7.2, p90 9.3 ms), and the FIFO is what
+  absorbs that. `fuxiearly=5` stays.
