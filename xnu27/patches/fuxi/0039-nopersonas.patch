@@ -1,0 +1,47 @@
+diff --git a/bsd/kern/sys_persona.c b/bsd/kern/sys_persona.c
+index a7f1578..0d43620 100644
+--- a/bsd/kern/sys_persona.c
++++ b/bsd/kern/sys_persona.c
+@@ -42,6 +42,7 @@
+ 
+ #include <libkern/libkern.h>
+ #include <IOKit/IOBSD.h>
++#include <pexpert/pexpert.h>
+ 
+ #define PERSONA_INFO_V1_SIZE offsetof(struct kpersona_info, persona_uid)
+ #define PERSONA_INFO_V2_SIZE sizeof(struct kpersona_info)
+@@ -145,6 +146,34 @@ kpersona_alloc_syscall(user_addr_t infop, user_addr_t idp, user_addr_t path)
+ 	}
+ 
+ #if defined(FUXI)
++	/*
++	 * fuxi_nopersonas=1: no persona is ever made, as in HakiOS (where none exist). Every allocation
++	 * succeeds with the id asked for (or a made-up one) and leaves nothing behind, so launchd spawns
++	 * every job without a persona, and containermanagerd, finding none, should take its path for a
++	 * device without them instead of refusing each client's proxy persona (INVALID_PERSONA).
++	 */
++	{
++		static int nopersonas = -1;
++		static uid_t fake_id = 30000;
++
++		if (nopersonas < 0) {
++			int on = 0;
++
++			nopersonas = PE_parse_boot_argn("fuxi_nopersonas", &on, sizeof(on)) && on == 1;
++		}
++		if (nopersonas) {
++			uid_t fake = id != PERSONA_ID_NONE ? id : fake_id++;
++
++			printf("fuxi: persona %u (%s) not made (fuxi_nopersonas)\n", fake, login != NULL ? login : "-");
++			kinfo.persona_id = fake;
++			error = copyout(&fake, idp, sizeof(fake));
++			if (error == 0) {
++				error = kpersona_copyout(&kinfo, infop);
++			}
++			return error;
++		}
++	}
++
+ 	/*
+ 	 * Fuxi's init allocates usermanagerd's personas (same id, name and type) before launchd
+ 	 * starts, since launchd tags every job with a persona when it spawns it and usermanagerd

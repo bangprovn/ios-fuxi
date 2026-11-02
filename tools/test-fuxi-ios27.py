@@ -61,7 +61,7 @@ def layout():
     listed = series()
     files = sorted(p.relative_to(X27 / 'patches').as_posix() for p in (X27 / 'patches').rglob('*.patch'))
     assert sorted(listed) == files and len(set(listed)) == len(listed), 'series and patches/ differ'
-    assert listed[-38:] == ['fuxi/0001-machine-config.patch', 'fuxi/0002-builtin-crypto.patch',
+    assert listed[-39:] == ['fuxi/0001-machine-config.patch', 'fuxi/0002-builtin-crypto.patch',
                            'fuxi/0003-console.patch', 'fuxi/0004-components.patch', 'fuxi/0005-crypto-kext-handoff.patch',
                            'fuxi/0006-log-ring-fileset.patch', 'fuxi/0007-root27-storage.patch',
                            'fuxi/0008-dada-apfs.patch', 'fuxi/0009-cryptex-graft.patch', 'fuxi/0010-proc-log.patch',
@@ -82,7 +82,8 @@ def layout():
                            'fuxi/0031-iosurface-framebuffer-standins.patch',
                            'fuxi/0032-iouc-macf-bypass.patch', 'fuxi/0033-fuxi-iouc-open-sandbox-filter.patch',
                            'fuxi/0034-sandbox-permissive.patch', 'fuxi/0035-ramfs-fullfsync.patch', 'fuxi/0036-persona-realloc.patch',
-                           'fuxi/0037-exec-log-persona.patch', 'fuxi/0038-sandbox-container-path.patch']
+                           'fuxi/0037-exec-log-persona.patch', 'fuxi/0038-sandbox-container-path.patch',
+                           'fuxi/0039-nopersonas.patch']
     plog = (X27 / 'patches/fuxi/0010-proc-log.patch').read_text()
     assert plog.count('+#if defined(FUXI)') == 4 and 'PE_parse_boot_argn("fuxi_proc_log"' in plog
     watch = (X27 / 'patches/fuxi/0011-pid1-watch.patch').read_text()
@@ -137,6 +138,7 @@ def layout():
     assert 'persona %d uid %d' in (X27 / 'patches/fuxi/0037-exec-log-persona.patch').read_text()
     cpath = (X27 / 'patches/fuxi/0038-sandbox-container-path.patch').read_text()
     assert 'uap->call == 4' in cpath and 'policy_syscall 4 (container path)' in cpath
+    assert 'fuxi_nopersonas' in (X27 / 'patches/fuxi/0039-nopersonas.patch').read_text()
     perm = (X27 / 'patches/fuxi/0034-sandbox-permissive.patch').read_text()
     assert 'fuxi_sandbox_permissive' in perm and 'FUXI_MAC_PERMIT(mpc, #check, __step_err)' in perm
     assert 'allowed unfiltered (fuxi_iouc_open)' in filt and '+\t\t\t\t\t\t\tres = kIOReturnSuccess;' in filt
