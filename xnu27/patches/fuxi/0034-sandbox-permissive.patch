@@ -1,0 +1,86 @@
+diff --git a/security/mac_base.c b/security/mac_base.c
+index 9f90247..c17f764 100644
+--- a/security/mac_base.c
++++ b/security/mac_base.c
+@@ -852,6 +852,55 @@ mac_policy_unregister(mac_policy_handle_t handle)
+  * Define an error value precedence, and given two arguments, selects the
+  * value with the higher precedence.
+  */
++#if defined(FUXI)
++#include <pexpert/pexpert.h>
++
++/*
++ * fuxi_sandbox_permissive=1: a refusal by the policy named "Sandbox" (Apple's Sandbox kext) is
++ * logged and ignored. Its profiles refuse broadly here (user clients its profiles allow, file
++ * creation in the mobile user's home), while its queries (sandbox_check, container paths,
++ * extensions) still answer as on a device. The first 300 refusals print, and every check's
++ * first one.
++ */
++int
++fuxi_mac_permit(struct mac_policy_conf *mpc, const char *check, int error)
++{
++	static int permissive = -1;
++	static uint32_t logged;
++	static const char *seen[64];
++	char name[32] = "?";
++	bool first = true;
++
++	if (error == 0 || mpc->mpc_name == NULL || strcmp(mpc->mpc_name, "Sandbox") != 0) {
++		return error;
++	}
++	if (permissive < 0) {
++		int on = 0;
++
++		permissive = PE_parse_boot_argn("fuxi_sandbox_permissive", &on, sizeof(on)) && on == 1;
++	}
++	if (!permissive) {
++		return error;
++	}
++	for (unsigned i = 0; i < 64; i++) {
++		if (seen[i] == check) {
++			first = false;
++			break;
++		}
++		if (seen[i] == NULL) {
++			seen[i] = check;
++			break;
++		}
++	}
++	if (first || logged < 300) {
++		logged++;
++		proc_selfname(name, sizeof(name));
++		printf("fuxi: sandbox %s refused %s[%d] (error %d): allowed\n", check, name, proc_selfpid(), error);
++	}
++	return 0;
++}
++#endif
++
+ int
+ mac_error_select(int error1, int error2)
+ {
+diff --git a/security/mac_internal.h b/security/mac_internal.h
+index 6e8e2ca..8cc3c73 100644
+--- a/security/mac_internal.h
++++ b/security/mac_internal.h
+@@ -200,6 +200,13 @@ mac_cred_check_enforce(kauth_cred_t cred)
+  */
+ 
+ int mac_error_select(int error1, int error2);
++#if defined(FUXI)
++struct mac_policy_conf;
++int fuxi_mac_permit(struct mac_policy_conf *mpc, const char *check, int error);
++#define FUXI_MAC_PERMIT(mpc, check, error) fuxi_mac_permit(mpc, check, error)
++#else
++#define FUXI_MAC_PERMIT(mpc, check, error) (error)
++#endif
+ 
+ void  mac_policy_list_busy(void);
+ int   mac_policy_list_conditional_busy(void);
+@@ -267,6 +274,7 @@ enum mac_iterate_types {
+ 	    if (mpc->mpc_ops->mpo_ ## check != NULL) {                   \
+ 	            MAC_CHECK_CALL(check, mpc);                          \
+ 	            int __step_err = mpc->mpc_ops->mpo_ ## check (args); \
++	            __step_err = FUXI_MAC_PERMIT(mpc, #check, __step_err); \
+ 	            MAC_CHECK_RSLT(check, mpc);                          \
+ 	            error = mac_error_select(__step_err, error);         \
+ 	    }                                                            \
