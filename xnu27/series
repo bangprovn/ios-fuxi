@@ -104,3 +104,4 @@ fuxi/0036-persona-realloc.patch
 fuxi/0037-exec-log-persona.patch
 fuxi/0038-sandbox-container-path.patch
 fuxi/0039-nopersonas.patch
+fuxi/0040-trace-max.patch

@@ -1,0 +1,50 @@
+diff --git a/bsd/dev/arm/systemcalls.c b/bsd/dev/arm/systemcalls.c
+index 6f329f6..62d1920 100644
+--- a/bsd/dev/arm/systemcalls.c
++++ b/bsd/dev/arm/systemcalls.c
+@@ -89,7 +89,8 @@ extern int mach_trap_count;
+ #if defined(FUXI)
+ /*
+  * fuxi_trace=NAME[,NAME...]: print the file system calls that fail in the processes with those names
+- * (p_comm), with the path and the error, at most 120 lines a process and 3000 a boot; a missing
++ * (p_comm), with the path and the error, at most 120 lines a process (fuxi_trace_max=N) and 3000 a boot;
++ * mkdir of what exists already (EEXIST) is not reported, nor a missing
+  * FeatureFlags or Logging preference file is not reported (every process looks for dozens). For
+  * daemons whose own logging goes to os_log only.
+  */
+@@ -98,7 +99,7 @@ fuxi_syscall_trace(struct proc *proc, unsigned short code, const u_int64_t *arg,
+ {
+ 	static char names[128];
+ 	static int state;       /* 0 not read, 1 on, 2 off */
+-	static int lines, pids[64], pid_lines[64];
++	static int lines, pids[64], pid_lines[64], max_lines = 120;
+ 	unsigned slot;
+ 	char path[2][160] = { "", "" };
+ 	int at[2] = { -1, -1 };
+@@ -106,6 +107,7 @@ fuxi_syscall_trace(struct proc *proc, unsigned short code, const u_int64_t *arg,
+ 
+ 	if (state == 0) {
+ 		state = PE_parse_boot_arg_str("fuxi_trace", names, sizeof(names)) && names[0] != '\0' ? 1 : 2;
++		(void)PE_parse_boot_argn("fuxi_trace_max", &max_lines, sizeof(max_lines));
+ 	}
+ 	if (state != 1 || lines >= 3000) {
+ 		return;
+@@ -124,6 +126,9 @@ fuxi_syscall_trace(struct proc *proc, unsigned short code, const u_int64_t *arg,
+ 		}
+ 		s += len + 1;
+ 	}
++	if (code == 136 && error == EEXIST) {
++		return;
++	}
+ 	switch (code) {
+ 	case 5: case 10: case 15: case 16: case 33: case 58: case 136: case 137: case 167: case 200: case 220:
+ 	case 221: case 338: case 340: case 345: case 398:
+@@ -154,7 +159,7 @@ fuxi_syscall_trace(struct proc *proc, unsigned short code, const u_int64_t *arg,
+ 		pids[slot] = proc_getpid(proc);
+ 		pid_lines[slot] = 0;
+ 	}
+-	if (pid_lines[slot]++ >= 120) {
++	if (pid_lines[slot]++ >= max_lines) {
+ 		return;
+ 	}
+ 	lines++;
