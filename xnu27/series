@@ -108,3 +108,4 @@ fuxi/0040-trace-max.patch
 fuxi/0041-spawn-nopersona.patch
 fuxi/0042-spawn-nopersona-proxy-only.patch
 fuxi/0043-spawn-join-label.patch
+fuxi/0044-bank-persona-log.patch

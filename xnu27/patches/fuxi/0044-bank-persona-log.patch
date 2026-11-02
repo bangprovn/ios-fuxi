@@ -1,0 +1,115 @@
+diff --git a/osfmk/bank/bank.c b/osfmk/bank/bank.c
+index b00d966..f464b33 100644
+--- a/osfmk/bank/bank.c
++++ b/osfmk/bank/bank.c
+@@ -109,6 +109,40 @@ static LCK_SPIN_DECLARE_ATTR(g_bank_task_lock_data, &bank_lock_grp, &bank_lock_a
+ static TUNABLE(bool, disable_persona_propagate_check,
+     "disable_persona_propagate_check", false);
+ 
++#if defined(FUXI)
++#include <pexpert/pexpert.h>
++extern void proc_name(int pid, char *buf, int size);
++
++/*
++ * fuxi_bank_log=NAME[,NAME]: log the persona a bank task (a process's side of a voucher) gets, and every
++ * persona query of a voucher, for the processes whose names are in the list. To see what containermanagerd
++ * learns of a client's persona (it answers INVALID_PERSONA).
++ */
++static bool
++fuxi_bank_log_wanted(int pid, char *name, int size)
++{
++	static char list[128];
++	static int parsed;
++	static int logged;
++
++	if (!parsed) {
++		parsed = 1;
++		if (!PE_parse_boot_argn("fuxi_bank_log", list, sizeof(list))) {
++			list[0] = '\0';
++		}
++	}
++	if (list[0] == '\0' || logged >= 400) {
++		return false;
++	}
++	proc_name(pid, name, size);
++	if (name[0] == '\0' || strnstr(list, name, sizeof(list)) == NULL) {
++		return false;
++	}
++	logged++;
++	return true;
++}
++#endif
++
+ #define global_bank_task_lock() \
+ 	lck_spin_lock_grp(&g_bank_task_lock_data, &bank_lock_grp)
+ #define global_bank_task_lock_try() \
+@@ -810,6 +844,17 @@ bank_command(
+ 			token = (struct persona_token *)(void *)&out_content[0];
+ 			memcpy(&token->originator, &bank_secureoriginator->bt_proc_persona, sizeof(struct proc_persona_info));
+ 			memcpy(&token->proximate, &bank_proximateprocess->bt_proc_persona, sizeof(struct proc_persona_info));
++#if defined(FUXI)
++			{
++				char name[32];
++
++				if (fuxi_bank_log_wanted(task_pid(current_task()), name, sizeof(name))) {
++					printf("fuxi: bank %s[%d] persona token: originator pid %d persona %u uid %u, proximate pid %d persona %u uid %u\n",
++					    name, task_pid(current_task()), token->originator.pid, token->originator.persona_id,
++					    token->originator.uid, token->proximate.pid, token->proximate.persona_id, token->proximate.uid);
++				}
++			}
++#endif
+ 
+ 			*out_content_size = (mach_voucher_attr_content_size_t)sizeof(*token);
+ 			return KERN_SUCCESS;
+@@ -846,6 +891,17 @@ bank_command(
+ 				panic("Bogus bank type: %d passed in voucher_command", bank_element->be_type);
+ 			}
+ 
++#if defined(FUXI)
++			{
++				char name[32];
++
++				if (fuxi_bank_log_wanted(task_pid(current_task()), name, sizeof(name))) {
++					printf("fuxi: bank %s[%d] persona id %u (%s of pid %d)\n", name, task_pid(current_task()), persona_id,
++					    bank_element->be_type == BANK_TASK ? "task" : "account", bank_element->be_type == BANK_TASK ?
++					    bank_task->bt_pid : bank_account->ba_holder->bt_pid);
++				}
++			}
++#endif
+ 			memcpy(out_content, &persona_id, sizeof(persona_id));
+ 			*out_content_size = (mach_voucher_attr_content_size_t)sizeof(persona_id);
+ 			return KERN_SUCCESS;
+@@ -868,6 +924,15 @@ bank_command(
+ 		}
+ 
+ 		adopt_any_persona = (bank_merchant->bt_flags & PROC_PERSONA_INFO_FLAG_ADOPTION_ALLOWED) != 0;
++#if defined(FUXI)
++		{
++			char name[32];
++
++			if (fuxi_bank_log_wanted(task_pid(current_task()), name, sizeof(name))) {
++				printf("fuxi: bank %s[%d] adopt any persona: %d\n", name, task_pid(current_task()), adopt_any_persona);
++			}
++		}
++#endif
+ 		memcpy(out_content, &adopt_any_persona, sizeof(adopt_any_persona));
+ 		*out_content_size = (mach_voucher_attr_content_size_t)sizeof(adopt_any_persona);
+ 		return KERN_SUCCESS;
+@@ -1000,6 +1065,17 @@ bank_task_alloc_init(task_t task)
+ 
+ 	persona_put(persona);
+ 	persona = NULL;
++#if defined(FUXI)
++	{
++		char name[32];
++
++		if (fuxi_bank_log_wanted(new_bank_task->bt_pid, name, sizeof(name))) {
++			printf("fuxi: bank task %s[%d] persona %u uid %u flags 0x%x propagate %d platform %d\n", name,
++			    new_bank_task->bt_pid, new_bank_task->bt_persona_id, new_bank_task->bt_persona_uid,
++			    new_bank_task->bt_flags, new_bank_task->bt_hasentitlement, task_get_platform_binary(task));
++		}
++	}
++#endif
+ 
+ #if DEVELOPMENT || DEBUG
+ 	new_bank_task->bt_task = NULL;
