@@ -72,6 +72,7 @@ struct kpersona_info {
 } __attribute__((packed));
 _Static_assert(sizeof(struct kpersona_info) == 348, "kpersona_info");
 #define PERSONA_INFO_V2         2
+#define PERSONA_SYSTEM          4
 #define PERSONA_SYSTEM_PROXY    6
 int kpersona_alloc(struct kpersona_info *info, uid_t *id);
 
@@ -334,18 +335,19 @@ cryptex_files(void)
 }
 
 /*
- * launchd looks up a system proxy persona (type 6) of the job's user for every job it spawns
- * ("Unable to find persona with type 6"). usermanagerd creates the personas from a manifest it
- * keeps with AppleKeyStore, which Fuxi has not got, so this program makes the two for root and
- * mobile.
+ * launchd looks up personas for the jobs it spawns: the system domain a system proxy persona
+ * (type 6) with no user ("No matching personas of type 6 uid -1"), user/501 a system persona
+ * (type 4). usermanagerd creates the personas from a manifest it keeps with AppleKeyStore, which
+ * Fuxi has not got, so this program makes the two.
  */
 static void
 personas(void)
 {
 	static const struct {
 		const char *name;
+		int type;
 		uid_t uid;
-	} proxies[] = { { "fuxi.proxy.root", 0 }, { "fuxi.proxy.mobile", 501 } };
+	} proxies[] = { { "fuxi.proxy", PERSONA_SYSTEM_PROXY, (uid_t)-1 }, { "fuxi.system.mobile", PERSONA_SYSTEM, 501 } };
 
 	for (unsigned i = 0; i < sizeof(proxies) / sizeof(proxies[0]); i++) {
 		struct kpersona_info info;
@@ -354,11 +356,11 @@ personas(void)
 		memset(&info, 0, sizeof(info));
 		info.persona_info_version = PERSONA_INFO_V2;
 		info.persona_id = (uid_t)-1;
-		info.persona_type = PERSONA_SYSTEM_PROXY;
+		info.persona_type = proxies[i].type;
 		info.persona_uid = proxies[i].uid;
 		strlcpy(info.persona_name, proxies[i].name, sizeof(info.persona_name));
 		if (kpersona_alloc(&info, &id) == 0) {
-			say("persona %s (type %d, uid %u): id %u", proxies[i].name, PERSONA_SYSTEM_PROXY, proxies[i].uid, id);
+			say("persona %s (type %d, uid %d): id %u", proxies[i].name, proxies[i].type, (int)proxies[i].uid, id);
 		} else {
 			say("persona %s: %s", proxies[i].name, strerror(errno));
 		}
