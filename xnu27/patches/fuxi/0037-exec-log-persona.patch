@@ -1,0 +1,15 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 1363944..fb5e8c7 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -3124,7 +3124,9 @@ encapsulated_binary:
+ bad:
+ #if defined(FUXI)
+ 	if (fuxi_proc_log()) {
+-		printf("fuxi: exec pid %d %s: %d\n", proc_getpid(p), excpath != NULL ? excpath : "?", error);
++		/* with the persona launchd spawned it with (containermanagerd answers by persona) */
++		printf("fuxi: exec pid %d %s: %d persona %d uid %d\n", proc_getpid(p), excpath != NULL ? excpath : "?", error,
++		    (int)proc_persona_id(p), (int)kauth_getuid());
+ 	}
+ #endif
+ 	proc_transend(p, 0);

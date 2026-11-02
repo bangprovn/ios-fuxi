@@ -1,0 +1,23 @@
+diff --git a/security/mac_base.c b/security/mac_base.c
+index c17f764..ae334c2 100644
+--- a/security/mac_base.c
++++ b/security/mac_base.c
+@@ -1642,6 +1642,18 @@ __mac_syscall(proc_t p, struct __mac_syscall_args *uap, int *retv __unused)
+ 		    mpc->mpc_ops->mpo_policy_syscall != NULL) {
+ 			error = mpc->mpc_ops->mpo_policy_syscall(p,
+ 			    uap->call, uap->arg);
++#if defined(FUXI)
++			/*
++			 * Sandbox request 4 is the container path of a process (sandbox_container_path_for_pid).
++			 * Apple's Sandbox learns it when a contained program is spawned, which nothing does here,
++			 * and answers ENOTSUP; containermanagerd asked it over and over for lsd and gave up. As in
++			 * HakiOS's minisandbox (APSL 2.0), a process without a container gets success and the
++			 * buffer untouched. Only with fuxi_sandbox_permissive=1.
++			 */
++			if (error != 0 && uap->call == 4) {
++				error = fuxi_mac_permit(mpc, "policy_syscall 4 (container path)", error);
++			}
++#endif
+ 			goto done;
+ 		}
+ 	}

@@ -101,3 +101,5 @@ fuxi/0033-fuxi-iouc-open-sandbox-filter.patch
 fuxi/0034-sandbox-permissive.patch
 fuxi/0035-ramfs-fullfsync.patch
 fuxi/0036-persona-realloc.patch
+fuxi/0037-exec-log-persona.patch
+fuxi/0038-sandbox-container-path.patch
