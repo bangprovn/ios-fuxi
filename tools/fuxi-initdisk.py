@@ -12,6 +12,8 @@ OUT_DIR gets:
   jobs/empty/               bound over LaunchAngels and NanoLaunchDaemons
   jobs/xpc/                 bound over /System/Library/xpc: its files except launchd.plist(.sig), so that
                             launchd reads the job directory, not the prebuilt job cache
+  var/mobile/Library/Preferences/com.apple.migration.plist
+                            copied into /private/var by fuxi-init (var_files)
 
 The job set follows HakiOS / hakios-arm64e-dada's mkjobs.py (APSL 2.0), reimplemented here: the LABELs
 (DEFAULT_LABELS when none are given) are copied whole and start as iOS starts them; every other job with
@@ -51,6 +53,10 @@ JOB_LOGS = '/private/var/fuxi/log'   # fuxi-init's JOB_LOGS
 # skips them on this boot, and AMFI's launch constraints kill them when anything but launchd starts them, so
 # they become jobs that run once at load.
 BOOT_TASKS = {'keybag': ['/usr/libexec/keybagd', '--init'], 'usermanagerd': ['/usr/libexec/usermanagerd', '--init']}
+
+# Files for /private/var (fuxi-init var_files copies them, owned by mobile): DataMigration's record that the
+# volume's build was migrated already, so that datamigrator does not run its plugins (backboardd waits for it).
+MIGRATION_PLIST = 'var/mobile/Library/Preferences/com.apple.migration.plist'
 
 
 class Volumes:
@@ -141,6 +147,11 @@ def main():
         to_console(job, label, a.log)
         with open(os.path.join(a.out, 'jobs/LaunchDaemons', name), 'wb') as f:
             plistlib.dump(job, f, fmt=plistlib.FMT_BINARY)
+    build = plistlib.loads(root.read('/System/Library/CoreServices/SystemVersion.plist'))['ProductBuildVersion']
+    os.makedirs(os.path.dirname(os.path.join(a.out, MIGRATION_PLIST)), exist_ok=True)
+    with open(os.path.join(a.out, MIGRATION_PLIST), 'wb') as f:
+        plistlib.dump({'LastBuildVersion': build, 'LastMigratedBuild': build}, f)
+    print(f'  migration record: build {build}')
     for task, argv in BOOT_TASKS.items():
         label = f'fuxi.boottask.{task}'
         job = {'Label': label, 'ProgramArguments': argv, 'RunAtLoad': True, 'LaunchOnlyOnce': True, 'UserName': 'root'}

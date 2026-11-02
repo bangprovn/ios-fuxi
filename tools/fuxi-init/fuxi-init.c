@@ -237,6 +237,35 @@ copy_tree(const char *rel)
 	closedir(dir);
 }
 
+/*
+ * Files the init disk carries for /private/var (fuxi-initdisk.py VAR_FILES): the mobile user's
+ * com.apple.migration preferences, which tell DataMigration that this build was migrated
+ * already. Without them datamigrator runs every migration plugin, and backboardd waits for it
+ * before it brings up its displays.
+ */
+static void
+var_files(void)
+{
+	static const char *const files[] = {
+		"mobile/Library/Preferences/com.apple.migration.plist",
+	};
+	char from[1024], to[1024];
+	struct stat st;
+
+	for (unsigned i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+		snprintf(from, sizeof(from), "%s/var/%s", DISK, files[i]);
+		snprintf(to, sizeof(to), "/private/var/%s", files[i]);
+		if (stat(from, &st) != 0) {
+			continue;
+		}
+		st.st_uid = st.st_gid = 501;    /* mobile */
+		st.st_mode = 0600;
+		unlink(to);
+		copy_file(from, to, &st);
+		say("var file %s: %s", to, access(to, F_OK) == 0 ? "ok" : strerror(errno));
+	}
+}
+
 static void
 writable_var(void)
 {
@@ -271,6 +300,7 @@ writable_var(void)
 	if (mkdir("/private/var/keybags", 0700) != 0) {
 		say("mkdir /private/var/keybags: %s", strerror(errno));
 	}
+	var_files();
 	say("/private/var on ramfs: %u dirs %u links %u files (%llu KB), %u files over %d KB skipped (%llu KB), "
 	    "%u errors, %llu ms", count.dirs, count.links, count.files, count.bytes >> 10, count.skipped, FILE_LIMIT >> 10,
 	    count.skipped_bytes >> 10, count.errors, now_ms() - t0);
