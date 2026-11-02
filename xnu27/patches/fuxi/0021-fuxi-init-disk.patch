@@ -1,0 +1,49 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index dc7c54e..1363944 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8118,6 +8118,18 @@ load_init_program(proc_t p)
+ 	(void) memorystatus_init_at_boot_snapshot();
+ #endif /* CONFIG_MEMORYSTATUS */
+ 
++#if defined(FUXI)
++	/* fuxi_init=PATH: our own process 1 (on the init disk, see fuxi_initdisk), which ends by exec'ing /sbin/launchd */
++	char fuxi_init_path[128];
++	if (PE_parse_boot_argn("fuxi_init", fuxi_init_path, sizeof(fuxi_init_path)) && fuxi_init_path[0] == '/') {
++		printf("load_init_program: attempting to load %s\n", fuxi_init_path);
++		error = load_init_program_at_path(p, (user_addr_t)scratch_addr, fuxi_init_path);
++		if (!error) {
++			return;
++		}
++		printf("load_init_program: failed loading %s: errno %d\n", fuxi_init_path, error);
++	}
++#endif
+ #if DEBUG || DEVELOPMENT
+ 	/* Check for boot-arg suffix first */
+ 	char launchd_suffix[64];
+diff --git a/bsd/miscfs/apfs/apfs_vfsops.c b/bsd/miscfs/apfs/apfs_vfsops.c
+index fe626b6..df9e791 100644
+--- a/bsd/miscfs/apfs/apfs_vfsops.c
++++ b/bsd/miscfs/apfs/apfs_vfsops.c
+@@ -1619,6 +1619,21 @@ fuxi_root27_graft(void)
+ 		    "/System/Library/Caches/com.apple.dyld", &fuxi_root27_cryptex_mp[1]);
+ 		(void)fuxi_graft_one("AppOS", NULL, "/private/preboot/Cryptexes/App", &fuxi_root27_cryptex_mp[2]);
+ 	}
++	/*
++	 * fuxi_initdisk=1: the boot payload's RAM disk (/dev/md0, an APFS container with our process 1
++	 * and the launchd jobs it puts in place) read only at /fuxi, for fuxi_init=/fuxi/init.
++	 */
++	on = 0;
++	if (buf != NULL && PE_parse_boot_argn("fuxi_initdisk", &on, sizeof(on)) && on == 1) {
++		int error = fuxi_graft_dir(buf, "/fuxi");
++
++		if (error == 0) {
++			strlcpy(buf, "/dev/md0", MAXPATHLEN);
++			error = kernel_mount("apfs", NULLVP, NULLVP, "/fuxi", buf, strlen(buf) + 1, MNT_RDONLY,
++			    KERNEL_MOUNT_NOAUTH, vfs_context_kernel());
++		}
++		printf("fuxi: init disk md0 at /fuxi: %d\n", error);
++	}
+ 	if (buf != NULL) {
+ 		kfree_data(buf, MAXPATHLEN);
+ 	}

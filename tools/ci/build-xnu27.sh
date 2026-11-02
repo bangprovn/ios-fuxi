@@ -39,10 +39,18 @@ git -C "$xnu" diff --quiet || die 'xnu checkout is not clean'
 [[ $(git -C "$work/libpthread" rev-parse HEAD) == "$LIBPTHREAD_SHA" ]] || die 'libpthread is not at LIBPTHREAD_SHA'
 
 # ld-classic emits __TEXT,__thread_starts, which a standalone arm64e kernel
-# needs (UniXNU arm64e-threaded-starts.patch). Fail before a long build.
+# needs (UniXNU arm64e-threaded-starts.patch). Xcode 27's ld has neither
+# ld-classic nor -threaded_starts_section; without it every link is the
+# chained-fixups one (the kernel the K2 prelink boots), and the K1 standalone
+# kernel is not built: mach.development.fuxi is then that chained kernel.
 xcodebuild -version
-ldc=$(xcrun -sdk iphoneos -find ld-classic) || die 'this Xcode has no ld-classic (needed for -threaded_starts_section)'
-echo "ld-classic: $ldc"
+if ldc=$(xcrun -sdk iphoneos -find ld-classic 2>/dev/null); then
+    echo "ld-classic: $ldc"
+    k1_chained=0
+else
+    echo '::warning::no ld-classic: every link uses chained fixups; no K1 standalone kernel' >&2
+    k1_chained=1
+fi
 
 bash "$root/xnu27/apply.sh" "$xnu"
 cp -R "$work/trustcache/EXTERNAL_HEADERS/TrustCache" "$xnu/EXTERNAL_HEADERS/"
@@ -100,7 +108,7 @@ kflags=(SDKROOT=iphoneos
     ARM64_LINK_ADDR=0xfffffff007004000 ARM64_PLKSEG_ADDR=0xfffffff004004000
     DEPLOYMENT_TARGET_FLAGS="-miphoneos-version-min=$XNU27_IOS_VERSION -DXNU_TARGET_OS_IOS"
     DEPLOYMENT_LINKER_FLAGS="-Wl,-ios_version_min,$XNU27_IOS_VERSION"
-    BOUND_CHECKS=0 BUILD_WERROR=0 XNU_KERNEL_CHAINED_FIXUPS=0
+    BOUND_CHECKS=0 BUILD_WERROR=0 XNU_KERNEL_CHAINED_FIXUPS=$k1_chained
     CFLAGS_EXTRA="-Wno-reserved-identifier -Wno-pre-c11-compat -Wno-missing-designated-field-initializers -Wno-suggest-override -Wno-unnecessary-virtual-specifier -Wno-suggest-destructor-override -Wno-ms-bitfield-padding -DXNU_NATIVE_PAN=1"
     copyio.o_CFLAGS_ADD=-march=armv8.1-a pcb.o_CFLAGS_ADD=-march=armv8.1-a platform_tests.o_CFLAGS_ADD=-march=armv8.1-a
     ubc_subr.o_CFLAGS_ADD=-DXNU_NATIVE_CS_HASH_CACHE=1)
@@ -143,7 +151,7 @@ done
 pthread_linked "$out/mach.development.fuxi.unstripped" | tee -a "$out/libpthread-linked.txt"
 # The loader build accepts a 12377 payload only with this object-path identity.
 grep -q DEVELOPMENT_ARM64_FUXI "$out/mach.development.fuxi" || die 'kernel lacks the DEVELOPMENT_ARM64_FUXI identity'
-python3 - "$out/mach.development.fuxi" "$root/tools" <<'PY' | tee "$out/kernel-arch.txt"
+python3 - "$out/mach.development.fuxi" "$root/tools" "$k1_chained" <<'PY' | tee "$out/kernel-arch.txt"
 import re, sys
 sys.path.insert(0, sys.argv[2])
 import mkpayload
@@ -152,8 +160,8 @@ m = mkpayload.parse_macho(buf)
 version = re.search(rb'Darwin Kernel Version [^\0]*', buf)
 print(version.group().decode(errors='replace') if version else 'no version string')
 print(f"cputype={m['cputype']:#x} cpusub={m['cpusub']} thread_starts={m['thread_starts']} chained_fixups={bool(m['fixups'])}")
-if m['cpusub'] != mkpayload.CPU_SUBTYPE_ARM64E or not m['thread_starts']:
-    raise SystemExit('ios27 kernel is not arm64e with __TEXT,__thread_starts')
+if m['cpusub'] != mkpayload.CPU_SUBTYPE_ARM64E or not (m['thread_starts'] or sys.argv[3] == '1' and m['fixups']):
+    raise SystemExit('ios27 kernel is not arm64e with __TEXT,__thread_starts (or chained fixups without ld-classic)')
 PY
 python3 "$root/tools/ci/kernel-inputs.py" --variant ios27 --out "$out"
 

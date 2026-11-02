@@ -61,7 +61,7 @@ def layout():
     listed = series()
     files = sorted(p.relative_to(X27 / 'patches').as_posix() for p in (X27 / 'patches').rglob('*.patch'))
     assert sorted(listed) == files and len(set(listed)) == len(listed), 'series and patches/ differ'
-    assert listed[-20:] == ['fuxi/0001-machine-config.patch', 'fuxi/0002-builtin-crypto.patch',
+    assert listed[-21:] == ['fuxi/0001-machine-config.patch', 'fuxi/0002-builtin-crypto.patch',
                            'fuxi/0003-console.patch', 'fuxi/0004-components.patch', 'fuxi/0005-crypto-kext-handoff.patch',
                            'fuxi/0006-log-ring-fileset.patch', 'fuxi/0007-root27-storage.patch',
                            'fuxi/0008-dada-apfs.patch', 'fuxi/0009-cryptex-graft.patch', 'fuxi/0010-proc-log.patch',
@@ -69,7 +69,8 @@ def layout():
                            'fuxi/0013-native4k-progress.patch', 'fuxi/0014-apfs-nocache-read.patch',
                            'fuxi/0015-user-pac-fail-log.patch', 'fuxi/0016-pac-fail-slot.patch',
                            'fuxi/0017-native-pac-default-jop-pid.patch', 'fuxi/0018-launchd-ramdisk-bootargs.patch',
-                           'fuxi/0019-spawn-nosys-log.patch', 'fuxi/0020-pid1-signal-backtrace.patch']
+                           'fuxi/0019-spawn-nosys-log.patch', 'fuxi/0020-pid1-signal-backtrace.patch',
+                           'fuxi/0021-fuxi-init-disk.patch']
     plog = (X27 / 'patches/fuxi/0010-proc-log.patch').read_text()
     assert plog.count('+#if defined(FUXI)') == 4 and 'PE_parse_boot_argn("fuxi_proc_log"' in plog
     watch = (X27 / 'patches/fuxi/0011-pid1-watch.patch').read_text()
@@ -92,6 +93,8 @@ def layout():
     assert '+posix_spawn_impl(proc_t ap, struct posix_spawn_args *uap, int32_t *retval)' in spawn and 'fuxi: nosys pid %d' in spawn
     bt = (X27 / 'patches/fuxi/0020-pid1-signal-backtrace.patch').read_text()
     assert '+fuxi_user_backtrace(int signum)' in bt and '+\t\t\tfuxi_user_backtrace(signum & ~WCOREFLAG);' in bt
+    initd = (X27 / 'patches/fuxi/0021-fuxi-init-disk.patch').read_text()
+    assert 'PE_parse_boot_argn("fuxi_initdisk"' in initd and 'PE_parse_boot_argn("fuxi_init", fuxi_init_path' in initd
     # 0009: the kernel grafts the SystemOS/AppOS cryptexes and the dyld cache directory when ignition is skipped.
     graft = (X27 / 'patches/fuxi/0009-cryptex-graft.patch').read_text()
     for need in ('+fuxi_root27_graft(void)', 'PE_parse_boot_argn("fuxi_root27_cryptex"', '"/private/preboot/Cryptexes/OS"',
@@ -579,8 +582,8 @@ def ci():
     assert 'python3 tools/test-fuxi-ios27.py' in body and 'bash tools/ci/build-xnu27.sh' in body
     assert 'KDK' not in body.replace('No KDK', '') and 'ipsw' not in body.lower()
     b27 = (ROOT / 'tools/ci/build-xnu27.sh').read_text()
-    for need in ('MACHINE_CONFIGS=FUXI', 'ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG=arm64e', 'XNU_KERNEL_CHAINED_FIXUPS=0',
-                 '-find ld-classic', 'xnu27/apply.sh', '--variant ios27', 'DEVELOPMENT_ARM64_FUXI'):
+    for need in ('MACHINE_CONFIGS=FUXI', 'ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG=arm64e', 'XNU_KERNEL_CHAINED_FIXUPS=$k1_chained',
+                 'k1_chained=0', 'k1_chained=1', '-find ld-classic', 'xnu27/apply.sh', '--variant ios27', 'DEVELOPMENT_ARM64_FUXI'):
         assert need in b27, need
     rel = b27[b27.index('# K2 matching reference'):]
     for need in ('KERNEL_CONFIGS=RELEASE', 'BUILD_LTO=1', 'OBJROOT="$robj"', '"${kflags[@]}"', 'MACHINE_CONFIGS=FUXI',
