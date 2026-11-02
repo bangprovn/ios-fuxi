@@ -11,6 +11,7 @@ boot-arg, ADT option or root-edit option, the kernel, ADT and root are unchanged
 | Privileges by entitlement | `xnu/fuxi-sys/fuxi_sys.h`, patch 0107 | boot-arg `fuxiprivs=1` | `hackios-xnu-kernel xnu/files/bsd/kern/kern_minimac.c` (APSL 2.0) |
 | Container path for an uncontained process | same | boot-arg `fuxisbpath=1` | same |
 | Sandbox extensions issued and consumed | same | boot-arg `fuxisbext=1` | Fuxi; HackiOS only returns success |
+| SpringBoard's frame rates: its in-process animations' display link, its animations through the window server | `tools/fuxi-sb/FuxiRates.c`, in `libfuxi-sb.dylib` | on where the library is installed; boot-arg `fxrate=0` turns it off, `1` and `2` one at a time | `hakios-xnu-kernel userland/src/inject_sb.c` (MIT) |
 | HAL devices Speaker/Hawking/Actuator/Codec | `tools/fuxi-audio/` | `fuxi-sys-root.py --audio-plugin` (+ `--restore-virtualaudio`) | `hackios-xnu-userland userland/src/audio_plugin.c`, `audio_plugin.plist` (MIT) |
 | `/product/haptics`, `/product/camera` | `tools/mkadt-fuxi.py` | `--product-haptics`, `--product-camera` | `hackios-xnu-userland` loader/identity notes (MIT); values from the local D22AP tree |
 | App snapshots as JPEG/PNG, not ATX | `tools/fuxi-sb/` | `fuxi-sys-root.py --sb-snapshots`; boot-arg `fuxisbjpeg=0` turns it off again | `hackios-xnu-userland userland/src/inject_sb.c` (MIT) |

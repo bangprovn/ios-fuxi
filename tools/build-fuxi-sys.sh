@@ -15,7 +15,7 @@ rm -rf "$bundle"
 mkdir -p "$bundle"
 cp tools/fuxi-audio/Info.plist "$bundle/Info.plist"
 "$cc" "${flags[@]}" -bundle tools/fuxi-audio/FuxiAudio.c -framework CoreFoundation -o "$bundle/FuxiAudio"
-"$cc" "${flags[@]}" -dynamiclib tools/fuxi-sb/FuxiSnapshots.c -lobjc \
+"$cc" "${flags[@]}" -dynamiclib tools/fuxi-sb/FuxiSnapshots.c tools/fuxi-sb/FuxiRates.c -lobjc \
  -install_name /usr/local/lib/fuxi/libfuxi-sb.dylib -o "$out/libfuxi-sb.dylib"
 for binary in "$bundle" "$out/libfuxi-sb.dylib"; do
  codesign -f -s - "$binary"
