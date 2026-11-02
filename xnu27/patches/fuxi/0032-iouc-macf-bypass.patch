@@ -1,0 +1,36 @@
+diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
+index e3c0911..5ef80b3 100644
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -4561,9 +4561,28 @@ is_io_service_open_extended(
+ 			}
+ #if CONFIG_MACF
+ 			else if (0 != mac_iokit_check_open(kauth_cred_get(), client, connect_type)) {
+-				IOLog("IOUC %s failed MACF in process %s\n",
+-				    client->getMetaClass()->getClassName(), creatorNameCStr);
+-				res = kIOReturnNotPermitted;
++#if defined(FUXI)
++				/*
++				 * fuxi_iouc_open=1: the Sandbox kext refuses user clients its profiles allow (even
++				 * RootDomainUserClient to mDNSResponder), so a MACF refusal is logged and let through.
++				 */
++				static int fuxi_iouc_open = -1, fuxi_iouc_logged;
++
++				if (fuxi_iouc_open < 0 && !PE_parse_boot_argn("fuxi_iouc_open", &fuxi_iouc_open, sizeof(fuxi_iouc_open))) {
++					fuxi_iouc_open = 0;
++				}
++				if (fuxi_iouc_open == 1) {
++					if (fuxi_iouc_logged++ < 200) {
++						IOLog("IOUC %s failed MACF in process %s: allowed (fuxi_iouc_open)\n",
++						    client->getMetaClass()->getClassName(), creatorNameCStr);
++					}
++				} else
++#endif
++				{
++					IOLog("IOUC %s failed MACF in process %s\n",
++					    client->getMetaClass()->getClassName(), creatorNameCStr);
++					res = kIOReturnNotPermitted;
++				}
+ 			}
+ #endif
+ 
