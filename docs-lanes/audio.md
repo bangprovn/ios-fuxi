@@ -14,7 +14,7 @@
 | The speaker heard by the mic, at the same lowest level | 2 kHz: 0.167 LSB before, 25.28 during, 0.754 after. Bias off: 0.019, 0.053, 0.041 | `a-loop1`, `a-loop2` |
 | Mic in the XNU kernel, `fuxiaudio=4` | 7 of 7, 772 periods, 0 bad, came back down | `a-kmic1` |
 | iOS sound through the amplifier (`fuxiaudioamp=1`), the top speaker, any higher level | written or not, **not run: each needs the owner's word** | |
-| `/dev/fuxiaudiomic` read by the plug-in in mediaserverd | written, root v7 made, not yet run | |
+| `/dev/fuxiaudiomic` read by the plug-in in mediaserverd | not proved. `fuxisbext=1` gets Safari past TCC to the prompt and the grant; the capture does not start: no StartIOProc on "Codec", no kernel mic line | `a-v8b`, `a-v8c` |
 
 Only numbers leave the phone in the mic's runs; the probes have no request that returns its samples.
 
