@@ -1,0 +1,31 @@
+diff --git a/bsd/kern/kern_sig.c b/bsd/kern/kern_sig.c
+index 222be41..0ec04c4 100644
+--- a/bsd/kern/kern_sig.c
++++ b/bsd/kern/kern_sig.c
+@@ -2098,6 +2098,26 @@ psignal_internal(proc_t p, task_t task, thread_t thread, int flavor, int signum,
+ 		}
+ 	}
+ 
++#if defined(FUXI)
++	/*
++	 * fuxi_proc_log=1: who sends SIGKILL to whom (launchd reports "sent by" the current process),
++	 * the kernel caller, and for the first 64 the sender's user stack (fuxi: bt lines).
++	 */
++	if (signum == SIGKILL && p != PROC_NULL && fuxi_proc_log()) {
++		static int fuxi_kills;
++		proc_t cur = current_proc();
++
++		printf("fuxi: SIGKILL by pid %d %s to pid %d %s, flavor 0x%x ns %d code 0x%llx, from 0x%lx\n",
++		    proc_getpid(cur), cur->p_name, proc_getpid(p), p->p_name, flavor,
++		    signal_reason ? (int)signal_reason->osr_namespace : -1,
++		    signal_reason ? (unsigned long long)signal_reason->osr_code : 0ULL,
++		    (unsigned long)VM_KERNEL_UNSLIDE(__builtin_return_address(0)));
++		if (os_atomic_inc(&fuxi_kills, relaxed) <= 64 && cur != kernproc) {
++			fuxi_user_backtrace(SIGKILL);
++		}
++	}
++#endif
++
+ 	/*
+ 	 *	We will need the task pointer later.  Grab it now to
+ 	 *	check for a zombie process.  Also don't send signals
