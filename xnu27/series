@@ -109,3 +109,4 @@ fuxi/0041-spawn-nopersona.patch
 fuxi/0042-spawn-nopersona-proxy-only.patch
 fuxi/0043-spawn-join-label.patch
 fuxi/0044-bank-persona-log.patch
+fuxi/0045-nosugid.patch

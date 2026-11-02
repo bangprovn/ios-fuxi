@@ -1,0 +1,42 @@
+diff --git a/bsd/kern/kern_prot.c b/bsd/kern/kern_prot.c
+index 2a4cdff..0ebd7cb 100644
+--- a/bsd/kern/kern_prot.c
++++ b/bsd/kern/kern_prot.c
+@@ -86,6 +86,7 @@
+  */
+ 
+ #include <sys/param.h>
++#include <pexpert/pexpert.h>
+ #include <sys/acct.h>
+ #include <sys/systm.h>
+ #include <sys/ucred.h>
+@@ -676,6 +677,29 @@ issetugid(proc_t p, __unused struct issetugid_args *uap, int32_t *retval)
+ 	 */
+ 
+ 	*retval = proc_issetugid(p);
++#if defined(FUXI)
++	/*
++	 * fuxi_nosugid=1: issetugid() answers 0. Every job here is started through a credential switch (its
++	 * persona, xpcproxy's setuid), and libraries ignore environment variables in a "tainted" process; the
++	 * variables wanted are those that send os_log to standard error (OS_ACTIVITY_DT_MODE).
++	 */
++	{
++		static int nosugid = -1;
++		static int logged;
++
++		if (nosugid < 0) {
++			int on = 0;
++
++			nosugid = PE_parse_boot_argn("fuxi_nosugid", &on, sizeof(on)) && on == 1;
++		}
++		if (nosugid && *retval != 0) {
++			if (logged++ < 60) {
++				printf("fuxi: issetugid pid %d %s: 1 -> 0\n", proc_getpid(p), p->p_comm);
++			}
++			*retval = 0;
++		}
++	}
++#endif
+ 	return 0;
+ }
+ 
