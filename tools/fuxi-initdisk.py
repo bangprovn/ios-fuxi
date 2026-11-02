@@ -55,7 +55,8 @@ JOB_LOGS = '/private/var/fuxi/log'   # fuxi-init's JOB_LOGS
 BOOT_TASKS = {'keybag': ['/usr/libexec/keybagd', '--init'], 'usermanagerd': ['/usr/libexec/usermanagerd', '--init']}
 
 # Files for /private/var (fuxi-init var_files copies them, owned by mobile): DataMigration's record that the
-# volume's build was migrated already, so that datamigrator does not run its plugins (backboardd waits for it).
+# volume's build was migrated already (LastSystemVersion, the key MobileInstallation edits to force a migration),
+# so that datamigrator does not run its plugins (backboardd waits for it).
 MIGRATION_PLIST = 'var/mobile/Library/Preferences/com.apple.migration.plist'
 
 
@@ -150,7 +151,7 @@ def main():
     build = plistlib.loads(root.read('/System/Library/CoreServices/SystemVersion.plist'))['ProductBuildVersion']
     os.makedirs(os.path.dirname(os.path.join(a.out, MIGRATION_PLIST)), exist_ok=True)
     with open(os.path.join(a.out, MIGRATION_PLIST), 'wb') as f:
-        plistlib.dump({'LastBuildVersion': build, 'LastMigratedBuild': build}, f)
+        plistlib.dump({'LastSystemVersion': build}, f)
     print(f'  migration record: build {build}')
     for task, argv in BOOT_TASKS.items():
         label = f'fuxi.boottask.{task}'
