@@ -243,6 +243,57 @@ copy_tree(const char *rel)
  * already. Without them datamigrator runs every migration plugin, and backboardd waits for it
  * before it brings up its displays.
  */
+/*
+ * The container tree a restore lays out on the data volume. containermanagerd does not make the
+ * top of it: without these its lookups of system group containers find nothing (ENOENT on
+ * /private/var/containers/...), its boot state (MobileContainerManager/System) is never written,
+ * and lsd's container_system_group_path_for_identifier() waits until lsd's own timeout aborts it.
+ * Owners as on a device: root's, except the mobile user's own.
+ */
+static void
+var_dirs(void)
+{
+	static const struct {
+		const char *path;
+		mode_t mode;
+		uid_t uid;
+	} dirs[] = {
+		{ "/private/var/containers", 0755, 0 },
+		{ "/private/var/containers/Bundle", 0755, 0 },
+		{ "/private/var/containers/Bundle/Application", 0755, 0 },
+		{ "/private/var/containers/Bundle/Framework", 0755, 0 },
+		{ "/private/var/containers/Bundle/VPNPlugin", 0755, 0 },
+		{ "/private/var/containers/Data", 0755, 0 },
+		{ "/private/var/containers/Data/System", 0755, 0 },
+		{ "/private/var/containers/Data/ProtectedSystem", 0755, 0 },
+		{ "/private/var/containers/Shared", 0755, 0 },
+		{ "/private/var/containers/Shared/SystemGroup", 0755, 0 },
+		{ "/private/var/root/Library/MobileContainerManager/System", 0755, 0 },
+		{ "/private/var/root/Library/Caches/com.apple.containermanagerd/System", 0755, 0 },
+		{ "/private/var/root/Library/Caches/com.apple.containermanagerd/System/Staging", 0755, 0 },
+		{ "/private/var/root/Library/Caches/com.apple.containermanagerd/System/Dead", 0755, 0 },
+		{ "/private/var/root/Library/Caches/com.apple.containermanagerd/System/Temp", 0755, 0 },
+		{ "/private/var/mobile/Containers/Data", 0755, 501 },
+		{ "/private/var/mobile/Containers/Data/Application", 0755, 501 },
+		{ "/private/var/mobile/Containers/Data/PluginKitPlugin", 0755, 501 },
+		{ "/private/var/mobile/Containers/Shared", 0755, 501 },
+		{ "/private/var/mobile/Containers/Shared/AppGroup", 0755, 501 },
+	};
+	unsigned made = 0;
+
+	for (unsigned i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+		if (mkdir(dirs[i].path, dirs[i].mode) != 0) {
+			if (errno != EEXIST) {
+				say("mkdir %s: %s", dirs[i].path, strerror(errno));
+			}
+			continue;
+		}
+		chown(dirs[i].path, dirs[i].uid, dirs[i].uid);
+		made++;
+	}
+	say("var dirs: %u made", made);
+}
+
 static void
 var_files(void)
 {
@@ -300,6 +351,7 @@ writable_var(void)
 	if (mkdir("/private/var/keybags", 0700) != 0) {
 		say("mkdir /private/var/keybags: %s", strerror(errno));
 	}
+	var_dirs();
 	var_files();
 	say("/private/var on ramfs: %u dirs %u links %u files (%llu KB), %u files over %d KB skipped (%llu KB), "
 	    "%u errors, %llu ms", count.dirs, count.links, count.files, count.bytes >> 10, count.skipped, FILE_LIMIT >> 10,
