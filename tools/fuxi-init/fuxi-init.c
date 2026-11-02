@@ -249,6 +249,8 @@ copy_tree(const char *rel)
  * top of it: without these its lookups of system group containers find nothing (ENOENT on
  * /private/var/containers/...), its boot state (MobileContainerManager/System) is never written,
  * and lsd's container_system_group_path_for_identifier() waits until lsd's own timeout aborts it.
+ * The daemon containers (InternalDaemon) likewise: installd exited "Failed to get installd daemon
+ * container" (ENOENT) at every start, and lsd's database seeding waited on it.
  * Owners as on a device: root's, except the mobile user's own.
  */
 static void
@@ -264,11 +266,14 @@ var_dirs(void)
 		{ "/private/var/containers/Bundle/Application", 0755, 0 },
 		{ "/private/var/containers/Bundle/Framework", 0755, 0 },
 		{ "/private/var/containers/Bundle/VPNPlugin", 0755, 0 },
+		{ "/private/var/containers/Bundle/PluginKitPlugin", 0755, 0 },
 		{ "/private/var/containers/Data", 0755, 0 },
 		{ "/private/var/containers/Data/System", 0755, 0 },
 		{ "/private/var/containers/Data/ProtectedSystem", 0755, 0 },
 		{ "/private/var/containers/Shared", 0755, 0 },
 		{ "/private/var/containers/Shared/SystemGroup", 0755, 0 },
+		{ "/private/var/containers/Temp/Bundle/PluginKitPlugin", 0755, 0 },
+		{ "/private/var/containers/Temp/Data/System", 0755, 0 },
 		{ "/private/var/root/Library/MobileContainerManager/System", 0755, 0 },
 		{ "/private/var/root/Library/Caches/com.apple.containermanagerd/System", 0755, 0 },
 		{ "/private/var/root/Library/Caches/com.apple.containermanagerd/System/Staging", 0755, 0 },
@@ -277,6 +282,13 @@ var_dirs(void)
 		{ "/private/var/mobile/Containers/Data", 0755, 501 },
 		{ "/private/var/mobile/Containers/Data/Application", 0755, 501 },
 		{ "/private/var/mobile/Containers/Data/PluginKitPlugin", 0755, 501 },
+		{ "/private/var/mobile/Containers/Data/InternalDaemon", 0755, 501 },
+		{ "/private/var/mobile/Containers/Data/XPCService", 0755, 501 },
+		{ "/private/var/mobile/Containers/Data/VPNPlugin", 0755, 501 },
+		{ "/private/var/mobile/Containers/Data/TempDir", 0755, 501 },
+		{ "/private/var/mobile/Containers/Temp/Data/InternalDaemon", 0755, 501 },
+		{ "/private/var/mobile/Containers/Temp/Data/PluginKitPlugin", 0755, 501 },
+		{ "/private/var/mobile/Containers/Temp/Data/XPCService", 0755, 501 },
 		{ "/private/var/mobile/Containers/Shared", 0755, 501 },
 		{ "/private/var/mobile/Containers/Shared/AppGroup", 0755, 501 },
 	};
