@@ -95,3 +95,4 @@ fuxi/0027-apple-keystore-standin.patch
 fuxi/0028-syscall-trace-aks-verbose.patch
 fuxi/0029-trace-budget.patch
 fuxi/0030-crash-backtraces.patch
+fuxi/0031-iosurface-framebuffer-standins.patch

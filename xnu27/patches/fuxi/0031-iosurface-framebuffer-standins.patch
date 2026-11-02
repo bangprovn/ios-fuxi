@@ -1,0 +1,4225 @@
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index 9d64f9b..8bc05e6 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -83,6 +83,7 @@
+ extern void fuxi_early_mark(unsigned int stage, const char *label); /* osfmk/arm64/fuxi_console.c */
+ extern void fuxi_root27_start(void); /* iokit/Kernel/arm/FuxiRoot27.cpp */
+ extern void fuxi_aks_start(void); /* iokit/Kernel/arm/FuxiAppleKeyStore.cpp */
++extern void fuxi_fb_start(void); /* iokit/Kernel/arm/FuxiFramebuffer.cpp */
+ #endif
+ #include <sys/param.h>
+ #include <sys/filedesc.h>
+@@ -708,6 +709,7 @@ bsd_init(void)
+ #if defined(FUXI)
+ 	fuxi_root27_start();
+ 	fuxi_aks_start();
++	fuxi_fb_start();
+ #endif
+ 
+ #if CONFIG_PROC_UUID_POLICY
+diff --git a/iokit/Kernel/arm/FuxiFramebuffer.cpp b/iokit/Kernel/arm/FuxiFramebuffer.cpp
+new file mode 100644
+index 0000000..ae9a427
+--- /dev/null
++++ b/iokit/Kernel/arm/FuxiFramebuffer.cpp
+@@ -0,0 +1,1514 @@
++/*
++ * Fuxi: a stand-in IOMobileFramebuffer (boot-arg fuxi_fb=1; it starts FuxiIOSurface.cpp too).
++ *
++ * Fuxi has no display driver the iOS 27 user space can talk to: Apple's IOMobileGraphicsFamily
++ * and DCP kexts need Apple hardware, so backboardd finds no display and SpringBoard's
++ * FBSDisplayMonitor asserts. The display here is the splash framebuffer ABL left scanned out
++ * (ADT /sweet-fbcon, 1080x2400 a8r8g8b8, the text console's: pexpert/arm/pe_serial.c).
++ * Apple's IOMobileGraphicsFamily kext must not be prelinked next to this one: both define
++ * IOMobileFramebuffer (tools/ios27-prelink.py --drop).
++ *
++ * Ported from hakios-arm64e-dada's MiniIOMobileFramebuffer.cpp (base/xnu/files/iokit/Kernel,
++ * APSL 2.0, a derivative work of XNU), which describes the situation and the protocol:
++ *
++ *   The display is the framebuffer the boot loader left us (the one the kernel's text console
++ *   draws on). There is no hardware behind it that we drive: a "swap" copies the pixels of the
++ *   surfaces of its layers into that memory, and "vsync" is a timer. The protocol (selectors and
++ *   the layout of the swap request) was worked out from the user-space side of iOS 16.5 [and
++ *   iOS 26's 0x588-byte swap request]. Everything not implemented is logged once.
++ *
++ * The display user space is told about is 1125x2436 at 458 ppi, the screen of the device the ADT
++ * names (iPhone12,3, the same as hakios's iPhone X); a swap scales the picture to the 1080x2400
++ * panel, bilinear. Left out of hakios's driver: their display controller scan-out, the GPU waits,
++ * the screen recording, the per-pixel diff and the touch latency lines. Added for Fuxi: the
++ * command-mode panel is kicked after each frame (fuxi_fbcon_flush), and RequestPowerChange(0)
++ * blacks the panel until it is asked on again (as the iOS 16.7 SweetFramebuffer did).
++ *
++ * Boot-args (all optional): fuxi_fb_hz=N refresh and vsync rate (default 60, 1..240);
++ * fuxi_fb_width/fuxi_fb_height the display size reported; fuxi_fb_filter=0 nearest neighbour;
++ * fuxi_fb_threads=N processors that scale a frame (1..8, default 3); fuxi_fb_queue=1|2 frames that
++ * may wait for the panel; fuxi_fb_beat=0 shows a frame at once rather than on the next beat;
++ * fuxi_fb_trace=N logs the first N calls of every selector (default 3); fuxi_fb_console=1 keeps the
++ * text console drawing over the GUI; fuxi_fb_accel=0 publishes no IOAcceleratorES.
++ */
++#if defined(FUXI)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IODeviceTreeSupport.h>
++#include <libkern/c++/OSData.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSArray.h>
++#include <libkern/c++/OSBoolean.h>
++#include <libkern/c++/OSString.h>
++#include <libkern/c++/OSSymbol.h>
++#include <kern/thread_call.h>
++#include <kern/thread.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
++#include <sys/systm.h>
++#include <sys/proc.h>
++
++#include "FuxiIOSurface.h"
++
++extern "C" void fuxi_fb_start(void);
++
++/* IOConnectCallMethod selectors of the framebuffer user client (iOS 16.5; hakios found them unchanged in iOS 26) */
++enum {
++	kFBMethodGetLayerDefaultSurface = 3,
++	kFBMethodSwapBegin              = 4,
++	kFBMethodSwapEnd                = 5,
++	kFBMethodSwapWait               = 6,
++	kFBMethodGetID                  = 7,
++	kFBMethodGetDisplaySize         = 8,
++	kFBMethodRequestPowerChange     = 12,
++	kFBMethodSwapSignal             = 20,
++	kFBMethodGetDigitalOutState     = 25,
++	kFBMethodGetDotPitch            = 28,
++	kFBMethodGetDisplayArea         = 29,
++	kFBMethodSwapCancel             = 52,
++	kFBMethodGetColorRemapMode      = 57,
++	kFBMethodNotifications          = 72,
++	kFBMethodChangeFrameInfo        = 73,
++	kFBMethodSupportedFrameInfo     = 74,
++	kFBMethodGetCurrentAbsoluteTime = 77,
++	kFBMethodGetBlock               = 79,
++	kFBMethodSwapCancelAll          = 81,
++	kFBMethodGetProtectionOptions   = 82,
++};
++
++/* The swap request (IOMobileFramebufferSwapEnd): 0x46c bytes, of which we read these. */
++#define SWAP_SIZE               0x46c
++#define SWAP_ID                 0x50
++#define SWAP_SURFACE(layer)     (0x54 + 4 * (layer))    /* surface number, 0 = none */
++#define SWAP_SOURCE(layer)      (0x64 + 16 * (layer))   /* x, y, width, height in the surface */
++#define SWAP_ENABLED(layer)     (0xa4 + 4 * (layer))
++#define SWAP_DEST(layer)        (0xc4 + 16 * (layer))   /* x, y, width, height on the display */
++#define SWAP_LAYERS_SET         0x104                   /* bit per layer given in this swap */
++#define SWAP_LAYERS_CLEARED     0x108
++#define SWAP26_SIZE             0x588                   /* iOS 26's request ... */
++#define SWAP26_SHIFT            0x48                    /* ... with these fields that much further on */
++#define SWAP_LAYERS             4
++
++#define kFBNotifyVSync          5
++#define kFBNotifyTypes          8
++#define kFBRefreshHz            60                      /* unless boot-arg fuxi_fb_hz says otherwise */
++
++#define FRAME_TIMES             64                      /* milliseconds told apart between two frames */
++#define FRAME_PAUSE             90                      /* from so many on, nothing was moving: not a slow frame */
++#define SWAP_HELD_MS            700                     /* a swap that cannot be taken by then is not shown at all */
++#define SWAP_QUEUE              2                       /* frames that may wait for the panel at most (fuxi_fb_queue) */
++
++#define FOURCC(a, b, c, d) ((uint32_t)(a) << 24 | (uint32_t)(b) << 16 | (uint32_t)(c) << 8 | (uint32_t)(d))
++
++static uint64_t gFBLogged[2];           /* selectors already reported */
++static uint8_t  gFBCalls[128];          /* how many calls of each selector were traced */
++static uint32_t gFBSwapSizeSaid;        /* a swap request size that is neither iOS 16.5's nor iOS 26's, said once */
++
++/*
++ * The display user space is told about: MobileGestalt knows what screen the device the ADT
++ * names has (iPhone12,3: 1125 x 2436 at 458 ppi), and with any other size it reports an unknown
++ * screen class and the user interface has no layout for it.
++ */
++#define kFBDefaultWidth         1125
++#define kFBDefaultHeight        2436
++#define kFBDotsPerInch          458
++
++/* Boot-args, read once by fuxi_fb_start(). */
++static uint32_t gFBWidth = kFBDefaultWidth;
++static uint32_t gFBHeight = kFBDefaultHeight;
++static uint32_t gFBTrace = 3;
++/*
++ * fuxi_fb_filter=0: the picture is scaled to the panel nearest neighbour. 1125 x 2436 on 1080 x 2400
++ * is 45 columns and 36 rows fewer: nearest neighbour leaves out every 25th column and every 67th
++ * row, a step in a letter or a stroke a pixel thinner here and there. By default every pixel of the
++ * panel is worked out from the four of the picture around where it falls (bilinear).
++ */
++static uint32_t gFilter = 1;
++static uint32_t gRefreshHz = kFBRefreshHz;
++static uint32_t gOnTheBeat = 1;
++/* fuxi_fb_threads=N (1 to 8): so many processors scale a frame onto the panel together (see drawRows()). */
++static uint32_t gThreads = 3;
++static uint32_t gQueue = 2;
++static uint32_t gKeepConsole;
++static uint32_t gAccelerator = 1;
++
++static inline unsigned
++swapQueue(void)
++{
++	return gQueue >= 1 && gQueue <= SWAP_QUEUE ? gQueue : 1;
++}
++
++static inline uint32_t
++refreshHz(void)
++{
++	return gRefreshHz >= 1 && gRefreshHz <= 240 ? gRefreshHz : kFBRefreshHz;
++}
++
++static uint32_t
++swapWord(const uint8_t * swap, unsigned offset)
++{
++	uint32_t value;
++
++	memcpy(&value, swap + offset, sizeof(value));
++	return value;
++}
++
++/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
++
++struct RowJob;
++
++class IOMobileFramebuffer : public IOService
++{
++	OSDeclareDefaultStructors(IOMobileFramebuffer);
++
++public:
++	IOLock *        fLock;
++	uint8_t *       fBase;                  /* the splash framebuffer: the panel (write-combined) */
++	uint32_t        fPanelWidth, fPanelHeight, fRowBytes;
++	uint32_t        fWidth, fHeight;        /* the display as user space sees it */
++	FuxiIOSurface * fDefaultSurface;
++	uint32_t        fSwapID;
++	uint32_t        fSwapsShown;
++	uint32_t        fLayersShown;           /* which layers the last swap had a surface in */
++	bool            fGraphics;              /* the first picture is on the panel: the text console stopped */
++	bool            fPowerOff;              /* RequestPowerChange(0): the panel is black until it is asked on */
++	/*
++	 * A frame goes to the panel from a thread of ours, and whoever made the frame is back at the
++	 * next one meanwhile. By default two frames may wait (fuxi_fb_queue=1: one): CoreAnimation
++	 * draws on a clock of its own, and a SwapEnd held past its next tick makes that tick late.
++	 */
++	IOLock *        fSwapLock;              /* around the next four */
++	uint8_t         fSwap[SWAP_QUEUE][SWAP_SIZE];   /* the swaps on their way to the panel, from fSwapFirst on */
++	FuxiIOSurface * fSwapSurfaces[SWAP_QUEUE][SWAP_LAYERS]; /* ... their surfaces, held from SwapEnd on: their maker may let go of them */
++	unsigned        fSwapFirst, fSwapsWaiting;
++	/*
++	 * ... and not whenever it happens to be ready, but on a beat of the refresh rate (fuxi_fb_beat=0:
++	 * at once): frames then follow each other at an even pace whatever each took to draw, as long
++	 * as there is one for every beat. The beat starts with a frame that comes later than a beat and
++	 * a half after the one before, and gives way by an eighth of what a frame is early or late.
++	 */
++	uint64_t        fBeat;                  /* the beat the last frame was shown on */
++	uint64_t        fReady;                 /* when the last frame was ready to be shown */
++	uint32_t        fStatOnBeat;            /* frames that waited for a refresh, and for how long together */
++	uint64_t        fStatBeatWait;
++	uint32_t        fStatSurfaces[8];       /* the first different surfaces the bottom layer was given */
++	uint32_t        fStatHeld, fStatLost;   /* swaps that waited for the one before; that gave up waiting */
++	uint64_t        fSwapTime;              /* when the last swap was handed over */
++	uint32_t        fStatSwapsLate;         /* swaps that came more than a refresh and a quarter after the one before (and no pause) */
++	/* how the display is doing: frames and time spent drawing them here since fStatSince */
++	uint32_t        fStatFrames;
++	uint64_t        fStatSince, fStatDrawing;
++	/* ... and how evenly: the time from each frame to the next, counted by the millisecond (the last count: longer) */
++	uint64_t        fLastFrame;
++	uint32_t        fFrameTimes[FRAME_TIMES + 1], fFramePauses, fFrameLongest;
++	uint32_t *      fColumn;                /* drawLayer(): source column for every panel column */
++	uint16_t *      fColumnWeight;          /* ... with fuxi_fb_filter: how much of the column after it, of 256 */
++	uint32_t *      fBlendRow;              /* ... and a row of the picture blended from two (fBlendRowSize pixels) */
++	uint32_t        fBlendRowSize;
++	/* the scaling shared out (fuxi_fb_threads): fThreads drawers, the presenter and fThreads - 1 helpers */
++	unsigned        fThreads;
++	IOLock *        fHelperLock;
++	const struct RowJob * fHelperJob;
++	uint64_t        fHelperGeneration;
++	unsigned        fHelpersBusy, fHelpersStarted;
++	uint32_t *      fHelperBlend[7];
++
++	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
++	void publishModes(void);
++	FuxiIOSurface * defaultSurface(void);
++	void present(const uint8_t * swap);
++	void show(const uint8_t * swap, FuxiIOSurface ** surfaces);
++	void presenter(void);
++	static void presenterMain(void * self, wait_result_t result);
++	void reportFrameTimes(void);
++	void drawLayer(FuxiIOSurface * s, const int32_t * src, const int32_t * dst);
++	void drawRows(const struct RowJob * job, int32_t y0, int32_t y1, uint32_t * blendRow);
++	static void helperMain(void * self, wait_result_t result);
++	void blackPanel(void);
++	void setPower(bool on);
++};
++
++OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
++
++static void
++setNumber(OSDictionary * dict, const char * key, uint64_t value)
++{
++	OSNumber * n = OSNumber::withNumber(value, 32);
++
++	if (n != NULL) {
++		dict->setObject(key, n);
++		n->release();
++	}
++}
++
++/*
++ * The modes of the display, the way CoreAnimation reads them (the properties TimingElements
++ * and ColorElements; without a mode it draws nothing). One timing, the display's size at
++ * fuxi_fb_hz, with one colour mode, 8-bit RGB. The identifiers are what "the current mode"
++ * (block 0x40) answers with.
++ */
++#define kFBTimingID     1
++#define kFBColorID      1
++
++void
++IOMobileFramebuffer::publishModes(void)
++{
++	/*
++	 * hakios: iOS 26 takes the modes the way a real phone's display driver lays them out (an M1's
++	 * AppleCLCD2, read with ioreg, is the model here): besides the attributes, each element carries
++	 * its binary description (ElementData), and the timing says it is the preferred one. With only
++	 * the attributes iOS 16.5 was content; iOS 26 found no preferred mode ("preferred mode (0 x 0)",
++	 * current mode 16383 x 16383) and never drew. The porches are made up, the pixel clock follows.
++	 */
++	const uint32_t hz = refreshHz();
++	const uint32_t hSync = 32, hBack = 42, hFront = 8, vSync = 8, vBack = 42, vFront = 32;
++	const uint32_t hTotal = fWidth + hSync + hBack + hFront, vTotal = fHeight + vSync + vBack + vFront;
++	const uint64_t pixelClock = (uint64_t) hTotal * vTotal * hz;
++	const uint32_t lineRate = (uint32_t) (((pixelClock << 16) / hTotal) / 1000);     /* kHz, 16.16 */
++	const uint32_t frameRate = hz << 16;                                            /* Hz, 16.16 */
++	uint32_t timingData[20] = {
++		0, hTotal, fWidth, hSync, hBack, hFront, lineRate, 1, 0,
++		vTotal, fHeight, vSync, vBack, vFront, frameRate, 1, 0,
++		(uint32_t) pixelClock, 13, 0,
++	};
++	uint8_t colorData[32] = { 8 };
++	OSDictionary * timing = OSDictionary::withCapacity(24);
++	OSDictionary * horizontal = OSDictionary::withCapacity(9);
++	OSDictionary * vertical = OSDictionary::withCapacity(9);
++	OSDictionary * color = OSDictionary::withCapacity(12);
++	OSDictionary * refresh = OSDictionary::withCapacity(6);
++	OSDictionary * attributes = OSDictionary::withCapacity(1);
++	OSDictionary * product = OSDictionary::withCapacity(1);
++	OSArray * timings = OSArray::withCapacity(1);
++	OSArray * colors = OSArray::withCapacity(1);
++	OSArray * none = OSArray::withCapacity(1);
++	OSData * data;
++	uint64_t frameTicks;
++
++	if (timing == NULL || horizontal == NULL || vertical == NULL || color == NULL || refresh == NULL ||
++	    attributes == NULL || product == NULL || timings == NULL || colors == NULL || none == NULL) {
++		goto out;
++	}
++	colorData[12] = 16;                                     /* colorimetry */
++	setNumber(color, "ID", kFBColorID);
++	setNumber(color, "ElementType", 1);
++	setNumber(color, "StandardType", 0);
++	setNumber(color, "PixelEncoding", 0);                   /* RGB 4:4:4 */
++	setNumber(color, "Depth", 8);
++	setNumber(color, "Colorimetry", 16);
++	setNumber(color, "EOTF", 0);
++	setNumber(color, "DynamicRange", 0);
++	setNumber(color, "SupportsDSC", 0);
++	setNumber(color, "Score", 240999);
++	color->setObject("IsVirtual", kOSBooleanFalse);
++	if ((data = OSData::withBytes(colorData, sizeof(colorData))) != NULL) {
++		color->setObject("ElementData", data);
++		data->release();
++	}
++	colors->setObject(color);
++
++	setNumber(horizontal, "Active", fWidth);
++	setNumber(horizontal, "Total", hTotal);
++	setNumber(horizontal, "SyncWidth", hSync);
++	setNumber(horizontal, "BackPorch", hBack);
++	setNumber(horizontal, "FrontPorch", hFront);
++	setNumber(horizontal, "SyncPolarity", 1);
++	setNumber(horizontal, "PixelRepetition", 0);
++	setNumber(horizontal, "SyncRate", lineRate);
++	setNumber(horizontal, "PreciseSyncRate", lineRate);
++	setNumber(vertical, "Active", fHeight);
++	setNumber(vertical, "Total", vTotal);
++	setNumber(vertical, "SyncWidth", vSync);
++	setNumber(vertical, "BackPorch", vBack);
++	setNumber(vertical, "FrontPorch", vFront);
++	setNumber(vertical, "SyncPolarity", 1);
++	setNumber(vertical, "PixelRepetition", 0);
++	setNumber(vertical, "SyncRate", frameRate);
++	setNumber(vertical, "PreciseSyncRate", frameRate);
++	setNumber(timing, "ID", kFBTimingID);
++	setNumber(timing, "ElementType", 0);
++	setNumber(timing, "StandardType", 0);
++	setNumber(timing, "TimingType", 3);
++	setNumber(timing, "ScanInformation", 0);
++	setNumber(timing, "Score", 16346);
++	setNumber(timing, "AspectRatio", 13);
++	setNumber(timing, "PreciseAspectRatio", (uint64_t) fWidth * 65536 / fHeight);
++	setNumber(timing, "ValidPixelEncodings", 1);
++	setNumber(timing, "MinimumVariableRefreshRate", 0);
++	setNumber(timing, "MaximumVariableRefreshRate", 0);
++	timing->setObject("IsPreferred", kOSBooleanTrue);
++	timing->setObject("IsVirtual", kOSBooleanFalse);
++	timing->setObject("IsOverscanned", kOSBooleanFalse);
++	timing->setObject("IsInterlaced", kOSBooleanFalse);
++	timing->setObject("IsSplit", kOSBooleanFalse);
++	timing->setObject("IsPromoted", kOSBooleanFalse);
++	timing->setObject("HorizontalAttributes", horizontal);
++	timing->setObject("VerticalAttributes", vertical);
++	timing->setObject("ColorModes", colors);
++	timing->setObject("DiscreteMediaRefreshRates", none);
++	timing->setObject("UnsafeColorElementIDs", none);
++	timing->setObject("DSCRequiredColorElementIDs", none);
++	if ((data = OSData::withBytes(timingData, sizeof(timingData))) != NULL) {
++		timing->setObject("ElementData", data);
++		data->release();
++	}
++	timings->setObject(timing);
++
++	setProperty("TimingElements", timings);
++	setProperty("ColorElements", colors);
++	setProperty("DPTimingModeId", kFBTimingID, 32);
++	setProperty("DisplayWidth", fWidth, 32);
++	setProperty("DisplayHeight", fHeight, 32);
++	setProperty("PixelClock", pixelClock, 64);
++	attributes->setObject("ProductAttributes", product);
++	setProperty("DisplayAttributes", attributes);
++	nanoseconds_to_absolutetime(NSEC_PER_SEC / hz, &frameTicks);
++	setNumber(refresh, "displayMinRefreshInterval", (1ULL << 32) / hz);
++	setNumber(refresh, "displayMaxRefreshInterval", (1ULL << 32) / hz);
++	setNumber(refresh, "displayMinRefreshIntervalMachTime", frameTicks);
++	setNumber(refresh, "displayMaxRefreshIntervalMachTime", frameTicks);
++	setNumber(refresh, "displayRefreshStep", 0);
++	setNumber(refresh, "displayRefreshStepMachTime", 0);
++	setProperty("IOMFBDisplayRefresh", refresh);
++out:
++	OSSafeReleaseNULL(timings);
++	OSSafeReleaseNULL(colors);
++	OSSafeReleaseNULL(none);
++	OSSafeReleaseNULL(timing);
++	OSSafeReleaseNULL(horizontal);
++	OSSafeReleaseNULL(vertical);
++	OSSafeReleaseNULL(color);
++	OSSafeReleaseNULL(refresh);
++	OSSafeReleaseNULL(attributes);
++	OSSafeReleaseNULL(product);
++}
++
++bool
++IOMobileFramebuffer::start(IOService * provider)
++{
++	volatile void * base = NULL;
++	uint32_t width = 0, height = 0, stride = 0;
++	thread_t thread;
++
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	/* (the console's mapping of it: write-combined, not cached; written, never read here) */
++	if (!fuxi_fbcon_geometry(&base, &width, &height, &stride) || base == NULL || width == 0 || height == 0 ||
++	    stride < width * 4 || (stride & 7) != 0) {
++		IOLog("FuxiFramebuffer: no usable splash framebuffer (/sweet-fbcon %ux%u, %u bytes a row)\n", width, height, stride);
++		return false;
++	}
++	fBase = (uint8_t *) (uintptr_t) base;
++	fPanelWidth = width;
++	fPanelHeight = height;
++	fRowBytes = stride;
++	fWidth = gFBWidth ? gFBWidth : fPanelWidth;
++	fHeight = gFBHeight ? gFBHeight : fPanelHeight;
++	fLock = IOLockAlloc();
++	fSwapLock = IOLockAlloc();
++	fHelperLock = IOLockAlloc();
++	fColumn = IONewZero(uint32_t, fPanelWidth);
++	fColumnWeight = IONewZero(uint16_t, fPanelWidth);
++	if (fLock == NULL || fSwapLock == NULL || fHelperLock == NULL || fColumn == NULL || fColumnWeight == NULL) {
++		IOLog("FuxiFramebuffer: no memory\n");
++		return false;
++	}
++	if (kernel_thread_start(&IOMobileFramebuffer::presenterMain, this, &thread) != KERN_SUCCESS) {
++		IOLog("FuxiFramebuffer: no thread to put frames on the panel with\n");
++		return false;
++	}
++	thread_set_thread_name(thread, "frames to the panel");
++	thread_deallocate(thread);
++	fThreads = gThreads >= 1 && gThreads <= 8 ? gThreads : 1;
++	for (unsigned i = 0; i + 1 < fThreads; i++) {
++		if (kernel_thread_start(&IOMobileFramebuffer::helperMain, this, &thread) != KERN_SUCCESS) {
++			fThreads = i + 1;
++			break;
++		}
++		thread_set_thread_name(thread, "frames to the panel: a helper");
++		thread_deallocate(thread);
++	}
++	IOLog("FuxiFramebuffer: display %ux%u at %u Hz on a panel of %ux%u (%u bytes per row), %u drawing\n", fWidth, fHeight,
++	    refreshHz(), fPanelWidth, fPanelHeight, fRowBytes, fThreads);
++
++	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
++	setProperty("external", false);
++	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++	publishModes();
++	setName("disp0");
++	registerService();
++	return true;
++}
++
++FuxiIOSurface *
++IOMobileFramebuffer::defaultSurface(void)
++{
++	IOLockLock(fLock);
++	if (fDefaultSurface == NULL) {
++		fDefaultSurface = FuxiIOSurfaceCreateSimple(fWidth, fHeight, FOURCC('B', 'G', 'R', 'A'));
++	}
++	IOLockUnlock(fLock);
++	return fDefaultSurface;
++}
++
++/*
++ * The panel black. Plain aligned stores, not bzero: hakios's panel memory faulted on bzero's DC ZVA
++ * and unaligned stores, and this one is write-combined (DC ZVA wants cacheable memory). With fLock held.
++ */
++void
++IOMobileFramebuffer::blackPanel(void)
++{
++	for (uint32_t y = 0; y < fPanelHeight; y++) {
++		volatile uint64_t * row = (volatile uint64_t *) (fBase + (size_t) y * fRowBytes);
++
++		for (uint32_t x = 0; x < fPanelWidth / 2; x++) {
++			row[x] = 0;
++		}
++	}
++	fuxi_fbcon_flush();
++}
++
++/* RequestPowerChange: off blacks the panel (AMOLED: black pixels are off) until the next on. */
++void
++IOMobileFramebuffer::setPower(bool on)
++{
++	IOLockLock(fLock);
++	if (on == fPowerOff) {
++		fPowerOff = !on;
++		if (!on) {
++			blackPanel();
++		}
++		IOLog("FuxiFramebuffer: display %s\n", on ? "on" : "off");
++	}
++	IOLockUnlock(fLock);
++}
++
++/* Two pixels mixed: `w` of 256 of the second. Two of the four channels at a time, in one word. */
++static inline uint32_t
++blend(uint32_t a, uint32_t b, uint32_t w)
++{
++	uint32_t rb = ((a & 0xff00ff) * (256 - w) + (b & 0xff00ff) * w) >> 8 & 0xff00ff;
++	uint32_t ga = ((a >> 8 & 0xff00ff) * (256 - w) + (b >> 8 & 0xff00ff) * w) & 0xff00ff00;
++
++	return rb | ga;
++}
++
++/*
++ * Where the middle of the `i`th of `out` pixels falls among `in` of them, in 256ths of a pixel,
++ * kept within the first and the last.
++ */
++static inline int64_t
++sample_at(int64_t i, int64_t in, int64_t out)
++{
++	int64_t at = ((2 * i + 1) * in - out) * 128 / out;
++
++	return at < 0 ? 0 : at > (in - 1) * 256 ? (in - 1) * 256 : at;
++}
++
++/*
++ * The rows of one layer, from `y0` to `y1` (panel rows), as drawLayer() has worked them out:
++ * scaling a whole frame takes one processor some 9 ms, so with fuxi_fb_threads=N it is shared
++ * out between N of them, each with rows of its own and a row of blending of its own.
++ */
++struct RowJob {
++	const uint8_t * pixels;
++	uint32_t        stride;
++	int32_t         sx, sy, sw, sh, px0, py0, px1, py1, cx0, cx1;
++	bool            filter, unscaled;
++};
++
++void
++IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32_t * blendRow)
++{
++	const uint8_t * pixels = job->pixels;
++	uint32_t stride = job->stride;
++	int32_t sx = job->sx, sy = job->sy, sw = job->sw, sh = job->sh;
++	int32_t px0 = job->px0, py0 = job->py0, py1 = job->py1, cx0 = job->cx0, cx1 = job->cx1;
++	bool filter = job->filter;
++
++	for (int32_t y = y0; y < y1; y++) {
++		const uint32_t * from;
++		uint32_t * to;
++
++		if (y < 0 || (uint32_t) y >= fPanelHeight) {
++			continue;
++		}
++		to = (uint32_t *) (fBase + (size_t) y * fRowBytes);
++		if (job->unscaled) {
++			/* not scaled at all */
++			memcpy(to + px0, pixels + (size_t) (sy + y - py0) * stride + (size_t) sx * 4, (size_t) sw * 4);
++			continue;
++		}
++		if (filter) {
++			int64_t at = sample_at(y - py0, sh, py1 - py0);
++			uint32_t row = (uint32_t) (at >> 8), weight = (uint32_t) (at & 255);
++			const uint32_t * upper = (const uint32_t *) (pixels + (size_t) (sy + row) * stride) + sx;
++
++			if (weight == 0 || row + 1 >= (uint32_t) sh) {
++				from = upper;
++			} else {
++				const uint32_t * lower = (const uint32_t *) (pixels + (size_t) (sy + row + 1) * stride) + sx;
++				uint32_t first = fColumn[cx0], last = fColumn[cx1 - 1] + 1 < (uint32_t) sw ? fColumn[cx1 - 1] + 1 : fColumn[cx1 - 1];
++				uint32_t * __restrict mixed = blendRow;
++
++				for (uint32_t c = first; c <= last; c++) {
++					uint32_t a = upper[c], b = lower[c];
++
++					mixed[c] = a == b ? a : blend(a, b, weight);           /* (most of a screen is the same as next to it) */
++				}
++				from = blendRow;
++			}
++		} else {
++			from = (const uint32_t *) (pixels + (size_t) (sy + (int64_t) (y - py0) * sh / (py1 - py0)) * stride);
++		}
++		if (filter) {
++			const uint32_t * __restrict column = fColumn + cx0;
++			const uint16_t * __restrict weights = fColumnWeight + cx0;
++			uint32_t * __restrict out = to + cx0;
++
++			for (uint32_t i = 0, n = (uint32_t) (cx1 - cx0); i < n; i++) {
++				uint32_t c = column[i], w = weights[i], a = from[c];
++
++				out[i] = w == 0 || a == from[c + 1] ? a : blend(a, from[c + 1], w);
++			}
++		} else {
++			for (int32_t x = cx0; x < cx1; x++) {
++				to[x] = from[fColumn[x]];
++			}
++		}
++	}
++}
++
++/* A helper of the scaling (fuxi_fb_threads): waits for rows to do, does them, says so. */
++void
++IOMobileFramebuffer::helperMain(void * self, wait_result_t result __unused)
++{
++	IOMobileFramebuffer * fb = (IOMobileFramebuffer *) self;
++	unsigned index;
++	uint64_t done = 0;
++
++	IOLockLock(fb->fHelperLock);
++	index = fb->fHelpersStarted++;
++	IOLockUnlock(fb->fHelperLock);
++	for (;;) {
++		const RowJob * job;
++		int32_t rows, y0, y1;
++		uint32_t * blendRow;
++
++		IOLockLock(fb->fHelperLock);
++		while (fb->fHelperGeneration == done) {
++			IOLockSleep(fb->fHelperLock, &fb->fHelperGeneration, THREAD_UNINT);
++		}
++		done = fb->fHelperGeneration;
++		job = fb->fHelperJob;
++		IOLockUnlock(fb->fHelperLock);
++		/* share index + 1 of fThreads (the presenter takes share 0) */
++		rows = job->py1 - job->py0;
++		y0 = job->py0 + (int32_t) ((int64_t) rows * (index + 1) / fb->fThreads);
++		y1 = job->py0 + (int32_t) ((int64_t) rows * (index + 2) / fb->fThreads);
++		blendRow = fb->fHelperBlend[index];
++		fb->drawRows(job, y0, y1, blendRow);
++		IOLockLock(fb->fHelperLock);
++		fb->fHelpersBusy--;
++		if (fb->fHelpersBusy == 0) {
++			IOLockWakeup(fb->fHelperLock, &fb->fHelpersBusy, true);
++		}
++		IOLockUnlock(fb->fHelperLock);
++	}
++}
++
++/*
++ * Put a rectangle of a 32-bit surface on the screen. `dst` is in display coordinates; the
++ * panel may be of another size, and the layer itself may be scaled: both are done in one
++ * step, bilinear (or nearest neighbour: fuxi_fb_filter=0).
++ */
++void
++IOMobileFramebuffer::drawLayer(FuxiIOSurface * s, const int32_t * src, const int32_t * dst)
++{
++	int32_t sx = src[0], sy = src[1], sw = src[2], sh = src[3];
++	int32_t dx = dst[0], dy = dst[1], dw = dst[2], dh = dst[3];
++	int32_t px0, py0, px1, py1, cx0, cx1;
++	bool filter = gFilter != 0;
++	RowJob job;
++
++	if (sw <= 0 || sh <= 0) {
++		sx = sy = 0;
++		sw = (int32_t) s->info.width;
++		sh = (int32_t) s->info.height;
++	}
++	if (dw <= 0 || dh <= 0) {
++		dx = dy = 0;
++		dw = (int32_t) fWidth;
++		dh = (int32_t) fHeight;
++	}
++	if (sx < 0 || sy < 0 || (uint32_t) (sx + sw) > s->info.width || (uint32_t) (sy + sh) > s->info.height) {
++		return;
++	}
++	/* the rectangle on the panel */
++	px0 = (int32_t) ((int64_t) dx * fPanelWidth / fWidth);
++	py0 = (int32_t) ((int64_t) dy * fPanelHeight / fHeight);
++	px1 = (int32_t) ((int64_t) (dx + dw) * fPanelWidth / fWidth);
++	py1 = (int32_t) ((int64_t) (dy + dh) * fPanelHeight / fHeight);
++	if (px1 <= px0 || py1 <= py0) {
++		return;
++	}
++	/* (blending, a row of the picture mixed from two: room for it, for every one who draws rows) */
++	if (filter && fBlendRowSize < (uint32_t) sw) {
++		if (fBlendRow != NULL) {
++			IODelete(fBlendRow, uint32_t, fBlendRowSize);
++		}
++		for (unsigned i = 0; i + 1 < fThreads; i++) {
++			if (fHelperBlend[i] != NULL) {
++				IODelete(fHelperBlend[i], uint32_t, fBlendRowSize);
++				fHelperBlend[i] = NULL;
++			}
++		}
++		fBlendRowSize = (uint32_t) sw;
++		fBlendRow = IONew(uint32_t, fBlendRowSize);
++		for (unsigned i = 0; i + 1 < fThreads; i++) {
++			fHelperBlend[i] = IONew(uint32_t, fBlendRowSize);
++			if (fHelperBlend[i] == NULL && fBlendRow != NULL) {
++				IODelete(fBlendRow, uint32_t, fBlendRowSize);
++				fBlendRow = NULL;
++			}
++		}
++		if (fBlendRow == NULL) {
++			/* (the helpers' rows stay, for the next try; they are freed by the size they were made with) */
++			for (unsigned i = 0; i + 1 < fThreads; i++) {
++				if (fHelperBlend[i] != NULL) {
++					IODelete(fHelperBlend[i], uint32_t, fBlendRowSize);
++					fHelperBlend[i] = NULL;
++				}
++			}
++			fBlendRowSize = 0;
++		}
++	}
++	filter = filter && fBlendRow != NULL;
++	/* which pixel of a source row each pixel of a panel row takes: worked out once, not 2.6 million times */
++	cx0 = px0 < 0 ? 0 : px0;
++	cx1 = (uint32_t) px1 > fPanelWidth ? (int32_t) fPanelWidth : px1;
++	if (cx1 <= cx0) {
++		return;
++	}
++	for (int32_t x = cx0; x < cx1; x++) {
++		if (filter) {
++			int64_t at = sample_at(x - px0, sw, px1 - px0);
++
++			fColumn[x] = (uint32_t) (at >> 8);              /* (in the blended row: from sx on) */
++			fColumnWeight[x] = (uint16_t) (fColumn[x] + 1 < (uint32_t) sw ? at & 255 : 0);
++		} else {
++			fColumn[x] = (uint32_t) (sx + (int64_t) (x - px0) * sw / (px1 - px0));
++		}
++	}
++	job.pixels = s->pixels();
++	job.stride = s->info.bytesPerRow;
++	job.sx = sx;
++	job.sy = sy;
++	job.sw = sw;
++	job.sh = sh;
++	job.px0 = px0;
++	job.py0 = py0;
++	job.px1 = px1;
++	job.py1 = py1;
++	job.cx0 = cx0;
++	job.cx1 = cx1;
++	job.filter = filter;
++	job.unscaled = px1 - px0 == sw && py1 - py0 == sh && px0 >= 0 && (uint32_t) px1 <= fPanelWidth;
++	if (fThreads <= 1 || fHelpersStarted + 1 < fThreads) {
++		drawRows(&job, py0, py1, fBlendRow);
++		return;
++	}
++	/* shared out: the helpers take their rows, this thread the first share, then waits for them */
++	IOLockLock(fHelperLock);
++	fHelperJob = &job;
++	fHelpersBusy = fThreads - 1;
++	fHelperGeneration++;
++	IOLockWakeup(fHelperLock, &fHelperGeneration, false);
++	IOLockUnlock(fHelperLock);
++	drawRows(&job, py0, py0 + (int32_t) ((int64_t) (py1 - py0) / fThreads), fBlendRow);
++	IOLockLock(fHelperLock);
++	while (fHelpersBusy != 0) {
++		IOLockSleep(fHelperLock, &fHelpersBusy, THREAD_UNINT);
++	}
++	IOLockUnlock(fHelperLock);
++}
++
++/*
++ * How evenly the frames of the last seconds came: how many followed the one before within the
++ * time of one refresh at 120, 60, 40 and 30 a second, and the times half and 95 in 100 of them
++ * stayed under. With the lock held.
++ */
++void
++IOMobileFramebuffer::reportFrameTimes(void)
++{
++	static const uint32_t limits[] = { 10, 18, 26, 35, FRAME_TIMES + 1 };
++	uint32_t within[sizeof(limits) / sizeof(limits[0])] = { 0 }, total = 0, sum = 0, half = 0, most = 0;
++
++	for (uint32_t ms = 0; ms <= FRAME_TIMES; ms++) {
++		for (uint32_t i = 0; i < sizeof(limits) / sizeof(limits[0]); i++) {
++			if (ms < limits[i]) {
++				within[i] += fFrameTimes[ms];
++				break;
++			}
++		}
++		total += fFrameTimes[ms];
++	}
++	for (uint32_t ms = 0; ms <= FRAME_TIMES && total != 0; ms++) {
++		sum += fFrameTimes[ms];
++		if (half == 0 && 2 * sum >= total) {
++			half = ms + 1;
++		}
++		if (most == 0 && 100 * sum >= 95 * total) {
++			most = ms + 1;
++		}
++	}
++	if (total != 0) {
++		IOLog("FuxiFramebuffer: from one frame to the next: %u times under 10 ms, %u under 18, %u under 26, %u under 35, "
++		    "%u longer (the longest %u ms); half under %u ms, 95 in 100 under %u ms; %u pauses\n", within[0], within[1],
++		    within[2], within[3], within[4], fFrameLongest, half, most, fFramePauses);
++	}
++	bzero(fFrameTimes, sizeof(fFrameTimes));
++	fFramePauses = fFrameLongest = 0;
++}
++
++/* SwapEnd: the swap is handed to the thread that puts frames on the panel, as soon as that has room for it. */
++void
++IOMobileFramebuffer::present(const uint8_t * swap)
++{
++	uint64_t now = mach_absolute_time(), period, pause, deadline;
++	unsigned slot;
++
++	/* (a frame that is late on the panel was late here already, or it was not: for telling whose it is) */
++	nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz() * 5 / 4, &period);
++	nanoseconds_to_absolutetime(FRAME_PAUSE * NSEC_PER_MSEC, &pause);
++	clock_interval_to_deadline(SWAP_HELD_MS, kMillisecondScale, &deadline);
++	IOLockLock(fSwapLock);
++	fStatSwapsLate += fSwapTime != 0 && now - fSwapTime > period && now - fSwapTime < pause;
++	fSwapTime = now;
++	fStatHeld += fSwapsWaiting >= swapQueue();
++	while (fSwapsWaiting >= swapQueue()) {
++		if (IOLockSleepDeadline(fSwapLock, &fSwapsWaiting, deadline, THREAD_UNINT) == THREAD_TIMED_OUT &&
++		    fSwapsWaiting >= swapQueue()) {
++			fStatLost++;
++			IOLockUnlock(fSwapLock);
++			return;
++		}
++	}
++	slot = (fSwapFirst + fSwapsWaiting) % SWAP_QUEUE;
++	memcpy(fSwap[slot], swap, SWAP_SIZE);
++	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
++		uint32_t sid = swapWord(swap, SWAP_SURFACE(layer));
++
++		fSwapSurfaces[slot][layer] = sid != 0 ? FuxiIOSurfaceCopy(sid) : NULL;
++	}
++	fSwapsWaiting++;
++	IOLockWakeup(fSwapLock, fSwap, true);
++	IOLockUnlock(fSwapLock);
++}
++
++void
++IOMobileFramebuffer::presenterMain(void * self, wait_result_t result __unused)
++{
++	((IOMobileFramebuffer *) self)->presenter();
++}
++
++void
++IOMobileFramebuffer::presenter(void)
++{
++	static uint8_t swap[SWAP_SIZE];         /* (one thread) */
++	FuxiIOSurface * surfaces[SWAP_LAYERS];
++
++	for (;;) {
++		IOLockLock(fSwapLock);
++		while (fSwapsWaiting == 0) {
++			IOLockSleep(fSwapLock, fSwap, THREAD_UNINT);
++		}
++		memcpy(swap, fSwap[fSwapFirst], SWAP_SIZE);
++		memcpy(surfaces, fSwapSurfaces[fSwapFirst], sizeof(surfaces));
++		IOLockUnlock(fSwapLock);
++		show(swap, surfaces);
++		for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
++			if (surfaces[layer] != NULL) {
++				FuxiIOSurfaceDrop(surfaces[layer]);
++			}
++		}
++		FuxiIOSurfaceClearKept();               /* (the next frame is some milliseconds away) */
++	}
++}
++
++/* A swap's surfaces onto the panel, on its beat. */
++void
++IOMobileFramebuffer::show(const uint8_t * swap, FuxiIOSurface ** surfaces)
++{
++	uint32_t set = swapWord(swap, SWAP_LAYERS_SET);
++	uint64_t began = mach_absolute_time(), nanos;
++	uint32_t layers = 0;
++	bool report, written = false;
++
++	if (gOnTheBeat) {
++		uint64_t period, aim, next;
++
++		nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz(), &period);
++		aim = period * 3 / 8;
++		next = fReady;
++		fReady = began;
++		if (fBeat == 0 || began - next > period * 3 / 2) {
++			fBeat = began;
++		} else {
++			for (next = fBeat + period; next < began; next += period) {
++			}
++			if (next - began > aim) {
++				next -= (next - began - aim) / 8;
++			} else {
++				next += (aim - (next - began)) / 8;
++			}
++			clock_delay_until(next);
++			fBeat = next;
++			fStatOnBeat++;
++			fStatBeatWait += mach_absolute_time() - began;
++			began = mach_absolute_time();
++		}
++	}
++	/* its turn has come: the swap after it may be handed over */
++	IOLockLock(fSwapLock);
++	fSwapFirst = (fSwapFirst + 1) % SWAP_QUEUE;
++	fSwapsWaiting--;
++	IOLockWakeup(fSwapLock, &fSwapsWaiting, true);
++	IOLockUnlock(fSwapLock);
++	IOLockLock(fLock);
++	if (fLastFrame != 0) {
++		absolutetime_to_nanoseconds(began - fLastFrame, &nanos);
++		nanos /= NSEC_PER_MSEC;
++		if (nanos >= FRAME_PAUSE) {
++			fFramePauses++;
++		} else {
++			fFrameTimes[nanos < FRAME_TIMES ? nanos : FRAME_TIMES]++;
++			fFrameLongest = nanos > fFrameLongest ? (uint32_t) nanos : fFrameLongest;
++		}
++	}
++	fLastFrame = began;
++	report = fSwapsShown < 8;
++	if (report) {
++		IOLog("FuxiFramebuffer: swap %u (#%u): surfaces %u %u %u %u, layers set 0x%x cleared 0x%x\n",
++		    swapWord(swap, SWAP_ID), fSwapsShown, swapWord(swap, SWAP_SURFACE(0)), swapWord(swap, SWAP_SURFACE(1)),
++		    swapWord(swap, SWAP_SURFACE(2)), swapWord(swap, SWAP_SURFACE(3)), set, swapWord(swap, SWAP_LAYERS_CLEARED));
++	}
++	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
++		uint32_t sid = swapWord(swap, SWAP_SURFACE(layer));
++		int32_t src[4], dst[4];
++		FuxiIOSurface * s;
++
++		layers |= sid != 0 ? 1u << layer : 0;
++		/* the frames' surfaces: is it a few, in turn? */
++		for (unsigned i = 0; layer == 0 && sid != 0 && i < 8; i++) {
++			if (fStatSurfaces[i] == 0 || fStatSurfaces[i] == sid) {
++				fStatSurfaces[i] = sid;
++				break;
++			}
++		}
++		if (fPowerOff) {
++			continue;                       /* (the panel stays black until it is asked on) */
++		}
++		if (sid == 0) {
++			/* the bottom layer taken away: nothing is shown, the screen is black */
++			if (layer == 0 && (set & 1) && fGraphics) {
++				blackPanel();
++			}
++			continue;
++		}
++		memcpy(src, swap + SWAP_SOURCE(layer), sizeof(src));
++		memcpy(dst, swap + SWAP_DEST(layer), sizeof(dst));
++		s = surfaces[layer];
++		if (report) {
++			IOLog("FuxiFramebuffer: swap %u layer %u: surface %u%s (%ux%u '%c%c%c%c') "
++			    "from %d,%d %dx%d to %d,%d %dx%d, layers set 0x%x\n", swapWord(swap, SWAP_ID), layer, sid,
++			    s ? "" : " MISSING", s ? s->info.width : 0, s ? s->info.height : 0,
++			    s ? (int) (s->info.pixelFormat >> 24 & 0xff) : '?', s ? (int) (s->info.pixelFormat >> 16 & 0xff) : '?',
++			    s ? (int) (s->info.pixelFormat >> 8 & 0xff) : '?', s ? (int) (s->info.pixelFormat & 0xff) : '?',
++			    src[0], src[1], src[2], src[3], dst[0], dst[1], dst[2], dst[3], set);
++		}
++		if (s == NULL) {
++			continue;
++		}
++		if (s->info.bytesPerElement == 4 && s->info.planeCount == 0) {
++			if (!fGraphics) {
++				/* the first picture: the kernel's text console must stop drawing over it (fuxi_fb_console=1: it goes on) */
++				fGraphics = true;
++				if (!gKeepConsole) {
++					fuxi_fbcon_quiet();
++				}
++				IOLog("FuxiFramebuffer: the first picture (swap %u, surface %u); the text console %s\n", swapWord(swap, SWAP_ID),
++				    sid, gKeepConsole ? "goes on drawing over it" : "stops");
++			}
++			drawLayer(s, src, dst);
++			written = true;
++		}
++	}
++	if (written) {
++		fuxi_fbcon_flush();
++	}
++	fSwapsShown++;
++	if (layers != fLayersShown) {
++		IOLog("FuxiFramebuffer: swap #%u: surfaces in layers 0x%x now (0x%x before): %u %u %u %u\n", fSwapsShown, layers,
++		    fLayersShown, swapWord(swap, SWAP_SURFACE(0)), swapWord(swap, SWAP_SURFACE(1)), swapWord(swap, SWAP_SURFACE(2)),
++		    swapWord(swap, SWAP_SURFACE(3)));
++		fLayersShown = layers;
++	}
++
++	/* every five seconds in which something was drawn: how many frames, and what each cost here */
++	fStatFrames++;
++	fStatDrawing += mach_absolute_time() - began;
++	if (fStatSince == 0) {
++		fStatSince = began;
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time() - fStatSince, &nanos);
++	if (nanos >= 5 * NSEC_PER_SEC) {
++		uint64_t drawing, beat;
++		unsigned different;
++
++		absolutetime_to_nanoseconds(fStatDrawing, &drawing);
++		absolutetime_to_nanoseconds(fStatBeatWait, &beat);
++		IOLog("FuxiFramebuffer: %u frames in %llu ms (%llu a second), %llu us each in the driver, %u of them waited "
++		    "%llu us for the next refresh; %u swaps waited for the frame before, %u gave up; %u swaps came a refresh "
++		    "late themselves\n", fStatFrames, nanos / NSEC_PER_MSEC, fStatFrames * NSEC_PER_SEC / nanos,
++		    drawing / fStatFrames / NSEC_PER_USEC, fStatOnBeat, fStatOnBeat ? beat / fStatOnBeat / NSEC_PER_USEC : 0,
++		    fStatHeld, fStatLost, fStatSwapsLate);
++		fStatSwapsLate = 0;
++		/*
++		 * hakios: the last swap as it came, every five seconds rather than for the first eight: the
++		 * words of the header that are not zero, offset:value, for what the window server put where.
++		 */
++		{
++			char words[400];
++			unsigned at = 0;
++
++			for (unsigned off = 0; off < 0x110 && at < sizeof(words) - 24; off += 4) {
++				uint32_t w = swapWord(swap, off);
++
++				if (w != 0) {
++					at += (unsigned) snprintf(words + at, sizeof(words) - at, " %x:%x", off, w);
++				}
++			}
++			words[at] = '\0';
++			IOLog("FuxiFramebuffer: the last swap: surfaces %u %u %u %u (found %d %d %d %d); words%s\n",
++			    swapWord(swap, SWAP_SURFACE(0)), swapWord(swap, SWAP_SURFACE(1)), swapWord(swap, SWAP_SURFACE(2)),
++			    swapWord(swap, SWAP_SURFACE(3)), surfaces[0] != NULL, surfaces[1] != NULL, surfaces[2] != NULL,
++			    surfaces[3] != NULL, words);
++		}
++		for (different = 0; different < 8 && fStatSurfaces[different] != 0; different++) {
++		}
++		if (different == 8 && fStatFrames > 8) {
++			uint32_t made, freed, again;
++			uint64_t making, freeing;
++
++			/* (CoreAnimation has made itself a new surface for every frame: see "the frames' surfaces" above) */
++			FuxiIOSurfaceCost(&made, &making, &freed, &freeing, &again);
++			IOLog("FuxiFramebuffer: the frames came in surfaces %u, %u, %u, %u, %u and on, none twice; in that time "
++			    "%u surfaces of all kinds were made, in %llu us each (%u of them of memory kept from one before), and %u "
++			    "freed, in %llu us each\n", fStatSurfaces[0], fStatSurfaces[1], fStatSurfaces[2], fStatSurfaces[3],
++			    fStatSurfaces[4], made, making, again, freed, freeing);
++		}
++		bzero(fStatSurfaces, sizeof(fStatSurfaces));
++		fStatHeld = fStatLost = fStatOnBeat = 0;
++		fStatBeatWait = 0;
++		reportFrameTimes();
++		fStatFrames = 0;
++		fStatDrawing = 0;
++		fStatSince = 0;
++	}
++	IOLockUnlock(fLock);
++}
++
++/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
++
++class IOMobileFramebufferUserClient : public IOUserClient
++{
++	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
++
++	task_t                  fTask;
++	IOMobileFramebuffer *   fOwner;
++	IOLock *                fLock;
++	mach_port_t             fPorts[kFBNotifyTypes];
++	mach_vm_address_t       fCallbacks[kFBNotifyTypes];
++	io_user_reference_t     fRefcons[kFBNotifyTypes];
++	thread_call_t           fVSyncCall;
++	uint64_t                fVSyncCount;
++	uint64_t                fVSyncTime;             /* when the refresh being waited for is due */
++	bool                    fVSyncRunning;
++	bool                    fClosed;
++
++	static void vsyncFired(thread_call_param_t self, thread_call_param_t unused);
++	void vsync(void);
++	void armVSync(void);
++
++public:
++	virtual bool initWithTask(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties) APPLE_KEXT_OVERRIDE;
++	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	virtual void free(void) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn registerNotificationPort(mach_port_t port, UInt32 type, io_user_reference_t refCon) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments * args,
++	    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
++
++bool
++IOMobileFramebufferUserClient::initWithTask(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties)
++{
++	char procname[32] = "?";
++
++	if (!IOUserClient::initWithTask(owningTask, securityID, type, properties)) {
++		return false;
++	}
++	fTask = owningTask;
++	proc_selfname(procname, sizeof(procname));
++	IOLog("FuxiFramebuffer: opened by %s[%d], type %u\n", procname, proc_selfpid(), (unsigned) type);
++	return true;
++}
++
++bool
++IOMobileFramebufferUserClient::start(IOService * provider)
++{
++	fOwner = OSDynamicCast(IOMobileFramebuffer, provider);
++	if (fOwner == NULL || !IOUserClient::start(provider)) {
++		return false;
++	}
++	fLock = IOLockAlloc();
++	fVSyncCall = thread_call_allocate(&IOMobileFramebufferUserClient::vsyncFired, this);
++	return fLock != NULL && fVSyncCall != NULL;
++}
++
++IOReturn
++IOMobileFramebufferUserClient::clientClose(void)
++{
++	if (fLock != NULL) {
++		IOLockLock(fLock);
++		fClosed = true;
++		IOLockUnlock(fLock);
++	}
++	if (fVSyncCall != NULL) {
++		thread_call_cancel_wait(fVSyncCall);
++	}
++	if (!isInactive()) {
++		terminate();
++	}
++	return kIOReturnSuccess;
++}
++
++void
++IOMobileFramebufferUserClient::free(void)
++{
++	if (fVSyncCall != NULL) {
++		thread_call_cancel_wait(fVSyncCall);
++		thread_call_free(fVSyncCall);
++		fVSyncCall = NULL;
++	}
++	for (unsigned i = 0; i < kFBNotifyTypes; i++) {
++		if (fPorts[i] != NULL) {
++			releaseNotificationPort(fPorts[i]);
++			fPorts[i] = NULL;
++		}
++	}
++	if (fLock != NULL) {
++		IOLockFree(fLock);
++		fLock = NULL;
++	}
++	IOUserClient::free();
++}
++
++IOReturn
++IOMobileFramebufferUserClient::registerNotificationPort(mach_port_t port, UInt32 type, io_user_reference_t refCon __unused)
++{
++	mach_port_t old;
++
++	IOLog("FuxiFramebuffer: notification port for type %u\n", (unsigned) type);
++	if (type >= kFBNotifyTypes) {
++		return kIOReturnBadArgument;
++	}
++	IOLockLock(fLock);
++	old = fPorts[type];
++	fPorts[type] = port;
++	IOLockUnlock(fLock);
++	if (old != NULL) {
++		releaseNotificationPort(old);
++	}
++	return kIOReturnSuccess;
++}
++
++void
++IOMobileFramebufferUserClient::vsyncFired(thread_call_param_t self, thread_call_param_t unused __unused)
++{
++	((IOMobileFramebufferUserClient *) self)->vsync();
++}
++
++/* With the lock held. */
++void
++IOMobileFramebufferUserClient::armVSync(void)
++{
++	uint64_t period, now = mach_absolute_time();
++
++	/* one refresh after the last, not after whenever we got round to this: the rate does not drift */
++	nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz(), &period);
++	fVSyncTime += period;
++	if (fVSyncTime <= now || fVSyncTime > now + 2 * period) {
++		fVSyncTime = now + period;
++	}
++	thread_call_enter_delayed(fVSyncCall, fVSyncTime);
++}
++
++/*
++ * One refresh: tell the client, which gets three 64-bit numbers as six 32-bit halves --
++ * the time of this refresh, the same again (the time it was presented), and a counter.
++ */
++void
++IOMobileFramebufferUserClient::vsync(void)
++{
++	OSAsyncReference64 ref;
++	io_user_reference_t args[6];
++	uint64_t now;
++	bool send = false;
++
++	IOLockLock(fLock);
++	now = fVSyncTime;
++	if (fClosed || fCallbacks[kFBNotifyVSync] == 0 || fPorts[kFBNotifyVSync] == NULL) {
++		fVSyncRunning = false;
++	} else {
++		fVSyncCount++;
++		setAsyncReference64(ref, fPorts[kFBNotifyVSync], fCallbacks[kFBNotifyVSync], fRefcons[kFBNotifyVSync], fTask);
++		args[0] = (uint32_t) now;
++		args[1] = now >> 32;
++		args[2] = (uint32_t) now;
++		args[3] = now >> 32;
++		args[4] = (uint32_t) fVSyncCount;
++		args[5] = fVSyncCount >> 32;
++		send = true;
++		armVSync();
++	}
++	IOLockUnlock(fLock);
++	if (send) {
++		sendAsyncResult64WithOptions(ref, kIOReturnSuccess, args, 6, kIOUserNotifyOptionCanDrop);
++	}
++}
++
++IOReturn
++IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments * args,
++    IOExternalMethodDispatch * dispatch __unused, OSObject * target __unused, void * reference __unused)
++{
++	const uint64_t * in = args->scalarInput;
++	uint64_t * out = args->scalarOutput;
++	FuxiIOSurface * s;
++
++	if (selector < 128 && gFBCalls[selector] < gFBTrace) {
++		char procname[32] = "?";
++
++		gFBCalls[selector]++;
++		proc_selfname(procname, sizeof(procname));
++		IOLog("FuxiFramebuffer: %s[%d] selector %u (scalars %u in [0x%llx 0x%llx 0x%llx 0x%llx], %u out; "
++		    "structure %u in, %u out)\n", procname, proc_selfpid(), selector, args->scalarInputCount,
++		    args->scalarInputCount > 0 ? in[0] : 0, args->scalarInputCount > 1 ? in[1] : 0,
++		    args->scalarInputCount > 2 ? in[2] : 0, args->scalarInputCount > 3 ? in[3] : 0, args->scalarOutputCount,
++		    args->structureInputSize, args->structureOutputSize);
++	}
++
++	switch (selector) {
++	case kFBMethodGetDisplaySize:                   /* out: width, height */
++		if (args->scalarOutputCount < 2) {
++			return kIOReturnBadArgument;
++		}
++		out[0] = fOwner->fWidth;
++		out[1] = fOwner->fHeight;
++		args->scalarOutputCount = 2;
++		return kIOReturnSuccess;
++
++	case kFBMethodGetID:
++		if (args->scalarOutputCount < 1) {
++			return kIOReturnBadArgument;
++		}
++		out[0] = 1;
++		args->scalarOutputCount = 1;
++		return kIOReturnSuccess;
++
++	case kFBMethodGetDotPitch:                      /* out: pixels per inch */
++		if (args->scalarOutputCount < 1) {
++			return kIOReturnBadArgument;
++		}
++		out[0] = kFBDotsPerInch * fOwner->fWidth / kFBDefaultWidth;
++		args->scalarOutputCount = 1;
++		return kIOReturnSuccess;
++
++	case kFBMethodGetLayerDefaultSurface:           /* in: size wanted (or 0, 0); out: a send right for the surface */
++		if (args->scalarOutputCount < 1) {
++			return kIOReturnBadArgument;
++		}
++		s = fOwner->defaultSurface();
++		if (s == NULL) {
++			return kIOReturnNoMemory;
++		}
++		out[0] = FuxiIOSurfaceMakeSendRight(fTask, s);
++		args->scalarOutputCount = 1;
++		return out[0] != 0 ? kIOReturnSuccess : kIOReturnNoMemory;
++
++	case kFBMethodSwapBegin:                        /* out: the number of the new swap */
++		if (args->scalarOutputCount < 1) {
++			return kIOReturnBadArgument;
++		}
++		out[0] = OSIncrementAtomic(&fOwner->fSwapID) + 1;
++		args->scalarOutputCount = 1;
++		return kIOReturnSuccess;
++
++	case kFBMethodSwapEnd:
++		if (args->structureInput == NULL || args->structureInputSize < SWAP_SIZE) {
++			IOLog("FuxiFramebuffer: swap request of %u bytes, expected %u\n", args->structureInputSize, SWAP_SIZE);
++			return kIOReturnBadArgument;
++		}
++		if (args->structureInputSize != SWAP_SIZE && args->structureInputSize != SWAP26_SIZE &&
++		    gFBSwapSizeSaid != args->structureInputSize) {
++			/* (iOS 27 may have moved the fields again: the request is still read as iOS 26's) */
++			gFBSwapSizeSaid = args->structureInputSize;
++			IOLog("FuxiFramebuffer: swap request of %#x bytes (iOS 16.5: %#x, iOS 26: %#x)\n", args->structureInputSize,
++			    SWAP_SIZE, SWAP26_SIZE);
++		}
++		if (args->structureInputSize >= SWAP26_SIZE) {
++			/*
++			 * hakios: iOS 26's request (0x588 bytes) is iOS 16.5's with 0x48 bytes more ahead of the swap's
++			 * own fields: the ID, the layers' surfaces, source rectangles, flags, destination rectangles and
++			 * the masks of the layers set and cleared all sit 0x48 further on (kern_SwapBegin/SwapSetLayer in
++			 * IOMobileFramebuffer.framework). Seen from there it is the old one.
++			 */
++			uint8_t old[SWAP_SIZE];
++
++			memcpy(old, (const uint8_t *) args->structureInput + SWAP26_SHIFT, SWAP_SIZE);
++			fOwner->present(old);
++			return kIOReturnSuccess;
++		}
++		fOwner->present((const uint8_t *) args->structureInput);
++		return kIOReturnSuccess;
++
++	case kFBMethodRequestPowerChange:               /* in: 0 = display off (power button, auto-lock), else on */
++		if (args->scalarInputCount >= 1) {
++			fOwner->setPower(in[0] != 0);
++		}
++		return kIOReturnSuccess;
++
++	case kFBMethodSwapWait:                         /* a swap is on the screen as soon as it is made */
++	case kFBMethodSwapSignal:
++	case kFBMethodSwapCancel:
++	case kFBMethodSwapCancelAll:
++	case kFBMethodChangeFrameInfo:
++		return kIOReturnSuccess;
++
++	case kFBMethodNotifications:                    /* in: callback (0 = off), its argument, type, 0 */
++		if (args->scalarInputCount < 3 || in[2] >= kFBNotifyTypes) {
++			return kIOReturnBadArgument;
++		}
++		IOLockLock(fLock);
++		fCallbacks[in[2]] = in[0];
++		fRefcons[in[2]] = in[1];
++		if (in[2] == kFBNotifyVSync && in[0] != 0 && !fVSyncRunning && !fClosed) {
++			fVSyncRunning = true;
++			armVSync();
++		}
++		IOLockUnlock(fLock);
++		return kIOReturnSuccess;
++
++	case kFBMethodSupportedFrameInfo:               /* in: type; out: how many, and their tags: none */
++		if (args->scalarOutputCount >= 1) {
++			out[0] = 0;
++			args->scalarOutputCount = 1;
++		}
++		if (args->structureOutput != NULL) {
++			bzero(args->structureOutput, args->structureOutputSize);
++		}
++		return kIOReturnSuccess;
++
++	case kFBMethodGetBlock:                         /* in: which block; out: its bytes */
++		if (args->structureOutput == NULL) {
++			return kIOReturnBadArgument;
++		}
++		bzero(args->structureOutput, args->structureOutputSize);
++		if (args->scalarInputCount >= 1 && in[0] == 0x40 && args->structureOutputSize >= 12) {
++			/* the current mode: its colour and timing identifiers */
++			uint32_t ids[2] = { kFBColorID, kFBTimingID };
++
++			memcpy((uint8_t *) args->structureOutput + 4, ids, sizeof(ids));
++		}
++		return kIOReturnSuccess;
++
++	case kFBMethodGetCurrentAbsoluteTime:
++		if (args->scalarOutputCount < 1) {
++			return kIOReturnBadArgument;
++		}
++		out[0] = mach_absolute_time();
++		args->scalarOutputCount = 1;
++		return kIOReturnSuccess;
++
++	default:
++		break;
++	}
++
++	if (selector < 128 && !(gFBLogged[selector / 64] & (1ULL << (selector % 64)))) {
++		gFBLogged[selector / 64] |= 1ULL << (selector % 64);
++		IOLog("FuxiFramebuffer: selector %u not implemented (scalars %u in [0x%llx 0x%llx 0x%llx], %u out; "
++		    "structure %u in, %u out)\n", selector, args->scalarInputCount, args->scalarInputCount > 0 ? in[0] : 0,
++		    args->scalarInputCount > 1 ? in[1] : 0, args->scalarInputCount > 2 ? in[2] : 0, args->scalarOutputCount,
++		    args->structureInputSize, args->structureOutputSize);
++	}
++	/* a request that only sets something is accepted; one that wants an answer gets zeros */
++	if (args->scalarOutputCount != 0) {
++		bzero(out, args->scalarOutputCount * sizeof(out[0]));
++	}
++	if (args->structureOutput != NULL && args->structureOutputSize != 0) {
++		bzero(args->structureOutput, args->structureOutputSize);
++	}
++	return kIOReturnSuccess;
++}
++
++/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
++
++/*
++ * IOMobileFramebuffer.framework counts the displays it should wait for by looking for
++ * children of /arm-io in the device tree whose device_type is "display-subsystem". The ADT
++ * may carry one (tools/mkadt-fuxi27.py --display); otherwise it is made here, in the
++ * registry's device tree plane only, with the canvas size the iOS 16.7 framework read off it.
++ */
++static bool
++hasDisplayNode(IORegistryEntry * armio)
++{
++	OSIterator * children = armio->getChildIterator(gIODTPlane);
++	IORegistryEntry * child;
++	bool found = false;
++
++	while (children != NULL && !found && (child = OSDynamicCast(IORegistryEntry, children->getNextObject())) != NULL) {
++		OSData * type = OSDynamicCast(OSData, child->getProperty("device_type"));
++
++		found = type != NULL && type->getLength() >= sizeof("display-subsystem") &&
++		    strncmp((const char *) type->getBytesNoCopy(), "display-subsystem", sizeof("display-subsystem")) == 0;
++	}
++	OSSafeReleaseNULL(children);
++	return found;
++}
++
++static void
++publishDisplayNode(uint32_t width, uint32_t height)
++{
++	IORegistryEntry * armio = IORegistryEntry::fromPath("/arm-io", gIODTPlane);
++	IORegistryEntry * node;
++	OSDictionary * props;
++	OSData * data;
++
++	if (armio == NULL) {
++		IOLog("FuxiFramebuffer: no /arm-io in the device tree\n");
++		return;
++	}
++	if (hasDisplayNode(armio)) {
++		IOLog("FuxiFramebuffer: the device tree has a display-subsystem under /arm-io already\n");
++		armio->release();
++		return;
++	}
++	node = OSTypeAlloc(IORegistryEntry);
++	props = OSDictionary::withCapacity(6);
++	if (node != NULL && props != NULL) {
++		data = OSData::withBytes("display-subsystem", sizeof("display-subsystem"));
++		props->setObject("device_type", data);
++		OSSafeReleaseNULL(data);
++		data = OSData::withBytes("fuxi,framebuffer", sizeof("fuxi,framebuffer"));
++		props->setObject("compatible", data);
++		OSSafeReleaseNULL(data);
++		data = OSData::withBytes("disp0", sizeof("disp0"));
++		props->setObject("name", data);
++		OSSafeReleaseNULL(data);
++		data = OSData::withBytes(&width, sizeof(width));
++		props->setObject("canvas-width", data);
++		OSSafeReleaseNULL(data);
++		data = OSData::withBytes(&height, sizeof(height));
++		props->setObject("canvas-height", data);
++		OSSafeReleaseNULL(data);
++		if (node->init(props)) {
++			node->setName("disp0");
++			node->attachToParent(armio, gIODTPlane);
++		}
++	}
++	OSSafeReleaseNULL(props);
++	OSSafeReleaseNULL(node);
++	armio->release();
++}
++
++/*
++ * The graphics accelerator. There is none, but (hakios) CoreAnimation waits half a minute for a
++ * service of this class to appear before it looks for a GPU at all (once per process). An
++ * accelerator without the properties that name its Metal and OpenGL ES drivers is passed over
++ * by both, which leaves CoreAnimation with its software renderer. (hakios's metal=1 switch, which
++ * lets user space set those properties, is not ported.) fuxi_fb_accel=0: none is published.
++ */
++class IOAcceleratorES : public IOService
++{
++	OSDeclareDefaultStructors(IOAcceleratorES);
++};
++
++OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
++
++static void
++publishAccelerator(IOService * provider)
++{
++	IOAcceleratorES * accelerator = OSTypeAlloc(IOAcceleratorES);
++
++	if (accelerator != NULL && accelerator->init() && accelerator->attach(provider)) {
++		accelerator->setName("sgx");
++		accelerator->registerService();
++	}
++	OSSafeReleaseNULL(accelerator);
++}
++
++/* Called from bsd_init() next to fuxi_aks_start(): IOSurface first, then the display on it. */
++extern "C" void
++fuxi_fb_start(void)
++{
++	IOService * resources = IOService::getResourceService();
++	IOMobileFramebuffer * fb;
++	uint32_t on = 0;
++
++	if (!PE_parse_boot_argn("fuxi_fb", &on, sizeof(on)) || on < 1) {
++		return;
++	}
++	PE_parse_boot_argn("fuxi_fb_hz", &gRefreshHz, sizeof(gRefreshHz));
++	PE_parse_boot_argn("fuxi_fb_width", &gFBWidth, sizeof(gFBWidth));
++	PE_parse_boot_argn("fuxi_fb_height", &gFBHeight, sizeof(gFBHeight));
++	PE_parse_boot_argn("fuxi_fb_trace", &gFBTrace, sizeof(gFBTrace));
++	PE_parse_boot_argn("fuxi_fb_filter", &gFilter, sizeof(gFilter));
++	PE_parse_boot_argn("fuxi_fb_threads", &gThreads, sizeof(gThreads));
++	PE_parse_boot_argn("fuxi_fb_queue", &gQueue, sizeof(gQueue));
++	PE_parse_boot_argn("fuxi_fb_beat", &gOnTheBeat, sizeof(gOnTheBeat));
++	PE_parse_boot_argn("fuxi_fb_console", &gKeepConsole, sizeof(gKeepConsole));
++	PE_parse_boot_argn("fuxi_fb_accel", &gAccelerator, sizeof(gAccelerator));
++	if (resources == NULL) {
++		IOLog("FuxiFramebuffer: no IOResources\n");
++		return;
++	}
++	FuxiIOSurfaceStart(resources);
++
++	fb = OSTypeAlloc(IOMobileFramebuffer);
++	if (fb == NULL || !fb->init() || !fb->attach(resources)) {
++		OSSafeReleaseNULL(fb);
++		IOLog("FuxiFramebuffer: cannot create the service\n");
++		return;
++	}
++	if (fb->start(resources)) {
++		publishDisplayNode(fb->fWidth, fb->fHeight);
++		if (gAccelerator) {
++			publishAccelerator(resources);
++		}
++		IOLog("FuxiFramebuffer: started\n");
++	} else {
++		fb->detach(resources);
++		IOLog("FuxiFramebuffer: the display did not start\n");
++	}
++	fb->release();
++}
++
++#endif /* FUXI */
+diff --git a/iokit/Kernel/arm/FuxiIOSurface.cpp b/iokit/Kernel/arm/FuxiIOSurface.cpp
+new file mode 100644
+index 0000000..e9650ef
+--- /dev/null
++++ b/iokit/Kernel/arm/FuxiIOSurface.cpp
+@@ -0,0 +1,2403 @@
++/*
++ * Fuxi: a stand-in IOSurface (boot-arg fuxi_fb=1; see FuxiIOSurface.h and FuxiFramebuffer.cpp).
++ *
++ * Apple's IOSurface kext must not be prelinked next to this one (tools/ios27-prelink.py --drop):
++ * both define IOCoreSurfaceRoot, IOSurfaceRootUserClient and IOSurfaceSendRight.
++ *
++ * Ported from hakios-arm64e-dada's MiniIOSurface.cpp (base/xnu/files/iokit/Kernel, APSL 2.0,
++ * a derivative work of XNU), which describes the situation and the protocol:
++ *
++ *   A surface is a piece of wired kernel memory: one page of state that clients read directly,
++ *   followed by the pixels. Every client that knows a surface has the whole of it mapped once.
++ *   Surfaces travel between processes as Mach send rights (IOSurfaceSendRight) or by number.
++ *   [...] What is not here: child surfaces, wrapping of client memory in pieces, purgeability,
++ *   compression, notifications. Calls that are not implemented are logged once and refused.
++ *
++ * The iOS 26 layouts (the 0xc68-byte surface description, the 0x28-byte init reply) are kept
++ * as hakios has them: iOS 27's IOSurface.framework is assumed to be the same until a boot says
++ * otherwise, and a size seen for the first time is logged.
++ *
++ * Boot-args: fuxi_surf_trace=N logs the first N surfaces made (default 24); fuxi_surf_trace_of=NAME
++ * counts only those of programs whose name begins with NAME, and says what becomes of them;
++ * fuxi_surf_clear=0 gives kept memory out uncleared (to measure what the clearing costs).
++ */
++#if defined(FUXI)
++#include <IOKit/IOLib.h>
++#include <pexpert/pexpert.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <libkern/c++/OSSerialize.h>
++#include <libkern/c++/OSUnserialize.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSCollectionIterator.h>
++#include <libkern/c++/OSSymbol.h>
++#include <libkern/c++/OSArray.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSBoolean.h>
++#include <libkern/c++/OSString.h>
++#include <kern/thread_call.h>
++#include <sys/systm.h>
++#include <sys/proc.h>
++
++#include "FuxiIOSurface.h"
++
++static_assert(sizeof(struct fuxisurf_plane) == 0x80, "plane layout");
++static_assert(sizeof(struct fuxisurf_result) == 0x68, "result layout");
++static_assert(offsetof(struct fuxisurf_shared, attachments) == 0x30, "shared layout");
++static_assert(sizeof(struct fuxisurf_result) + 20 * sizeof(struct fuxisurf_plane) == FUXISURF_RESULT_MAX, "result size");
++
++/* IOConnectCallMethod selectors of IOSurfaceRootUserClient (iOS 16.5) */
++enum {
++	kSurfaceMethodCreate            = 0,
++	kSurfaceMethodLookup            = 4,
++	kSurfaceMethodSetYCbCrMatrix    = 5,
++	kSurfaceMethodWrapClientImage   = 6,
++	kSurfaceMethodWrapClientMemory  = 7,
++	kSurfaceMethodSetValue          = 9,
++	kSurfaceMethodCopyValue         = 10,
++	kSurfaceMethodRemoveValue       = 11,
++	kSurfaceMethodBindAccel         = 12,
++	kSurfaceMethodInit              = 13,
++	kSurfaceMethodLog               = 19,
++	kSurfaceMethodSetPurgeable      = 20,
++	kSurfaceMethodSetOwnership      = 21,
++	kSurfaceMethodSetTiled          = 22,
++	kSurfaceMethodSetTimestamp      = 24,
++	kSurfaceMethodSetBulkAttachments = 27,
++	kSurfaceMethodCommPageAddress   = 32,
++	kSurfaceMethodSetIndexedTimestamp = 33,
++	kSurfaceMethodLookupFromPort    = 34,
++	kSurfaceMethodCreatePort        = 35,
++	kSurfaceMethodEventCreate       = 36,   /* IOSurfaceSharedEvent: in options; out its port, its value's address here */
++	kSurfaceMethodEventMap          = 38,   /* in an event's port; out -, its value's address here, its id, 0 */
++	kSurfaceMethodEventNotify       = 39,   /* in the event's port, the listener, the event object, the block, the value */
++	kSurfaceMethodEventAddListener  = 40,   /* async: the listener's notification port and its reference (callback, listener) */
++	kSurfaceMethodEventRemoveListener = 41, /* in the listener */
++	kSurfaceMethodDetachModeCode    = 43,
++	kSurfaceMethodSetOwnershipIdentity = 44,
++};
++
++/* IOConnectTrap indices */
++enum {
++	kSurfaceTrapIncrementUseCount   = 0,
++	kSurfaceTrapDecrementUseCount   = 1,
++	kSurfaceTrapLock                = 2,
++	kSurfaceTrapUnlock              = 3,
++	kSurfaceTrapDetach              = 4,    /* the client is about to release: forget it has the surface */
++	kSurfaceTrapRelease             = 5,
++	kSurfaceTrapEventWait           = 6,    /* the event's port, the value, a timeout in ms */
++	kSurfaceTrapEventSignal         = 7,    /* the event's port, the value */
++	kSurfaceTrapCount
++};
++
++#define kSurfaceLockReadOnly    1u
++
++#define FUXISURF_TABLE_SIZE     16384
++#define FUXISURF_MAX_DIMENSION  16384
++#define FUXISURF_MAX_ALLOC      (512u << 20)
++#define FUXISURF_ROW_ALIGN      64
++
++#define FOURCC(a, b, c, d) ((uint32_t)(a) << 24 | (uint32_t)(b) << 16 | (uint32_t)(c) << 8 | (uint32_t)(d))
++
++static IOLock *         gSurfaceLock;
++static FuxiIOSurface *  gSurfaceTable[FUXISURF_TABLE_SIZE];     /* index = surface number; [0] unused */
++static uint32_t         gSurfaceNext = 1;
++static uint32_t         gSurfaceCount;
++static uint64_t         gSurfaceBytes;
++static uint32_t         gSurfaceUnheld;         /* surfaces around client memory that could not be made (said a few times) */
++/* what making surfaces and taking them away has cost since it was last asked (FuxiIOSurfaceCost()) */
++static uint64_t         gSurfaceMaking, gSurfaceFreeing;
++static uint32_t         gSurfacesMade, gSurfacesFreed;
++static uint64_t         gSurfaceLogged[2];                      /* selectors already complained about */
++/* Boot-arg fuxi_surf_trace=N: log the first N surfaces created (default 24). */
++static uint32_t         gSurfaceTrace = 24;
++static uint32_t         gSurfaceTraced;
++/*
++ * Boot-arg fuxi_surf_trace_of=NAME: only the surfaces made by programs whose name begins with NAME count
++ * for fuxi_surf_trace (then up to N of theirs), and what becomes of them is said as well: the ports made
++ * for them and who looks them up from a port (another program, which shows it: the window server for a layer).
++ */
++static char             gSurfaceTraceOf[32];
++static uint32_t         gSurfaceSizesSaid[4];   /* result sizes asked for that are neither iOS 16.5's nor iOS 26's */
++
++/* A line about a traced surface. */
++static void
++traceLine(const char * format, ...) __printflike(1, 2);
++
++static void
++traceLine(const char * format, ...)
++{
++	char line[256];
++	va_list list;
++
++	va_start(list, format);
++	vsnprintf(line, sizeof(line), format, list);
++	va_end(list);
++	IOLog("%s", line);
++}
++
++/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
++
++OSDefineMetaClassAndStructors(FuxiIOSurface, OSObject);
++
++/*
++ * The memory of the big surfaces is kept when they go, a few pieces of it, and given to the
++ * next surface of the same size. CoreAnimation makes a surface of the whole display for every
++ * frame and frees one: 14 MB got, cleared, entered into the kernel's map and taken out of it
++ * again, sixty times a second -- 2.8 ms to make and 2 ms to free each, a quarter of the time
++ * there is for a frame, on the thread that draws it. A piece that is kept is cleared again
++ * before it is given out: a new surface is all zeroes, whoever makes it. The clearing is done
++ * by the display's driver between two frames (FuxiIOSurfaceClearKept(): while it copies a
++ * frame to the panel the memory is busy enough, and the copy took half as long again when
++ * this ran beside it), or a moment later by a thread of this file's if no frames are going
++ * out, or by whoever asks for the memory if that comes first.
++ */
++#define SURFACE_KEEP_FROM       (4u << 20)      /* bytes: smaller ones are not worth it */
++#define SURFACE_KEPT            4
++#define SURFACE_CLEAR_MS        40              /* kept memory is cleared this long after, if the display's driver has not done it */
++
++static struct {
++	IOBufferMemoryDescriptor *      memory;
++	bool                            clear;          /* cleared since it was last a surface's */
++	bool                            busy;           /* being cleared right now */
++	uint64_t                        since;          /* when it was kept */
++} gSurfaceKept[SURFACE_KEPT];
++static uint32_t         gSurfacesNotKept[2];    /* memory not kept: somebody else had it too; it put out a piece kept longer */
++static IOLock *         gSurfaceKeptLock;
++static thread_call_t    gSurfaceClearing;
++static uint32_t         gSurfacesGivenAgain;    /* for FuxiIOSurfaceCost() */
++/* boot-arg fuxi_surf_clear=0: kept memory is given out as it is (to see what the clearing costs; a surface is then not all zeroes) */
++static uint32_t         gSurfaceClear = 1;
++
++/*
++ * (hakios also wrote zeroed memory back out of the processor's cache, for their GPU, which drew into
++ * it underneath the cache. Here only the processor touches surfaces, so that is left out; a GPU that
++ * draws into them will need it back.)
++ */
++
++void
++FuxiIOSurfaceClearKept(void)
++{
++	if (gSurfaceKeptLock == NULL || !gSurfaceClear) {
++		return;
++	}
++	IOLockLock(gSurfaceKeptLock);
++	for (unsigned i = 0; i < SURFACE_KEPT; i++) {
++		IOBufferMemoryDescriptor * memory = gSurfaceKept[i].memory;
++
++		if (memory == NULL || gSurfaceKept[i].clear || gSurfaceKept[i].busy) {
++			continue;
++		}
++		gSurfaceKept[i].busy = true;
++		IOLockUnlock(gSurfaceKeptLock);
++		bzero(memory->getBytesNoCopy(), memory->getCapacity());
++		IOLockLock(gSurfaceKeptLock);
++		gSurfaceKept[i].busy = false;
++		gSurfaceKept[i].clear = true;
++	}
++	IOLockUnlock(gSurfaceKeptLock);
++}
++
++static void
++surfaceMemoryClear(thread_call_param_t unused0 __unused, thread_call_param_t unused1 __unused)
++{
++	FuxiIOSurfaceClearKept();
++}
++
++/* Memory for a surface: the state page and `bytes` after it, all zeroes. */
++static IOBufferMemoryDescriptor *
++surfaceMemory(vm_size_t bytes)
++{
++	IOBufferMemoryDescriptor * memory = NULL;
++	bool clear = false;
++
++	if (bytes >= SURFACE_KEEP_FROM && gSurfaceKeptLock != NULL) {
++		IOLockLock(gSurfaceKeptLock);
++		for (int pass = 0; pass < 2 && memory == NULL; pass++) {
++			/* one that is clear already, if there is one */
++			for (unsigned i = 0; i < SURFACE_KEPT && memory == NULL; i++) {
++				if (gSurfaceKept[i].memory != NULL && !gSurfaceKept[i].busy && (pass == 1 || gSurfaceKept[i].clear) &&
++				    gSurfaceKept[i].memory->getCapacity() == bytes) {
++					memory = gSurfaceKept[i].memory;
++					clear = gSurfaceKept[i].clear;
++					gSurfaceKept[i].memory = NULL;
++				}
++			}
++		}
++		gSurfacesGivenAgain += memory != NULL;
++		IOLockUnlock(gSurfaceKeptLock);
++		if (memory != NULL && !clear) {
++			bzero(memory->getBytesNoCopy(), gSurfaceClear ? bytes : PAGE_SIZE);
++		}
++	}
++	if (memory == NULL) {
++		memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared, bytes,
++		    PAGE_SIZE);
++	}
++	return memory;
++}
++
++/*
++ * A surface is gone: its memory is kept for the next, if it is big and nobody else has it. When
++ * all the places are taken, it takes the place of the piece kept longest: pieces of a size nobody
++ * asks for again (a big picture made once) once stayed there for good, and then no frame's memory
++ * was kept any more -- each made afresh and freed (2 to 4 ms, and 1 to 2) instead of 0.3 and 0.05.
++ */
++static void
++surfaceMemoryBack(IOBufferMemoryDescriptor * memory)
++{
++	IOBufferMemoryDescriptor * evicted = NULL;
++
++	if (memory->getCapacity() >= SURFACE_KEEP_FROM && memory->getRetainCount() != 1) {
++		OSIncrementAtomic(&gSurfacesNotKept[0]);
++	}
++	if (memory->getCapacity() >= SURFACE_KEEP_FROM && memory->getRetainCount() == 1 && gSurfaceKeptLock != NULL) {
++		int oldest = -1;
++
++		IOLockLock(gSurfaceKeptLock);
++		for (unsigned i = 0; i < SURFACE_KEPT && memory != NULL; i++) {
++			if (gSurfaceKept[i].memory == NULL) {
++				gSurfaceKept[i].memory = memory;
++				gSurfaceKept[i].clear = gSurfaceKept[i].busy = false;
++				gSurfaceKept[i].since = mach_absolute_time();
++				memory = NULL;
++			} else if (!gSurfaceKept[i].busy && (oldest < 0 || gSurfaceKept[i].since < gSurfaceKept[oldest].since)) {
++				oldest = (int) i;
++			}
++		}
++		if (memory != NULL && oldest >= 0) {
++			evicted = gSurfaceKept[oldest].memory;
++			gSurfaceKept[oldest].memory = memory;
++			gSurfaceKept[oldest].clear = gSurfaceKept[oldest].busy = false;
++			gSurfaceKept[oldest].since = mach_absolute_time();
++			memory = NULL;
++			gSurfacesNotKept[1]++;
++		}
++		IOLockUnlock(gSurfaceKeptLock);
++		if (evicted != NULL) {
++			evicted->release();
++		}
++		if (memory == NULL) {
++			if (gSurfaceClear) {
++				AbsoluteTime deadline;
++
++				clock_interval_to_deadline(SURFACE_CLEAR_MS, kMillisecondScale, &deadline);
++				thread_call_enter_delayed(gSurfaceClearing, deadline);
++			}
++			return;
++		}
++	}
++	memory->release();
++}
++
++void
++FuxiIOSurface::free(void)
++{
++	uint64_t began = mach_absolute_time();
++
++	if (traced && kpixels != NULL) {
++		uint32_t nonzero = 0, middle = 0;
++
++		for (uint32_t at = 0; at + 4 <= info.allocSize; at += 64) {
++			nonzero += kpixels[at] != 0 || kpixels[at + 1] != 0 || kpixels[at + 2] != 0 || kpixels[at + 3] != 0;
++		}
++		memcpy(&middle, kpixels + (info.allocSize / 2 & ~3u), 4);
++		traceLine("FuxiIOSurface: surface %u (%ux%u) goes: of every 64 bytes %u of %u begin with a pixel that is not 0, one in "
++		    "the middle %#010x\n", sid, info.width, info.height, nonzero, info.allocSize / 64, middle);
++	}
++
++	OSSafeReleaseNULL(values);
++	OSSafeReleaseNULL(clientMap);
++	if (client != NULL) {
++		client->complete();
++		client->release();
++		client = NULL;
++	}
++	if (memory != NULL) {
++		surfaceMemoryBack(memory);
++		memory = NULL;
++	}
++	OSObject::free();
++	OSAddAtomic64((SInt64) (mach_absolute_time() - began), (SInt64 *) &gSurfaceFreeing);
++	OSIncrementAtomic(&gSurfacesFreed);
++}
++
++/* How many surfaces were made and freed since this was last asked, and the microseconds each took on average. */
++void
++FuxiIOSurfaceCost(uint32_t * made, uint64_t * making, uint32_t * freed, uint64_t * freeing, uint32_t * again)
++{
++	uint64_t nanos;
++
++	*again = OSBitAndAtomic(0, &gSurfacesGivenAgain);
++
++	*made = OSBitAndAtomic(0, &gSurfacesMade);
++	*freed = OSBitAndAtomic(0, &gSurfacesFreed);
++	absolutetime_to_nanoseconds(gSurfaceMaking, &nanos);
++	*making = *made ? nanos / NSEC_PER_USEC / *made : 0;
++	absolutetime_to_nanoseconds(gSurfaceFreeing, &nanos);
++	*freeing = *freed ? nanos / NSEC_PER_USEC / *freed : 0;
++	gSurfaceMaking = gSurfaceFreeing = 0;
++}
++
++/* The values changed: a new seed, and how much room a client needs to fetch them. */
++void
++FuxiIOSurface::updateValuesState(void)
++{
++	struct fuxisurf_shared * sh = shared();
++	uint32_t size = 0;
++
++	if (values != NULL && values->getCount() != 0) {
++		OSSerialize * s = OSSerialize::binaryWithCapacity(4096);
++		if (s != NULL) {
++			if (values->serialize(s)) {
++				size = s->getLength() + 8;
++			}
++			s->release();
++		}
++	}
++	sh->valuesSeed = (sh->valuesSeed + 2) | 1;
++	sh->valuesSize = size;
++}
++
++static uint32_t
++dictNumber(OSDictionary * dict, const char * key, uint32_t missing)
++{
++	OSObject * obj = dict ? dict->getObject(key) : NULL;
++	OSNumber * num = OSDynamicCast(OSNumber, obj);
++
++	if (num != NULL) {
++		return num->unsigned32BitValue();
++	}
++	if (obj == kOSBooleanTrue) {
++		return 1;
++	}
++	if (obj == kOSBooleanFalse) {
++		return 0;
++	}
++	return missing;
++}
++
++static uint32_t
++alignUp(uint64_t value, uint32_t to)
++{
++	return (uint32_t) ((value + to - 1) / to * to);
++}
++
++/* Bytes per element when the client did not say. */
++static uint32_t
++defaultBytesPerElement(uint32_t format)
++{
++	switch (format) {
++	case FOURCC('L', '0', '0', '8'):
++	case FOURCC('A', '0', '0', '8'):
++	case 0x00000008:
++		return 1;
++	case FOURCC('L', '5', '6', '5'):
++	case FOURCC('B', '5', '6', '5'):
++	case FOURCC('L', '5', '5', '5'):
++	case FOURCC('2', 'v', 'u', 'y'):
++	case FOURCC('y', 'u', 'v', 's'):
++	case FOURCC('y', 'u', 'v', 'f'):
++	case FOURCC('L', '0', '1', '6'):
++	case FOURCC('L', '0', '0', 'h'):
++		return 2;
++	case FOURCC('R', 'G', 'h', 'A'):
++		return 8;
++	case FOURCC('R', 'G', 'f', 'A'):
++		return 16;
++	default:
++		return 4;
++	}
++}
++
++/*
++ * Two-plane YCbCr formats: luma, then interleaved chroma.
++ * Returns false for anything else. *wide: 10-bit samples in 16 bits.
++ */
++static bool
++biplanarLayout(uint32_t format, uint32_t * hsub, uint32_t * vsub, bool * wide)
++{
++	switch (format) {
++	case FOURCC('4', '2', '0', 'v'): case FOURCC('4', '2', '0', 'f'):
++		*hsub = 2; *vsub = 2; *wide = false; return true;
++	case FOURCC('4', '2', '2', 'v'): case FOURCC('4', '2', '2', 'f'):
++		*hsub = 2; *vsub = 1; *wide = false; return true;
++	case FOURCC('4', '4', '4', 'v'): case FOURCC('4', '4', '4', 'f'):
++		*hsub = 1; *vsub = 1; *wide = false; return true;
++	case FOURCC('x', '4', '2', '0'): case FOURCC('x', 'f', '2', '0'):
++		*hsub = 2; *vsub = 2; *wide = true; return true;
++	case FOURCC('x', '4', '2', '2'): case FOURCC('x', 'f', '2', '2'):
++		*hsub = 2; *vsub = 1; *wide = true; return true;
++	case FOURCC('x', '4', '4', '4'): case FOURCC('x', 'f', '4', '4'):
++		*hsub = 1; *vsub = 1; *wide = true; return true;
++	default:
++		return false;
++	}
++}
++
++static void
++describeComponents(struct fuxisurf_plane * plane, uint32_t format)
++{
++	/* in memory order; names: 1 alpha, 2 red, 3 green, 4 blue */
++	static const uint8_t bgra[4] = { 4, 3, 2, 1 };
++	static const uint8_t rgba[4] = { 2, 3, 4, 1 };
++	const uint8_t * names;
++
++	if (format == FOURCC('B', 'G', 'R', 'A')) {
++		names = bgra;
++	} else if (format == FOURCC('R', 'G', 'B', 'A')) {
++		names = rgba;
++	} else {
++		return;
++	}
++	plane->componentCount = 4;
++	for (unsigned i = 0; i < 4; i++) {
++		plane->componentBitDepth[i] = 8;
++		plane->componentBitOffset[i] = (uint8_t) (8 * i);
++		plane->componentName[i] = names[i];
++		plane->componentType[i] = 1;            /* unsigned integer */
++		plane->componentRange[i] = 1;           /* full range */
++	}
++}
++
++/*
++ * Make a surface from the properties a client gave to IOSurfaceCreate().
++ * Returned with one holder, and entered in the table.
++ */
++static FuxiIOSurface *
++surfaceCreate(OSDictionary * props, IOReturn * error)
++{
++	FuxiIOSurface * s;
++	struct fuxisurf_result * info;
++	uint32_t width, height, format, bpe, ew, eh, bpr, alloc, offset, planeCount = 0;
++	uint32_t hsub, vsub;
++	bool wide, onePlane = false, lossless = false;
++	OSArray * planeInfo;
++	OSNumber * wrapped;
++	uint64_t needed;
++
++	*error = kIOReturnBadArgument;
++	width = dictNumber(props, "IOSurfaceWidth", 0);
++	height = dictNumber(props, "IOSurfaceHeight", 0);
++	format = dictNumber(props, "IOSurfacePixelFormat", 0);
++	/*
++	 * Ten bits a colour, packed into 32-bit pixels: what a device with a wide-gamut display
++	 * (the iPhone X is one) asks for when it wants a picture of the screen, a snapshot for a
++	 * transition for instance. CoreAnimation's software renderer does not draw into those
++	 * ("SW renderer invalid destination format w30r": the transition comes out black), and
++	 * there is no wide gamut on this panel anyway. The surface is made as ordinary BGRA of
++	 * the same geometry, and says so: whoever uses it reads the format back from the surface.
++	 */
++	if (format == FOURCC('w', '3', '0', 'r') || format == FOURCC('l', '1', '0', 'r') || format == FOURCC('w', '3', '0', 'R')) {
++		format = FOURCC('B', 'G', 'R', 'A');
++	}
++	/*
++	 * The same with alpha in a plane of its own: what CoreAnimation makes the screen's own
++	 * surfaces of once it draws with a GPU's renderer (hakios's OpenGL ES, userland/src/eagl.c) instead
++	 * of its software one. One plane of BGRA here too; the framebuffer shows nothing else.
++	 */
++	if (format == FOURCC('b', '3', 'a', '8')) {
++		format = FOURCC('B', 'G', 'R', 'A');
++		onePlane = true;
++	}
++	/*
++	 * iOS 26: what CoreAnimation makes the screen's surfaces of once it draws with Metal --
++	 * kCVPixelFormatType_Lossless_32BGRA, BGRA that Apple's GPU keeps compressed, described in
++	 * planes (the pixels and the compression's metadata). There is no compression here: one
++	 * plane of plain BGRA, which is what the display driver copies to the panel (it skipped
++	 * these, a plane count of more than none, and the panel kept the loader's picture).
++	 */
++	if (format == FOURCC('&', 'B', 'G', 'A')) {
++		format = FOURCC('B', 'G', 'R', 'A');
++		onePlane = true;
++		lossless = true;
++	}
++	ew = dictNumber(props, "IOSurfaceElementWidth", 1);
++	eh = dictNumber(props, "IOSurfaceElementHeight", 1);
++	bpe = dictNumber(props, "IOSurfaceBytesPerElement", 0);
++	offset = dictNumber(props, "IOSurfaceOffset", 0);
++	if (lossless) {
++		/* (the element geometry asked for is the compressed one's: plain pixels here) */
++		ew = eh = 1;
++		bpe = 4;
++	}
++	if (width > FUXISURF_MAX_DIMENSION || height > FUXISURF_MAX_DIMENSION || ew == 0 || eh == 0 || ew > 255 || eh > 255) {
++		return NULL;
++	}
++	if (props->getObject("IOSurfaceAddressRanges") != NULL) {
++		IOLog("FuxiIOSurface: wrapping client memory in pieces is not supported\n");
++		*error = kIOReturnUnsupported;
++		return NULL;
++	}
++	/*
++	 * A surface around memory the client has already: CoreAnimation's OpenGL ES renderer makes
++	 * them around pictures it has in memory (an application's icon, a layer's contents as the
++	 * application has drawn them), to hand them to the GPU as they are. The surface's pixels
++	 * are that memory itself, not a copy: the picture goes on being drawn into after the
++	 * surface is made, and whoever looks at the surface is to see what is there now.
++	 */
++	wrapped = OSDynamicCast(OSNumber, props->getObject("IOSurfaceAddress"));
++
++	s = OSTypeAlloc(FuxiIOSurface);
++	if (s == NULL || !s->init()) {
++		OSSafeReleaseNULL(s);
++		*error = kIOReturnNoMemory;
++		return NULL;
++	}
++	info = &s->info;
++
++	planeInfo = onePlane ? NULL : OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
++	needed = 0;
++	if (planeInfo != NULL && planeInfo->getCount() != 0) {
++		planeCount = planeInfo->getCount();
++		if (planeCount > FUXISURF_MAX_PLANES) {
++			IOLog("FuxiIOSurface: %u planes asked for, %u supported\n", planeCount, FUXISURF_MAX_PLANES);
++			s->release();
++			return NULL;
++		}
++		for (uint32_t i = 0; i < planeCount; i++) {
++			OSDictionary * pd = OSDynamicCast(OSDictionary, planeInfo->getObject(i));
++			struct fuxisurf_plane * p = &s->planes[i];
++			uint32_t pew = dictNumber(pd, "IOSurfacePlaneElementWidth", 1);
++			uint32_t peh = dictNumber(pd, "IOSurfacePlaneElementHeight", 1);
++
++			if (pew == 0 || peh == 0 || pew > 255 || peh > 255) {
++				s->release();
++				return NULL;
++			}
++			p->width = dictNumber(pd, "IOSurfacePlaneWidth", width);
++			p->height = dictNumber(pd, "IOSurfacePlaneHeight", height);
++			p->bytesPerElement = (uint16_t) dictNumber(pd, "IOSurfacePlaneBytesPerElement", bpe ? bpe : 1);
++			p->elementWidth = (uint8_t) pew;
++			p->elementHeight = (uint8_t) peh;
++			p->bytesPerRow = dictNumber(pd, "IOSurfacePlaneBytesPerRow", 0);
++			if (p->bytesPerRow == 0) {
++				p->bytesPerRow = alignUp((uint64_t) ((p->width + pew - 1) / pew) * p->bytesPerElement, FUXISURF_ROW_ALIGN);
++			}
++			p->size = dictNumber(pd, "IOSurfacePlaneSize", 0);
++			if (p->size == 0) {
++				p->size = p->bytesPerRow * ((p->height + peh - 1) / peh);
++			}
++			p->offset = dictNumber(pd, "IOSurfacePlaneOffset", dictNumber(pd, "IOSurfacePlaneBase", (uint32_t) needed));
++			p->extendedPixels[0] = dictNumber(pd, "IOSurfacePlaneExtendedPixelsOnLeft", 0);
++			p->extendedPixels[1] = dictNumber(pd, "IOSurfacePlaneExtendedPixelsOnRight", 0);
++			p->extendedPixels[2] = dictNumber(pd, "IOSurfacePlaneExtendedPixelsOnTop", 0);
++			p->extendedPixels[3] = dictNumber(pd, "IOSurfacePlaneExtendedPixelsOnBottom", 0);
++			if ((uint64_t) p->offset + p->size > needed) {
++				needed = (uint64_t) p->offset + p->size;
++			}
++		}
++	} else if (biplanarLayout(format, &hsub, &vsub, &wide) && width != 0 && height != 0) {
++		struct fuxisurf_plane * y = &s->planes[0], * c = &s->planes[1];
++
++		planeCount = 2;
++		y->width = width;
++		y->height = height;
++		y->bytesPerElement = wide ? 2 : 1;
++		y->elementWidth = y->elementHeight = 1;
++		y->bytesPerRow = alignUp((uint64_t) width * y->bytesPerElement, FUXISURF_ROW_ALIGN);
++		y->size = y->bytesPerRow * height;
++		y->offset = 0;
++		c->width = (width + hsub - 1) / hsub;
++		c->height = (height + vsub - 1) / vsub;
++		c->bytesPerElement = wide ? 4 : 2;
++		c->elementWidth = c->elementHeight = 1;
++		c->bytesPerRow = alignUp((uint64_t) c->width * c->bytesPerElement, FUXISURF_ROW_ALIGN);
++		c->size = c->bytesPerRow * c->height;
++		c->offset = y->size;
++		needed = (uint64_t) c->offset + c->size;
++	}
++
++	if (bpe == 0) {
++		bpe = planeCount ? s->planes[0].bytesPerElement : defaultBytesPerElement(format);
++	}
++	bpr = dictNumber(props, "IOSurfaceBytesPerRow", 0);
++	if (lossless && bpr < (uint64_t) width * 4) {
++		bpr = 0;
++	}
++	if (bpr == 0) {
++		bpr = planeCount ? s->planes[0].bytesPerRow
++		    : alignUp((uint64_t) ((width + ew - 1) / ew) * bpe, FUXISURF_ROW_ALIGN);
++	}
++	if (planeCount == 0) {
++		needed = (uint64_t) bpr * ((height + eh - 1) / eh);
++		/* the one implicit plane, for the per-plane getters */
++		s->planes[0].width = width;
++		s->planes[0].height = height;
++		s->planes[0].bytesPerRow = bpr;
++		s->planes[0].bytesPerElement = (uint16_t) bpe;
++		s->planes[0].elementWidth = (uint8_t) ew;
++		s->planes[0].elementHeight = (uint8_t) eh;
++		s->planes[0].size = (uint32_t) needed;
++		describeComponents(&s->planes[0], format);
++	}
++	needed += offset;
++	alloc = dictNumber(props, "IOSurfaceAllocSize", 0);
++	if (alloc < needed) {
++		if (alloc != 0) {
++			IOLog("FuxiIOSurface: alloc size %u too small for %ux%u '%.4s', using %llu\n", alloc, width, height,
++			    (const char *) &format, needed);
++		}
++		if (needed > FUXISURF_MAX_ALLOC) {
++			s->release();
++			return NULL;
++		}
++		alloc = (uint32_t) needed;
++	}
++	if (alloc == 0 || alloc > FUXISURF_MAX_ALLOC) {
++		s->release();
++		return NULL;
++	}
++	if (wrapped == NULL) {
++		alloc = alignUp(alloc, (uint32_t) PAGE_SIZE);
++	} else {
++		/* (the memory is as big as its owner says, and not a byte of ours is added to it) */
++		alloc = dictNumber(props, "IOSurfaceAllocSize", (uint32_t) needed);
++	}
++
++	s->memory = surfaceMemory((vm_size_t) PAGE_SIZE + (wrapped ? 0 : alloc));
++	if (s->memory == NULL) {
++		IOLog("FuxiIOSurface: no memory for %u bytes (%u surfaces, %llu MB in use)\n", alloc, gSurfaceCount,
++		    gSurfaceBytes >> 20);
++		s->release();
++		*error = kIOReturnNoMemory;
++		return NULL;
++	}
++	s->kbase = (uint8_t *) s->memory->getBytesNoCopy();
++	s->values = OSDictionary::withCapacity(4);
++	s->kpixels = s->kbase + PAGE_SIZE;
++	if (wrapped != NULL) {
++		s->clientTask = current_task();
++		s->clientAddress = wrapped->unsigned64BitValue();
++		IOReturn held = kIOReturnNoMemory;
++
++		/* (held for writing if it can be written, which a picture that is only shown need not be) */
++		for (unsigned attempt = 0; attempt < 2 && held != kIOReturnSuccess; attempt++) {
++			OSSafeReleaseNULL(s->client);
++			s->client = IOMemoryDescriptor::withAddressRange(s->clientAddress, alloc,
++			    attempt == 0 ? kIODirectionInOut : kIODirectionOut, s->clientTask);
++			held = s->client != NULL ? s->client->prepare() : kIOReturnNoMemory;
++		}
++		if (held == kIOReturnSuccess) {
++			s->clientMap = s->client->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapReadOnly);
++		} else {
++			OSSafeReleaseNULL(s->client);
++		}
++		if (s->clientMap == NULL) {
++			if (gSurfaceUnheld++ < 8) {
++				IOLog("FuxiIOSurface: the memory to make a surface around (%u bytes at %#llx) cannot be %s (%#x)\n", alloc,
++				    s->clientAddress, held == kIOReturnSuccess ? "seen from here" : "held", held);
++			}
++			s->release();
++			*error = kIOReturnVMError;
++			return NULL;
++		}
++		s->kpixels = (uint8_t *) s->clientMap->getVirtualAddress();
++	}
++
++	info->allocSize = alloc;
++	info->width = width;
++	info->height = height;
++	info->bytesPerRow = bpr;
++	info->offset = offset;
++	info->pixelFormat = format;
++	info->planeCount = planeCount;
++	info->bytesPerElement = (uint16_t) bpe;
++	info->elementWidth = (uint8_t) ew;
++	info->elementHeight = (uint8_t) eh;
++	info->cacheMode = dictNumber(props, "IOSurfaceCacheMode", 0);
++	info->subsampling = (uint8_t) dictNumber(props, "IOSurfaceSubsampling", 0);
++	info->prohibitUseCount = (uint8_t) dictNumber(props, "IOSurfaceProhibitUseCount", 0);
++	info->sliceCount = dictNumber(props, "IOSurfaceSliceCount", 0);
++	info->protectionOptions = dictNumber(props, "IOSurfaceProtectionOptions", 0);
++
++	IOLockLock(gSurfaceLock);
++	uint32_t sid = 0;
++	for (uint32_t tries = 0; tries < FUXISURF_TABLE_SIZE - 1; tries++) {
++		uint32_t candidate = gSurfaceNext;
++
++		gSurfaceNext = (gSurfaceNext + 1 < FUXISURF_TABLE_SIZE) ? gSurfaceNext + 1 : 1;
++		if (gSurfaceTable[candidate] == NULL) {
++			sid = candidate;
++			break;
++		}
++	}
++	if (sid == 0) {
++		IOLockUnlock(gSurfaceLock);
++		IOLog("FuxiIOSurface: the surface table is full\n");
++		s->release();
++		*error = kIOReturnNoResources;
++		return NULL;
++	}
++	s->sid = sid;
++	s->holders = 1;
++	info->sid = sid;
++	info->traceID = sid;
++	gSurfaceTable[sid] = s;                 /* the table owns the object until the last holder goes */
++	gSurfaceCount++;
++	gSurfaceBytes += alloc;
++
++	struct fuxisurf_shared * sh = s->shared();
++	sh->registryID = 0x100000000ULL + sid;
++	sh->seed = 1;
++	sh->valuesSeed = 1;
++	sh->pixelSizeCasting = (uint8_t) dictNumber(props, "IOSurfacePixelSizeCastingAllowed", 1);
++	sh->displayable = 1;
++	sh->sysMemOnly = (uint8_t) dictNumber(props, "IOSurfaceSysMemOnly", 0);
++	IOLockUnlock(gSurfaceLock);
++
++	*error = kIOReturnSuccess;
++	return s;
++}
++
++/* With the lock held. */
++static void
++surfaceHold(FuxiIOSurface * s)
++{
++	s->holders++;
++}
++
++/* With the lock held. The caller must not touch the surface afterwards. */
++static void
++surfaceUnhold(FuxiIOSurface * s)
++{
++	if (--s->holders != 0) {
++		return;
++	}
++	gSurfaceTable[s->sid] = NULL;
++	gSurfaceCount--;
++	gSurfaceBytes -= s->info.allocSize;
++	s->release();
++}
++
++FuxiIOSurface *
++FuxiIOSurfaceCopy(uint32_t sid)
++{
++	FuxiIOSurface * s = NULL;
++
++	if (gSurfaceLock == NULL || sid == 0 || sid >= FUXISURF_TABLE_SIZE) {
++		return NULL;
++	}
++	IOLockLock(gSurfaceLock);
++	s = gSurfaceTable[sid];
++	if (s != NULL) {
++		surfaceHold(s);
++	}
++	IOLockUnlock(gSurfaceLock);
++	return s;
++}
++
++void
++FuxiIOSurfaceDrop(FuxiIOSurface * s)
++{
++	if (s == NULL) {
++		return;
++	}
++	IOLockLock(gSurfaceLock);
++	surfaceUnhold(s);
++	IOLockUnlock(gSurfaceLock);
++}
++
++FuxiIOSurface *
++FuxiIOSurfaceCreateSimple(uint32_t width, uint32_t height, uint32_t pixelFormat)
++{
++	OSDictionary * props = OSDictionary::withCapacity(4);
++	FuxiIOSurface * s = NULL;
++	IOReturn error;
++
++	if (props == NULL || gSurfaceLock == NULL) {
++		OSSafeReleaseNULL(props);
++		return NULL;
++	}
++	OSNumber * n;
++	n = OSNumber::withNumber(width, 32); props->setObject("IOSurfaceWidth", n); n->release();
++	n = OSNumber::withNumber(height, 32); props->setObject("IOSurfaceHeight", n); n->release();
++	n = OSNumber::withNumber(pixelFormat, 32); props->setObject("IOSurfacePixelFormat", n); n->release();
++	s = surfaceCreate(props, &error);
++	props->release();
++	return s;
++}
++
++/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
++
++/* What a Mach send right for a surface points at. Holds the surface while any right exists. */
++/*
++ * hakios: IOSurfaceSharedEvent, the events processes signal each other's frames with (CoreAnimation, PosterKit): a value of 64 bits in a
++ * page every holder maps read-only, set through a trap, waited for through another, and listeners told by an asynchronous message
++ * once it reaches theirs. Missing, every poster's IOSurfaceSharedEventAddEventListener failed (e00002c7), no snapshot completed and
++ * the wallpaper stayed black (hakios g2k16). The event's port is the event object's own.
++ */
++/* The event: kept by an IOSurfaceSendRight (whose port is the event's) in memory of no type -- a class of its own was one kalloc type
++ * too many for its size (hakios g2k17 panicked at boot: KT_ZONES_FOR_SIZE_SIZE). */
++struct fuxi_event_data {
++	IOBufferMemoryDescriptor *      page;
++	volatile uint64_t *             value;
++	uint64_t                        id;
++};
++class IOSurfaceSendRight;
++typedef IOSurfaceSendRight FuxiSharedEvent;
++
++#define FUXI_EVENT_WAITS        512
++struct fuxi_event_wait {
++	FuxiSharedEvent *       event;          /* held while waiting */
++	void *                  client;         /* the user client that asked (forgotten as it closes) */
++	uint64_t                target;
++	OSAsyncReference64      ref;
++	io_user_reference_t     args[3];        /* the block, the event object, the value */
++};
++static IOLock * gEventLock;
++static struct fuxi_event_wait gEventWaits[FUXI_EVENT_WAITS];
++static uint64_t gEventIds;
++
++class IOSurfaceSendRight : public OSObject
++{
++	OSDeclareDefaultStructors(IOSurfaceSendRight);
++
++public:
++	FuxiIOSurface * surface;
++	struct fuxi_event_data * ev;            /* an IOSurfaceSharedEvent's, not a surface's */
++
++	virtual bool
++	init(void) APPLE_KEXT_OVERRIDE
++	{
++		return OSObject::init();
++	}
++	virtual void free(void) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(IOSurfaceSendRight, OSObject);
++
++void
++IOSurfaceSendRight::free(void)
++{
++	if (ev != NULL) {
++		OSSafeReleaseNULL(ev->page);
++		IOFreeData(ev, sizeof(*ev));
++		ev = NULL;
++	}
++	if (surface != NULL) {
++		FuxiIOSurfaceDrop(surface);
++	}
++	surface = NULL;
++	OSObject::free();
++}
++
++/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
++
++class IOCoreSurfaceRoot : public IOService
++{
++	OSDeclareDefaultStructors(IOCoreSurfaceRoot);
++
++public:
++	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(IOCoreSurfaceRoot, IOService);
++
++bool
++IOCoreSurfaceRoot::start(IOService * provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "IOSurfaceRootUserClient");
++	setName("IOCoreSurfaceRoot");
++	registerService();
++	return true;
++}
++
++void
++FuxiIOSurfaceStart(IOService * provider)
++{
++	IOCoreSurfaceRoot * root;
++
++	if (gSurfaceLock != NULL) {
++		return;                         /* (started once) */
++	}
++	gSurfaceLock = IOLockAlloc();
++	gSurfaceKeptLock = IOLockAlloc();
++	gEventLock = IOLockAlloc();
++	PE_parse_boot_argn("fuxi_surf_trace", &gSurfaceTrace, sizeof(gSurfaceTrace));
++	PE_parse_boot_argn("fuxi_surf_clear", &gSurfaceClear, sizeof(gSurfaceClear));
++	if (!PE_parse_boot_arg_str("fuxi_surf_trace_of", gSurfaceTraceOf, sizeof(gSurfaceTraceOf))) {
++		gSurfaceTraceOf[0] = 0;
++	}
++	gSurfaceClearing = thread_call_allocate(surfaceMemoryClear, NULL);
++	if (gSurfaceLock == NULL || gSurfaceKeptLock == NULL || gEventLock == NULL || gSurfaceClearing == NULL) {
++		IOLog("FuxiIOSurface: no locks\n");
++		return;
++	}
++	root = OSTypeAlloc(IOCoreSurfaceRoot);
++	if (root == NULL || !root->init() || !root->attach(provider)) {
++		OSSafeReleaseNULL(root);
++		IOLog("FuxiIOSurface: cannot create the root service\n");
++		return;
++	}
++	if (!root->start(provider)) {
++		root->detach(provider);
++		IOLog("FuxiIOSurface: the root service did not start\n");
++	}
++	root->release();
++}
++
++/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
++
++/* One surface as one client has it. */
++struct fuxisurf_client_ref {
++	FuxiIOSurface * surface;                /* held */
++	IOMemoryMap *   map;                    /* the whole of it in the client's address space */
++	IOMemoryMap *   pixelMap;               /* ... the pixels, where those are another client's memory */
++	uint32_t        use[2];                 /* what this client added to the use counts */
++	bool            detached;               /* the client let go of it and will release shortly */
++};
++
++class IOSurfaceRootUserClient : public IOUserClient
++{
++	OSDeclareDefaultStructors(IOSurfaceRootUserClient);
++
++	task_t                          fTask;
++	struct fuxisurf_client_ref *    fRefs;
++	uint32_t                        fRefCount;
++	uint32_t                        fRefCapacity;
++	IOExternalTrap                  fTraps[kSurfaceTrapCount];
++	struct {
++		uint64_t                key;            /* the listener object's address (its reference's refcon) */
++		OSAsyncReference64      ref;
++	}                               fListeners[16];
++	OSArray *                       fEventMaps;     /* the event pages mapped into the task */
++
++	struct fuxisurf_client_ref * findRef(uint32_t sid, bool detached);
++	struct fuxisurf_client_ref * addRef(FuxiIOSurface * surface);
++	void dropRef(struct fuxisurf_client_ref * ref);
++	IOReturn returnSurface(struct fuxisurf_client_ref * ref, bool known, IOExternalMethodArguments * args);
++	IOReturn returnSurface26(struct fuxisurf_client_ref * ref, bool known, IOExternalMethodArguments * args);
++
++	IOReturn methodInit(IOExternalMethodArguments * args);
++	IOReturn methodCreate(IOExternalMethodArguments * args);
++	IOReturn methodLookup(IOExternalMethodArguments * args);
++	IOReturn methodLookupFromPort(IOExternalMethodArguments * args);
++	IOReturn methodCreatePort(IOExternalMethodArguments * args);
++	IOReturn methodSetValue(IOExternalMethodArguments * args, const uint8_t * in, size_t inSize);
++	IOReturn methodCopyValue(IOExternalMethodArguments * args, const uint8_t * in, size_t inSize);
++	IOReturn methodRemoveValue(IOExternalMethodArguments * args, const uint8_t * in, size_t inSize);
++	IOReturn methodSetBulkAttachments(const uint8_t * in, size_t inSize);
++
++	IOReturn trapIncrementUseCount(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
++	IOReturn trapDecrementUseCount(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
++	IOReturn trapLock(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
++	IOReturn trapUnlock(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
++	IOReturn trapDetach(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
++	IOReturn trapRelease(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
++	IOReturn trapEventWait(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
++	IOReturn trapEventSignal(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
++	FuxiSharedEvent * copyEvent(mach_port_name_t name);
++	IOReturn mapEvent(FuxiSharedEvent * event, uint64_t * address);
++	IOReturn methodEventCreate(IOExternalMethodArguments * args);
++	IOReturn methodEventMap(IOExternalMethodArguments * args);
++	IOReturn methodEventNotify(IOExternalMethodArguments * args);
++	IOReturn methodEventAddListener(IOExternalMethodArguments * args);
++	IOReturn methodEventRemoveListener(IOExternalMethodArguments * args);
++	void forgetEventWaits(void);
++	static void eventTell(FuxiSharedEvent * event, uint64_t value);
++	IOReturn lockCommon(uint32_t sid, uint32_t options, user_addr_t seedOut);
++	IOReturn useCountCommon(uint32_t sid, uint32_t category, int delta);
++
++public:
++	virtual bool initWithTask(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties) APPLE_KEXT_OVERRIDE;
++	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	virtual void free(void) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments * args,
++	    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference) APPLE_KEXT_OVERRIDE;
++	virtual IOExternalTrap * getTargetAndTrapForIndex(IOService ** targetP, UInt32 index) APPLE_KEXT_OVERRIDE;
++	static mach_port_name_t makeSendRight(task_t task, FuxiIOSurface * surface);
++};
++
++OSDefineMetaClassAndStructors(IOSurfaceRootUserClient, IOUserClient);
++
++bool
++IOSurfaceRootUserClient::initWithTask(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties)
++{
++	if (!IOUserClient::initWithTask(owningTask, securityID, type, properties)) {
++		return false;
++	}
++	fTask = owningTask;
++	{
++		char procname[32] = "?";
++		proc_selfname(procname, sizeof(procname));
++		IOLog("FuxiIOSurface: opened by %s[%d], type %u\n", procname, proc_selfpid(), (unsigned) type);
++	}
++	return true;
++}
++
++bool
++IOSurfaceRootUserClient::start(IOService * provider)
++{
++	if (!IOUserClient::start(provider)) {
++		return false;
++	}
++	fTraps[kSurfaceTrapIncrementUseCount].func = (IOTrap) & IOSurfaceRootUserClient::trapIncrementUseCount;
++	fTraps[kSurfaceTrapDecrementUseCount].func = (IOTrap) & IOSurfaceRootUserClient::trapDecrementUseCount;
++	fTraps[kSurfaceTrapLock].func = (IOTrap) & IOSurfaceRootUserClient::trapLock;
++	fTraps[kSurfaceTrapUnlock].func = (IOTrap) & IOSurfaceRootUserClient::trapUnlock;
++	fTraps[kSurfaceTrapDetach].func = (IOTrap) & IOSurfaceRootUserClient::trapDetach;
++	fTraps[kSurfaceTrapRelease].func = (IOTrap) & IOSurfaceRootUserClient::trapRelease;
++	fTraps[kSurfaceTrapEventWait].func = (IOTrap) & IOSurfaceRootUserClient::trapEventWait;
++	fTraps[kSurfaceTrapEventSignal].func = (IOTrap) & IOSurfaceRootUserClient::trapEventSignal;
++	for (unsigned i = 0; i < kSurfaceTrapCount; i++) {
++		fTraps[i].object = this;
++	}
++	return true;
++}
++
++IOReturn
++IOSurfaceRootUserClient::clientClose(void)
++{
++	forgetEventWaits();
++	IOLockLock(gSurfaceLock);
++	while (fRefCount != 0) {
++		dropRef(&fRefs[fRefCount - 1]);
++	}
++	IOLockUnlock(gSurfaceLock);
++	if (!isInactive()) {
++		terminate();
++	}
++	return kIOReturnSuccess;
++}
++
++void
++IOSurfaceRootUserClient::free(void)
++{
++	if (fRefs != NULL) {
++		if (gSurfaceLock != NULL) {
++			IOLockLock(gSurfaceLock);
++			while (fRefCount != 0) {
++				dropRef(&fRefs[fRefCount - 1]);
++			}
++			IOLockUnlock(gSurfaceLock);
++		}
++		IODelete(fRefs, struct fuxisurf_client_ref, fRefCapacity);
++		fRefs = NULL;
++	}
++	forgetEventWaits();
++	OSSafeReleaseNULL(fEventMaps);
++	IOUserClient::free();
++}
++
++/* All three with the lock held. */
++struct fuxisurf_client_ref *
++IOSurfaceRootUserClient::findRef(uint32_t sid, bool detached)
++{
++	for (uint32_t i = 0; i < fRefCount; i++) {
++		if (fRefs[i].surface->sid == sid && fRefs[i].detached == detached) {
++			return &fRefs[i];
++		}
++	}
++	return NULL;
++}
++
++struct fuxisurf_client_ref *
++IOSurfaceRootUserClient::addRef(FuxiIOSurface * surface)
++{
++	struct fuxisurf_client_ref * ref;
++	IOMemoryMap * map;
++
++	if (fRefCount == fRefCapacity) {
++		uint32_t capacity = fRefCapacity ? fRefCapacity * 2 : 16;
++		struct fuxisurf_client_ref * refs = IONew(struct fuxisurf_client_ref, capacity);
++
++		if (refs == NULL) {
++			return NULL;
++		}
++		if (fRefs != NULL) {
++			memcpy(refs, fRefs, fRefCount * sizeof(*refs));
++			IODelete(fRefs, struct fuxisurf_client_ref, fRefCapacity);
++		}
++		fRefs = refs;
++		fRefCapacity = capacity;
++	}
++	map = surface->memory->createMappingInTask(fTask, 0, kIOMapAnywhere);
++	if (map == NULL) {
++		IOLog("FuxiIOSurface: cannot map surface %u (%u bytes) into the client\n", surface->sid, surface->info.allocSize);
++		return NULL;
++	}
++	ref = &fRefs[fRefCount++];
++	bzero(ref, sizeof(*ref));
++	ref->surface = surface;
++	ref->map = map;
++	if (surface->client != NULL && surface->clientTask != fTask) {
++		ref->pixelMap = surface->client->createMappingInTask(fTask, 0, kIOMapAnywhere);
++	}
++	surfaceHold(surface);
++	return ref;
++}
++
++void
++IOSurfaceRootUserClient::dropRef(struct fuxisurf_client_ref * ref)
++{
++	FuxiIOSurface * s = ref->surface;
++
++	for (unsigned c = 0; c < 2; c++) {
++		s->useCount[c] -= ref->use[c];
++	}
++	s->shared()->useCount = (uint64_t) s->useCount[1] << 32 | s->useCount[0];
++	OSSafeReleaseNULL(ref->map);
++	OSSafeReleaseNULL(ref->pixelMap);
++	*ref = fRefs[--fRefCount];
++	surfaceUnhold(s);
++}
++
++static uint32_t
++resultSize(const FuxiIOSurface * s)
++{
++	uint32_t planes = s->info.planeCount ? s->info.planeCount : 1;
++
++	return (uint32_t) (sizeof(struct fuxisurf_result) + planes * sizeof(struct fuxisurf_plane));
++}
++
++/*
++ * The description iOS 26's IOSurface.framework takes (it reserves 0xc68 bytes for it, and copies it to
++ * offset 0x70 of its client object, where its getters read it): the iOS 16.5 one with the sizes widened
++ * to 64 bits. In the header, allocSize, width, height, bytesPerRow and offset become 64-bit and what
++ * follows them moves down; each plane's first six words (width, height, -, offset, bytesPerRow, size)
++ * become 64-bit and the rest of the plane moves down by 0x18, so a plane is 0x98 bytes.
++ */
++#define FUXISURF_RESULT26_HEADER 0x88
++#define FUXISURF_PLANE26_SIZE    0x98
++#define FUXISURF_RESULT26_MAX    (FUXISURF_RESULT26_HEADER + 20 * FUXISURF_PLANE26_SIZE)
++static_assert(FUXISURF_RESULT26_MAX == 0xc68, "iOS 26 result size");
++
++/*
++ * Fuxi: hakios had iOS 26 in front of it, this runs iOS 27. A size of request or reply that is
++ * neither of the two known is said once per kind (which = 0 surface description, 1 init reply).
++ */
++static void
++sizeSaid(unsigned which, uint32_t size, uint32_t old, uint32_t new26, const char * what)
++{
++	if (size == old || size == new26 || which >= sizeof(gSurfaceSizesSaid) / sizeof(gSurfaceSizesSaid[0]) ||
++	    gSurfaceSizesSaid[which] == size) {
++		return;
++	}
++	gSurfaceSizesSaid[which] = size;
++	IOLog("FuxiIOSurface: %s of %#x bytes asked for (iOS 16.5: %#x, iOS 26: %#x)\n", what, size, old, new26);
++}
++
++static void
++put64(uint8_t * p, size_t at, uint64_t v)
++{
++	memcpy(p + at, &v, sizeof(v));
++}
++
++static void
++put32(uint8_t * p, size_t at, uint32_t v)
++{
++	memcpy(p + at, &v, sizeof(v));
++}
++
++IOReturn
++IOSurfaceRootUserClient::returnSurface26(struct fuxisurf_client_ref * ref, bool known, IOExternalMethodArguments * args)
++{
++	FuxiIOSurface * s = ref->surface;
++	const struct fuxisurf_result * i = &s->info;
++	uint32_t planes = i->planeCount ? i->planeCount : 1;
++	uint32_t size = FUXISURF_RESULT26_HEADER + planes * FUXISURF_PLANE26_SIZE;
++	uint8_t * r = (uint8_t *) args->structureOutput;
++	mach_vm_address_t address = ref->map->getAddress();
++
++	if (r == NULL || args->structureOutputSize < size) {
++		return kIOReturnBadArgument;
++	}
++	bzero(r, size);
++	put64(r, 0x00, known ? ~0ULL : s->client == NULL ? address + PAGE_SIZE :
++	    ref->pixelMap != NULL ? ref->pixelMap->getAddress() : s->clientAddress);
++	put64(r, 0x08, address);
++	put64(r, 0x10, address + FUXISURF_AUX_OFFSET);
++	put32(r, 0x18, i->sid);
++	put64(r, 0x20, i->allocSize);
++	put64(r, 0x28, i->width);
++	put64(r, 0x30, i->height);
++	put64(r, 0x38, i->bytesPerRow);
++	put64(r, 0x40, i->offset);
++	put32(r, 0x48, i->pixelFormat);
++	put32(r, 0x58, i->planeCount);
++	/* bytesPerElement .. lockSeed, then subsampling .. protectionOptions: as in iOS 16.5, 0x20 further on */
++	memcpy(r + 0x60, (const uint8_t *) i + 0x40, 0x88 - 0x60);
++	for (uint32_t k = 0; k < planes; k++) {
++		const struct fuxisurf_plane * p = &s->planes[k];
++		uint8_t * o = r + FUXISURF_RESULT26_HEADER + k * FUXISURF_PLANE26_SIZE;
++
++		put64(o, 0x00, p->width);
++		put64(o, 0x08, p->height);
++		put64(o, 0x18, p->offset);
++		put64(o, 0x20, p->bytesPerRow);
++		put64(o, 0x28, p->size);
++		memcpy(o + 0x30, (const uint8_t *) p + 0x18, sizeof(*p) - 0x18);
++	}
++	args->structureOutputSize = size;
++	return kIOReturnSuccess;
++}
++
++/* Describe the surface to the client. known: it has the surface already, do not build a second view. */
++IOReturn
++IOSurfaceRootUserClient::returnSurface(struct fuxisurf_client_ref * ref, bool known, IOExternalMethodArguments * args)
++{
++	FuxiIOSurface * s = ref->surface;
++	uint32_t size = resultSize(s);
++	struct fuxisurf_result * r = (struct fuxisurf_result *) args->structureOutput;
++	mach_vm_address_t address = ref->map->getAddress();
++
++	if (r == NULL || args->structureOutputSize < size) {
++		return kIOReturnBadArgument;
++	}
++	sizeSaid(0, args->structureOutputSize, FUXISURF_RESULT_MAX, FUXISURF_RESULT26_MAX, "surface description");
++	if (args->structureOutputSize >= FUXISURF_RESULT26_MAX) {
++		return returnSurface26(ref, known, args);
++	}
++	*r = s->info;
++	memcpy(r + 1, s->planes, size - sizeof(*r));
++	r->shared = address;
++	r->aux = address + FUXISURF_AUX_OFFSET;
++	r->base = known ? ~0ULL : s->client == NULL ? address + PAGE_SIZE :
++	    ref->pixelMap != NULL ? ref->pixelMap->getAddress() : s->clientAddress;
++	args->structureOutputSize = size;
++	return kIOReturnSuccess;
++}
++
++IOReturn
++IOSurfaceRootUserClient::methodInit(IOExternalMethodArguments * args)
++{
++	struct {
++		uint32_t allocAlignMask;
++		uint32_t rowAlignMask;
++		uint32_t maxBytesPerRow;
++		uint32_t maxWidth;
++		uint32_t maxHeight;
++		uint16_t reserved;
++		uint16_t version;
++	} reply;
++
++	/*
++	 * iOS 26 (IOSurface.framework, _iosConnectInitalize) asks for 0x28 bytes: the same limits with the
++	 * maxima widened to 64 bits, a byte at 0x20 it reads in IOSurfaceClientInitDetachModeCode and
++	 * IOSurfaceClientSetIndexedTimestamp (left 0), and the version, which must be 1, at 0x22.
++	 */
++	struct {
++		uint32_t allocAlignMask;
++		uint32_t rowAlignMask;
++		uint64_t maxBytesPerRow;
++		uint64_t maxWidth;
++		uint64_t maxHeight;
++		uint8_t  features;
++		uint8_t  reserved;
++		uint16_t version;
++		uint32_t reserved2;
++	} reply26;
++
++	static_assert(sizeof(reply) == 0x18, "init reply");
++	static_assert(sizeof(reply26) == 0x28, "init reply (iOS 26)");
++	sizeSaid(1, args->structureOutputSize, sizeof(reply), sizeof(reply26), "init reply");
++	if (args->structureOutput != NULL && args->structureOutputSize >= sizeof(reply26)) {
++		bzero(&reply26, sizeof(reply26));
++		reply26.allocAlignMask = (uint32_t) PAGE_MASK;
++		reply26.rowAlignMask = FUXISURF_ROW_ALIGN - 1;
++		reply26.maxBytesPerRow = FUXISURF_MAX_DIMENSION * 16;
++		reply26.maxWidth = FUXISURF_MAX_DIMENSION;
++		reply26.maxHeight = FUXISURF_MAX_DIMENSION;
++		reply26.version = 1;
++		memcpy(args->structureOutput, &reply26, sizeof(reply26));
++		args->structureOutputSize = sizeof(reply26);
++		return kIOReturnSuccess;
++	}
++	if (args->structureOutput == NULL || args->structureOutputSize < sizeof(reply)) {
++		return kIOReturnBadArgument;
++	}
++	reply.allocAlignMask = (uint32_t) PAGE_MASK;
++	reply.rowAlignMask = FUXISURF_ROW_ALIGN - 1;
++	reply.maxBytesPerRow = FUXISURF_MAX_DIMENSION * 16;
++	reply.maxWidth = FUXISURF_MAX_DIMENSION;
++	reply.maxHeight = FUXISURF_MAX_DIMENSION;
++	reply.reserved = 0;
++	reply.version = 1;
++	memcpy(args->structureOutput, &reply, sizeof(reply));
++	args->structureOutputSize = sizeof(reply);
++	return kIOReturnSuccess;
++}
++
++/* The serialized object in a request, or NULL. */
++static OSObject *
++unserialize(const uint8_t * data, size_t size)
++{
++	if (data == NULL || size < 4) {
++		return NULL;
++	}
++	return OSUnserializeXML((const char *) data, size, NULL);
++}
++
++IOReturn
++IOSurfaceRootUserClient::methodCreate(IOExternalMethodArguments * args)
++{
++	IOReturn ret;
++	IOMemoryMap * inMap = NULL;
++	const uint8_t * in = (const uint8_t *) args->structureInput;
++	size_t inSize = args->structureInputSize;
++	OSObject * obj;
++	OSDictionary * props;
++	FuxiIOSurface * s;
++	struct fuxisurf_client_ref * ref;
++	uint64_t began = mach_absolute_time();
++
++	if (args->scalarInputCount >= 1 && args->scalarInput[0] != 0) {
++		IOLog("FuxiIOSurface: child surfaces are not supported (parent %llu)\n", args->scalarInput[0]);
++		return kIOReturnUnsupported;
++	}
++	if (args->structureInputDescriptor != NULL) {
++		inMap = args->structureInputDescriptor->map(kIOMapReadOnly);
++		if (inMap == NULL) {
++			return kIOReturnNoMemory;
++		}
++		in = (const uint8_t *) inMap->getVirtualAddress();
++		inSize = inMap->getLength();
++	}
++	obj = unserialize(in, inSize);
++	OSSafeReleaseNULL(inMap);
++	props = OSDynamicCast(OSDictionary, obj);
++	if (props == NULL) {
++		OSSafeReleaseNULL(obj);
++		return kIOReturnBadArgument;
++	}
++	uint64_t made_at = mach_absolute_time();
++	s = surfaceCreate(props, &ret);
++	made_at = mach_absolute_time() - made_at;
++	if (s == NULL) {
++		IOLog("FuxiIOSurface: create failed 0x%x: %ux%u format 0x%x alloc %u\n", ret,
++		    dictNumber(props, "IOSurfaceWidth", 0), dictNumber(props, "IOSurfaceHeight", 0),
++		    dictNumber(props, "IOSurfacePixelFormat", 0), dictNumber(props, "IOSurfaceAllocSize", 0));
++		props->release();
++		return ret;
++	}
++	{
++		char procname[32] = "?";
++		static unsigned keysSaid;
++
++		proc_selfname(procname, sizeof(procname));
++		/* what a traced program asks for, key by key (the first few surfaces) */
++		if (gSurfaceTraceOf[0] != 0 && strncmp(procname, gSurfaceTraceOf, strlen(gSurfaceTraceOf)) == 0 && keysSaid++ < 6) {
++			OSCollectionIterator * keys = OSCollectionIterator::withCollection(props);
++			char line[256];
++			size_t used = 0;
++			OSSymbol * key;
++
++			line[0] = 0;
++			while (keys != NULL && (key = OSDynamicCast(OSSymbol, keys->getNextObject())) != NULL && used < sizeof(line)) {
++				OSNumber * n = OSDynamicCast(OSNumber, props->getObject(key));
++
++				used += (size_t) snprintf(line + used, sizeof(line) - used, " %s=%lld", key->getCStringNoCopy(),
++				    n ? (long long) n->unsigned64BitValue() : -1LL);
++			}
++			OSSafeReleaseNULL(keys);
++			traceLine("FuxiIOSurface: %s asks for a surface with%s\n", procname, line);
++		}
++	}
++	props->release();
++	{
++		char procname[32] = "?";
++
++		proc_selfname(procname, sizeof(procname));
++		if (gSurfaceTraceOf[0] != 0 && strncmp(procname, gSurfaceTraceOf, strlen(gSurfaceTraceOf)) != 0) {
++			procname[0] = 0;        /* (not one of those asked about: not counted) */
++		}
++		if (procname[0] != 0 && gSurfaceTraced < gSurfaceTrace) {
++			s->traced = gSurfaceTraceOf[0] != 0;
++		}
++	}
++	if (s->traced || (gSurfaceTraceOf[0] == 0 && gSurfaceTraced < gSurfaceTrace)) {
++		char procname[32] = "?";
++
++		gSurfaceTraced++;
++		proc_selfname(procname, sizeof(procname));
++		traceLine("FuxiIOSurface: %s[%d] created surface %u: %ux%u '%c%c%c%c', %u bytes per row, %u planes, %u bytes\n",
++		    procname, proc_selfpid(), s->sid, s->info.width, s->info.height, (int) (s->info.pixelFormat >> 24 & 0xff),
++		    (int) (s->info.pixelFormat >> 16 & 0xff), (int) (s->info.pixelFormat >> 8 & 0xff),
++		    (int) (s->info.pixelFormat & 0xff), s->info.bytesPerRow, s->info.planeCount, s->info.allocSize);
++	}
++
++	uint64_t mapped_at = mach_absolute_time();
++	IOLockLock(gSurfaceLock);
++	ref = addRef(s);
++	ret = ref ? returnSurface(ref, false, args) : kIOReturnNoMemory;
++	if (ref != NULL && ret != kIOReturnSuccess) {
++		dropRef(ref);
++	}
++	surfaceUnhold(s);                       /* the creator's hold; the client's own is in the ref */
++	IOLockUnlock(gSurfaceLock);
++	mapped_at = mach_absolute_time() - mapped_at;
++	OSAddAtomic64((SInt64) (mach_absolute_time() - began), (SInt64 *) &gSurfaceMaking);
++	OSIncrementAtomic(&gSurfacesMade);
++	if (s->info.allocSize >= SURFACE_KEEP_FROM) {
++		/* the big ones (the window server's of the whole display): where the time to make one goes, every 5 s */
++		static uint64_t since, all, making, mapping;
++		static uint32_t count;
++		uint64_t now = mach_absolute_time(), ns;
++
++		count++;
++		all += now - began;
++		making += made_at;
++		mapping += mapped_at;
++		absolutetime_to_nanoseconds(now - since, &ns);
++		if (since == 0) {
++			since = now;
++		} else if (ns >= 5 * NSEC_PER_SEC) {
++			uint64_t a, m, p;
++
++			absolutetime_to_nanoseconds(all, &a);
++			absolutetime_to_nanoseconds(making, &m);
++			absolutetime_to_nanoseconds(mapping, &p);
++			IOLog("FuxiIOSurface: %u big surfaces made, %llu us each: %llu getting the memory and the surface, %llu mapping it "
++			    "for its maker; memory not kept as somebody else had it %u times, a piece kept longer put out for it %u times\n",
++			    count, a / 1000 / count, m / 1000 / count, p / 1000 / count, OSBitAndAtomic(0, &gSurfacesNotKept[0]),
++			    OSBitAndAtomic(0, &gSurfacesNotKept[1]));
++			since = now;
++			count = 0;
++			all = making = mapping = 0;
++		}
++	}
++	return ret;
++}
++
++IOReturn
++IOSurfaceRootUserClient::methodLookup(IOExternalMethodArguments * args)
++{
++	IOReturn ret = kIOReturnNotFound;
++	uint32_t sid;
++	struct fuxisurf_client_ref * ref;
++
++	if (args->scalarInputCount < 1) {
++		return kIOReturnBadArgument;
++	}
++	sid = (uint32_t) args->scalarInput[0];
++	IOLockLock(gSurfaceLock);
++	ref = findRef(sid, false);
++	if (ref == NULL && sid != 0 && sid < FUXISURF_TABLE_SIZE && gSurfaceTable[sid] != NULL) {
++		ref = addRef(gSurfaceTable[sid]);
++		if (ref == NULL) {
++			ret = kIOReturnNoMemory;
++		}
++	}
++	if (ref != NULL) {
++		ret = returnSurface(ref, false, args);
++	}
++	IOLockUnlock(gSurfaceLock);
++	return ret;
++}
++
++IOReturn
++IOSurfaceRootUserClient::methodLookupFromPort(IOExternalMethodArguments * args)
++{
++	IOReturn ret;
++	OSObject * obj = NULL;
++	IOSurfaceSendRight * right;
++	struct fuxisurf_client_ref * ref;
++	bool known;
++
++	if (args->scalarInputCount < 1) {
++		return kIOReturnBadArgument;
++	}
++	ret = copyObjectForPortNameInTask(fTask, (mach_port_name_t) args->scalarInput[0], &obj);
++	right = OSDynamicCast(IOSurfaceSendRight, obj);
++	if (ret != kIOReturnSuccess || right == NULL || right->surface == NULL) {
++		static unsigned said;
++
++		if (said++ < 48) {
++			char procname[32] = "?";
++
++			proc_selfname(procname, sizeof(procname));
++			traceLine("FuxiIOSurface: %s[%d] looked up a surface from port %#llx: %s\n", procname, proc_selfpid(),
++			    args->scalarInput[0], ret != kIOReturnSuccess ? "no object behind the port" : obj ? "not a surface's port" :
++			    "no surface");
++		}
++		OSSafeReleaseNULL(obj);
++		return kIOReturnBadArgument;
++	}
++	{
++		static unsigned found;
++
++		if (found++ < 48) {
++			char procname[32] = "?";
++
++			proc_selfname(procname, sizeof(procname));
++			traceLine("FuxiIOSurface: %s[%d] found surface %u (%ux%u) from port %#llx (%u found)\n", procname, proc_selfpid(),
++			    right->surface->sid, right->surface->info.width, right->surface->info.height, args->scalarInput[0], found);
++		}
++	}
++	IOLockLock(gSurfaceLock);
++	ref = findRef(right->surface->sid, false);
++	known = ref != NULL;
++	if (ref == NULL) {
++		ref = addRef(right->surface);
++	}
++	ret = ref ? returnSurface(ref, known, args) : kIOReturnNoMemory;
++	IOLockUnlock(gSurfaceLock);
++	if (right->surface->traced) {
++		char procname[32] = "?";
++		uint32_t format = right->surface->info.pixelFormat, nonzero = 0, first = 0, middle = 0;
++		const uint8_t * pixels = right->surface->kpixels;
++		uint32_t size = right->surface->info.allocSize;
++
++		/* what is in it by now: how many of its bytes are not zero, its first pixel and one in the middle */
++		for (uint32_t at = 0; pixels != NULL && at < size; at += 64) {
++			nonzero += pixels[at] != 0 || pixels[at + 1] != 0 || pixels[at + 2] != 0 || pixels[at + 3] != 0;
++		}
++		if (pixels != NULL && size >= 8) {
++			memcpy(&first, pixels, 4);
++			memcpy(&middle, pixels + (size / 2 & ~3u), 4);
++		}
++		proc_selfname(procname, sizeof(procname));
++		traceLine("FuxiIOSurface: %s[%d] looked up surface %u (%ux%u '%c%c%c%c') from a port: %#x; of every 64 bytes %u of %u "
++		    "begin with a pixel that is not 0, the first %#010x, one in the middle %#010x\n", procname, proc_selfpid(),
++		    right->surface->sid, right->surface->info.width, right->surface->info.height, (int) (format >> 24 & 0xff),
++		    (int) (format >> 16 & 0xff), (int) (format >> 8 & 0xff), (int) (format & 0xff), ret, nonzero, size / 64, first, middle);
++	}
++	obj->release();
++	return ret;
++}
++
++mach_port_name_t
++IOSurfaceRootUserClient::makeSendRight(task_t task, FuxiIOSurface * s)
++{
++	IOSurfaceSendRight * right;
++	mach_port_name_t name = 0;
++
++	right = OSTypeAlloc(IOSurfaceSendRight);
++	if (right == NULL || !right->init()) {
++		OSSafeReleaseNULL(right);
++		return 0;
++	}
++	IOLockLock(gSurfaceLock);
++	surfaceHold(s);                         /* for as long as the send right exists */
++	IOLockUnlock(gSurfaceLock);
++	right->surface = s;
++	copyPortNameForObjectInTask(task, right, &name);
++	right->release();
++	return name;
++}
++
++mach_port_name_t
++FuxiIOSurfaceMakeSendRight(task_t task, FuxiIOSurface * surface)
++{
++	return IOSurfaceRootUserClient::makeSendRight(task, surface);
++}
++
++IOReturn
++IOSurfaceRootUserClient::methodCreatePort(IOExternalMethodArguments * args)
++{
++	FuxiIOSurface * s;
++	mach_port_name_t name;
++
++	if (args->scalarInputCount < 1 || args->scalarOutputCount < 1) {
++		return kIOReturnBadArgument;
++	}
++	s = FuxiIOSurfaceCopy((uint32_t) args->scalarInput[0]);
++	if (s == NULL) {
++		static unsigned missed;
++
++		/* (hakios: backboardd once looked up port 0 for the wallpaper's surfaces: a maker's port that was never made) */
++		if (missed++ < 32) {
++			char procname[32] = "?";
++
++			proc_selfname(procname, sizeof(procname));
++			traceLine("FuxiIOSurface: %s[%d] asked a port for surface %llu, which is not there\n", procname, proc_selfpid(),
++			    args->scalarInput[0]);
++		}
++		return kIOReturnNotFound;
++	}
++	name = makeSendRight(fTask, s);
++	{
++		static unsigned made;
++
++		if (made++ < 48 || name == 0) {
++			char procname[32] = "?";
++
++			proc_selfname(procname, sizeof(procname));
++			traceLine("FuxiIOSurface: %s[%d] port for surface %u (%ux%u): %#x (%u ports made)\n", procname, proc_selfpid(), s->sid,
++			    s->info.width, s->info.height, name, made);
++		}
++	}
++	if (s->traced) {
++		char procname[32] = "?";
++
++		proc_selfname(procname, sizeof(procname));
++		traceLine("FuxiIOSurface: %s[%d] made a port for surface %u: %#x\n", procname, proc_selfpid(), s->sid, name);
++	}
++	FuxiIOSurfaceDrop(s);
++	args->scalarOutput[0] = name;
++	args->scalarOutputCount = 1;
++	return name != 0 ? kIOReturnSuccess : kIOReturnNoMemory;
++}
++
++/* Requests about values start with the surface number in 8 bytes; the reply to a change is the new seed. */
++static IOReturn
++returnSeed(IOExternalMethodArguments * args, uint32_t seed)
++{
++	if (args->structureOutput != NULL && args->structureOutputSize >= sizeof(seed)) {
++		memcpy(args->structureOutput, &seed, sizeof(seed));
++		args->structureOutputSize = sizeof(seed);
++	}
++	return kIOReturnSuccess;
++}
++
++IOReturn
++IOSurfaceRootUserClient::methodSetValue(IOExternalMethodArguments * args, const uint8_t * in, size_t inSize)
++{
++	uint32_t sid, seed = 0;
++	OSObject * obj;
++	OSArray * array;
++	struct fuxisurf_client_ref * ref;
++	IOReturn ret = kIOReturnBadArgument;
++
++	if (inSize < 12) {
++		return kIOReturnBadArgument;
++	}
++	memcpy(&sid, in, sizeof(sid));
++	obj = unserialize(in + 8, inSize - 8);
++	array = OSDynamicCast(OSArray, obj);
++	if (array == NULL) {
++		OSSafeReleaseNULL(obj);
++		return kIOReturnBadArgument;
++	}
++	IOLockLock(gSurfaceLock);
++	ref = findRef(sid, false);
++	if (ref == NULL) {
++		ret = kIOReturnNotFound;
++	} else if (ref->surface->values != NULL) {
++		FuxiIOSurface * s = ref->surface;
++		OSString * key = OSDynamicCast(OSString, array->getObject(1));
++		OSDictionary * all = OSDynamicCast(OSDictionary, array->getObject(0));
++
++		if (array->getCount() == 2 && key != NULL) {
++			s->values->setObject(key, array->getObject(0));         /* [value, key] */
++			ret = kIOReturnSuccess;
++		} else if (array->getCount() == 1 && all != NULL) {
++			s->values->merge(all);                                   /* [all the values] */
++			ret = kIOReturnSuccess;
++		}
++		if (ret == kIOReturnSuccess) {
++			s->updateValuesState();
++			seed = s->shared()->valuesSeed;
++		}
++	}
++	IOLockUnlock(gSurfaceLock);
++	obj->release();
++	return ret == kIOReturnSuccess ? returnSeed(args, seed) : ret;
++}
++
++IOReturn
++IOSurfaceRootUserClient::methodRemoveValue(IOExternalMethodArguments * args, const uint8_t * in, size_t inSize)
++{
++	uint32_t sid, seed = 0;
++	struct fuxisurf_client_ref * ref;
++	IOReturn ret = kIOReturnNotFound;
++
++	if (inSize < 9 || in[inSize - 1] != 0) {
++		return kIOReturnBadArgument;
++	}
++	memcpy(&sid, in, sizeof(sid));
++	IOLockLock(gSurfaceLock);
++	ref = findRef(sid, false);
++	if (ref != NULL && ref->surface->values != NULL) {
++		FuxiIOSurface * s = ref->surface;
++		const char * key = (const char *) in + 8;
++
++		if (key[0] == 0) {
++			s->values->flushCollection();
++		} else {
++			s->values->removeObject(key);
++		}
++		s->updateValuesState();
++		seed = s->shared()->valuesSeed;
++		ret = kIOReturnSuccess;
++	}
++	IOLockUnlock(gSurfaceLock);
++	return ret == kIOReturnSuccess ? returnSeed(args, seed) : ret;
++}
++
++/* The reply: 4 bytes unused, the seed, then the serialized value (a dictionary when all were asked for). */
++IOReturn
++IOSurfaceRootUserClient::methodCopyValue(IOExternalMethodArguments * args, const uint8_t * in, size_t inSize)
++{
++	uint32_t sid, header[2] = { 0, 0 };
++	struct fuxisurf_client_ref * ref;
++	OSSerialize * s = NULL;
++	IOReturn ret = kIOReturnNotFound;
++	uint32_t length = 0, total;
++
++	if (inSize < 9 || in[inSize - 1] != 0) {
++		return kIOReturnBadArgument;
++	}
++	memcpy(&sid, in, sizeof(sid));
++	IOLockLock(gSurfaceLock);
++	ref = findRef(sid, false);
++	if (ref != NULL && ref->surface->values != NULL) {
++		const char * key = (const char *) in + 8;
++		OSObject * value = key[0] ? ref->surface->values->getObject(key) : ref->surface->values;
++
++		header[1] = ref->surface->shared()->valuesSeed;
++		ret = kIOReturnSuccess;
++		if (value != NULL && (key[0] != 0 || ref->surface->values->getCount() != 0)) {
++			s = OSSerialize::binaryWithCapacity(4096);
++			if (s == NULL || !value->serialize(s)) {
++				ret = kIOReturnNoMemory;
++			} else {
++				length = s->getLength();
++			}
++		}
++	}
++	IOLockUnlock(gSurfaceLock);
++
++	total = (uint32_t) sizeof(header) + length;
++	if (ret == kIOReturnSuccess) {
++		if (args->structureOutputDescriptor != NULL) {
++			IOMemoryDescriptor * out = args->structureOutputDescriptor;
++
++			if (out->getLength() < total) {
++				ret = kIOReturnNoSpace;
++			} else if ((ret = out->prepare()) == kIOReturnSuccess) {
++				out->writeBytes(0, header, sizeof(header));
++				if (length != 0) {
++					out->writeBytes(sizeof(header), s->text(), length);
++				}
++				out->complete();
++				args->structureOutputDescriptorSize = total;
++			}
++		} else if (args->structureOutput == NULL || args->structureOutputSize < total) {
++			ret = kIOReturnNoSpace;
++		} else {
++			memcpy(args->structureOutput, header, sizeof(header));
++			if (length != 0) {
++				memcpy((uint8_t *) args->structureOutput + sizeof(header), s->text(), length);
++			}
++			args->structureOutputSize = total;
++		}
++	}
++	OSSafeReleaseNULL(s);
++	return ret;
++}
++
++/*
++ * Colour space, transfer function and the like: a fixed structure kept in the shared page.
++ * The request: the structure, its size, a mask of the fields that changed, the surface number.
++ */
++IOReturn
++IOSurfaceRootUserClient::methodSetBulkAttachments(const uint8_t * in, size_t inSize)
++{
++	static const struct {
++		uint8_t from, to;
++	} fields[15] = {
++		{ 0x00, 0x20 }, { 0x20, 0x30 }, { 0x30, 0x38 }, { 0x38, 0x39 }, { 0x39, 0x3a }, { 0x3a, 0x3b }, { 0x3b, 0x3c },
++		{ 0x3c, 0x3d }, { 0x3d, 0x3e }, { 0x3e, 0x3f }, { 0x3f, 0x40 }, { 0x40, 0x58 }, { 0x58, 0x5c }, { 0x5c, 0x64 },
++		{ 0x64, 0x65 },
++	};
++	uint64_t size, mask;
++	uint32_t sid;
++	struct fuxisurf_client_ref * ref;
++	IOReturn ret = kIOReturnNotFound;
++
++	if (inSize < 0x88) {
++		return kIOReturnBadArgument;
++	}
++	memcpy(&size, in + 0x70, sizeof(size));
++	memcpy(&mask, in + 0x78, sizeof(mask));
++	memcpy(&sid, in + 0x80, sizeof(sid));
++	if (size > 0x70) {
++		return kIOReturnBadArgument;
++	}
++	IOLockLock(gSurfaceLock);
++	ref = findRef(sid, false);
++	if (ref != NULL) {
++		uint8_t * attachments = ref->surface->shared()->attachments;
++
++		for (unsigned i = 0; i < 15; i++) {
++			if ((mask & (1ULL << i)) && fields[i].to <= size) {
++				memcpy(attachments + fields[i].from, in + fields[i].from, fields[i].to - fields[i].from);
++			}
++		}
++		ret = kIOReturnSuccess;
++	}
++	IOLockUnlock(gSurfaceLock);
++	return ret;
++}
++
++IOReturn
++IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments * args,
++    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference)
++{
++	const uint8_t * in = (const uint8_t *) args->structureInput;
++	size_t inSize = args->structureInputSize;
++	IOMemoryMap * inMap = NULL;
++	struct fuxisurf_client_ref * ref;
++	IOReturn ret;
++	static uint32_t hk_calls;
++
++	if (hk_calls < 40) {
++		char procname[32] = "?";
++		hk_calls++;
++		proc_selfname(procname, sizeof(procname));
++		IOLog("FuxiIOSurface: %s[%d] selector %u (scalars %u in, %u out; structure %u in, %u out)\n", procname,
++		    proc_selfpid(), selector, args->scalarInputCount, args->scalarOutputCount, args->structureInputSize,
++		    args->structureOutputSize);
++	}
++
++	switch (selector) {
++	case kSurfaceMethodInit:
++		return methodInit(args);
++	case kSurfaceMethodCreate:
++		return methodCreate(args);
++	case kSurfaceMethodLookup:
++		return methodLookup(args);
++	case kSurfaceMethodLookupFromPort:
++		return methodLookupFromPort(args);
++	case kSurfaceMethodCreatePort:
++		return methodCreatePort(args);
++	case kSurfaceMethodEventCreate:
++		return methodEventCreate(args);
++	case kSurfaceMethodEventMap:
++		return methodEventMap(args);
++	case kSurfaceMethodEventNotify:
++		return methodEventNotify(args);
++	case kSurfaceMethodEventAddListener:
++		return methodEventAddListener(args);
++	case kSurfaceMethodEventRemoveListener:
++		return methodEventRemoveListener(args);
++
++	case kSurfaceMethodSetValue:
++	case kSurfaceMethodCopyValue:
++	case kSurfaceMethodRemoveValue:
++	case kSurfaceMethodSetBulkAttachments:
++		if (args->structureInputDescriptor != NULL) {
++			inMap = args->structureInputDescriptor->map(kIOMapReadOnly);
++			if (inMap == NULL) {
++				return kIOReturnNoMemory;
++			}
++			in = (const uint8_t *) inMap->getVirtualAddress();
++			inSize = inMap->getLength();
++		}
++		if (in == NULL) {
++			ret = kIOReturnBadArgument;
++		} else if (selector == kSurfaceMethodSetValue) {
++			ret = methodSetValue(args, in, inSize);
++		} else if (selector == kSurfaceMethodCopyValue) {
++			ret = methodCopyValue(args, in, inSize);
++		} else if (selector == kSurfaceMethodRemoveValue) {
++			ret = methodRemoveValue(args, in, inSize);
++		} else {
++			ret = methodSetBulkAttachments(in, inSize);
++		}
++		OSSafeReleaseNULL(inMap);
++		return ret;
++
++	case kSurfaceMethodSetPurgeable:                /* in: surface, new state; out: old state */
++		if (args->scalarInputCount < 2) {
++			return kIOReturnBadArgument;
++		}
++		ret = kIOReturnNotFound;
++		IOLockLock(gSurfaceLock);
++		ref = findRef((uint32_t) args->scalarInput[0], false);
++		if (ref != NULL) {
++			if (args->scalarOutputCount >= 1) {
++				args->scalarOutput[0] = ref->surface->purgeable;
++				args->scalarOutputCount = 1;
++			}
++			if (args->scalarInput[1] != 3) {        /* 3 = keep current */
++				ref->surface->purgeable = (uint32_t) args->scalarInput[1];
++			}
++			ret = kIOReturnSuccess;
++		}
++		IOLockUnlock(gSurfaceLock);
++		return ret;
++
++	case kSurfaceMethodBindAccel:                   /* in: surface, accelerator, sub-id */
++		if (args->scalarInputCount < 3) {
++			return kIOReturnBadArgument;
++		}
++		IOLockLock(gSurfaceLock);
++		ref = findRef((uint32_t) args->scalarInput[0], false);
++		if (ref != NULL) {
++			ref->surface->shared()->accelID = (uint16_t) args->scalarInput[1];
++			ref->surface->shared()->accelSubID = (uint16_t) args->scalarInput[2];
++		}
++		IOLockUnlock(gSurfaceLock);
++		return ref ? kIOReturnSuccess : kIOReturnNotFound;
++
++	case kSurfaceMethodSetYCbCrMatrix:              /* in: surface, matrix */
++		if (args->scalarInputCount < 2) {
++			break;
++		}
++		IOLockLock(gSurfaceLock);
++		ref = findRef((uint32_t) args->scalarInput[0], false);
++		if (ref != NULL) {
++			ref->surface->shared()->ycbcrMatrix = (uint32_t) args->scalarInput[1];
++		}
++		IOLockUnlock(gSurfaceLock);
++		return ref ? kIOReturnSuccess : kIOReturnNotFound;
++
++	case kSurfaceMethodSetOwnership:
++	case kSurfaceMethodSetOwnershipIdentity:
++	case kSurfaceMethodSetTimestamp:
++	case kSurfaceMethodSetIndexedTimestamp:
++	case kSurfaceMethodDetachModeCode:
++	case kSurfaceMethodLog:
++		/* accounting and diagnostics: nothing depends on them here */
++		if (args->scalarOutputCount != 0) {
++			bzero(args->scalarOutput, args->scalarOutputCount * sizeof(args->scalarOutput[0]));
++		}
++		return kIOReturnSuccess;
++
++	default:
++		break;
++	}
++
++	if (selector < 128 && !(gSurfaceLogged[selector / 64] & (1ULL << (selector % 64)))) {
++		gSurfaceLogged[selector / 64] |= 1ULL << (selector % 64);
++		IOLog("FuxiIOSurface: selector %u not implemented (scalars %u in, %u out; structure %u in, %u out)\n", selector,
++		    args->scalarInputCount, args->scalarOutputCount, args->structureInputSize, args->structureOutputSize);
++	}
++	return kIOReturnUnsupported;
++}
++
++/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
++
++/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
++/* IOSurfaceSharedEvent (FuxiSharedEvent above) */
++
++FuxiSharedEvent *
++IOSurfaceRootUserClient::copyEvent(mach_port_name_t name)
++{
++	OSObject * obj = NULL;
++	FuxiSharedEvent * event;
++
++	if (copyObjectForPortNameInTask(fTask, name, &obj) != kIOReturnSuccess) {
++		return NULL;
++	}
++	event = OSDynamicCast(IOSurfaceSendRight, obj);
++	if (event == NULL || event->ev == NULL) {
++		OSSafeReleaseNULL(obj);
++		return NULL;
++	}
++	return event;
++}
++
++/* The event's page, read-only, in this client's task (kept until the client goes): its value's address there. */
++IOReturn
++IOSurfaceRootUserClient::mapEvent(FuxiSharedEvent * event, uint64_t * address)
++{
++	IOMemoryMap * map;
++
++	map = event->ev->page->createMappingInTask(fTask, 0, kIOMapAnywhere | kIOMapReadOnly);
++	if (map == NULL) {
++		return kIOReturnNoMemory;
++	}
++	IOLockLock(gEventLock);
++	if (fEventMaps == NULL) {
++		fEventMaps = OSArray::withCapacity(4);
++	}
++	if (fEventMaps != NULL) {
++		fEventMaps->setObject(map);
++	}
++	IOLockUnlock(gEventLock);
++	*address = map->getAddress();
++	map->release();
++	return fEventMaps != NULL ? kIOReturnSuccess : kIOReturnNoMemory;
++}
++
++IOReturn
++IOSurfaceRootUserClient::methodEventCreate(IOExternalMethodArguments * args)
++{
++	FuxiSharedEvent * event;
++	mach_port_name_t name = 0;
++	uint64_t address = 0;
++	IOReturn ret;
++
++	if (args->scalarOutputCount < 2) {
++		return kIOReturnBadArgument;
++	}
++	event = OSTypeAlloc(IOSurfaceSendRight);
++	if (event == NULL || !event->init()) {
++		OSSafeReleaseNULL(event);
++		return kIOReturnNoMemory;
++	}
++	event->ev = (struct fuxi_event_data *) IOMallocZeroData(sizeof(struct fuxi_event_data));
++	if (event->ev != NULL) {
++		event->ev->page = IOBufferMemoryDescriptor::withOptions(kIODirectionInOut | kIOMemoryKernelUserShared, PAGE_SIZE, PAGE_SIZE);
++	}
++	if (event->ev == NULL || event->ev->page == NULL) {
++		event->release();
++		return kIOReturnNoMemory;
++	}
++	event->ev->value = (volatile uint64_t *) event->ev->page->getBytesNoCopy();
++	bzero((void *) event->ev->value, PAGE_SIZE);
++	event->ev->id = OSIncrementAtomic64((SInt64 *) &gEventIds) + 1;
++	ret = mapEvent(event, &address);
++	if (ret == kIOReturnSuccess) {
++		copyPortNameForObjectInTask(fTask, event, &name);
++	}
++	event->release();
++	if (ret != kIOReturnSuccess || name == 0) {
++		return ret != kIOReturnSuccess ? ret : kIOReturnNoMemory;
++	}
++	args->scalarOutput[0] = name;
++	args->scalarOutput[1] = address;
++	args->scalarOutputCount = 2;
++	return kIOReturnSuccess;
++}
++
++IOReturn
++IOSurfaceRootUserClient::methodEventMap(IOExternalMethodArguments * args)
++{
++	FuxiSharedEvent * event;
++	uint64_t address = 0;
++	IOReturn ret;
++
++	if (args->scalarInputCount < 1 || args->scalarOutputCount < 4) {
++		return kIOReturnBadArgument;
++	}
++	event = copyEvent((mach_port_name_t) args->scalarInput[0]);
++	if (event == NULL) {
++		return kIOReturnBadArgument;
++	}
++	ret = mapEvent(event, &address);
++	if (ret == kIOReturnSuccess) {
++		args->scalarOutput[0] = 0;
++		args->scalarOutput[1] = address;
++		args->scalarOutput[2] = event->ev->id;
++		args->scalarOutput[3] = 0;
++		args->scalarOutputCount = 4;
++	}
++	event->release();
++	return ret;
++}
++
++/* Tell, outside the lock, the listeners whose values `event` has reached (every event's where `event` is NULL and `client` given: none) */
++void
++IOSurfaceRootUserClient::eventTell(FuxiSharedEvent * event, uint64_t value)
++{
++	struct {
++		OSAsyncReference64 ref;
++		io_user_reference_t args[3];
++		FuxiSharedEvent * event;
++	} told[16];
++	unsigned count;
++
++	do {
++		count = 0;
++		IOLockLock(gEventLock);
++		for (unsigned i = 0; i < FUXI_EVENT_WAITS && count < 16; i++) {
++			struct fuxi_event_wait * w = &gEventWaits[i];
++
++			if (w->event == event && w->target <= value) {
++				memcpy(told[count].ref, w->ref, sizeof(w->ref));
++				memcpy(told[count].args, w->args, sizeof(w->args));
++				told[count].event = w->event;
++				count++;
++				bzero(w, sizeof(*w));
++			}
++		}
++		IOLockUnlock(gEventLock);
++		for (unsigned i = 0; i < count; i++) {
++			IOUserClient::sendAsyncResult64(told[i].ref, kIOReturnSuccess, told[i].args, 3);
++			told[i].event->release();
++		}
++	} while (count == 16);
++}
++
++IOReturn
++IOSurfaceRootUserClient::methodEventNotify(IOExternalMethodArguments * args)
++{
++	FuxiSharedEvent * event;
++	uint64_t listener, target;
++	IOReturn ret = kIOReturnNoResources;
++	unsigned l;
++
++	if (args->scalarInputCount < 5) {
++		return kIOReturnBadArgument;
++	}
++	event = copyEvent((mach_port_name_t) args->scalarInput[0]);
++	if (event == NULL) {
++		return kIOReturnBadArgument;
++	}
++	listener = args->scalarInput[1];
++	target = args->scalarInput[4];
++	IOLockLock(gEventLock);
++	for (l = 0; l < 16 && fListeners[l].key != listener; l++) {
++	}
++	if (l == 16 || listener == 0) {
++		ret = kIOReturnNotFound;
++	} else {
++		for (unsigned i = 0; i < FUXI_EVENT_WAITS; i++) {
++			struct fuxi_event_wait * w = &gEventWaits[i];
++
++			if (w->event == NULL) {
++				w->event = event;
++				event->retain();
++				w->client = this;
++				w->target = target;
++				memcpy(w->ref, fListeners[l].ref, sizeof(w->ref));
++				w->args[0] = args->scalarInput[3];      /* the block */
++				w->args[1] = args->scalarInput[2];      /* the event object */
++				w->args[2] = target;
++				ret = kIOReturnSuccess;
++				break;
++			}
++		}
++	}
++	IOLockUnlock(gEventLock);
++	if (ret == kIOReturnSuccess) {
++		eventTell(event, *event->ev->value);        /* reached already */
++	} else {
++		static unsigned said;
++
++		if (said++ < 8) {
++			IOLog("FuxiIOSurface: an event's notification refused: %#x\n", ret);
++		}
++	}
++	event->release();
++	return ret;
++}
++
++IOReturn
++IOSurfaceRootUserClient::methodEventAddListener(IOExternalMethodArguments * args)
++{
++	uint64_t key;
++	IOReturn ret = kIOReturnNoResources;
++
++	if (args->asyncWakePort == MACH_PORT_NULL || args->asyncReference == NULL) {
++		return kIOReturnBadArgument;
++	}
++	key = args->asyncReference[kIOAsyncCalloutRefconIndex];
++	IOLockLock(gEventLock);
++	for (unsigned l = 0; l < 16; l++) {
++		if (fListeners[l].key == 0 || fListeners[l].key == key) {
++			fListeners[l].key = key;
++			bzero(fListeners[l].ref, sizeof(fListeners[l].ref));
++			memcpy(fListeners[l].ref, args->asyncReference,
++			    MIN(sizeof(fListeners[l].ref), args->asyncReferenceCount * sizeof(io_user_reference_t)));
++			ret = kIOReturnSuccess;
++			break;
++		}
++	}
++	IOLockUnlock(gEventLock);
++	return ret;
++}
++
++IOReturn
++IOSurfaceRootUserClient::methodEventRemoveListener(IOExternalMethodArguments * args)
++{
++	if (args->scalarInputCount < 1) {
++		return kIOReturnBadArgument;
++	}
++	IOLockLock(gEventLock);
++	for (unsigned l = 0; l < 16; l++) {
++		if (fListeners[l].key == args->scalarInput[0]) {
++			bzero(&fListeners[l], sizeof(fListeners[l]));
++		}
++	}
++	IOLockUnlock(gEventLock);
++	return kIOReturnSuccess;
++}
++
++/* The client goes: its notifications still waiting are dropped. */
++void
++IOSurfaceRootUserClient::forgetEventWaits(void)
++{
++	FuxiSharedEvent * drop[16];
++	unsigned count;
++
++	if (gEventLock == NULL) {
++		return;
++	}
++	do {
++		count = 0;
++		IOLockLock(gEventLock);
++		for (unsigned i = 0; i < FUXI_EVENT_WAITS && count < 16; i++) {
++			if (gEventWaits[i].event != NULL && gEventWaits[i].client == this) {
++				drop[count++] = gEventWaits[i].event;
++				bzero(&gEventWaits[i], sizeof(gEventWaits[i]));
++			}
++		}
++		bzero(fListeners, sizeof(fListeners));
++		IOLockUnlock(gEventLock);
++		for (unsigned i = 0; i < count; i++) {
++			drop[i]->release();
++		}
++	} while (count == 16);
++}
++
++IOReturn
++IOSurfaceRootUserClient::trapEventSignal(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6)
++{
++	FuxiSharedEvent * event = copyEvent((mach_port_name_t) (uintptr_t) p1);
++	uint64_t value = (uint64_t) p2;
++
++	if (event == NULL) {
++		return kIOReturnBadArgument;
++	}
++	IOLockLock(gEventLock);
++	*event->ev->value = value;
++	IOLockWakeup(gEventLock, (event_t) event, false);
++	IOLockUnlock(gEventLock);
++	eventTell(event, value);
++	event->release();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++IOSurfaceRootUserClient::trapEventWait(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6)
++{
++	FuxiSharedEvent * event = copyEvent((mach_port_name_t) (uintptr_t) p1);
++	uint64_t target = (uint64_t) p2, ms = (uint64_t) p3, deadline;
++	IOReturn ret = kIOReturnSuccess;
++
++	if (event == NULL) {
++		return kIOReturnBadArgument;
++	}
++	clock_interval_to_deadline((uint32_t) MIN(ms, 0xffffffffull), kMillisecondScale, &deadline);
++	IOLockLock(gEventLock);
++	while (*event->ev->value < target) {
++		int r = IOLockSleepDeadline(gEventLock, (event_t) event, deadline, THREAD_ABORTSAFE);
++
++		if (r != THREAD_AWAKENED && *event->ev->value < target) {
++			ret = r == THREAD_TIMED_OUT ? kIOReturnTimeout : kIOReturnAborted;
++			break;
++		}
++	}
++	IOLockUnlock(gEventLock);
++	event->release();
++	return ret;
++}
++
++IOExternalTrap *
++IOSurfaceRootUserClient::getTargetAndTrapForIndex(IOService ** targetP, UInt32 index)
++{
++	if (index >= kSurfaceTrapCount) {
++		return NULL;
++	}
++	*targetP = this;
++	return &fTraps[index];
++}
++
++IOReturn
++IOSurfaceRootUserClient::useCountCommon(uint32_t sid, uint32_t category, int delta)
++{
++	struct fuxisurf_client_ref * ref;
++	IOReturn ret = kIOReturnNotFound;
++
++	if (category > 1) {
++		return kIOReturnBadArgument;
++	}
++	IOLockLock(gSurfaceLock);
++	ref = findRef(sid, false);
++	if (ref != NULL) {
++		FuxiIOSurface * s = ref->surface;
++
++		if (delta > 0 || ref->use[category] != 0) {
++			ref->use[category] += delta;
++			s->useCount[category] += delta;
++			s->shared()->useCount = (uint64_t) s->useCount[1] << 32 | s->useCount[0];
++		}
++		ret = kIOReturnSuccess;
++	}
++	IOLockUnlock(gSurfaceLock);
++	return ret;
++}
++
++IOReturn
++IOSurfaceRootUserClient::trapIncrementUseCount(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6)
++{
++	return useCountCommon((uint32_t) (uintptr_t) p1, (uint32_t) (uintptr_t) p2, 1);
++}
++
++IOReturn
++IOSurfaceRootUserClient::trapDecrementUseCount(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6)
++{
++	return useCountCommon((uint32_t) (uintptr_t) p1, (uint32_t) (uintptr_t) p2, -1);
++}
++
++/*
++ * Lock and unlock do not exclude anybody: the memory is shared and always mapped.
++ * What matters is the seed, which tells readers that the pixels may have changed.
++ */
++IOReturn
++IOSurfaceRootUserClient::lockCommon(uint32_t sid, uint32_t options, user_addr_t seedOut)
++{
++	struct fuxisurf_client_ref * ref;
++	uint32_t seed = 0;
++
++	IOLockLock(gSurfaceLock);
++	ref = findRef(sid, false);
++	if (ref != NULL) {
++		struct fuxisurf_shared * sh = ref->surface->shared();
++
++		if (!(options & kSurfaceLockReadOnly)) {
++			sh->seed++;
++		}
++		seed = sh->seed;
++	}
++	IOLockUnlock(gSurfaceLock);
++	if (ref == NULL) {
++		return kIOReturnNotFound;
++	}
++	if (seedOut != 0) {
++		copyout(&seed, seedOut, sizeof(seed));
++	}
++	return kIOReturnSuccess;
++}
++
++IOReturn
++IOSurfaceRootUserClient::trapLock(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6)
++{
++	return lockCommon((uint32_t) (uintptr_t) p1, (uint32_t) (uintptr_t) p2, (user_addr_t) (uintptr_t) p3);
++}
++
++IOReturn
++IOSurfaceRootUserClient::trapUnlock(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6)
++{
++	return lockCommon((uint32_t) (uintptr_t) p1, (uint32_t) (uintptr_t) p2, (user_addr_t) (uintptr_t) p3);
++}
++
++/*
++ * A client drops a surface in two steps: "detach" while it still holds its own lock, and
++ * "release" after it. A lookup of the same surface in between must make a fresh view.
++ */
++IOReturn
++IOSurfaceRootUserClient::trapDetach(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6)
++{
++	struct fuxisurf_client_ref * ref;
++
++	IOLockLock(gSurfaceLock);
++	ref = findRef((uint32_t) (uintptr_t) p1, false);
++	if (ref != NULL) {
++		ref->detached = true;
++	}
++	IOLockUnlock(gSurfaceLock);
++	return kIOReturnSuccess;
++}
++
++IOReturn
++IOSurfaceRootUserClient::trapRelease(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6)
++{
++	struct fuxisurf_client_ref * ref;
++	uint32_t sid = (uint32_t) (uintptr_t) p1;
++
++	IOLockLock(gSurfaceLock);
++	ref = findRef(sid, true);
++	if (ref == NULL) {
++		ref = findRef(sid, false);
++	}
++	if (ref != NULL) {
++		dropRef(ref);
++	}
++	IOLockUnlock(gSurfaceLock);
++	return ref ? kIOReturnSuccess : kIOReturnNotFound;
++}
++
++#endif /* FUXI */
+diff --git a/iokit/Kernel/arm/FuxiIOSurface.h b/iokit/Kernel/arm/FuxiIOSurface.h
+new file mode 100644
+index 0000000..0ad72bc
+--- /dev/null
++++ b/iokit/Kernel/arm/FuxiIOSurface.h
+@@ -0,0 +1,191 @@
++/*
++ * Fuxi: a stand-in IOSurface (boot-arg fuxi_fb=1, with FuxiFramebuffer.cpp).
++ *
++ * Fuxi has no IOSurface kext of its own: Apple's needs the GPU and display families around it,
++ * and CoreAnimation's window server (backboardd) cannot make a single buffer without it.
++ *
++ * Ported from hakios-arm64e-dada's MiniIOSurface.h (base/xnu/files/iokit/Kernel, APSL 2.0,
++ * a derivative work of XNU), which describes the situation and the protocol:
++ *
++ *   enough of it for the iOS window server and its clients to share pixel buffers on a machine
++ *   without Apple hardware. The protocol (user client selectors, traps and the layout of the
++ *   structures the kernel hands to IOSurface.framework) was worked out from the user-space side
++ *   of iOS 16.5 [and widened for iOS 26].
++ *
++ * The GPU's parts of it (snapshots of client memory, the GPU's submissions per surface) are left
++ * out: here only the processor draws, and the framebuffer copies what it drew.
++ */
++#ifndef _IOKIT_ARM_FUXIIOSURFACE_H
++#define _IOKIT_ARM_FUXIIOSURFACE_H
++
++#if defined(FUXI)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++
++#define FUXISURF_MAX_PLANES     4
++#define FUXISURF_RESULT_MAX     0xa68           /* what IOSurface.framework (iOS 16.5) reserves for a result */
++
++/* One plane, as IOSurface.framework reads it (0x80 bytes). */
++struct fuxisurf_plane {
++	uint32_t width;                         /* 0x00 */
++	uint32_t height;                        /* 0x04 */
++	uint32_t reserved08;
++	uint32_t offset;                        /* 0x0c from the base address */
++	uint32_t bytesPerRow;                   /* 0x10 */
++	uint32_t size;                          /* 0x14 */
++	uint16_t bytesPerElement;               /* 0x18 */
++	uint8_t  elementWidth;                  /* 0x1a */
++	uint8_t  elementHeight;                 /* 0x1b */
++	uint8_t  componentCount;                /* 0x1c */
++	uint8_t  addressFormat;                 /* 0x1d */
++	uint8_t  reserved1e[2];
++	uint8_t  componentBitDepth[4];          /* 0x20 */
++	uint8_t  componentBitOffset[4];         /* 0x24 */
++	uint8_t  componentName[4];              /* 0x28 */
++	uint8_t  componentType[4];              /* 0x2c */
++	uint8_t  componentRange[4];             /* 0x30 */
++	uint8_t  reserved34[0x20];
++	uint8_t  compression;                   /* 0x54: 1 = compressed, then there is no base address */
++	uint8_t  reserved55[0x1b];
++	uint32_t extendedPixels[4];             /* 0x70 */
++};
++
++/* What "create" and the lookups return: this header, then the planes (at least one). */
++struct fuxisurf_result {
++	uint64_t base;                          /* 0x00 where the memory is mapped in the client */
++	uint64_t shared;                        /* 0x08 struct fuxisurf_shared, mapped in the client */
++	uint64_t aux;                           /* 0x10 struct fuxisurf_aux, mapped in the client */
++	uint32_t sid;                           /* 0x18 */
++	uint32_t allocSize;                     /* 0x1c */
++	uint32_t width;                         /* 0x20 */
++	uint32_t height;                        /* 0x24 */
++	uint32_t bytesPerRow;                   /* 0x28 */
++	uint32_t offset;                        /* 0x2c */
++	uint32_t pixelFormat;                   /* 0x30 */
++	uint32_t reserved34;
++	uint32_t planeCount;                    /* 0x38 */
++	uint32_t reserved3c;
++	uint16_t bytesPerElement;               /* 0x40 */
++	uint8_t  elementWidth;                  /* 0x42 */
++	uint8_t  elementHeight;                 /* 0x43 */
++	uint32_t cacheMode;                     /* 0x44 */
++	uint32_t lockSeed;                      /* 0x48 the client keeps the seed of its last lock here */
++	uint8_t  subsampling;                   /* 0x4c */
++	uint8_t  prohibitUseCount;              /* 0x4d */
++	uint16_t reserved4e;
++	uint32_t parentID;                      /* 0x50 */
++	uint32_t sliceCount;                    /* 0x54 */
++	uint64_t traceID;                       /* 0x58 */
++	uint64_t protectionOptions;             /* 0x60 */
++};
++
++/* State that every client reads straight from memory shared with the kernel. */
++struct fuxisurf_shared {
++	uint64_t registryID;                    /* 0x00 */
++	uint16_t accelID;                       /* 0x08 */
++	uint16_t accelSubID;                    /* 0x0a */
++	uint32_t seed;                          /* 0x0c changes when somebody has written the pixels */
++	uint32_t reserved10;
++	uint8_t  tiled;                         /* 0x14 */
++	uint8_t  reserved15[3];
++	uint64_t useCount;                      /* 0x18 two 32-bit counters, one per category */
++	uint32_t valuesSeed;                    /* 0x20 */
++	uint32_t ycbcrMatrix;                   /* 0x24 */
++	uint32_t valuesSize;                    /* 0x28 room needed to fetch the values; 0 = none */
++	uint8_t  pixelSizeCasting;              /* 0x2c */
++	uint8_t  displayable;                   /* 0x2d */
++	uint8_t  sysMemOnly;                    /* 0x2e */
++	uint8_t  reserved2f;
++	uint8_t  attachments[0x70];             /* 0x30 the "bulk attachments" */
++};
++
++struct fuxisurf_aux {
++	uint64_t timestamps[4];
++	uint64_t detachModeCode;
++};
++
++#define FUXISURF_AUX_OFFSET     0x400           /* of the aux structure inside the shared page */
++
++class FuxiIOSurface : public OSObject
++{
++	OSDeclareDefaultStructors(FuxiIOSurface);
++
++public:
++	uint32_t                        sid;
++	uint32_t                        holders;        /* clients, send rights, kernel users */
++	IOBufferMemoryDescriptor *      memory;         /* one page of shared state, then the pixels */
++	uint8_t *                       kbase;          /* the same, in the kernel */
++	/*
++	 * ... unless the surface was made around memory its maker has already (IOSurfaceAddress):
++	 * then the pixels are that memory, held in place and seen from the kernel as well, and
++	 * `memory` is the page of shared state alone.
++	 */
++	IOMemoryDescriptor *            client;
++	IOMemoryMap *                   clientMap;
++	task_t                          clientTask;     /* whose memory it is (not held: only compared) */
++	mach_vm_address_t               clientAddress;  /* ... and where it is there */
++	uint8_t *                       kpixels;        /* where the pixel memory starts in the kernel, either way */
++	struct fuxisurf_result          info;           /* addresses not filled in */
++	struct fuxisurf_plane           planes[FUXISURF_MAX_PLANES];
++	OSDictionary *                  values;
++	uint32_t                        useCount[2];
++	uint32_t                        purgeable;
++	bool                            traced;         /* made by a program of boot-arg fuxi_surf_trace_of */
++
++	virtual bool
++	init(void) APPLE_KEXT_OVERRIDE
++	{
++		return OSObject::init();
++	}
++	virtual void free(void) APPLE_KEXT_OVERRIDE;
++
++	struct fuxisurf_shared *
++	shared(void) const
++	{
++		return (struct fuxisurf_shared *) kbase;
++	}
++	struct fuxisurf_aux *
++	aux(void) const
++	{
++		return (struct fuxisurf_aux *) (kbase + FUXISURF_AUX_OFFSET);
++	}
++	/* The first byte of the pixels (the "base address" clients see). */
++	uint8_t *
++	pixels(void) const
++	{
++		return kpixels + info.offset;
++	}
++	void updateValuesState(void);
++};
++
++/* Publishes IOService:/IOResources/IOCoreSurfaceRoot (FuxiFramebuffer.cpp fuxi_fb_start). */
++void            FuxiIOSurfaceStart(IOService * provider);
++/*
++ * For the framebuffer: a surface found or made here is held until FuxiIOSurfaceDrop().
++ */
++FuxiIOSurface * FuxiIOSurfaceCopy(uint32_t sid);
++FuxiIOSurface * FuxiIOSurfaceCreateSimple(uint32_t width, uint32_t height, uint32_t pixelFormat);
++void            FuxiIOSurfaceDrop(FuxiIOSurface * surface);
++/*
++ * What making and freeing surfaces has cost since this was last asked: how many, microseconds
++ * each; how many got memory that was kept from one before.
++ */
++void            FuxiIOSurfaceCost(uint32_t * made, uint64_t * making, uint32_t * freed, uint64_t * freeing, uint32_t * again);
++/* Clear the memory that is kept of surfaces that are gone, for the next ones: when the caller has a moment. */
++void            FuxiIOSurfaceClearKept(void);
++/* A Mach send right for the surface in the task (what IOSurfaceCreateMachPort gives); 0 on failure. */
++mach_port_name_t FuxiIOSurfaceMakeSendRight(task_t task, FuxiIOSurface * surface);
++
++/*
++ * pexpert/arm/pe_serial.c: the splash framebuffer the text console draws on (ADT /sweet-fbcon),
++ * which the panel scans out by itself.
++ */
++extern "C" {
++int  fuxi_fbcon_geometry(volatile void ** base, uint32_t * width, uint32_t * height, uint32_t * stride);
++void fuxi_fbcon_quiet(void);            /* the text console stops drawing (a panic still draws) */
++void fuxi_fbcon_flush(void);            /* a frame is written: out to memory, and the panel kicked if it needs it */
++}
++
++#endif /* FUXI */
++#endif /* _IOKIT_ARM_FUXIIOSURFACE_H */
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 3ac858e..6496b0f 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -13,3 +13,6 @@ iokit/Kernel/arm/ArmDTPlatform.cpp				optional iokitcpp
+ # Fuxi iOS 27 root file on UFS (K4): xnu27/patches/fuxi/0007.
+ iokit/Kernel/arm/FuxiRoot27.cpp					optional iokitcpp
+ iokit/Kernel/arm/FuxiAppleKeyStore.cpp				optional iokitcpp
++# Fuxi stand-in IOSurface and IOMobileFramebuffer on the splash framebuffer (boot-arg fuxi_fb=1).
++iokit/Kernel/arm/FuxiIOSurface.cpp					optional iokitcpp
++iokit/Kernel/arm/FuxiFramebuffer.cpp				optional iokitcpp
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index 9747cdd..82ce18c 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -204,9 +204,45 @@ fbcon_transmit_ready(void)
+ 	return 1;
+ }
+ 
++/*
++ * The framebuffer stand-in (iokit/Kernel/arm/FuxiFramebuffer.cpp, boot-arg fuxi_fb=1) draws the
++ * GUI into the same memory. From its first frame on the text stops (it still reaches the log
++ * ring through _cnputs); a panic draws again, over the GUI.
++ */
++static bool fbcon_quiet;
++
++int
++fuxi_fbcon_geometry(volatile void **base, uint32_t *width, uint32_t *height, uint32_t *stride)
++{
++	if (fbcon_base == NULL) {
++		return 0;
++	}
++	*base = (volatile void *)fbcon_base;
++	*width = fbcon_width;
++	*height = fbcon_height;
++	*stride = fbcon_stride;
++	return 1;
++}
++
++void
++fuxi_fbcon_quiet(void)
++{
++	fbcon_quiet = true;
++}
++
++/* A frame is in the panel's memory (write-combined): out of the write buffers, and START if the panel needs one. */
++void
++fuxi_fbcon_flush(void)
++{
++	fuxi_display_kick();
++}
++
+ static void
+ fbcon_transmit_data(uint8_t c)
+ {
++	if (fbcon_quiet && !panic_active()) {
++		return;
++	}
+ 	if (c == '\r') {
+ 		fbcon_col = 0;
+ 		return;
+diff --git a/pexpert/pexpert/arm/protos.h b/pexpert/pexpert/arm/protos.h
+index d007c34..d972c25 100644
+--- a/pexpert/pexpert/arm/protos.h
++++ b/pexpert/pexpert/arm/protos.h
+@@ -38,6 +38,13 @@ int uart_getc(void);
+ 
+ void pe_init_fiq(void);
+ 
++#if defined(FUXI)
++/* pe_serial.c: the splash framebuffer (ADT /sweet-fbcon), for iokit/Kernel/arm/FuxiFramebuffer.cpp */
++int fuxi_fbcon_geometry(volatile void **base, uint32_t *width, uint32_t *height, uint32_t *stride);
++void fuxi_fbcon_quiet(void);
++void fuxi_fbcon_flush(void);
++#endif /* FUXI */
++
+ #ifdef PRIVATE
+ /**
+  * One hot ids to distinquish between all supported serial devices

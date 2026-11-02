@@ -3,7 +3,7 @@
 
   mkadt-fuxi27.py OUT.adt [--cpus 1|7] [--psci-method smc|hvc] [--product iphone12,3|board] [--dump]
                   [--root-extents EXTENTS.json --root-bytes N --root-uuid OS-VOLUME-UUID]
-                  [--root-hash SYSTEMVOLUME.root_hash] [--fstab]
+                  [--root-hash SYSTEMVOLUME.root_hash] [--fstab] [--display]
 
 The xnu-8796 kernel matched its own SweetDTPlatform/SweetCPU; the 12377 kernel
 uses UniXNU's ArmDTPlatform and ArmCpu (docs-lanes/ios27.md), which read a
@@ -43,6 +43,14 @@ the system-vol entry iOS device trees carry: APFS reads the EDT fstab to decide
 which volume role may be mounted at '/' (K4 boots A-D had no /filesystems and
 APFS refused 'not allowed to mount as root').
 
+--display adds /arm-io/disp0 (device_type display-subsystem, compatible
+fuxi,framebuffer, canvas-width/height 1125 x 2436: the iPhone12,3 screen) and
+/chosen display-scale = 3, as mkadt.py gave the iOS 16.7 lane. The kernel's
+stand-in IOMobileFramebuffer (iokit/Kernel/arm/FuxiFramebuffer.cpp, boot-arg
+fuxi_fb=1) makes the same /arm-io/disp0 in the registry when the ADT has none;
+display-scale only comes from here (SpringBoard read scale 0 as an invalid
+"infxinf@0x" mode on iOS 16.7). Without --display the ADT is unchanged.
+
 No chip-id/unique-chip-id at K1: IOPlatformExpert hashes them with SHA-1,
 which only a corecrypto kext provides on this kernel (docs-lanes/ios27.md).
 """
@@ -70,6 +78,7 @@ FSTAB = (('system-vol', '/', 'ro', '', 1, 'System', 1),)
 GICR_STRIDE = 0x40000
 TIMEBASE = 19200000
 FB_W, FB_H = 1080, 2400
+CANVAS_W, CANVAS_H, DISPLAY_SCALE = 1125, 2436, 3   # --display: the iPhone12,3 screen user space expects
 CPU_REGS = (0x000, 0x200, 0x300, 0x400, 0x500, 0x600, 0x700)
 ADT_MAX, ADT_MAX_ROOT = 0x4000, 0x10000   # loader: v1 payloads 16 KiB, v2 64 KiB
 PRODUCTS = {'iphone12,3': ('iPhone 11 Pro', 'iPhone12,3'), 'board': ('Xiaomi 13', 'xiaomi,fuxi')}
@@ -102,7 +111,7 @@ def root_matching(volume_uuid):
 
 
 def build(cpus=1, psci_method='smc', seed=None, mem_size=fuxi.MEM_SIZE, product='iphone12,3', root_props=(),
-          root_uuid=None, root_hash=None, fstab=False):
+          root_uuid=None, root_hash=None, fstab=False, display=False):
     if cpus not in (1, len(CPU_REGS)):
         raise ValueError('cpus must be 1 or 7')
     seed = os.urandom(256) if seed is None else seed
@@ -124,7 +133,8 @@ def build(cpus=1, psci_method='smc', seed=None, mem_size=fuxi.MEM_SIZE, product=
         ('effective-security-mode-sep', u32(1)),
         ('amfi-only-platform-code', u32(1)),
     ] + nvram_proxy() + list(root_props) + ([('root-matching', root_matching(root_uuid))] if root_uuid else [])
-      + ([('system-volume-auth-blob', root_hash)] if root_hash else []),
+      + ([('system-volume-auth-blob', root_hash)] if root_hash else [])
+      + ([('display-scale', u32(DISPLAY_SCALE))] if display else []),
         [node('memory-map'), node('manifest-properties')])
     cpu_nodes = [node(f'cpu{i}', [
         ('state', cstr('running' if i == 0 else 'waiting')),
@@ -150,7 +160,12 @@ def build(cpus=1, psci_method='smc', seed=None, mem_size=fuxi.MEM_SIZE, product=
             ('compatible', cstr('arm,gic-v3')),
             ('reg', u64(fuxi.GICD - ARMIO_BASE, 0x10000, fuxi.GICR - ARMIO_BASE, fuxi.GICR_SIZE)),
             ('redistributor-stride', u64(GICR_STRIDE)),
-        ])]),
+        ])] + ([node('disp0', [
+            ('device_type', cstr('display-subsystem')),
+            ('compatible', cstr('fuxi,framebuffer')),
+            ('canvas-width', u32(CANVAS_W)),
+            ('canvas-height', u32(CANVAS_H)),
+        ])] if display else [])),
         node('sweet-fbcon', [
             ('reg', u64(fuxi.FB, fuxi.FB_SIZE)),
             ('width', u32(FB_W)),
@@ -189,6 +204,8 @@ def main():
     ap.add_argument('--root-hash', type=Path,
                     help='K4: SystemVolume root-hash file for /chosen system-volume-auth-blob (local input)')
     ap.add_argument('--fstab', action='store_true', help='K4: /filesystems/fstab with the system volume at /')
+    ap.add_argument('--display', action='store_true',
+                    help='/arm-io/disp0 and /chosen display-scale for the kernel stand-in framebuffer (fuxi_fb=1)')
     ap.add_argument('--dump', action='store_true')
     args = ap.parse_args()
     if (args.root_extents is None) != (args.root_bytes is None) or (args.root_uuid and not args.root_extents):
@@ -198,7 +215,7 @@ def main():
         blob = adt.serialize(build(args.cpus, args.psci_method, product=args.product, root_props=root_props,
                                    root_uuid=args.root_uuid,
                                    root_hash=args.root_hash.read_bytes() if args.root_hash else None,
-                                   fstab=args.fstab))
+                                   fstab=args.fstab, display=args.display))
     except (ValueError, KeyError, TypeError, OSError, struct.error) as error:
         ap.exit(1, str(error) + '\n')
     limit = ADT_MAX_ROOT if root_props else ADT_MAX

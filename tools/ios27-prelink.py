@@ -17,7 +17,14 @@ the platform kexts they link against, and their dependency closure pulls most of
 them in anyway). --drop-soc removes the nine SoC hardware roots (ApplePMGR,
 scaler, AV/HDCP/CEC, IIS, audio, clocking); no trouble from keeping them has
 been shown yet. --drop-apfs leaves out Apple's APFS kext when the kernel's own
-apfs (xnu27 fuxi/0008, from hakios-arm64e-dada) mounts the root. AMFI's original policy initializer runs before lockdown through
+apfs (xnu27 fuxi/0008, from hakios-arm64e-dada) mounts the root. --drop BUNDLE
+(repeatable) leaves out any root; preflight fails if a dropped bundle is still in
+the closure and names the kexts that link against it. The kernel's stand-in
+IOSurface and IOMobileFramebuffer (boot-arg fuxi_fb=1) need Apple's IOSurface
+and IOMobileFramebuffer classes gone: --drop com.apple.iokit.IOSurface --drop
+com.apple.iokit.IOMobileGraphicsFamily --drop com.apple.iokit.IOGPUFamily --drop
+com.apple.driver.AppleM2ScalerCSCDriver (the 24A446 kexts that link against
+IOSurface). AMFI's original policy initializer runs before lockdown through
 native-security-init (--early-security-init, the profile's address).
 
 Outputs in DIR (refused if kernel.prelinked exists, unless --force):
@@ -96,7 +103,7 @@ def parse_initializers(items):
     return result
 
 
-def preflight(native_data, cache_data, roots, initializers, allow_missing, kit, default_initializer):
+def preflight(native_data, cache_data, roots, initializers, allow_missing, kit, default_initializer, dropped=()):
     """Everything the emitter would trip over later, collected; returns (failures, facts)."""
     kc_image, fileset_emit, fileset_layout = kit[:3]
     failures, facts = [], {}
@@ -132,6 +139,12 @@ def preflight(native_data, cache_data, roots, initializers, allow_missing, kit, 
     try:
         closure = fileset_emit.dependency_closure(cache, roots)
         facts['closure'] = len(closure)
+        if set(dropped) & closure:
+            libraries = {e['CFBundleIdentifier']: e.get('OSBundleLibraries') or {}
+                         for e in fileset_emit.prelink_info(cache)[1]['_PrelinkInfoDictionary']}
+            for bundle in sorted(set(dropped) & closure):
+                users = sorted(b for b in closure if bundle in libraries.get(b, {}))
+                failures.append(f'dropped {bundle} is still in the closure: linked against by {",".join(users) or "?"}')
         for bundle, address in initializers.items():
             entry = kc_image.Image(cache.data, cache.entries[bundle][1])
             if not any(s['name'] == '__TEXT_EXEC' and s['va'] <= address < s['va'] + s['size'] for s in entry.segments):
@@ -428,6 +441,8 @@ def main():
     ap.add_argument('--drop-soc', action='store_true', help='leave out the nine SoC hardware roots')
     ap.add_argument('--drop-apfs', action='store_true',
                     help="leave out Apple's APFS kext (the kernel's own apfs, xnu27 fuxi/0008, mounts the root)")
+    ap.add_argument('--drop', action='append', default=[], metavar='BUNDLE',
+                    help='leave out this root (repeat); preflight fails if it stays in the closure')
     ap.add_argument('--early-security-init', action='append', metavar='BUNDLE=ORIGINAL_VA',
                     help=f'default: {EARLY_SECURITY_INIT} (24A446 j820 only)')
     ap.add_argument('--allow-missing', action='store_true',
@@ -446,6 +461,7 @@ def main():
         roots = [r for r in roots if r not in SOC_ROOTS]
     if a.drop_apfs:
         roots = [r for r in roots if r != 'com.apple.filesystems.apfs']
+    roots = [r for r in roots if r not in a.drop]
     initializers = parse_initializers(a.early_security_init or [EARLY_SECURITY_INIT])
     out = a.out
     output = out / 'kernel.prelinked'
@@ -456,9 +472,9 @@ def main():
     print('reference: ' + (f'{a.reference} (--fileset-reference)' if a.reference else
                            'none: matching against the native kernel only (no RELEASE comparison build given)'))
     failures, facts = preflight(native_data, cache_data, roots, initializers, a.allow_missing, kit,
-                                not a.early_security_init)
+                                not a.early_security_init, a.drop)
     out.mkdir(parents=True, exist_ok=True)
-    pre = {'roots': roots, 'early_security_init': {k: hex(v) for k, v in initializers.items()},
+    pre = {'roots': roots, 'dropped': a.drop, 'early_security_init': {k: hex(v) for k, v in initializers.items()},
            'reference': str(a.reference) if a.reference else None, 'kit': str(a.kit), 'failures': failures,
            'trial': a.trial, **{k: v for k, v in facts.items() if k != 'layout'}, 'layout': facts.get('layout')}
     (out / 'preflight.json').write_text(json.dumps(pre, indent=2) + '\n')

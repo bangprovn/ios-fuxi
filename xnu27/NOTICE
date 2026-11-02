@@ -138,3 +138,12 @@ base/xnu/files/iokit/Kernel/MiniAppleKeyStore.cpp (same commit f1ae906, APSL
 a passcode. The selectors, DER answers and wrap transformation are theirs; the
 file is renamed, started from bsd_init() behind boot-arg fuxi_aks=1 and gated
 by FUXI.
+
+patches/fuxi/0031-iosurface-framebuffer-standins.patch adds
+iokit/Kernel/arm/FuxiIOSurface.cpp/.h and FuxiFramebuffer.cpp, ports of
+hakios-arm64e-dada's MiniIOSurface.cpp/.h and MiniIOMobileFramebuffer.cpp (same
+commit f1ae906, APSL 2.0, derivative works of XNU): IOSurface and
+IOMobileFramebuffer stand-ins. Their protocol work (selectors, surface and swap
+request layouts) is kept; the display is Fuxi's boot splash framebuffer, their
+scan-out, recording and GPU paths are left out, started from bsd_init() behind
+boot-arg fuxi_fb=1 and gated by FUXI.
