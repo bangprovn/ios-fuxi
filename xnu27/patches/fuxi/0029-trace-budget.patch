@@ -1,0 +1,52 @@
+diff --git a/bsd/dev/arm/systemcalls.c b/bsd/dev/arm/systemcalls.c
+index 9b5dc4d..6f329f6 100644
+--- a/bsd/dev/arm/systemcalls.c
++++ b/bsd/dev/arm/systemcalls.c
+@@ -89,15 +89,17 @@ extern int mach_trap_count;
+ #if defined(FUXI)
+ /*
+  * fuxi_trace=NAME[,NAME...]: print the file system calls that fail in the processes with those names
+- * (p_comm), with the path and the error, at most 600 lines a boot. For daemons whose own logging
+- * goes to os_log only.
++ * (p_comm), with the path and the error, at most 120 lines a process and 3000 a boot; a missing
++ * FeatureFlags or Logging preference file is not reported (every process looks for dozens). For
++ * daemons whose own logging goes to os_log only.
+  */
+ static void
+ fuxi_syscall_trace(struct proc *proc, unsigned short code, const u_int64_t *arg, int error)
+ {
+ 	static char names[128];
+ 	static int state;       /* 0 not read, 1 on, 2 off */
+-	static int lines;
++	static int lines, pids[64], pid_lines[64];
++	unsigned slot;
+ 	char path[2][160] = { "", "" };
+ 	int at[2] = { -1, -1 };
+ 	size_t n;
+@@ -105,7 +107,7 @@ fuxi_syscall_trace(struct proc *proc, unsigned short code, const u_int64_t *arg,
+ 	if (state == 0) {
+ 		state = PE_parse_boot_arg_str("fuxi_trace", names, sizeof(names)) && names[0] != '\0' ? 1 : 2;
+ 	}
+-	if (state != 1 || lines >= 600) {
++	if (state != 1 || lines >= 3000) {
+ 		return;
+ 	}
+ 	for (const char *s = names;;) {
+@@ -144,6 +146,17 @@ fuxi_syscall_trace(struct proc *proc, unsigned short code, const u_int64_t *arg,
+ 			strlcpy(path[i], "?", sizeof(path[i]));
+ 		}
+ 	}
++	if (error == ENOENT && (strnstr(path[0], "/FeatureFlags/", sizeof(path[0])) != NULL || strnstr(path[0], "/Preferences/Logging/", sizeof(path[0])) != NULL)) {
++		return;
++	}
++	slot = (unsigned)proc_getpid(proc) % 64;
++	if (pids[slot] != proc_getpid(proc)) {
++		pids[slot] = proc_getpid(proc);
++		pid_lines[slot] = 0;
++	}
++	if (pid_lines[slot]++ >= 120) {
++		return;
++	}
+ 	lines++;
+ 	printf("fuxi: trace %s[%d] syscall %u error %d %s%s%s (args 0x%llx 0x%llx 0x%llx)\n", proc->p_comm,
+ 	    proc_getpid(proc), code, error, path[0], path[1][0] != '\0' ? " -> " : "", path[1],

@@ -81,8 +81,10 @@ def to_console(job, label, log):
     # Only root may open the console: for any other user xpcproxy's open fails with EACCES (the node
     # is 0622, so a policy refuses it), and a job without UserName may still run as mobile (its domain
     # is user/501). Every job writes to a file in JOB_LOGS, which fuxi-init's log relay copies to the
-    # console.
-    job['StandardErrorPath'] = job['StandardOutPath'] = f'{JOB_LOGS}/{label}.log'
+    # console. Output and error get a file each: launchd opens them without O_APPEND, so one shared file
+    # had the two overwriting each other.
+    job['StandardOutPath'] = f'{JOB_LOGS}/{label}.out'
+    job['StandardErrorPath'] = f'{JOB_LOGS}/{label}.err'
     job.pop('_Conclave', None)
     job.pop('_LimitLoadToDeviceTree', None)
     if 'all' in log or label in log:
