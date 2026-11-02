@@ -27,6 +27,17 @@ def main():
             assert p.returncode == 0, p.stderr
             assert 'AddressSanitizer' not in p.stderr and 'runtime error:' not in p.stderr, p.stderr
             print(p.stdout, end='')
+        # fmtl bits 16, 17 and 18: the GPU pass and draw timers and RT_SHADOW without a root write.
+        src = Path(tmp)/'fmtl.cpp'
+        src.write_text('#include "TranslationPolicy.hpp"\n#include <cstdio>\nint main(){fuxi::applyBootOptions("debug=0xc fmtl=50021 x=1");'
+                       'const char *k[]={"FUXI_MTL_ORDER_FETCH_ONLY","FUXI_MTL_SAMPLE_SHADOW","FUXI_MTL_GPU_PASS_TIMES","FUXI_MTL_GPU_DRAW_TIMES","FUXI_MTL_RT_SHADOW"};'
+                       'for(auto *s:k){const char *v=getenv(s);printf("%s=%s\\n",s,v?v:"-");}}\n')
+        subprocess.run(['clang++', '-std=c++17', '-Wall', '-Wextra', '-Werror', '-I'+str(a.headers), '-I'+str(ROOT/'tools/fuxi-metal'),
+                        str(src), '-o', str(Path(tmp)/'fmtl')], check=True)
+        env = {k: v for k, v in os.environ.items() if not k.startswith('FUXI_MTL_')}
+        out = subprocess.run([str(Path(tmp)/'fmtl')], env=env, capture_output=True, text=True, timeout=30, check=True).stdout
+        assert out.split() == ['FUXI_MTL_ORDER_FETCH_ONLY=1', 'FUXI_MTL_SAMPLE_SHADOW=1', 'FUXI_MTL_GPU_PASS_TIMES=1',
+                               'FUXI_MTL_GPU_DRAW_TIMES=-', 'FUXI_MTL_RT_SHADOW=1'], out
 
 
 if __name__ == '__main__':

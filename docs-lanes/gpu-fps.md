@@ -322,3 +322,17 @@ CPU clock budget is two reads per sampled frame. Both versions allocate two
 descriptor sets per traced frame with this workload. Every measured process
 checks exact pixels and deferred two-flight ownership. These numbers establish
 host CPU-work reduction, not achievement of the device's 16.6 ms/heat target.
+
+## Linear samples split, and three more `fmtl` bits
+
+The frame trace's `sampled_mb/frame` linear figure counts each binding at the
+texture's full size, per draw, so it is an upper bound, not traffic. On the
+phone (`d-ft1`) it read 97.4 MB per frame against 13.5 MB optimal. A new field,
+`linear_split/frame=imported:N,imported_mb:M,large:L`, says how much of it is
+IOSurface or other imports (the rest are textures over an `MTLBuffer`), and how
+many of those samples are of a million pixels or more.
+
+`fmtl` (hex, on the boot line) gains bit 16 `FUXI_MTL_GPU_PASS_TIMES`, bit 17
+`FUXI_MTL_GPU_DRAW_TIMES` and bit 18 `FUXI_MTL_RT_SHADOW`, so each can be tried
+without a root write. `RT_SHADOW` has not run on the phone yet. Test:
+`tools/test-fuxi-metal-frametrace.py` checks `applyBootOptions` sets these.
