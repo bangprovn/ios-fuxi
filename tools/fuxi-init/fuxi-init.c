@@ -244,6 +244,72 @@ writable_var(void)
 	    count.skipped_bytes >> 10, count.errors, now_ms() - t0);
 }
 
+/*
+ * dyld searches the OS cryptex as well only when libignition hands it the cryptex root, and
+ * dyld_flags=8 skips libignition (whose image4 sysctl blocks on this kernel). The files that are
+ * only in the cryptex (libobjc-trampolines, the objc message-send variants, ...) are then not
+ * found. dir becomes a directory on ramfs of symlinks: to every entry of the original (bound at
+ * ro) and to every entry of each extra directory that the original lacks.
+ */
+static void
+merge_dir(const char *dir, const char *ro, const char *const *extra, const char *merged)
+{
+	char from[1024], to[1024];
+	unsigned own = 0, added = 0;
+	DIR *d;
+	struct dirent *e;
+	struct stat st;
+
+	if (!bind_ro(dir, ro) || mkdir(merged, 0755) != 0) {
+		say("merge %s: %s", dir, strerror(errno));
+		return;
+	}
+	for (int pass = 0; pass == 0 || extra[pass - 1] != NULL; pass++) {
+		const char *src = pass == 0 ? ro : extra[pass - 1];
+
+		if ((d = opendir(src)) == NULL) {
+			say("merge %s: opendir %s: %s", dir, src, strerror(errno));
+			continue;
+		}
+		while ((e = readdir(d)) != NULL) {
+			if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) {
+				continue;
+			}
+			snprintf(from, sizeof(from), "%s/%s", src, e->d_name);
+			snprintf(to, sizeof(to), "%s/%s", merged, e->d_name);
+			if (lstat(to, &st) == 0) {
+				continue;
+			}
+			if (symlink(from, to) != 0) {
+				say("merge %s: symlink %s: %s", dir, to, strerror(errno));
+				continue;
+			}
+			if (pass == 0) {
+				own++;
+			} else {
+				added++;
+			}
+		}
+		closedir(d);
+	}
+	say("merge %s: %u entries of its own, %u from the cryptexes", dir, own, added);
+	if (added > 0) {
+		bind_ro(merged, dir);
+	}
+}
+
+static void
+cryptex_files(void)
+{
+	static const char *const usr_lib[] = { "/System/Cryptexes/OS/usr/lib", NULL };
+
+	if (mkdir("/private/var/fuxi", 0755) != 0) {
+		say("mkdir /private/var/fuxi: %s", strerror(errno));
+		return;
+	}
+	merge_dir("/usr/lib", DISK "/mnt/usrlib", usr_lib, "/private/var/fuxi/usr-lib");
+}
+
 static void
 job_set(void)
 {
@@ -263,6 +329,7 @@ main(int argc, char **argv, char **envp)
 	console();
 	say("pid %d, preparing /private/var and the job set", getpid());
 	writable_var();
+	cryptex_files();
 	job_set();
 	say("exec /sbin/launchd");
 	/*

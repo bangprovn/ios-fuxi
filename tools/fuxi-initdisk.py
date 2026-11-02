@@ -7,6 +7,7 @@
 OUT_DIR gets:
   init                      process 1 (tools/fuxi-init, built and signed on the Mac), when --init is given
   mnt/var/                  where fuxi-init binds the system volume's read-only /private/var
+  mnt/usrlib/               where it binds /usr/lib before merging the OS cryptex's /usr/lib into it
   jobs/LaunchDaemons/       the job set bound over /System/Library/LaunchDaemons
   jobs/empty/               bound over LaunchAngels and NanoLaunchDaemons
   jobs/xpc/                 bound over /System/Library/xpc: its files except launchd.plist(.sig), so that
@@ -100,7 +101,7 @@ def main():
     vols = Volumes(a.os, a.system_os, a.app_os)
     root = vols.root
 
-    for d in ('mnt/var', 'jobs/LaunchDaemons', 'jobs/empty', 'jobs/xpc'):
+    for d in ('mnt/var', 'mnt/usrlib', 'jobs/LaunchDaemons', 'jobs/empty', 'jobs/xpc'):
         os.makedirs(os.path.join(a.out, d), exist_ok=True)
     if a.init:
         with open(a.init, 'rb') as f, open(os.path.join(a.out, 'init'), 'wb') as g:
