@@ -282,14 +282,26 @@ var_dirs(void)
 	unsigned made = 0;
 
 	for (unsigned i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
-		if (mkdir(dirs[i].path, dirs[i].mode) != 0) {
-			if (errno != EEXIST) {
-				say("mkdir %s: %s", dirs[i].path, strerror(errno));
+		char path[256];
+
+		/* parents first (what is missing gets the same owner and mode), then the directory */
+		strlcpy(path, dirs[i].path, sizeof(path));
+		for (char *slash = strchr(path + 1, '/'); ; slash = strchr(slash + 1, '/')) {
+			if (slash != NULL) {
+				*slash = '\0';
 			}
-			continue;
+			if (mkdir(path, dirs[i].mode) == 0) {
+				chown(path, dirs[i].uid, dirs[i].uid);
+				made++;
+			} else if (errno != EEXIST) {
+				say("mkdir %s: %s", path, strerror(errno));
+				break;
+			}
+			if (slash == NULL) {
+				break;
+			}
+			*slash = '/';
 		}
-		chown(dirs[i].path, dirs[i].uid, dirs[i].uid);
-		made++;
 	}
 	say("var dirs: %u made", made);
 }
