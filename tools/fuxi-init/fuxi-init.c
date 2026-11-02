@@ -336,9 +336,9 @@ cryptex_files(void)
 
 /*
  * launchd looks up personas for the jobs it spawns: the system domain a system proxy persona
- * (type 6) with no user ("No matching personas of type 6 uid -1"), user/501 a system persona
- * (type 4). usermanagerd creates the personas from a manifest it keeps with AppleKeyStore, which
- * Fuxi has not got, so this program makes the two.
+ * (type 6) with no user ("No matching personas of type 6 uid -1"), XPC services of mobile's
+ * processes one with uid 501, user/501 a system persona (type 4). usermanagerd creates the personas from a manifest it keeps with AppleKeyStore, which
+ * Fuxi has not got, so this program makes them.
  */
 static void
 personas(void)
@@ -347,7 +347,11 @@ personas(void)
 		const char *name;
 		int type;
 		uid_t uid;
-	} proxies[] = { { "fuxi.proxy", PERSONA_SYSTEM_PROXY, (uid_t)-1 }, { "fuxi.system.mobile", PERSONA_SYSTEM, 501 } };
+	} proxies[] = {
+		{ "fuxi.proxy", PERSONA_SYSTEM_PROXY, (uid_t)-1 },
+		{ "fuxi.proxy.mobile", PERSONA_SYSTEM_PROXY, 501 },
+		{ "fuxi.system.mobile", PERSONA_SYSTEM, 501 },
+	};
 
 	for (unsigned i = 0; i < sizeof(proxies) / sizeof(proxies[0]); i++) {
 		struct kpersona_info info;

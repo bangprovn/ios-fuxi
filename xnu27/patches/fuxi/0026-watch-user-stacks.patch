@@ -1,0 +1,94 @@
+diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
+index 61cf14e..06cc4b9 100644
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1977,12 +1977,13 @@ extern void IOSleep(unsigned int milliseconds);
+ 
+ /*
+  * With fuxi_proc_log=1: what pid 1's threads are doing, every 20 s for 8 minutes; with
+- * fuxi_watch=NAME also those of every process of that name (p_comm, e.g. backboardd).
++ * fuxi_watch=NAME[,NAME...] also those of every process with one of those names (p_comm, so at
++ * most 16 characters, e.g. backboardd).
+  */
+ static void
+ fuxi_proc_watch(__unused void *arg, __unused wait_result_t wr)
+ {
+-	static char name[MAXCOMLEN + 1];
++	static char name[128];
+ 
+ 	if (!PE_parse_boot_arg_str("fuxi_watch", name, sizeof(name))) {
+ 		name[0] = '\0';
+@@ -1998,8 +1999,17 @@ fuxi_proc_watch(__unused void *arg, __unused wait_result_t wr)
+ 			if ((p = proc_find(pid)) == PROC_NULL) {
+ 				continue;
+ 			}
+-			if (strncmp(p->p_comm, name, sizeof(p->p_comm)) == 0) {
+-				fuxi_task_report(proc_task(p), pid);
++			for (const char *n = name; *n != '\0';) {
++				size_t len = 0;
++
++				while (n[len] != '\0' && n[len] != ',') {
++					len++;
++				}
++				if (len > 0 && strlen(p->p_comm) == len && strncmp(p->p_comm, n, len) == 0) {
++					fuxi_task_report(proc_task(p), pid);
++					break;
++				}
++				n += len + (n[len] == ',');
+ 			}
+ 			proc_rele(p);
+ 		}
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index 3de15f5..3ae0fc2 100644
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -10924,12 +10924,18 @@ void fuxi_task_report(task_t task, int pid);
+ /*
+  * fuxi_proc_log=1 watchdog (bsd kern_exit.c): one line for the task, then one per thread with its
+  * state, wait event, user pc/lr (last trap or interrupt from EL0) and, for a waiting thread, up to
+- * 8 kernel return addresses walked inside its own kernel stack. Kernel addresses are slid.
++ * 8 kernel return addresses walked inside its own kernel stack. Kernel addresses are slid. For a
++ * pid other than 1, each thread's user frame chain follows ("fuxi:   ubt tid: ..." -- PAC stripped,
++ * not unslid; subtract the srslide of the watch line), read from the task's map after the lock.
+  */
+ void
+ fuxi_task_report(task_t task, int pid)
+ {
+ 	thread_t th;
++	struct {
++		uint64_t tid, fp;
++	} uf[32];
++	int nuf = 0;
+ 
+ 	if (task == TASK_NULL) {
+ 		return;
+@@ -10963,7 +10969,29 @@ fuxi_task_report(task_t task, int pid)
+ 		    us != NULL ? (unsigned long long)get_saved_state_reg(us, 0) : 0ULL,
+ 		    us != NULL ? (unsigned long long)get_saved_state_reg(us, 1) : 0ULL,
+ 		    k[0], k[1], k[2], k[3], k[4], k[5], k[6], k[7]);
++		if (pid != 1 && us != NULL && nuf < 32) {
++			uf[nuf].tid = th->thread_id;
++			uf[nuf++].fp = get_saved_state_fp(us);
++		}
+ 	}
++	task_reference(task);
+ 	task_unlock(task);
++	for (int t = 0; t < nuf; t++) {
++		uint64_t ret[12] = { 0 }, frame[2], fp = uf[t].fp;
++		int n = 0;
++
++		while (n < 12 && fp != 0 && (fp & 0xf) == 0 &&
++		    vm_map_read_user(task->map, fp, frame, sizeof(frame)) == KERN_SUCCESS && frame[1] != 0) {
++			ret[n++] = frame[1] & 0x0000007fffffffffULL;
++			if (frame[0] <= fp) {
++				break;
++			}
++			fp = frame[0];
++		}
++		printf("fuxi:   ubt %llu: %llx %llx %llx %llx %llx %llx %llx %llx %llx %llx %llx %llx\n",
++		    (unsigned long long)uf[t].tid, ret[0], ret[1], ret[2], ret[3], ret[4], ret[5], ret[6], ret[7],
++		    ret[8], ret[9], ret[10], ret[11]);
++	}
++	task_deallocate(task);
+ }
+ #endif /* FUXI && __arm64__ */
