@@ -1582,7 +1582,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
    auto it=rtShadows.find(key);
    if(it!=rtShadows.end() && (it->second.w!=l->width || it->second.h!=l->height || it->second.format!=l->format || it->second.sampled!=sampled || it->second.offset!=l->backingOffset || it->second.row!=l->backingRow)){destroyTextureUnlocked(it->second.s);rtShadows.erase(it);it=rtShadows.end();}
    if(it==rtShadows.end()){if(rtRefused.count(key))return -1;
-    while(!rtShadows.empty() && (rtShadows.size()>=8 || rtShadowBytes()+uint64_t(l->width)*l->height*texelBytes(l->format)>shadowBytesCap)){auto victim=rtShadows.begin();for(auto v=rtShadows.begin();v!=rtShadows.end();++v)if(v->second.used<victim->second.used)victim=v;destroyTextureUnlocked(victim->second.s);rtShadows.erase(victim);}
+    while(!rtShadows.empty() && (rtShadows.size()>=16 || rtShadowBytes()+uint64_t(l->width)*l->height*texelBytes(l->format)>(uint64_t(systemTranslationPolicy().rtShadowMb)<<20))){auto victim=rtShadows.begin();for(auto v=rtShadows.begin();v!=rtShadows.end();++v)if(v->second.used<victim->second.used)victim=v;destroyTextureUnlocked(victim->second.s);rtShadows.erase(victim);}
     try {OptionalScope optionalScope(*this);auto *s=allocateTextureUnlocked(l->format,sampled|4u,l->width,l->height);s->rtTarget=true;
      it=rtShadows.emplace(key,RtEntry{s,l->width,l->height,l->format,sampled,l->backingOffset,l->backingRow,0,false}).first;++rtShadowCreated;
      fprintf(stderr,"FUXI MTL: render target shadow created %ux%u format=%u (optimal, %zu bytes) key=%03x total_created=%llu live=%zu\n",l->width,l->height,l->format,s->allocated,unsigned((uintptr_t(key)>>4)&0xfff),(unsigned long long)rtShadowCreated,rtShadows.size());}
@@ -1679,7 +1679,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
  struct RenameImage {Texture *t;uint32_t w,h,format,usage;uint64_t used;};
  std::vector<RenameImage> renamePool;uint64_t rtRenamed=0,rtHoisted=0,rtMergedMain=0,rtMainBefore=0,rtMainAfter=0,rtRenameSubmits=0;
  bool smallOffscreen(Texture *t) {return t && t->tiling==VK_IMAGE_TILING_OPTIMAL && !t->imported && !t->backingBuffer && !t->shadow && !t->rtTarget && !t->mapped && !t->borrowedMemory && t->textureType==2 && t->levels==1 && t->depth==1 && !(t->usage&VK_IMAGE_USAGE_STORAGE_BIT) && uint64_t(t->width)*t->height<=(2u<<20);}
- static constexpr uint64_t renamePoolCap=20u<<20,shadowBytesCap=48u<<20;
+ static constexpr uint64_t renamePoolCap=20u<<20; // the render target shadow cap is FUXI_MTL_RT_SHADOW_MB, default 48
  uint64_t renamePoolBytes() const {uint64_t n=0;for(auto &e:renamePool)n+=uint64_t(e.w)*e.h*texelBytes(e.format);return n;}
  uint64_t rtShadowBytes() const {uint64_t n=0;for(auto &e:rtShadows)n+=uint64_t(e.second.w)*e.second.h*texelBytes(e.second.format);return n;}
  void expireRenamePool() {for(size_t i=0;i<renamePool.size();){auto &e=renamePool[i];if(e.t->references==1 && rtRenameSubmits-e.used>300){destroyTextureUnlocked(e.t);renamePool.erase(renamePool.begin()+i);}else ++i;}} // idle for 300 submits
