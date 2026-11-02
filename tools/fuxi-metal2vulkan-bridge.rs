@@ -1086,6 +1086,8 @@ unsafe fn draw_impl(product:*mut c_void,input:*const DrawInput,out:*mut DrawOutp
   for w in &plan.descriptors {
    let layout=p.descriptors.iter().find(|d|d.set==w.set && d.binding==w.binding && d.ty==w.ty.as_raw() as u32).ok_or("draw layout mismatch")?;
    if w.set!=0 || w.array_element!=0{return Err("descriptor set/array".into());}let mut d=*layout;
+   // Texture views below: 1D, 2D or 3D (0, 1, 2), as reflect_textures admits and Backend viewTypeFor binds. Core Animation's
+   // colour cube is a 3D texture at fragment slot 14; refusing it here sent backboardd to CPU rendering for the rest of the boot.
    match &w.source {
     WriteSource::Neutral(NeutralResource::ZeroBuffer{min_bytes})=>{
      if !matches!(d.ty,6|7) || *min_bytes>16*1024*1024{return Err("neutral buffer bounds/type".into());}
@@ -1102,18 +1104,18 @@ unsafe fn draw_impl(product:*mut c_void,input:*const DrawInput,out:*mut DrawOutp
      let r=c.descriptor_ranges.iter().find(|r|r.set==0 && r.binding==w.binding).ok_or("missing planned buffer range")?;d.offset=r.range.offset;d.range=r.range.range;
     },
     WriteSource::Texture{slot,view}=>{
-     if d.ty!=2 || d.stages!=16 || slot.stage!=Stage::Fragment || slot.class!=SlotClass::Texture || slot.index>=SLOTS || i.formats[slot.index as usize]==0 || !matches!(view.view_type.as_raw(),0|1) || view.aspect.as_raw()!=1 || view.layout.as_raw()!=5 || view.level.is_some() || view.twin || view.shader_swizzle{return Err(format!("M6 draw texture slot={} view={} aspect={} layout={}",slot.index,view.view_type.as_raw(),view.aspect.as_raw(),view.layout.as_raw()));}
+     if d.ty!=2 || d.stages!=16 || slot.stage!=Stage::Fragment || slot.class!=SlotClass::Texture || slot.index>=SLOTS || i.formats[slot.index as usize]==0 || !matches!(view.view_type.as_raw(),0|1|2) || view.aspect.as_raw()!=1 || view.layout.as_raw()!=5 || view.level.is_some() || view.twin || view.shader_swizzle{return Err(format!("M6 draw texture slot={} view={} aspect={} layout={}",slot.index,view.view_type.as_raw(),view.aspect.as_raw(),view.layout.as_raw()));}
      d.slot=slot.index;d.format=view.format.as_raw() as u32;d.components=[view.components.r.as_raw() as u32,view.components.g.as_raw() as u32,view.components.b.as_raw() as u32,view.components.a.as_raw() as u32];
     },
     WriteSource::Sampler{slot,compare:false,integer,opaque_black:OpaqueBlackBorder::Stated}=>{
      if d.ty!=0 || d.stages!=16 || slot.stage!=Stage::Fragment || slot.class!=SlotClass::Sampler || slot.index>=SLOTS || i.filters[slot.index as usize]==0{return Err(format!("M6 draw sampler slot={}",slot.index));}if *integer && i.filters[slot.index as usize]&(2|4|16)!=0{return Err("integer sampler requires nearest filtering".into());}d.sampler=slot.index;
     },
     WriteSource::CombinedImageSampler{image:ImageSource::Texture{slot,view},sampler:SamplerSource::Immutable}=>{
-     if d.ty!=1 || d.stages!=16 || d.sampler!=u32::MAX || slot.stage!=Stage::Fragment || slot.class!=SlotClass::Texture || slot.index>=SLOTS || i.formats[slot.index as usize]==0 || !matches!(view.view_type.as_raw(),0|1) || view.aspect.as_raw()!=1 || view.layout.as_raw()!=5 || view.level.is_some() || view.twin || view.shader_swizzle{return Err(format!("M6 draw constexpr image slot={} view={}",slot.index,view.view_type.as_raw()));}
+     if d.ty!=1 || d.stages!=16 || d.sampler!=u32::MAX || slot.stage!=Stage::Fragment || slot.class!=SlotClass::Texture || slot.index>=SLOTS || i.formats[slot.index as usize]==0 || !matches!(view.view_type.as_raw(),0|1|2) || view.aspect.as_raw()!=1 || view.layout.as_raw()!=5 || view.level.is_some() || view.twin || view.shader_swizzle{return Err(format!("M6 draw constexpr image slot={} view={}",slot.index,view.view_type.as_raw()));}
      d.slot=slot.index;d.format=view.format.as_raw() as u32;d.components=[view.components.r.as_raw() as u32,view.components.g.as_raw() as u32,view.components.b.as_raw() as u32,view.components.a.as_raw() as u32];
     },
     WriteSource::CombinedImageSampler{image:ImageSource::Texture{slot,view},sampler:SamplerSource::Slot{slot:s,compare:false,integer,opaque_black:OpaqueBlackBorder::Stated}}=>{
-     if slot.stage!=Stage::Fragment || slot.class!=SlotClass::Texture || slot.index>=SLOTS || s.stage!=Stage::Fragment || s.class!=SlotClass::Sampler || s.index>=SLOTS || i.formats[slot.index as usize]==0 || i.filters[s.index as usize]==0 || !matches!(view.view_type.as_raw(),0|1) || view.aspect.as_raw()!=1 || view.layout.as_raw()!=5 || view.level.is_some() || view.twin || view.shader_swizzle{return Err(format!("M6 draw sample texture={} sampler={} view={} aspect={} layout={} level={} twin={} swizzle={}",slot.index,s.index,view.view_type.as_raw(),view.aspect.as_raw(),view.layout.as_raw(),view.level.is_some(),view.twin,view.shader_swizzle));}
+     if slot.stage!=Stage::Fragment || slot.class!=SlotClass::Texture || slot.index>=SLOTS || s.stage!=Stage::Fragment || s.class!=SlotClass::Sampler || s.index>=SLOTS || i.formats[slot.index as usize]==0 || i.filters[s.index as usize]==0 || !matches!(view.view_type.as_raw(),0|1|2) || view.aspect.as_raw()!=1 || view.layout.as_raw()!=5 || view.level.is_some() || view.twin || view.shader_swizzle{return Err(format!("M6 draw sample texture={} sampler={} view={} aspect={} layout={} level={} twin={} swizzle={}",slot.index,s.index,view.view_type.as_raw(),view.aspect.as_raw(),view.layout.as_raw(),view.level.is_some(),view.twin,view.shader_swizzle));}
      if *integer && i.filters[s.index as usize]&(2|4|16)!=0{return Err("integer sampler requires nearest filtering".into());}
      // Runtime samplers are clamp-to-edge, so integer/float border colors
      // cannot affect a sampled texel. Comparison sampling remains refused.
