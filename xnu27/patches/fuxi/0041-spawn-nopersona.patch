@@ -1,0 +1,37 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index fb5e8c7..ff07023 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -4039,6 +4039,32 @@ spawn_persona_adopt(proc_t p, struct _posix_spawn_persona_info *px_persona)
+ {
+ 	struct persona *persona = NULL;
+ 
++#if defined(FUXI)
++	/*
++	 * fuxi_spawn_nopersona=1: the persona's credential (uid, gid, groups) is applied, the persona
++	 * itself is not joined, as in HakiOS (APSL 2.0) where no persona exists. usermanagerd's personas
++	 * stay in the kernel for those that look them up (installd wants a daemon container per
++	 * persona), but no job runs in launchd's system proxy persona, which containermanagerd refused
++	 * as INVALID_PERSONA (lsd aborted at every start).
++	 */
++	{
++		static int nopersona = -1;
++
++		if (nopersona < 0) {
++			int on = 0;
++
++			nopersona = PE_parse_boot_argn("fuxi_spawn_nopersona", &on, sizeof(on)) && on == 1;
++		}
++		if (nopersona) {
++			(void)kauth_cred_proc_update(p, PROC_SETTOKEN_SETUGID,
++			    ^bool (kauth_cred_t parent __unused, kauth_cred_t model) {
++				return kauth_cred_model_setpersona(model, px_persona);
++			});
++			return 0;
++		}
++	}
++#endif
++
+ 	/*
+ 	 * we want to spawn into the given persona, but we want to override
+ 	 * the kauth with a different UID/GID combo
