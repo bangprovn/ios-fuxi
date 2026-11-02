@@ -264,6 +264,10 @@ main(int argc, char **argv, char **envp)
 	say("pid %d, preparing /private/var and the job set", getpid());
 	writable_var();
 	job_set();
+	/* the jobs' standard output and error are the console, and most daemons are not root */
+	if (chmod("/dev/console", 0666) != 0) {
+		say("chmod /dev/console: %s", strerror(errno));
+	}
 	say("exec /sbin/launchd");
 	/*
 	 * The kernel starts launchd with no open files; iOS 27's launchd takes an open standard
