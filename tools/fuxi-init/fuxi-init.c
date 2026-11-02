@@ -14,7 +14,10 @@
  *      first boot) back in place instead of copying them;
  *   4. binds the disk's own job set over /System/Library/LaunchDaemons, an empty directory
  *      over LaunchAngels and NanoLaunchDaemons, and the disk's xpc directory (without
- *      launchd.plist) over /System/Library/xpc.
+ *      launchd.plist) over /System/Library/xpc;
+ *   5. merges the OS cryptex's /usr/lib into /usr/lib (merge_dir) and makes the system proxy
+ *      personas launchd asks for (personas);
+ *   6. leaves a child that copies the non-root jobs' output (JOB_LOGS) to the console.
  *
  * The approach -- a process 1 of our own that prepares a writable /private/var and a chosen
  * job set and then execs launchd -- is that of HakiOS / hakios-arm64e-dada (userland init.c
@@ -31,6 +34,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
+#include <sys/param.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -38,6 +42,8 @@
 #define DISK            "/fuxi"
 #define RO_VAR          DISK "/mnt/var"
 #define FILE_LIMIT      (1024 * 1024)
+#define JOB_LOGS        "/private/var/fuxi/log"
+#define MAX_JOB_LOGS    512
 
 /* Subtrees of /private/var bound read only from the system volume instead of copied. */
 static const char *const BIND_SUBTREES[] = {
@@ -51,6 +57,23 @@ static const char *const LOG_MARKERS[] = {
 	"/private/var/db/diagnostics/timesync/.migrated",
 	"/private/var/db/uuidtext/.migrated",
 };
+
+/* bsd/sys/persona.h (xnu, APSL): private, so not in the SDK. */
+struct kpersona_info {
+	uint32_t persona_info_version;
+	uid_t persona_id;
+	int persona_type;
+	gid_t persona_gid;
+	uint32_t persona_ngroups;
+	gid_t persona_groups[NGROUPS];
+	uid_t persona_gmuid;
+	char persona_name[MAXLOGNAME + 1];
+	uid_t persona_uid;
+} __attribute__((packed));
+_Static_assert(sizeof(struct kpersona_info) == 348, "kpersona_info");
+#define PERSONA_INFO_V2         2
+#define PERSONA_SYSTEM_PROXY    6
+int kpersona_alloc(struct kpersona_info *info, uid_t *id);
 
 static struct {
 	unsigned dirs, links, files, skipped, errors;
@@ -310,6 +333,103 @@ cryptex_files(void)
 	merge_dir("/usr/lib", DISK "/mnt/usrlib", usr_lib, "/private/var/fuxi/usr-lib");
 }
 
+/*
+ * launchd looks up a system proxy persona (type 6) of the job's user for every job it spawns
+ * ("Unable to find persona with type 6"). usermanagerd creates the personas from a manifest it
+ * keeps with AppleKeyStore, which Fuxi has not got, so this program makes the two for root and
+ * mobile.
+ */
+static void
+personas(void)
+{
+	static const struct {
+		const char *name;
+		uid_t uid;
+	} proxies[] = { { "fuxi.proxy.root", 0 }, { "fuxi.proxy.mobile", 501 } };
+
+	for (unsigned i = 0; i < sizeof(proxies) / sizeof(proxies[0]); i++) {
+		struct kpersona_info info;
+		uid_t id = 0;
+
+		memset(&info, 0, sizeof(info));
+		info.persona_info_version = PERSONA_INFO_V2;
+		info.persona_id = (uid_t)-1;
+		info.persona_type = PERSONA_SYSTEM_PROXY;
+		info.persona_uid = proxies[i].uid;
+		strlcpy(info.persona_name, proxies[i].name, sizeof(info.persona_name));
+		if (kpersona_alloc(&info, &id) == 0) {
+			say("persona %s (type %d, uid %u): id %u", proxies[i].name, PERSONA_SYSTEM_PROXY, proxies[i].uid, id);
+		} else {
+			say("persona %s: %s", proxies[i].name, strerror(errno));
+		}
+	}
+}
+
+/*
+ * Only root may open the console (xpcproxy gets EACCES for any other user), so fuxi-initdisk
+ * points the other jobs' standard output and error at JOB_LOGS/<label>.log. A child of this
+ * process, which stays when the parent becomes launchd, copies what they write to the console,
+ * each chunk headed by the file name.
+ */
+static void
+log_relay(void)
+{
+	static struct {
+		char name[256];
+		off_t done;
+	} seen[MAX_JOB_LOGS];
+	static char buf[4096];
+	unsigned nseen = 0;
+
+	if (mkdir(JOB_LOGS, 01777) != 0 || chmod(JOB_LOGS, 01777) != 0) {
+		say("mkdir %s: %s", JOB_LOGS, strerror(errno));
+		return;
+	}
+	if (fork() != 0) {
+		return;
+	}
+	for (;;) {
+		DIR *d = opendir(JOB_LOGS);
+		struct dirent *e;
+
+		while (d != NULL && (e = readdir(d)) != NULL) {
+			char path[1024];
+			unsigned i;
+			ssize_t n;
+			int fd;
+
+			if (e->d_name[0] == '.') {
+				continue;
+			}
+			for (i = 0; i < nseen && strcmp(seen[i].name, e->d_name) != 0; i++) {
+			}
+			if (i == nseen) {
+				if (nseen == MAX_JOB_LOGS) {
+					continue;
+				}
+				strlcpy(seen[nseen++].name, e->d_name, sizeof(seen[0].name));
+			}
+			snprintf(path, sizeof(path), "%s/%s", JOB_LOGS, e->d_name);
+			if ((fd = open(path, O_RDONLY)) < 0) {
+				continue;
+			}
+			while ((n = pread(fd, buf, sizeof(buf), seen[i].done)) > 0) {
+				dprintf(2, "fuxi-log %s: ", e->d_name);
+				(void)write(2, buf, (size_t)n);
+				if (buf[n - 1] != '\n') {
+					(void)write(2, "\n", 1);
+				}
+				seen[i].done += n;
+			}
+			close(fd);
+		}
+		if (d != NULL) {
+			closedir(d);
+		}
+		usleep(500 * 1000);
+	}
+}
+
 static void
 job_set(void)
 {
@@ -330,6 +450,8 @@ main(int argc, char **argv, char **envp)
 	say("pid %d, preparing /private/var and the job set", getpid());
 	writable_var();
 	cryptex_files();
+	personas();
+	log_relay();
 	job_set();
 	say("exec /sbin/launchd");
 	/*

@@ -4,6 +4,8 @@
 <dict>
 	<key>com.apple.private.bindfs-allow</key>
 	<true/>
+	<key>com.apple.private.persona-mgmt</key>
+	<true/>
 	<key>platform-application</key>
 	<true/>
 </dict>
