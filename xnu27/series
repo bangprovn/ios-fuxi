@@ -91,3 +91,4 @@ fuxi/0023-sigkill-sender-log.patch
 fuxi/0024-fatal-port-log-nofatal.patch
 fuxi/0025-watch-by-name.patch
 fuxi/0026-watch-user-stacks.patch
+fuxi/0027-apple-keystore-standin.patch

@@ -130,3 +130,11 @@ run clocks. Inside it, bsd/miscfs/apfs/libdeflate/ is libdeflate (MIT, Eric
 Biggers and Google LLC; COPYING kept) and bsd/miscfs/apfs/libzbitmap/ with
 apfs_zbitmap.c is libzbitmap (GPL-2.0+ OR MIT, Corellium LLC), taken under MIT
 as in hakios-arm64e-dada.
+
+patches/fuxi/0027-apple-keystore-standin.patch adds
+iokit/Kernel/arm/FuxiAppleKeyStore.cpp, a port of hakios-arm64e-dada's
+base/xnu/files/iokit/Kernel/MiniAppleKeyStore.cpp (same commit f1ae906, APSL
+2.0, a derivative work of XNU): the AppleKeyStore stand-in for a device without
+a passcode. The selectors, DER answers and wrap transformation are theirs; the
+file is renamed, started from bsd_init() behind boot-arg fuxi_aks=1 and gated
+by FUXI.
