@@ -3,8 +3,8 @@
  * it, started on a second of zeros, and taken down again. What a-play2 did before iOS, here beside iOS.
  * fuxiaudio=2: instead /dev/fuxiaudio, which takes 48 kHz stereo 16 bit from tools/fuxi-audio's HAL plug-in in mediaserverd and never blocks it. The graph starts at the first
  * samples and comes down after two seconds without any. Whichever: no pin is muxed, no amplifier reached, nothing is heard; what this proves is iOS's samples reaching the DSP.
- * fuxiaudioamp=1, with fuxiaudio=2: the bottom amplifier as well, its pins and up while there are samples, at the lowest level the owner has agreed to in the loader. **Not yet run: the
- * owner has agreed to a second of tone there (a-tone5), not to iOS's sound.** Off without it, and then the two functions it calls do nothing at all.
+ * fuxiaudioamp=1, with fuxiaudio=2: the bottom amplifier as well, its pins and up while there are samples, at -30 dB, with analog at 0.5 dB. a-spk1: the owner heard iOS's alert tones through it,
+ * clear and clean, and very quiet. =2 is -20 dB and =3 is -12 dB: each only with the owner's word. Off without it, and then the two functions it calls do nothing at all.
  * fuxiaudio=3: as 2, and /dev/fuxiaudiomic gives what the mic hears to whoever has it open: 48 kHz, one channel of 16 bits, never holding the reader. fuxiaudio=4: as 3, with eight seconds of it taken at the start and counted, with nobody reading.
  * The loader has put apps_smmu's streams 0x1001/0x80 and 0x1061 into context bank 4 (poke 2 and 18); this does not touch the SMMU. The buffer is outside the bank XNU owns. */
 #ifdef FUXI
@@ -42,7 +42,7 @@ void fuxi_audio_dsp_init(void);
 #define FA_TDM_CLOCK    0x202u          /* LPASS_CLK_ID_SEC_TDM_IBIT, as the PRM numbers it */
 #define FA_PERIODS      50u
 #define FA_PERIOD_FRAMES 960u
-#define FA_RING_FRAMES  16384u          /* a power of two: about 340 ms */
+#define FA_RING_FRAMES  65536u          /* a power of two: about 1.4 s. a-spk1: 12288 frames were dropped at the start of every sound while the graph and the amplifier came up */
 #define FA_AHEAD        3u              /* periods the DSP holds at once */
 #define FA_IDLE_PERIODS 100u            /* 2 s of none, and the graph comes down */
 
@@ -460,6 +460,7 @@ static const struct cdevsw fa_cdevsw = {
 #define FA_TLMM 0x0f100000ull
 static vm_offset_t fa_se0, fa_gcc, fa_tlmm;
 static bool fa_amp_wanted, fa_amp_up_now, fa_amp_gave_up;
+static unsigned fa_amp_level;
 
 static vm_offset_t
 fa_amp_va(uint64_t pa)
@@ -569,7 +570,7 @@ fa_amp_up(void)
 		r = au_on_check(&fa_amp);
 	}
 	if (r == AU_ON_OK) {
-		r = au_on_unmute(&fa_amp, 0);
+		r = au_on_unmute(&fa_amp, fa_amp_level);
 	}
 	printf("FUXI AUDIO: amp up: %#x at step %u, reg %#x want %#x got %#x, status %#x %#x\n", r, fa_amp.step, fa_amp.failed_reg, fa_amp.failed_want, fa_amp.failed_got, fa_amp.status[0], fa_amp.status[2]);
 	if (r != AU_ON_OK) {
@@ -594,6 +595,17 @@ fa_amp_down(void)
 }
 
 /* Once in a while as it plays: a flag and it comes down for good. */
+/* fuxiaudioamp=1, 2, 3: the table's levels, and nothing else. */
+static bool
+fa_amp_asked(int amp)
+{
+	if (amp < 1 || (unsigned)amp > AU_ON_LEVELS) {
+		return false;
+	}
+	fa_amp_level = (unsigned)amp - 1u;
+	return true;
+}
+
 static void
 fa_amp_watch(void)
 {
@@ -902,7 +914,7 @@ fa_stream(void)
 {
 	for (;;) {
 		uint64_t frames = 0;
-		uint32_t idle = 0, peak = 0, short_periods = 0, sent_at_last = 0, last_said = 0;
+		uint32_t idle = 0, peak = 0, short_periods = 0, sent_at_last = 0, last_said = 0, sent_at_check = 0;
 
 		while (fa_ring_count() == 0) {
 			if (!fa_poll(0)) {
@@ -941,9 +953,12 @@ fa_stream(void)
 				return;
 			}
 			fa_mic_tick();
+			if (fa_g.write_sent - sent_at_check >= 50) {
+				sent_at_check = fa_g.write_sent;
+				fa_amp_watch();
+			}
 			if (fa_g.write_sent - sent_at_last >= 250) {
 				sent_at_last = fa_g.write_sent;
-				fa_amp_watch();
 				if (last_said != fa_g.write_sent) {
 					printf("FUXI AUDIO: playing: %u periods sent, %u played, %u bad, %u s of samples, peak %u, %u periods short, %u frames dropped\n", fa_g.write_sent, fa_g.write_done, fa_g.write_bad,
 					    (uint32_t)(frames / 48000), peak, short_periods, fa_dropped);
@@ -1018,12 +1033,12 @@ fuxi_audio_dsp_init(void)
 	if (on >= 2) {
 		int major = cdevsw_add(-1, &fa_cdevsw), amp = 0;
 
-		if (PE_parse_boot_argn("fuxiaudioamp", &amp, sizeof(amp)) && amp == 1) {
+		if (PE_parse_boot_argn("fuxiaudioamp", &amp, sizeof(amp)) && fa_amp_asked(amp)) {
 			fa_se0 = ml_io_map((vm_offset_t)FA_SE0, 0x4000);
 			fa_gcc = ml_io_map((vm_offset_t)FA_GCC, 0x80000);
 			fa_tlmm = ml_io_map((vm_offset_t)FA_TLMM, 0x104000);
 			fa_amp_wanted = fa_se0 != 0 && fa_gcc != 0 && fa_tlmm != 0;
-			printf("FUXI AUDIO: the amplifier was asked for: %d\n", fa_amp_wanted);
+			printf("FUXI AUDIO: the amplifier was asked for: %d, level %u\n", fa_amp_wanted, fa_amp_level);
 		}
 
 		if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "fuxiaudio") == NULL) {

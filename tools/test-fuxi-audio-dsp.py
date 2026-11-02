@@ -67,9 +67,9 @@ def main():
     rest = (text.replace(amp, '')).lower()
     for word in ('i2s1', 'geni', 'cs35l41', '0x15000000', 'smmu_', 'au_on_'):
         assert word not in rest, word
-    assert amp.count('au_on_unmute(') == 1 and 'au_on_unmute(&fa_amp, 0)' in amp and 'fa_amp.address = 0x40;' in amp and '0x42' not in amp
+    assert amp.count('au_on_unmute(') == 1 and 'au_on_unmute(&fa_amp, fa_amp_level)' in amp and 'fa_amp.address = 0x40;' in amp and '0x42' not in amp
     assert 'fa_amp_pin(182, 1u | 1u << 9, 0);' in amp and 'fa_amp_pin(182, 1u | 1u << 9, 1)' not in amp and ', 68' not in amp and 'fa_amp_pin(68' not in amp
-    assert 'if (!fa_amp_wanted ||' in amp and 'PE_parse_boot_argn("fuxiaudioamp", &amp, sizeof(amp)) && amp == 1' in text
+    assert 'if (!fa_amp_wanted ||' in amp and 'PE_parse_boot_argn("fuxiaudioamp", &amp, sizeof(amp)) && fa_amp_asked(amp)' in text and 'static unsigned fa_amp_level;' in amp and '(unsigned)amp > AU_ON_LEVELS' in amp
     assert text.count('ml_io_map(') == 9 and 'PE_parse_boot_argn("fuxiaudio"' in text
     # The mic: behind fuxiaudio=3 or 4, its registers behind the votes, and no vote of a rail: the driver of the RSC is Wi-Fi's alone. Nothing in it reaches the amplifier.
     mic = text[text.index('/* ---- the microphone, fuxiaudio=3'):text.index('/* Minor 0 the speaker')]

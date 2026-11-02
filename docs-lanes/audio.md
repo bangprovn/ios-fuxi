@@ -13,7 +13,8 @@
 | Mic capture through the DSP in the loader | 1641 periods, 0 bad. Gain 8 to 16: four times the level. Bias off: sample-to-sample change falls twelve times | `a-cap2` |
 | The speaker heard by the mic, at the same lowest level | 2 kHz: 0.167 LSB before, 25.28 during, 0.754 after. Bias off: 0.019, 0.053, 0.041 | `a-loop1`, `a-loop2` |
 | Mic in the XNU kernel, `fuxiaudio=4` | 7 of 7, 772 periods, 0 bad, came back down | `a-kmic1` |
-| iOS sound through the amplifier (`fuxiaudioamp=1`), the top speaker, any higher level | written or not, **not run: each needs the owner's word** | |
+| The bottom speaker heard by ear | the loader's tone at -30 dB, and iOS's alert tones through `fuxiaudioamp=1`: right tones, clear and clean, very quiet at half volume. 21 s without a bad buffer or a flag | `a-tone7`, `a-spk1` |
+| `fuxiaudioamp=2` and `=3` (-20, -12 dB), the top speaker | written or not, **not run: each needs the owner's word** | |
 | `/dev/fuxiaudiomic` read by the plug-in in mediaserverd | not proved. `fuxisbext=1` gets Safari past TCC to the prompt and the grant; the capture does not start: no StartIOProc on "Codec", no kernel mic line | `a-v8b`, `a-v8c` |
 
 Only numbers leave the phone in the mic's runs; the probes have no request that returns its samples.
