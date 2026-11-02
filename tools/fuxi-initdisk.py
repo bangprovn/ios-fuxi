@@ -17,8 +17,8 @@ The job set follows HakiOS / hakios-arm64e-dada's mkjobs.py (APSL 2.0), reimplem
 (DEFAULT_LABELS when none are given) are copied whole and start as iOS starts them; every other job with
 Mach services whose program is present is kept but on demand only (RunAtLoad, KeepAlive and the other
 start triggers removed), except the labels containing a DENY word (hardware Fuxi has not got, or jobs
-that must not run). Every root job's standard output and error go to the console, every other job's to a file that fuxi-init copies
-there (other users may not open the console); --log adds os_log to
+that must not run). Every job's standard output and error go to a file that fuxi-init copies to the console (only root
+may open the console itself); --log adds os_log to
 standard error for the named labels (or all). _Conclave and _LimitLoadToDeviceTree are dropped: launchd
 refuses a conclave on a job it does not trust, and the device-tree conditions name Apple hardware.
 
@@ -74,13 +74,11 @@ def program_of(job):
 
 
 def to_console(job, label, log):
-    # Only a root job may open the console: for any other user xpcproxy's open fails with EACCES (the
-    # node is 0622, so a policy refuses it) and the job never starts. The others write to a file in
-    # JOB_LOGS, which fuxi-init's log relay copies to the console.
-    if job.get('UserName', 'root') == 'root':
-        job['StandardErrorPath'] = job['StandardOutPath'] = '/dev/console'
-    else:
-        job['StandardErrorPath'] = job['StandardOutPath'] = f'{JOB_LOGS}/{label}.log'
+    # Only root may open the console: for any other user xpcproxy's open fails with EACCES (the node
+    # is 0622, so a policy refuses it), and a job without UserName may still run as mobile (its domain
+    # is user/501). Every job writes to a file in JOB_LOGS, which fuxi-init's log relay copies to the
+    # console.
+    job['StandardErrorPath'] = job['StandardOutPath'] = f'{JOB_LOGS}/{label}.log'
     job.pop('_Conclave', None)
     job.pop('_LimitLoadToDeviceTree', None)
     if 'all' in log or label in log:
