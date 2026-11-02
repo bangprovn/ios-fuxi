@@ -88,3 +88,4 @@ fuxi/0020-pid1-signal-backtrace.patch
 fuxi/0021-fuxi-init-disk.patch
 fuxi/0022-lockdown-mode-state-public.patch
 fuxi/0023-sigkill-sender-log.patch
+fuxi/0024-fatal-port-log-nofatal.patch

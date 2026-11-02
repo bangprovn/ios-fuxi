@@ -1,0 +1,59 @@
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index 7380c28..6be2938 100644
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -8608,6 +8608,17 @@ task_port_space_ast(__unused task_t task)
+ 	}
+ }
+ 
++#if defined(FUXI)
++extern bool fuxi_proc_log(void);
++
++static const char *
++fuxi_task_name(void)
++{
++	void *p = get_bsdtask_info(current_task());
++
++	return p != NULL ? proc_name_address(p) : "?";
++}
++#endif
+ #if CONFIG_PROC_RESOURCE_LIMITS
+ static mach_port_t
+ task_allocate_fatal_port(void)
+@@ -8619,6 +8630,13 @@ task_allocate_fatal_port(void)
+ 	if (kr) {
+ 		return MACH_PORT_NULL;
+ 	}
++#if defined(FUXI)
++	/* fuxi_proc_log=1: which resource limit (or the machdep.task_get_fatal_port sysctl) arms a fatal port */
++	if (fuxi_proc_log()) {
++		printf("fuxi: fatal port for pid %d %s, from 0x%lx\n", proc_selfpid(), fuxi_task_name(),
++		    (unsigned long)VM_KERNEL_UNSLIDE(__builtin_return_address(0)));
++	}
++#endif
+ 	task_fatal_port = ipc_kobject_alloc_port(token, IKOT_TASK_FATAL,
+ 	    IPC_KOBJECT_ALLOC_MAKE_SEND);
+ 
+@@ -8635,6 +8653,22 @@ task_fatal_port_no_senders(ipc_port_t port, __unused mach_port_mscount_t mscount
+ 	task_id_token_t token = ipc_kobject_get_stable(port, IKOT_TASK_FATAL);
+ 
+ 	assert(token != NULL);
++#if defined(FUXI)
++	/*
++	 * Boot-arg fuxi_nofatal=1: a dropped fatal port does not kill the task. On Fuxi the
++	 * resource-violation reports find no taker, so every armed port kills its task at once.
++	 */
++	static int fuxi_nofatal = -1;
++	if (fuxi_nofatal < 0) {
++		int v = 0;
++		fuxi_nofatal = (PE_parse_boot_argn("fuxi_nofatal", &v, sizeof(v)) && v == 1) ? 1 : 0;
++	}
++	if (token && fuxi_nofatal) {
++		printf("fuxi: fatal port dropped (pid %d %s), not killed\n", proc_selfpid(), fuxi_task_name());
++		task_id_token_release(token);
++		return;
++	}
++#endif
+ 	if (token) {
+ 		kr = task_identity_token_try_sigkill(token); /* takes a reference on task */
+ 		task_id_token_release(token); /* consumes ref given by notification */
