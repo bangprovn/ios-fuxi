@@ -1,0 +1,45 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index ff07023..9ed72a1 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -4041,8 +4041,8 @@ spawn_persona_adopt(proc_t p, struct _posix_spawn_persona_info *px_persona)
+ 
+ #if defined(FUXI)
+ 	/*
+-	 * fuxi_spawn_nopersona=1: the persona's credential (uid, gid, groups) is applied, the persona
+-	 * itself is not joined, as in HakiOS (APSL 2.0) where no persona exists. usermanagerd's personas
++	 * fuxi_spawn_nopersona=1: for a system proxy persona the credential (uid, gid, groups) is applied
++	 * and the persona itself is not joined, as in HakiOS (APSL 2.0) where no persona exists. usermanagerd's personas
+ 	 * stay in the kernel for those that look them up (installd wants a daemon container per
+ 	 * persona), but no job runs in launchd's system proxy persona, which containermanagerd refused
+ 	 * as INVALID_PERSONA (lsd aborted at every start).
+@@ -4056,6 +4056,21 @@ spawn_persona_adopt(proc_t p, struct _posix_spawn_persona_info *px_persona)
+ 			nopersona = PE_parse_boot_argn("fuxi_spawn_nopersona", &on, sizeof(on)) && on == 1;
+ 		}
+ 		if (nopersona) {
++			static int logged;
++			struct persona *asked = persona_lookup(px_persona->pspi_id);
++			int type = asked != NULL ? asked->pna_type : -1;
++
++			if (asked != NULL) {
++				persona_put(asked);
++			}
++			if (logged++ < 200) {
++				printf("fuxi: spawn pid %d persona %u (type %d) uid %d: %s\n", proc_getpid(p), px_persona->pspi_id,
++				    type, (int)px_persona->pspi_uid, type == PERSONA_SYSTEM_PROXY ? "credential only" : "joined");
++			}
++			/* only launchd's system proxy personas are what containermanagerd refused */
++			if (type != PERSONA_SYSTEM_PROXY) {
++				goto join;
++			}
+ 			(void)kauth_cred_proc_update(p, PROC_SETTOKEN_SETUGID,
+ 			    ^bool (kauth_cred_t parent __unused, kauth_cred_t model) {
+ 				return kauth_cred_model_setpersona(model, px_persona);
+@@ -4063,6 +4078,7 @@ spawn_persona_adopt(proc_t p, struct _posix_spawn_persona_info *px_persona)
+ 			return 0;
+ 		}
+ 	}
++join:
+ #endif
+ 
+ 	/*
