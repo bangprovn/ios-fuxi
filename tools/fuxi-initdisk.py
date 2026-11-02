@@ -16,7 +16,7 @@ The job set follows HakiOS / hakios-arm64e-dada's mkjobs.py (APSL 2.0), reimplem
 (DEFAULT_LABELS when none are given) are copied whole and start as iOS starts them; every other job with
 Mach services whose program is present is kept but on demand only (RunAtLoad, KeepAlive and the other
 start triggers removed), except the labels containing a DENY word (hardware Fuxi has not got, or jobs
-that must not run). Every job's standard output and error go to the console; --log adds os_log to
+that must not run). Every root job's standard output and error go to the console (other users may not open it); --log adds os_log to
 standard error for the named labels (or all). _Conclave and _LimitLoadToDeviceTree are dropped: launchd
 refuses a conclave on a job it does not trust, and the device-tree conditions name Apple hardware.
 
@@ -71,7 +71,13 @@ def program_of(job):
 
 
 def to_console(job, label, log):
-    job['StandardErrorPath'] = job['StandardOutPath'] = '/dev/console'
+    # Only a root job may open the console: for any other user xpcproxy's open fails with EACCES (the
+    # node is 0622, so a policy refuses it) and the job never starts. Those keep launchd's default.
+    if job.get('UserName', 'root') == 'root':
+        job['StandardErrorPath'] = job['StandardOutPath'] = '/dev/console'
+    else:
+        job.pop('StandardErrorPath', None)
+        job.pop('StandardOutPath', None)
     job.pop('_Conclave', None)
     job.pop('_LimitLoadToDeviceTree', None)
     if 'all' in log or label in log:
