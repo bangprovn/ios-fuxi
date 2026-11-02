@@ -89,3 +89,4 @@ fuxi/0021-fuxi-init-disk.patch
 fuxi/0022-lockdown-mode-state-public.patch
 fuxi/0023-sigkill-sender-log.patch
 fuxi/0024-fatal-port-log-nofatal.patch
+fuxi/0025-watch-by-name.patch

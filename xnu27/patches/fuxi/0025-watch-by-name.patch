@@ -1,0 +1,57 @@
+diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
+index b9e20be..61cf14e 100644
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1975,10 +1975,18 @@ fuxi_proc_log(void)
+ 
+ extern void IOSleep(unsigned int milliseconds);
+ 
+-/* With fuxi_proc_log=1: what pid 1's threads are doing, every 20 s for 8 minutes. */
++/*
++ * With fuxi_proc_log=1: what pid 1's threads are doing, every 20 s for 8 minutes; with
++ * fuxi_watch=NAME also those of every process of that name (p_comm, e.g. backboardd).
++ */
+ static void
+ fuxi_proc_watch(__unused void *arg, __unused wait_result_t wr)
+ {
++	static char name[MAXCOMLEN + 1];
++
++	if (!PE_parse_boot_arg_str("fuxi_watch", name, sizeof(name))) {
++		name[0] = '\0';
++	}
+ 	for (int i = 0; i < 24; i++) {
+ 		IOSleep(i == 0 ? 15000 : 20000);
+ 		proc_t p = proc_find(1);
+@@ -1986,6 +1994,15 @@ fuxi_proc_watch(__unused void *arg, __unused wait_result_t wr)
+ 			fuxi_task_report(proc_task(p), 1);
+ 			proc_rele(p);
+ 		}
++		for (int pid = 2; name[0] != '\0' && pid < 4096; pid++) {
++			if ((p = proc_find(pid)) == PROC_NULL) {
++				continue;
++			}
++			if (strncmp(p->p_comm, name, sizeof(p->p_comm)) == 0) {
++				fuxi_task_report(proc_task(p), pid);
++			}
++			proc_rele(p);
++		}
+ 	}
+ }
+ 
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index 6be2938..3de15f5 100644
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -10935,10 +10935,10 @@ fuxi_task_report(task_t task, int pid)
+ 		return;
+ 	}
+ 	task_lock(task);
+-	printf("fuxi: watch pid %d threads %d faults %llu pageins %llu dyld_info 0x%llx kslide 0x%lx\n", pid,
++	printf("fuxi: watch pid %d threads %d faults %llu pageins %llu dyld_info 0x%llx kslide 0x%lx srslide 0x%x\n", pid,
+ 	    task->thread_count, (unsigned long long)counter_load(&task->faults),
+ 	    (unsigned long long)counter_load(&task->pageins), (unsigned long long)task->all_image_info_addr,
+-	    (unsigned long)vm_kernel_slide);
++	    (unsigned long)vm_kernel_slide, task->task_shared_region_slide);
+ 	queue_iterate(&task->threads, th, thread_t, task_threads) {
+ 		struct arm_saved_state *us = th->machine.upcb;
+ 		uint64_t k[8] = { 0 };
