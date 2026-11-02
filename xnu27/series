@@ -97,3 +97,4 @@ fuxi/0029-trace-budget.patch
 fuxi/0030-crash-backtraces.patch
 fuxi/0031-iosurface-framebuffer-standins.patch
 fuxi/0032-iouc-macf-bypass.patch
+fuxi/0033-fuxi-iouc-open-sandbox-filter.patch

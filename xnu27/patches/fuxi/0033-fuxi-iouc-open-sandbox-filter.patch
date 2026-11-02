@@ -1,0 +1,50 @@
+diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
+index 5ef80b3..2c6bf5e 100644
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -4556,6 +4556,13 @@ is_io_service_open_extended(
+ 
+ 			OSSafeReleaseNULL(requiredEntitlement);
+ 
++#if defined(FUXI)
++			static int fuxi_iouc_open = -1, fuxi_iouc_logged;
++
++			if (fuxi_iouc_open < 0 && !PE_parse_boot_argn("fuxi_iouc_open", &fuxi_iouc_open, sizeof(fuxi_iouc_open))) {
++				fuxi_iouc_open = 0;
++			}
++#endif
+ 			if (disallowAccess) {
+ 				res = kIOReturnNotPrivileged;
+ 			}
+@@ -4566,11 +4573,6 @@ is_io_service_open_extended(
+ 				 * fuxi_iouc_open=1: the Sandbox kext refuses user clients its profiles allow (even
+ 				 * RootDomainUserClient to mDNSResponder), so a MACF refusal is logged and let through.
+ 				 */
+-				static int fuxi_iouc_open = -1, fuxi_iouc_logged;
+-
+-				if (fuxi_iouc_open < 0 && !PE_parse_boot_argn("fuxi_iouc_open", &fuxi_iouc_open, sizeof(fuxi_iouc_open))) {
+-					fuxi_iouc_open = 0;
+-				}
+ 				if (fuxi_iouc_open == 1) {
+ 					if (fuxi_iouc_logged++ < 200) {
+ 						IOLog("IOUC %s failed MACF in process %s: allowed (fuxi_iouc_open)\n",
+@@ -4598,6 +4600,19 @@ is_io_service_open_extended(
+ 					} else if (kIOReturnSuccess == res) {
+ 						client->filterForTask(owningTask, filterPolicy);
+ 					} else {
++#if defined(FUXI)
++						/*
++						 * fuxi_iouc_open=1: the Sandbox kext's filter policy refuses as its MACF check does,
++						 * and the client is closed: let it open unfiltered.
++						 */
++						if (fuxi_iouc_open == 1) {
++							if (fuxi_iouc_logged++ < 200) {
++								IOLog("IOUC %s failed sandbox in process %s: allowed unfiltered (fuxi_iouc_open)\n",
++								    client->getMetaClass()->getClassName(), creatorNameCStr);
++							}
++							res = kIOReturnSuccess;
++						} else
++#endif
+ 						IOLog("IOUC %s failed sandbox in process %s\n",
+ 						    client->getMetaClass()->getClassName(), creatorNameCStr);
+ 					}
