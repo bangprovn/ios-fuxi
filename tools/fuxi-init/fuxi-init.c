@@ -263,6 +263,14 @@ writable_var(void)
 			close(fd);
 		}
 	}
+	/*
+	 * Directories iOS makes at boot that the system volume's /private/var has not got:
+	 * /private/var/keybags holds keybagd's system bag and usermanagerd's user sessions and
+	 * persona manifest (every create there failed with ENOENT, and usermanagerd aborted).
+	 */
+	if (mkdir("/private/var/keybags", 0700) != 0) {
+		say("mkdir /private/var/keybags: %s", strerror(errno));
+	}
 	say("/private/var on ramfs: %u dirs %u links %u files (%llu KB), %u files over %d KB skipped (%llu KB), "
 	    "%u errors, %llu ms", count.dirs, count.links, count.files, count.bytes >> 10, count.skipped, FILE_LIMIT >> 10,
 	    count.skipped_bytes >> 10, count.errors, now_ms() - t0);
