@@ -35,8 +35,10 @@
 #include <string.h>
 #include <sys/mount.h>
 #include <sys/param.h>
+#include <sys/sysctl.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <signal.h>
 #include <unistd.h>
 
 #define DISK            "/fuxi"
@@ -45,6 +47,9 @@
 #define JOB_LOGS        "/private/var/fuxi/log"
 #define DAEMON_LOGS     "/private/var/logs"
 #define MAX_JOB_LOGS    512
+/* What usermanagerd's boot task (fuxi-initdisk's BOOT_TASKS) prints last. */
+#define UM_TASK_LOG     "fuxi.boottask.usermanagerd.out"
+#define UM_TASK_DONE    "DONE UMD_INIT"
 
 /* Subtrees of /private/var bound read only from the system volume instead of copied. */
 static const char *const BIND_SUBTREES[] = {
@@ -497,6 +502,37 @@ personas(void)
 }
 
 /*
+ * usermanagerd's daemon reads the persona manifest once, at start. launchd runs the boot task
+ * (usermanagerd --init) as an ordinary job here, not before the daemons as on iOS, and the daemon
+ * comes up as soon as the task has saved the manifest's first version (the system personas):
+ * it then answers every user persona query with ENOENT, containermanagerd has no personas
+ * and refuses persona 200 (INVALID_PERSONA), and lsd and SpringBoard never finish starting.
+ * When the task is done, the daemon is stopped; launchd starts it again on demand, with the
+ * whole manifest.
+ */
+static void
+restart_usermanagerd(void)
+{
+	int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
+	struct kinfo_proc *procs;
+	size_t size = 0;
+
+	if (sysctl(mib, 3, NULL, &size, NULL, 0) != 0 || (procs = malloc(size += 16 * sizeof(*procs))) == NULL) {
+		return;
+	}
+	if (sysctl(mib, 3, procs, &size, NULL, 0) == 0) {
+		for (size_t i = 0; i < size / sizeof(*procs); i++) {
+			if (strcmp(procs[i].kp_proc.p_comm, "usermanagerd") == 0) {
+				say("usermanagerd's boot task is done: stopping usermanagerd[%d] to reload the persona manifest",
+				    procs[i].kp_proc.p_pid);
+				(void)kill(procs[i].kp_proc.p_pid, SIGTERM);
+			}
+		}
+	}
+	free(procs);
+}
+
+/*
  * Only root may open the console (xpcproxy gets EACCES for any other user), so fuxi-initdisk
  * points the other jobs' standard output and error at JOB_LOGS/<label>.log. A child of this
  * process, which stays when the parent becomes launchd, copies what they write to the console,
@@ -513,6 +549,7 @@ log_relay(void)
 	} seen[MAX_JOB_LOGS];
 	static char buf[4096];
 	unsigned nseen = 0;
+	int um_task = 0;        /* 1: its last line seen, 2..: waited that many rounds, -1: restarted */
 
 	if (mkdir(JOB_LOGS, 01777) != 0 || chmod(JOB_LOGS, 01777) != 0) {
 		say("mkdir %s: %s", JOB_LOGS, strerror(errno));
@@ -550,6 +587,10 @@ log_relay(void)
 				while ((n = pread(fd, buf, sizeof(buf), seen[i].done)) > 0) {
 					dprintf(2, "fuxi-log %s: ", e->d_name);
 					(void)write(2, buf, (size_t)n);
+					if (um_task == 0 && strcmp(e->d_name, UM_TASK_LOG) == 0 &&
+					    memmem(buf, (size_t)n, UM_TASK_DONE, strlen(UM_TASK_DONE)) != NULL) {
+						um_task = 1;
+					}
 					if (buf[n - 1] != '\n') {
 						(void)write(2, "\n", 1);
 					}
@@ -560,6 +601,11 @@ log_relay(void)
 			if (d != NULL) {
 				closedir(d);
 			}
+		}
+		/* give the task a second to exit, so that only the daemon is left */
+		if (um_task > 0 && ++um_task > 3) {
+			restart_usermanagerd();
+			um_task = -1;
 		}
 		usleep(500 * 1000);
 	}
