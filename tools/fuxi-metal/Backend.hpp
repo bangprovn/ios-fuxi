@@ -247,6 +247,22 @@ private:
   if(optionalAlloc && shortBy()){++optionalRefusals;throw std::runtime_error("optional feature headroom");}
   limits.reserve(bytes);
  }
+ // A submit may not shed (its rewritten ops point at the shadows), so an IOSurface import inside one that finds the budget full
+ // fails backboardd over to the CPU (d-v12-rtb: 1125x2436 import, no shed). Before the rewrite nothing points at them yet: with
+ // under submitHeadroom left, the optional memory goes here instead.
+ static constexpr size_t submitHeadroom=32u<<20;
+ uint64_t submitSheds=0;
+ void shedBeforeSubmit() {
+  if(poisoned || ResourceLimits::budget-limits.used>=submitHeadroom)return;
+  if(sampleShadows.empty() && renamePool.empty() && rtShadows.empty())return;
+  const size_t before=limits.used;
+  releaseSampleShadows();releaseRenamePool();releaseRtShadows();++submitSheds;
+  // Released textures may sit in the recycling pools still charged; hand back what the headroom needs.
+  auto shortBy=[&]()->size_t{size_t left=ResourceLimits::budget-limits.used;return left<submitHeadroom?submitHeadroom-left:0;};
+  if(shortBy())textureMemory.reclaim(shortBy(),[&](VkDeviceMemory h,size_t n){freePooledUnlocked(h,n);});
+  if(shortBy())slabMemory.reclaim(shortBy(),[&](VkDeviceMemory h,size_t n){freePooledUnlocked(h,n);});
+  fprintf(stderr,"FUXI MTL: budget pressure shed optional memory before submit (sheds=%llu used=%zu->%zu)\n",(unsigned long long)submitSheds,before,limits.used);
+ }
  struct OptionalScope {Backend &b;bool old;explicit OptionalScope(Backend &x):b(x),old(x.optionalAlloc){b.optionalAlloc=true;}~OptionalScope(){b.optionalAlloc=old;}};
  // Two independently resettable lanes. A busy lane belongs to its retirement.
  // kind bits name the resource for conflict diagnostics: 1 buffer, 2 shadow backing, 4 texture, 8 surface, 16 index.
@@ -1776,6 +1792,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
   std::unique_lock<std::mutex> guard(mutex,std::defer_lock);{PhaseTimer phase(SubPhase::wait);guard.lock();}
   if(currentFrame)currentFrame->backendLock+=since(submitStart);
   requireLive();
+  shedBeforeSubmit();
   const bool sequenceLog=systemTranslationPolicy().passTimes && (opSequenceSubmits++%300)==1;
   struct HoldRelease {Backend &b;std::vector<Texture *> held;~HoldRelease(){for(auto *t:held)b.destroyTextureUnlocked(t);}} renameHold{*this,{}};
   const bool rtRenaming=systemTranslationPolicy().rtRename && ops.size()>2;size_t mainBefore=0;
