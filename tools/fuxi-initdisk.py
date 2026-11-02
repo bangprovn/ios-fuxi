@@ -18,7 +18,7 @@ The job set follows HakiOS / hakios-arm64e-dada's mkjobs.py (APSL 2.0), reimplem
 Mach services whose program is present is kept but on demand only (RunAtLoad, KeepAlive and the other
 start triggers removed), except the labels containing a DENY word (hardware Fuxi has not got, or jobs
 that must not run). Every job's standard output and error go to a file that fuxi-init copies to the console (only root
-may open the console itself); --log adds os_log to
+may open the console itself). BOOT_TASKS (keybagd --init, usermanagerd --init) are added as run-once jobs. --log adds os_log to
 standard error for the named labels (or all). _Conclave and _LimitLoadToDeviceTree are dropped: launchd
 refuses a conclave on a job it does not trust, and the device-tree conditions name Apple hardware.
 
@@ -47,6 +47,10 @@ START_KEYS = ('RunAtLoad', 'KeepAlive', 'StartInterval', 'StartCalendarInterval'
 STDERR_LOG = {'OS_ACTIVITY_DT_MODE': 'YES', 'ACTIVITY_LOG_STDERR': '1', 'CFLOG_FORCE_STDERR': '1'}
 JOBS = '/System/Library/LaunchDaemons'
 JOB_LOGS = '/private/var/fuxi/log'   # fuxi-init's JOB_LOGS
+# launchd's own boot tasks that set up /private/var/keybags (usermanagerd's persona manifest among it). launchd
+# skips them on this boot, and AMFI's launch constraints kill them when anything but launchd starts them, so
+# they become jobs that run once at load.
+BOOT_TASKS = {'keybag': ['/usr/libexec/keybagd', '--init'], 'usermanagerd': ['/usr/libexec/usermanagerd', '--init']}
 
 
 class Volumes:
@@ -134,6 +138,12 @@ def main():
             on_demand += 1
         to_console(job, label, a.log)
         with open(os.path.join(a.out, 'jobs/LaunchDaemons', name), 'wb') as f:
+            plistlib.dump(job, f, fmt=plistlib.FMT_BINARY)
+    for task, argv in BOOT_TASKS.items():
+        label = f'fuxi.boottask.{task}'
+        job = {'Label': label, 'ProgramArguments': argv, 'RunAtLoad': True, 'LaunchOnlyOnce': True, 'UserName': 'root'}
+        to_console(job, label, a.log)
+        with open(os.path.join(a.out, 'jobs/LaunchDaemons', label + '.plist'), 'wb') as f:
             plistlib.dump(job, f, fmt=plistlib.FMT_BINARY)
     missing = [l for l in labels if f'{l}.plist' not in names]
     print(f'{named} named jobs, {on_demand} on demand, of {len(names)}' + (f'; missing labels {missing}' if missing else ''))
