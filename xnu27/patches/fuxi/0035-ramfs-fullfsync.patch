@@ -1,0 +1,28 @@
+diff --git a/bsd/miscfs/ramfs/ramfs.c b/bsd/miscfs/ramfs/ramfs.c
+index ed657fd..ed17ab3 100644
+--- a/bsd/miscfs/ramfs/ramfs.c
++++ b/bsd/miscfs/ramfs/ramfs.c
+@@ -1378,10 +1378,21 @@ ramfs_readlink(struct vnop_readlink_args *ap)
+ 	return uiomove(node->rn_target, (int)node->rn_size, ap->a_uio);
+ }
+ 
++/*
++ * F_FULLFSYNC and F_BARRIERFSYNC (fcntl(2) hands them to the filesystem): what is written here is as
++ * stable as it will ever be. usermanagerd saves its persona manifest with F_BARRIERFSYNC, and with
++ * ENOTTY it threw the new file away and aborted at every start ("failed to load persona manifest").
++ */
+ static int
+-ramfs_ioctl(__unused struct vnop_ioctl_args *ap)
++ramfs_ioctl(struct vnop_ioctl_args *ap)
+ {
+-	return ENOTTY;
++	switch (ap->a_command) {
++	case F_FULLFSYNC:
++	case F_BARRIERFSYNC:
++		return 0;
++	default:
++		return ENOTTY;
++	}
+ }
+ 
+ /* Last reference gone: a node without a name has no reason to linger in the vnode cache. */
