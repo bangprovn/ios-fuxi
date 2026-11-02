@@ -1,0 +1,135 @@
+diff --git a/bsd/dev/arm/systemcalls.c b/bsd/dev/arm/systemcalls.c
+index 0906700..9b5dc4d 100644
+--- a/bsd/dev/arm/systemcalls.c
++++ b/bsd/dev/arm/systemcalls.c
+@@ -86,6 +86,71 @@ extern int mach_trap_count;
+  *
+  * Outputs:	none
+  */
++#if defined(FUXI)
++/*
++ * fuxi_trace=NAME[,NAME...]: print the file system calls that fail in the processes with those names
++ * (p_comm), with the path and the error, at most 600 lines a boot. For daemons whose own logging
++ * goes to os_log only.
++ */
++static void
++fuxi_syscall_trace(struct proc *proc, unsigned short code, const u_int64_t *arg, int error)
++{
++	static char names[128];
++	static int state;       /* 0 not read, 1 on, 2 off */
++	static int lines;
++	char path[2][160] = { "", "" };
++	int at[2] = { -1, -1 };
++	size_t n;
++
++	if (state == 0) {
++		state = PE_parse_boot_arg_str("fuxi_trace", names, sizeof(names)) && names[0] != '\0' ? 1 : 2;
++	}
++	if (state != 1 || lines >= 600) {
++		return;
++	}
++	for (const char *s = names;;) {
++		size_t len = 0;
++
++		while (s[len] != '\0' && s[len] != ',') {
++			len++;
++		}
++		if (len > 0 && strlen(proc->p_comm) == len && strncmp(proc->p_comm, s, len) == 0) {
++			break;
++		}
++		if (s[len] == '\0') {
++			return;
++		}
++		s += len + 1;
++	}
++	switch (code) {
++	case 5: case 10: case 15: case 16: case 33: case 58: case 136: case 137: case 167: case 200: case 220:
++	case 221: case 338: case 340: case 345: case 398:
++		at[0] = 0;
++		break;
++	case 9: case 57: case 128:
++		at[0] = 0; at[1] = 1;
++		break;
++	case 463: case 464: case 466: case 470: case 472: case 475: case 476:
++		at[0] = 1;
++		break;
++	case 462: case 488:
++		at[0] = 1; at[1] = 3;
++		break;
++	default:
++		break;
++	}
++	for (int i = 0; i < 2; i++) {
++		if (at[i] >= 0 && copyinstr((user_addr_t)arg[at[i]], path[i], sizeof(path[i]), &n) != 0) {
++			strlcpy(path[i], "?", sizeof(path[i]));
++		}
++	}
++	lines++;
++	printf("fuxi: trace %s[%d] syscall %u error %d %s%s%s (args 0x%llx 0x%llx 0x%llx)\n", proc->p_comm,
++	    proc_getpid(proc), code, error, path[0], path[1][0] != '\0' ? " -> " : "", path[1],
++	    (unsigned long long)arg[0], (unsigned long long)arg[1], (unsigned long long)arg[2]);
++}
++#endif /* FUXI */
++
+ void
+ unix_syscall(
+ 	struct arm_saved_state * state,
+@@ -204,6 +269,11 @@ skip_syscall:
+ 	assertf(prior == NULL, "thread_set_allocation_name(\"%s\") not cleared", kern_allocation_get_name(prior));
+ #endif /* DEBUG || DEVELOPMENT */
+ 
++#if defined(FUXI)
++	if (error != 0 && error != ERESTART && error != EJUSTRETURN) {
++		fuxi_syscall_trace(proc, code, uthread->uu_arg, error);
++	}
++#endif /* FUXI */
+ 	arm_prepare_syscall_return(callp, state, uthread, error);
+ 
+ 	uthread->uu_flag &= ~UT_NOTCANCELPT;
+diff --git a/iokit/Kernel/arm/FuxiAppleKeyStore.cpp b/iokit/Kernel/arm/FuxiAppleKeyStore.cpp
+index 3cf4a7b..9b194f5 100644
+--- a/iokit/Kernel/arm/FuxiAppleKeyStore.cpp
++++ b/iokit/Kernel/arm/FuxiAppleKeyStore.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Fuxi: a stand-in AppleKeyStore (boot-arg fuxi_aks=1).
++ * Fuxi: a stand-in AppleKeyStore (boot-arg fuxi_aks=1; fuxi_aks=2 also logs every call).
+  *
+  * Fuxi has no Secure Enclave and no AppleKeyStore kext, so every MobileKeyBag / libaks call fails
+  * ("Can't find AppleKeyStore service"); usermanagerd then cannot keep its persona manifest and
+@@ -63,6 +63,7 @@ enum {
+ 
+ static uint64_t gAKSLogged[4];          /* selectors already reported */
+ static bool     gAKSNotifyState;
++static int      gAKSVerbose;            /* fuxi_aks=2: log every call (the first 400) */
+ 
+ /* Append SEQUENCE { UTF8String key, INTEGER value } for a value below 128; returns the new length. */
+ static size_t
+@@ -221,6 +222,15 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 	uint8_t der[128];
+ 	uint64_t * out = args->scalarOutput;
+ 
++	if (gAKSVerbose > 0 && gAKSVerbose <= 400) {
++		char procname[32] = "?";
++
++		gAKSVerbose++;
++		proc_selfname(procname, sizeof(procname));
++		IOLog("FuxiAppleKeyStore: %s[%d] selector 0x%x (scalars %u in, %u out; structure %u in, %u out)%s0x%llx\n",
++		    procname, proc_selfpid(), selector, args->scalarInputCount, args->scalarOutputCount, args->structureInputSize,
++		    args->structureOutputSize, " scalar0 ", args->scalarInputCount > 0 ? (unsigned long long)args->scalarInput[0] : 0ULL);
++	}
+ 	switch (selector) {
+ 	case kAKSOpenCheck:
+ 	case kAKSLockDevice:
+@@ -327,9 +337,10 @@ fuxi_aks_start(void)
+ {
+ 	int on = 0;
+ 
+-	if (!PE_parse_boot_argn("fuxi_aks", &on, sizeof(on)) || on != 1) {
++	if (!PE_parse_boot_argn("fuxi_aks", &on, sizeof(on)) || on < 1) {
+ 		return;
+ 	}
++	gAKSVerbose = on >= 2;
+ 	/* user space looks for it by class, and by the path IOService:/IOResources/AppleKeyStore */
+ 	IOService * resources = IOService::getResourceService();
+ 	AppleKeyStore * store = OSTypeAlloc(AppleKeyStore);

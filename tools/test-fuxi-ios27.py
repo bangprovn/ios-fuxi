@@ -61,7 +61,7 @@ def layout():
     listed = series()
     files = sorted(p.relative_to(X27 / 'patches').as_posix() for p in (X27 / 'patches').rglob('*.patch'))
     assert sorted(listed) == files and len(set(listed)) == len(listed), 'series and patches/ differ'
-    assert listed[-27:] == ['fuxi/0001-machine-config.patch', 'fuxi/0002-builtin-crypto.patch',
+    assert listed[-28:] == ['fuxi/0001-machine-config.patch', 'fuxi/0002-builtin-crypto.patch',
                            'fuxi/0003-console.patch', 'fuxi/0004-components.patch', 'fuxi/0005-crypto-kext-handoff.patch',
                            'fuxi/0006-log-ring-fileset.patch', 'fuxi/0007-root27-storage.patch',
                            'fuxi/0008-dada-apfs.patch', 'fuxi/0009-cryptex-graft.patch', 'fuxi/0010-proc-log.patch',
@@ -75,7 +75,8 @@ def layout():
                            'fuxi/0024-fatal-port-log-nofatal.patch',
                            'fuxi/0025-watch-by-name.patch',
                            'fuxi/0026-watch-user-stacks.patch',
-                           'fuxi/0027-apple-keystore-standin.patch']
+                           'fuxi/0027-apple-keystore-standin.patch',
+                           'fuxi/0028-syscall-trace-aks-verbose.patch']
     plog = (X27 / 'patches/fuxi/0010-proc-log.patch').read_text()
     assert plog.count('+#if defined(FUXI)') == 4 and 'PE_parse_boot_argn("fuxi_proc_log"' in plog
     watch = (X27 / 'patches/fuxi/0011-pid1-watch.patch').read_text()
@@ -112,6 +113,8 @@ def layout():
     assert 'vm_map_read_user' in ubt and 'fuxi:   ubt' in ubt
     aks = (X27 / 'patches/fuxi/0027-apple-keystore-standin.patch').read_text()
     assert 'fuxi_aks' in aks and 'MiniAppleKeyStore.cpp' in aks and 'APSL 2.0' in aks
+    trace = (X27 / 'patches/fuxi/0028-syscall-trace-aks-verbose.patch').read_text()
+    assert 'fuxi_trace' in trace and 'fuxi: trace' in trace and 'gAKSVerbose' in trace
     # 0009: the kernel grafts the SystemOS/AppOS cryptexes and the dyld cache directory when ignition is skipped.
     graft = (X27 / 'patches/fuxi/0009-cryptex-graft.patch').read_text()
     for need in ('+fuxi_root27_graft(void)', 'PE_parse_boot_argn("fuxi_root27_cryptex"', '"/private/preboot/Cryptexes/OS"',
