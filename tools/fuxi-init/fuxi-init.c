@@ -17,7 +17,7 @@
  *      launchd.plist) over /System/Library/xpc;
  *   5. merges the OS cryptex's /usr/lib into /usr/lib (merge_dir) and makes the system proxy
  *      personas launchd asks for (personas);
- *   6. leaves a child that copies the non-root jobs' output (JOB_LOGS) to the console.
+ *   6. leaves a child that copies the non-root jobs' output (JOB_LOGS) and DAEMON_LOGS to the console.
  *
  * The approach -- a process 1 of our own that prepares a writable /private/var and a chosen
  * job set and then execs launchd -- is that of HakiOS / hakios-arm64e-dada (userland init.c
@@ -43,6 +43,7 @@
 #define RO_VAR          DISK "/mnt/var"
 #define FILE_LIMIT      (1024 * 1024)
 #define JOB_LOGS        "/private/var/fuxi/log"
+#define DAEMON_LOGS     "/private/var/logs"
 #define MAX_JOB_LOGS    512
 
 /* Subtrees of /private/var bound read only from the system volume instead of copied. */
@@ -499,13 +500,15 @@ personas(void)
  * Only root may open the console (xpcproxy gets EACCES for any other user), so fuxi-initdisk
  * points the other jobs' standard output and error at JOB_LOGS/<label>.log. A child of this
  * process, which stays when the parent becomes launchd, copies what they write to the console,
- * each chunk headed by the file name.
+ * each chunk headed by the file name. It copies DAEMON_LOGS too, where some daemons (usermanagerd)
+ * write their own log files.
  */
 static void
 log_relay(void)
 {
+	static const char *const dirs[] = { JOB_LOGS, DAEMON_LOGS };
 	static struct {
-		char name[256];
+		char path[512];
 		off_t done;
 	} seen[MAX_JOB_LOGS];
 	static char buf[4096];
@@ -519,42 +522,44 @@ log_relay(void)
 		return;
 	}
 	for (;;) {
-		DIR *d = opendir(JOB_LOGS);
-		struct dirent *e;
+		for (unsigned k = 0; k < sizeof(dirs) / sizeof(dirs[0]); k++) {
+			DIR *d = opendir(dirs[k]);
+			struct dirent *e;
 
-		while (d != NULL && (e = readdir(d)) != NULL) {
-			char path[1024];
-			unsigned i;
-			ssize_t n;
-			int fd;
+			while (d != NULL && (e = readdir(d)) != NULL) {
+				char path[512];
+				unsigned i;
+				ssize_t n;
+				int fd;
 
-			if (e->d_name[0] == '.') {
-				continue;
-			}
-			for (i = 0; i < nseen && strcmp(seen[i].name, e->d_name) != 0; i++) {
-			}
-			if (i == nseen) {
-				if (nseen == MAX_JOB_LOGS) {
+				if (e->d_name[0] == '.') {
 					continue;
 				}
-				strlcpy(seen[nseen++].name, e->d_name, sizeof(seen[0].name));
-			}
-			snprintf(path, sizeof(path), "%s/%s", JOB_LOGS, e->d_name);
-			if ((fd = open(path, O_RDONLY)) < 0) {
-				continue;
-			}
-			while ((n = pread(fd, buf, sizeof(buf), seen[i].done)) > 0) {
-				dprintf(2, "fuxi-log %s: ", e->d_name);
-				(void)write(2, buf, (size_t)n);
-				if (buf[n - 1] != '\n') {
-					(void)write(2, "\n", 1);
+				snprintf(path, sizeof(path), "%s/%s", dirs[k], e->d_name);
+				for (i = 0; i < nseen && strcmp(seen[i].path, path) != 0; i++) {
 				}
-				seen[i].done += n;
+				if (i == nseen) {
+					if (nseen == MAX_JOB_LOGS) {
+						continue;
+					}
+					strlcpy(seen[nseen++].path, path, sizeof(seen[0].path));
+				}
+				if ((fd = open(path, O_RDONLY)) < 0) {
+					continue;
+				}
+				while ((n = pread(fd, buf, sizeof(buf), seen[i].done)) > 0) {
+					dprintf(2, "fuxi-log %s: ", e->d_name);
+					(void)write(2, buf, (size_t)n);
+					if (buf[n - 1] != '\n') {
+						(void)write(2, "\n", 1);
+					}
+					seen[i].done += n;
+				}
+				close(fd);
 			}
-			close(fd);
-		}
-		if (d != NULL) {
-			closedir(d);
+			if (d != NULL) {
+				closedir(d);
+			}
 		}
 		usleep(500 * 1000);
 	}
