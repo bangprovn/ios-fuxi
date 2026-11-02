@@ -1,0 +1,38 @@
+diff --git a/bsd/kern/sys_persona.c b/bsd/kern/sys_persona.c
+index 8807526..a7f1578 100644
+--- a/bsd/kern/sys_persona.c
++++ b/bsd/kern/sys_persona.c
+@@ -144,6 +144,33 @@ kpersona_alloc_syscall(user_addr_t infop, user_addr_t idp, user_addr_t path)
+ 		id = kinfo.persona_id;
+ 	}
+ 
++#if defined(FUXI)
++	/*
++	 * Fuxi's init allocates usermanagerd's personas (same id, name and type) before launchd
++	 * starts, since launchd tags every job with a persona when it spawns it and usermanagerd
++	 * only makes them a minute later. usermanagerd's own allocation then finds the persona
++	 * there already: it is answered as if it had made it, not with EEXIST.
++	 */
++	if (id != PERSONA_ID_NONE && login != NULL) {
++		struct persona *existing = persona_lookup(id);
++
++		if (existing != NULL) {
++			bool same = existing->pna_type == kinfo.persona_type &&
++			    strncmp(existing->pna_login, login, sizeof(existing->pna_login)) == 0;
++
++			persona_put(existing);
++			if (same) {
++				printf("fuxi: persona %u (%s) exists already: allocated\n", id, login);
++				error = copyout(&id, idp, sizeof(id));
++				if (error == 0) {
++					error = kpersona_copyout(&kinfo, infop);
++				}
++				return error;
++			}
++		}
++	}
++#endif
++
+ 	if (path) {
+ 		pna_path = zalloc_flags(ZV_NAMEI, Z_WAITOK | Z_ZERO);
+ 

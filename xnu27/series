@@ -100,3 +100,4 @@ fuxi/0032-iouc-macf-bypass.patch
 fuxi/0033-fuxi-iouc-open-sandbox-filter.patch
 fuxi/0034-sandbox-permissive.patch
 fuxi/0035-ramfs-fullfsync.patch
+fuxi/0036-persona-realloc.patch
