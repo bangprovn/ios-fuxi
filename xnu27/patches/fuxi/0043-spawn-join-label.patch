@@ -1,5 +1,5 @@
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 9ed72a1..681d9a8 100644
+index 9ed72a1..fd12ee1 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
 @@ -4034,8 +4034,44 @@ kauth_cred_model_setpersona(
@@ -48,12 +48,12 @@ index 9ed72a1..681d9a8 100644
  {
  	struct persona *persona = NULL;
  
-@@ -4063,12 +4099,29 @@ spawn_persona_adopt(proc_t p, struct _posix_spawn_persona_info *px_persona)
+@@ -4063,12 +4099,41 @@ spawn_persona_adopt(proc_t p, struct _posix_spawn_persona_info *px_persona)
  			if (asked != NULL) {
  				persona_put(asked);
  			}
 +			/*
-+			 * fuxi_spawn_join=WORD: a spawn whose argv[1] (xpcproxy's job label) holds WORD joins even a
++			 * fuxi_spawn_join=WORD[,WORD]: a spawn whose argv[1] (xpcproxy's job label) holds a WORD joins even a
 +			 * system proxy persona, as on a device. installd exits at every start without one ("Failed
 +			 * to get installd daemon container", its persona GET and PIDINFO give ESRCH).
 +			 */
@@ -67,8 +67,20 @@ index 9ed72a1..681d9a8 100644
 +					join_word[0] = '\0';
 +				}
 +			}
-+			joins = type != PERSONA_SYSTEM_PROXY ||
-+			    (join_word[0] != '\0' && strnstr(fuxi_label, join_word, MAXPATHLEN) != NULL);
++			joins = type != PERSONA_SYSTEM_PROXY;
++			/* WORD may be a comma separated list */
++			for (const char *w = join_word; !joins && *w != '\0';) {
++				const char *comma = strchr(w, ',');
++				size_t n = comma != NULL ? (size_t)(comma - w) : strlen(w);
++				char one[64];
++
++				if (n > 0 && n < sizeof(one)) {
++					memcpy(one, w, n);
++					one[n] = '\0';
++					joins = strnstr(fuxi_label, one, MAXPATHLEN) != NULL;
++				}
++				w += n + (comma != NULL);
++			}
  			if (logged++ < 200) {
 -				printf("fuxi: spawn pid %d persona %u (type %d) uid %d: %s\n", proc_getpid(p), px_persona->pspi_id,
 -				    type, (int)px_persona->pspi_uid, type == PERSONA_SYSTEM_PROXY ? "credential only" : "joined");
@@ -81,7 +93,7 @@ index 9ed72a1..681d9a8 100644
  				goto join;
  			}
  			(void)kauth_cred_proc_update(p, PROC_SETTOKEN_SETUGID,
-@@ -5051,7 +5104,14 @@ do_fork1:
+@@ -5051,7 +5116,14 @@ do_fork1:
  			 * to ensure that the new persona has access to the image/file
  			 * being executed.
  			 */
