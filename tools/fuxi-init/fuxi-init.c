@@ -17,7 +17,8 @@
  *      launchd.plist) over /System/Library/xpc;
  *   5. merges the OS cryptex's /usr/lib into /usr/lib (merge_dir) and makes the system proxy
  *      personas launchd asks for (personas);
- *   6. leaves a child that copies the non-root jobs' output (JOB_LOGS) to the console.
+ *   6. leaves a child that copies the non-root jobs' output (JOB_LOGS) to the console;
+ *   7. runs the boot tasks that launchd skips here but the daemons need (boot_tasks).
  *
  * The approach -- a process 1 of our own that prepares a writable /private/var and a chosen
  * job set and then execs launchd -- is that of HakiOS / hakios-arm64e-dada (userland init.c
@@ -37,6 +38,8 @@
 #include <sys/param.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/wait.h>
+#include <signal.h>
 #include <unistd.h>
 
 #define DISK            "/fuxi"
@@ -436,6 +439,56 @@ log_relay(void)
 	}
 }
 
+/*
+ * launchd's own boot tasks "keybag" (keybagd --init) and "usermanagerd" (usermanagerd --init) set up
+ * /private/var/keybags, among it usermanagerd's persona manifest (persona.kb); without it every
+ * usermanagerd aborts "Daemon failed to load persona manifest". launchd skips both on this boot (they
+ * are not PerformAlways), so they run here, one at a time, each for at most BOOT_TASK_SECONDS.
+ */
+#define BOOT_TASK_SECONDS       30
+
+static void
+boot_tasks(void)
+{
+	static char *const keybagd[] = { "keybagd", "--init", NULL };
+	static char *const usermanagerd[] = { "/usr/libexec/usermanagerd", "--init", NULL };
+	static const struct {
+		const char *program;
+		char *const *argv;
+	} tasks[] = {
+		{ "/usr/libexec/keybagd", keybagd },
+		{ "/usr/libexec/usermanagerd", usermanagerd },
+	};
+	static char *const env[] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", NULL };
+
+	for (unsigned i = 0; i < sizeof(tasks) / sizeof(tasks[0]); i++) {
+		unsigned long long t0 = now_ms();
+		int status = 0;
+		pid_t pid = fork(), done = 0;
+
+		if (pid == 0) {
+			execve(tasks[i].program, tasks[i].argv, env);
+			_exit(127);
+		}
+		if (pid < 0) {
+			say("boot task %s: fork: %s", tasks[i].program, strerror(errno));
+			continue;
+		}
+		while ((done = waitpid(pid, &status, WNOHANG)) == 0 && now_ms() - t0 < BOOT_TASK_SECONDS * 1000ULL) {
+			usleep(100 * 1000);
+		}
+		if (done == 0) {
+			kill(pid, SIGKILL);
+			waitpid(pid, &status, 0);
+			say("boot task %s %s: killed after %d s", tasks[i].program, tasks[i].argv[1], BOOT_TASK_SECONDS);
+			continue;
+		}
+		say("boot task %s %s: %s %d, %llu ms", tasks[i].program, tasks[i].argv[1],
+		    WIFSIGNALED(status) ? "signal" : "exit", WIFSIGNALED(status) ? WTERMSIG(status) : WEXITSTATUS(status),
+		    now_ms() - t0);
+	}
+}
+
 static void
 job_set(void)
 {
@@ -458,6 +511,7 @@ main(int argc, char **argv, char **envp)
 	cryptex_files();
 	personas();
 	log_relay();
+	boot_tasks();
 	job_set();
 	say("exec /sbin/launchd");
 	/*
