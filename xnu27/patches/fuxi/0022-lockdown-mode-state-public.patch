@@ -1,0 +1,19 @@
+diff --git a/bsd/kern/lockdown_mode.c b/bsd/kern/lockdown_mode.c
+index 1c104b3..2a94feb 100644
+--- a/bsd/kern/lockdown_mode.c
++++ b/bsd/kern/lockdown_mode.c
+@@ -39,6 +39,14 @@ int lockdown_mode_state = 0;
+ 
+ SYSCTL_DECL(_security_mac);
+ SYSCTL_INT(_security_mac, OID_AUTO, lockdown_mode_state, CTLFLAG_RD | CTLFLAG_LOCKED, &lockdown_mode_state, 0, "Lockdown Mode state");
++#if defined(FUXI)
++/*
++ * iOS 27's libsystem_darwin (os_lockdown_mode_enabled) reads this name and asserts when it is
++ * missing, which aborts launchd; xnu-12377 has only the one above. Same value, read only.
++ */
++SYSCTL_INT(_security_mac, OID_AUTO, lockdown_mode_state_public, CTLFLAG_RD | CTLFLAG_LOCKED, &lockdown_mode_state, 0,
++    "Lockdown Mode state");
++#endif
+ 
+ __startup_func
+ void

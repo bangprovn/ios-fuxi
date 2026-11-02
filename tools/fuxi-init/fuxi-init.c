@@ -256,7 +256,7 @@ job_set(void)
 int
 main(int argc, char **argv, char **envp)
 {
-	static char *const launchd_argv[] = { "launchd", NULL };
+	static char *const launchd_argv[] = { "/sbin/launchd", NULL };
 
 	(void)argc;
 	(void)argv;
@@ -265,7 +265,15 @@ main(int argc, char **argv, char **envp)
 	writable_var();
 	job_set();
 	say("exec /sbin/launchd");
+	/*
+	 * The kernel starts launchd with no open files; iOS 27's launchd takes an open standard
+	 * output as being run by hand ("launchd cannot be run directly (stdout: 1)") and exits.
+	 */
+	close(0);
+	close(1);
+	close(2);
 	execve("/sbin/launchd", launchd_argv, envp);
+	console();
 	say("exec /sbin/launchd: %s", strerror(errno));
 	return 1;
 }
