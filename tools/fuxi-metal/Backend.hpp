@@ -1369,6 +1369,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
  struct OccPlan {std::vector<uint8_t> culled,hasCover,reads,mask;std::vector<Cover> cover;};
  // no-proof backoff: after 600 submits in which no cover was ever proven, analyze only every 64th submit; any proof resets it
  uint64_t nfBuilt=0;double nfBuildMs=0;uint64_t fetchSplitBarriers=0; // FUXI_MTL_FETCH_SPLIT: in-pass barriers issued before fetch draws
+ uint64_t fetchMergeSplits=0; // merge refusals: a fetch draw that would read an unflagged write of its own merged pass begins a new pass
  // FUXI_MTL_NOFETCH_RP: lazily built no-input-attachment pipeline variants
  std::atomic<uint64_t> occIdle{0},occSkipped{0};uint64_t occOkSeen{0};
  bool occProbe(){uint64_t ok=occCoverOk;if(ok!=occOkSeen){occOkSeen=ok;occIdle=0;}uint64_t n=++occIdle;if(n<=600||n%64==0)return true;++occSkipped;return false;}
@@ -2160,6 +2161,14 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
     mergeEnds.resize(ops.size());if(boundaryPerf)mergeAreas.resize(ops.size());
     auto area=[&](size_t n){auto &op=ops[n];return VkExtent2D{op.areaWidth?op.areaWidth:op.texture->levelWidth(op.dstLevel),op.areaHeight?op.areaHeight:op.texture->levelHeight(op.dstLevel)};};
     size_t first=0;VkExtent2D runArea{};
+    // A framebuffer-fetch draw reads its attachments as input attachments. Inside one Vulkan pass only rasterization-order access makes an
+    // earlier draw's writes visible to that read, and only for draws whose pipeline carries the RASTERIZATION_ORDER blend flag (Turnip sysmem:
+    // FLUSH_PER_OVERLAP is that pipeline's static prim mode). FUXI_MTL_ORDER_FETCH_ONLY=1 leaves the flag off ordinary pipelines; with
+    // FUXI_MTL_FETCH_SPLIT=1 a by-region barrier precedes the fetch draw, otherwise the fetch draw must begin a new pass, whose load sees the
+    // stored writes exactly as with merging off. Merged, it read stale texels: one triangle of a CA quad wrong, backdrop materials black.
+    const bool fetchNeedsPass=orderedColorAccess && systemTranslationPolicy().orderFetchOnly && !systemTranslationPolicy().fetchSplit;
+    auto unflagged=[&](size_t n){return fetchNeedsPass && ops[n].pipeline && !ops[n].pipeline->fetchMask;};
+    bool runUnflagged=false; // some draw of the run [first, n) writes its attachments without the rasterization-order flag
     auto isolated=[&](size_t n)->MergeSplit {
      auto &op=ops[n];if(!op.texture || !op.pipeline || op.clearOnly || op.upload || op.generateMips || op.src || op.dst)return MergeSplit::nonDraw;
      if(op.pipeline->fetchMask && !orderedColorAccess)return MergeSplit::fetch;
@@ -2205,12 +2214,16 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
        if(t && backing && (backing->memory==t->memory || hostRangesOverlap(backing->contents,backing->length,t->mapped,t->allocated)))return MergeSplit::shadow;
       }
      }
+     // y reads, by framebuffer fetch, attachments that an unflagged earlier draw of this run wrote: nothing orders that write before the read.
+     if(runUnflagged && y.pipeline->fetchMask)return MergeSplit::fetch;
      return MergeSplit::none;
     };
-    for(size_t n=1;n<=ops.size();++n){if(boundaryPerf && n==first+1 && ops[first].pipeline)runArea=area(first);auto reason=n==ops.size()?MergeSplit::none:boundary(n-1,n);
-     if(n<ops.size() && reason==MergeSplit::none){if(boundaryPerf){auto next=area(n);runArea={std::max(runArea.width,next.width),std::max(runArea.height,next.height)};}if(currentFrame && ops[n-1].encoderID!=ops[n].encoderID)++currentFrame->crossEncoderMerges;continue;}
+    for(size_t n=1;n<=ops.size();++n){if(n==first+1)runUnflagged=unflagged(first);if(boundaryPerf && n==first+1 && ops[first].pipeline)runArea=area(first);auto reason=n==ops.size()?MergeSplit::none:boundary(n-1,n);
+     if(n<ops.size() && reason==MergeSplit::none){runUnflagged=runUnflagged || unflagged(n);if(boundaryPerf){auto next=area(n);runArea={std::max(runArea.width,next.width),std::max(runArea.height,next.height)};}if(currentFrame && ops[n-1].encoderID!=ops[n].encoderID)++currentFrame->crossEncoderMerges;continue;}
      for(size_t i=first;i<n;++i){mergeEnds[i]=n-1;if(boundaryPerf)mergeAreas[i]=runArea;}
      if(currentFrame && n<ops.size() && (ops[n-1].pipeline || ops[n].pipeline))++currentFrame->mergeSplits[size_t(reason)];
+     if(reason==MergeSplit::fetch && fetchNeedsPass){auto count=++fetchMergeSplits;
+      if(count<=8 || !(count&(count-1)))fprintf(stderr,"FUXI MTL: merge split before fetch draw (unflagged write earlier in the pass, order_fetch_only=1 fetch_split=0) count=%llu\n",(unsigned long long)count);}
      first=n;
     }
    }
