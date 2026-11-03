@@ -1,0 +1,40 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 8f5cb9a..4fa5e77 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8857,10 +8857,32 @@ process_signature(proc_t p, struct image_params *imgp)
+ 	}
+ 
+ 	/* call the launch constraints hook */
+-	os_reason_t launch_constraint_reason;
++	os_reason_t launch_constraint_reason = OS_REASON_NULL;
+ 	if ((error = mac_proc_check_launch_constraints(p, imgp, &launch_constraint_reason)) != 0) {
+-		signature_failure_reason = launch_constraint_reason;
+-		goto done;
++		/*
++		 * boot-arg fuxi_lcskip=WORD: the programs whose path holds WORD are let through AMFI's launch
++		 * constraints (category 1 wants the system volume; Fuxi's own tools live on the init disk)
++		 */
++		static char fuxi_lcskip[64];
++		static int fuxi_lcskip_read;
++		const char *fuxi_path = imgp->ip_strings + strlen(EXECUTABLE_KEY);
++
++		if (!fuxi_lcskip_read) {
++			if (!PE_parse_boot_argn("fuxi_lcskip", fuxi_lcskip, sizeof(fuxi_lcskip))) {
++				fuxi_lcskip[0] = '\0';
++			}
++			fuxi_lcskip_read = 1;
++		}
++		if (fuxi_lcskip[0] != '\0' && strnstr(fuxi_path, fuxi_lcskip, MAXPATHLEN) != NULL) {
++			printf("fuxi: pid %d %s: launch constraints error %d skipped\n", proc_getpid(p), fuxi_path, error);
++			if (launch_constraint_reason != OS_REASON_NULL) {
++				os_reason_free(launch_constraint_reason);
++			}
++			error = 0;
++		} else {
++			signature_failure_reason = launch_constraint_reason;
++			goto done;
++		}
+ 	}
+ 
+ 	/*
