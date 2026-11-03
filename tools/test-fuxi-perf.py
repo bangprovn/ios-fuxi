@@ -819,7 +819,7 @@ int main(void) {
  reset_init();arg_name="fsf";arg_value=60;fp_configure();arg_name=0;log_count=0;
  all_temp(610);fp_worker(0,0);
  assert(fp_ready && fp_floor[1]==11 && fp_floor[2]==10 && fp_floor[0]==fp_cool[0] && log_count==2);
- assert(strstr(last_log,"ready policy launch 0 ms high 2323200/2342400 kHz (silver cool), scroll floor 60% 1785600/1843200 kHz (0 = off, cool 1401600/1363200)"));
+ assert(strstr(last_log,"ready policy launch 0 ms high 2323200/2342400 kHz (silver cool), floor 60% 1785600/1843200 kHz on touch 1 frames 0 ms (0 = off, cool 1401600/1363200)"));
  ticks=101;fuxi_perf_input();fp_worker(0,0);
  assert(!fp_boosted && fp_floor_on && scheduled==121);
  assert(regs[1][0x320/4]==11 && regs[2][0x320/4]==10 && regs[0][0x320/4]==fp_cool[0]);
@@ -829,7 +829,7 @@ int main(void) {
  all_temp(620);ticks=1700;fuxi_perf_input();fp_worker(0,0);
  assert(!fp_floor_on && fp_blocked && regs[1][0x320/4]==fp_cool[1]);
  ticks=10100;fp_worker(0,0);
- assert(strstr(last_log,"policy launches 0 launch 0 ms refused 0 floor 1501 ms L3 votes 0"));
+ assert(strstr(last_log,"policy touch boosts 0 0 ms, launches 0 0 ms refused 0, floor touch 1501 ms frames 0 ms, L3 votes 0"));
  /* Touch keeps its high vote; when its duty runs out the floor holds. */
  reset_init();arg_name="fsf";arg_value=60;fp_configure();arg_name=0;fp_worker(0,0);
  ticks=101;fuxi_perf_input();fp_worker(0,0);
@@ -840,7 +840,7 @@ int main(void) {
   * the touch duty; the touch boost still works and is cut on its own. */
  reset_init();arg_name="fla";arg_value=2000;fp_configure();arg_name=0;log_count=0;fp_worker(0,0);
  assert(fp_launch_hold==2000 && log_count==2);
- assert(strstr(last_log,"ready policy launch 2000 ms high 2323200/2342400 kHz (silver cool), scroll floor 0% "));
+ assert(strstr(last_log,"ready policy launch 2000 ms high 2323200/2342400 kHz (silver cool), floor 0% "));
  ticks=200;fuxi_perf_launch("Preferences");
  assert(scheduled==200 && fp_launch==200 && log_count==3 && strstr(last_log,"launch exec 1 Preferences"));
  fp_worker(0,0);
@@ -855,7 +855,7 @@ int main(void) {
  assert(strstr(last_log,"launch boost 2001 ms, ended by hold at 450 dC"));
  ticks=2210;fuxi_perf_input();fp_worker(0,0);assert(fp_boosted); /* 2 s of launch spent no duty */
  ticks=10100;fp_worker(0,0);
- assert(strstr(last_log,"policy launches 1 launch 2001 ms refused 0 floor 0 ms L3 votes 0"));
+ assert(strstr(last_log,"policy touch boosts 2 8090 ms, launches 1 2001 ms refused 0, floor touch 0 ms frames 0 ms, L3 votes 0"));
  /* Start refusal is counted once per exec and logged; a running launch is
   * cut by the hot latch. Off: the hook neither wakes nor logs. */
  reset_init();arg_name="fla";arg_value=2000;fp_configure();arg_name=0;all_temp(610);fp_worker(0,0);
@@ -879,6 +879,55 @@ int main(void) {
  ticks=200;fuxi_perf_launch("Preferences");fp_worker(0,0);
  assert(fp_launch_high && !fp_boosted && regs[5][0x90/4]==14);
  ticks=2201;fp_worker(0,0);assert(!fp_launch_high && regs[5][0x90/4]==12 && l3_writes==2);
+ /* fsw: frames alone hold the floor (fsf's PCT, else 60). The second swap of
+  * a burst wakes the worker, a lone swap does not, a touch without fsf does
+  * not floor, the hot latch vetoes it and silences the wake, and the window
+  * line splits touch and frame time. Off: swaps schedule nothing new. */
+ const unsigned fsw_args[4][2]={{99,0},{100,100},{1000,1000},{1001,0}};
+ for(unsigned i=0;i<4;i++) {
+  reset();arg_name="fsw";arg_value=fsw_args[i][0];fp_configure();
+  assert(fp_frame_ms==fsw_args[i][1] && fp_frame_hold==fsw_args[i][1] && !fp_floor_touch);
+  assert(fp_floor_pct==(fsw_args[i][1]?60u:0u));
+ }
+ reset();arg_name="fsf";arg_value=70;arg_name2="fsw";arg_value2=300;fp_configure();
+ assert(fp_floor_pct==70 && fp_floor_touch && fp_frame_ms==300);
+ arg_name=arg_name2=0;
+ reset_init();arg_name="fsw";arg_value=300;fp_configure();arg_name=0;all_temp(610);fp_worker(0,0);
+ assert(fp_floor[1]==11 && fp_floor[2]==10 && scheduled==200);
+ assert(strstr(last_log,"floor 60% 1785600/1843200 kHz on touch 0 frames 300 ms (0 = off, cool 1401600/1363200)"));
+ ticks=150;fuxi_perf_swap();assert(scheduled==200); /* a lone swap */
+ ticks=158;fuxi_perf_swap();assert(scheduled==158);
+ fp_worker(0,0);
+ assert(fp_floor_on && fp_floor_frames && regs[1][0x320/4]==11 && regs[2][0x320/4]==10 && regs[0][0x320/4]==fp_cool[0] && scheduled==178);
+ ticks=166;fuxi_perf_swap();assert(scheduled==178); /* on: no wake */
+ for(unsigned t=174;t<=1000;t+=8){ticks=t;fuxi_perf_swap();if(ticks>=scheduled)fp_worker(0,0);assert(fp_floor_on);}
+ ticks=1290;fp_worker(0,0);assert(fp_floor_on); /* last swaps 990, 998 */
+ ticks=1291;fp_worker(0,0);assert(!fp_floor_on && regs[1][0x320/4]==fp_cool[1] && scheduled==1391);
+ ticks=3000;fuxi_perf_swap();assert(scheduled==1391);fp_worker(0,0);assert(!fp_floor_on);
+ ticks=3100;fuxi_perf_input();fp_worker(0,0);assert(!fp_floor_on && !fp_boosted && regs[1][0x320/4]==fp_cool[1]);
+ all_temp(620);ticks=3200;fuxi_perf_swap();ticks=3208;fuxi_perf_swap();fp_worker(0,0);
+ assert(fp_blocked && !fp_floor_on && regs[1][0x320/4]==fp_cool[1]);
+ { uint64_t before=scheduled;ticks=3216;fuxi_perf_swap();assert(scheduled==before); }
+ ticks=10100;fp_worker(0,0);
+ assert(strstr(last_log,"policy touch boosts 0 0 ms, launches 0 0 ms refused 0, floor touch 0 ms frames 1133 ms, L3 votes 0"));
+ /* Touch and frames together: touch time while the input holds, frame time
+  * after it, one continuous floor. */
+ reset_init();arg_name="fsf";arg_value=60;arg_name2="fsw";arg_value2=300;fp_configure();arg_name=arg_name2=0;
+ all_temp(610);fp_worker(0,0);
+ ticks=101;fuxi_perf_input();fuxi_perf_swap();fuxi_perf_swap();fp_worker(0,0);
+ assert(fp_floor_on && !fp_floor_frames);
+ for(unsigned t=109;t<=2000;t+=8) {
+  ticks=t;fuxi_perf_swap();if(ticks>=scheduled)fp_worker(0,0);
+  assert(fp_floor_on);
+  if(t<=1601)assert(!fp_floor_frames);
+  if(t>=1632)assert(fp_floor_frames);
+ }
+ ticks=2289;fp_worker(0,0);assert(fp_floor_on); /* last swaps 1989, 1997 */
+ ticks=2290;fp_worker(0,0);assert(!fp_floor_on);
+ assert(fp_floor_time>=1501 && fp_floor_time<=1530 && fp_floor_time+fp_frame_time==2189);
+ /* fsw off: a swap burst never wakes the worker. */
+ reset_init();fp_worker(0,0);
+ { uint64_t before=scheduled;ticks=150;fuxi_perf_swap();ticks=158;fuxi_perf_swap();assert(scheduled==before); }
  /* fwi census: off counts nothing; exact 1 starts it once, without fuxiperf
   * and without touching the governor; by process and op (6/7/8 and unknown
   * ops included), CREATE2/NOTIFY types, NOTIFY deadline means and late
@@ -928,6 +977,7 @@ int main(void) {
  puts("PASS: fpk default off, 1401..cap bounds (fpc), base rows 1401/1800/2400 on real LUTs, raised only with valid sample and no thermal latch, compiled cool when hot/no quorum, 500 ms recovery, boost/silver unchanged, fast samples only while active, window line");
  puts("PASS: fwi census default off/exact 1/once, independent of fuxiperf; per process and op incl. 6/7/8/unknown, create2/notify types, deadline budget/used means and late count, 60 s report clears and re-arms, backboardd always reported, full-table drops, own lock only");
  puts("PASS: fsf floor rows on real LUTs (60/90/55/50/30 %), input-only 1.5 s window, cool-only, hot veto, duty-cut fallback, silver unchanged; fla 2 s launch high outside the touch duty, start refusal once per exec, thermal end, exec log limit, L3 with fl3, boot-arg bounds and off = no wake");
+ puts("PASS: fsw frame floor (fsf PCT or 60), second-swap wake, lone swap/touch-without-fsf/hot latch do nothing, no wake while on/blocked/off, touch then frame time on one floor, policy line by source");
  puts("PASS: fl3 default off/exact 1; L3 read once at ready, boot vote checked against state and LUT before any write; boost row while touch/compile high, boot row on unboost and thermal cut; one ready and one first-boost line; refusals, faults, lost enable and readback mismatch end voting with the boot row");
  puts("PASS: thermal pressure opt-in, read-only sysctl/readiness/no-MMIO, guard/quorum integration, Apple wire values, rising trips/falling hysteresis and no sleeping");
  puts("PASS: compile gate/default off, prime/gold votes, idle/touch precedence, thermal/quorum/duty cuts, cap, nested limit/no renewal, leave without enter, cross-thread isolation, dead-thread cleanup and balanced references");
@@ -1093,10 +1143,10 @@ static void reset(void) {
  fp_idle_start=fp_idle_entry=fp_idle_time=fp_idle_entries=fp_idle_transitions=0;
  fp_cap_mhz=fp_base_mhz=0;fp_base_on=0;fp_base_time=fp_base_fallback_time=0;
  memset(fp_base,0,sizeof(fp_base));memset(fp_base_khz,0,sizeof(fp_base_khz));
- fp_launch_ms=fp_floor_pct=0;
+ fp_launch_ms=fp_floor_pct=fp_fsf=fp_frame_ms=fp_floor_touch=0;
  arg_name=arg_name2=0;fp_configure();
  fp_launch=fp_launch_last=fp_launch_start=fp_launch_time=fp_launches=fp_launch_refused=fp_floor_time=0;
- fp_launch_seen=fp_launch_said=0;fp_launch_high=fp_floor_on=0;
+ fp_launch_seen=fp_launch_said=0;fp_launch_high=fp_floor_on=fp_floor_frames=0;fp_swap_prev=fp_frame_time=0;
  memset(fp_floor,0,sizeof(fp_floor));memset(fp_floor_khz,0,sizeof(fp_floor_khz));
  fp_recover_since=fp_above_time=fp_cuts=fp_active_start=0;
  fp_duty_count=0;fp_prev_temp=fp_prev_valid=fp_blocked=0;
