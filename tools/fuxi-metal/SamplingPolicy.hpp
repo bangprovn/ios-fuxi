@@ -1,6 +1,7 @@
 /* A sampling refusal can omit one draw, only with the explicit boot opt-in. */
 #pragma once
 #include "TranslationPolicy.hpp"
+#include "LogRate.hpp"
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -9,8 +10,7 @@ inline std::atomic<uint64_t> skippedSamplingDraws{0};
 inline bool skipSamplingDraw(const char *reason) {
  if(!systemTranslationPolicy().skipSampling)return false;
  auto count=++skippedSamplingDraws;
- // First eight, then powers of two: bounded log volume, cumulative count.
- if(count<=8 || !(count&(count-1)))fprintf(stderr,"FUXI MTL: sampling skip draw reason=%s count=%llu\n",reason,(unsigned long long)count);
+ if(logSampled(count))fprintf(stderr,"FUXI MTL: sampling skip draw reason=%s count=%llu\n",reason,(unsigned long long)count);
  return true;
 }
 inline std::atomic<uint64_t> allowedFeedbackDraws{0},undefinedFeedbackReads{0};
@@ -21,7 +21,7 @@ inline std::atomic<uint64_t> allowedFeedbackDraws{0},undefinedFeedbackReads{0};
 inline bool allowFeedbackDraw(const char *reason) {
  if(!systemTranslationPolicy().allowFeedback)return false;
  auto count=++allowedFeedbackDraws;
- if(count<=8 || !(count&(count-1)))fprintf(stderr,"FUXI MTL: sampling allow feedback reason=%s count=%llu\n",reason,(unsigned long long)count);
+ if(logSampled(count))fprintf(stderr,"FUXI MTL: sampling allow feedback reason=%s count=%llu\n",reason,(unsigned long long)count);
  return true;
 }
 // With the opt-in, a possible read of a never-written level samples undefined
@@ -29,7 +29,7 @@ inline bool allowFeedbackDraw(const char *reason) {
 inline bool allowUndefinedRead() {
  if(!systemTranslationPolicy().allowFeedback)return false;
  auto count=++undefinedFeedbackReads;
- if(count<=8 || !(count&(count-1)))fprintf(stderr,"FUXI MTL: sampling undefined mip allowed count=%llu\n",(unsigned long long)count);
+ if(logSampled(count))fprintf(stderr,"FUXI MTL: sampling undefined mip allowed count=%llu\n",(unsigned long long)count);
  return true;
 }
 }

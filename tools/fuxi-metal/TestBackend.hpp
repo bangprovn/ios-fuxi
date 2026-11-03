@@ -67,7 +67,7 @@ public:
  static inline bool modelTextures=false;
  static inline int live=0,submissions=0,constructed=0;std::atomic<bool> poisoned{false};
  explicit Backend(const char * ="unknown") {++constructed;}
- Buffer *allocate(size_t n) {
+ Buffer *allocate(size_t n,bool=false) {
   if(!n || n>maxBufferLength)throw std::runtime_error("length");
   limits.reserve(n);auto *b=new Buffer{calloc(1,n),n,n};++live;return b;
  }
