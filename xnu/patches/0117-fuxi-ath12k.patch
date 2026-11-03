@@ -766,7 +766,7 @@
  
  extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
  extern kern_return_t thread_terminate(thread_t);
-@@ -761,6 +762,211 @@
+@@ -765,6 +766,211 @@
  	}
  }
  
@@ -978,7 +978,7 @@
  void
  fuxi_keys_init(void)
  {
-@@ -820,6 +1026,14 @@
+@@ -828,6 +1034,14 @@
  			printf("FUXI TOUR: thread_start failed\n");
  		}
  	}
@@ -993,7 +993,7 @@
  	unsigned human = 0;
  	if (PE_parse_boot_argn("fuxihuman", &human, sizeof(human)) && human > 0 && human < 3600) {
  		unsigned v;
-@@ -831,7 +1045,9 @@
+@@ -839,7 +1053,9 @@
  			fk_tour_hold = v;
  			fk_human_shots = true;
  		}
