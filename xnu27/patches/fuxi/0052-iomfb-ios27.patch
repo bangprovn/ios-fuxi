@@ -1,0 +1,49 @@
+diff --git a/iokit/Kernel/arm/FuxiFramebuffer.cpp b/iokit/Kernel/arm/FuxiFramebuffer.cpp
+index ae9a427..417d736 100644
+--- a/iokit/Kernel/arm/FuxiFramebuffer.cpp
++++ b/iokit/Kernel/arm/FuxiFramebuffer.cpp
+@@ -65,6 +65,7 @@ enum {
+ 	kFBMethodGetID                  = 7,
+ 	kFBMethodGetDisplaySize         = 8,
+ 	kFBMethodRequestPowerChange     = 12,
++	kFBMethodIsMainDisplay          = 18,
+ 	kFBMethodSwapSignal             = 20,
+ 	kFBMethodGetDigitalOutState     = 25,
+ 	kFBMethodGetDotPitch            = 28,
+@@ -94,7 +95,7 @@ enum {
+ #define SWAP_LAYERS             4
+ 
+ #define kFBNotifyVSync          5
+-#define kFBNotifyTypes          8
++#define kFBNotifyTypes          12                      /* iOS 27: 0..11 (9 = ReqDCPReset, asked for by backboardd) */
+ #define kFBRefreshHz            60                      /* unless boot-arg fuxi_fb_hz says otherwise */
+ 
+ #define FRAME_TIMES             64                      /* milliseconds told apart between two frames */
+@@ -1226,6 +1227,15 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		args->scalarOutputCount = 2;
+ 		return kIOReturnSuccess;
+ 
++	case kFBMethodIsMainDisplay:                    /* iOS 27 IOMobileFramebufferIsMainDisplay wants exactly 1 */
++	case kFBMethodGetDigitalOutState:               /* CA's get_hotplug_state: 1 = connected */
++		if (args->scalarOutputCount < 1) {
++			return kIOReturnBadArgument;
++		}
++		out[0] = 1;
++		args->scalarOutputCount = 1;
++		return kIOReturnSuccess;
++
+ 	case kFBMethodGetID:
+ 		if (args->scalarOutputCount < 1) {
+ 			return kIOReturnBadArgument;
+@@ -1332,8 +1342,9 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			return kIOReturnBadArgument;
+ 		}
+ 		bzero(args->structureOutput, args->structureOutputSize);
+-		if (args->scalarInputCount >= 1 && in[0] == 0x40 && args->structureOutputSize >= 12) {
+-			/* the current mode: its colour and timing identifiers */
++		if (args->scalarInputCount >= 1 && (in[0] == 0x40 || in[0] == 0x41) && args->structureOutputSize >= 12) {
++			/* the current mode: its colour and timing identifiers (iOS 26: block 0x40; iOS 27
++			 * IOMobileFramebufferGetDigitalOutMode reads block 0x41, 44 bytes, ids at +4 and +8) */
+ 			uint32_t ids[2] = { kFBColorID, kFBTimingID };
+ 
+ 			memcpy((uint8_t *) args->structureOutput + 4, ids, sizeof(ids));

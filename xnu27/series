@@ -116,3 +116,4 @@ fuxi/0048-fsgetpath-log.patch
 fuxi/0049-envlog.patch
 fuxi/0050-taskallow.patch
 fuxi/0051-lcskip.patch
+fuxi/0052-iomfb-ios27.patch
