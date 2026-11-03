@@ -364,7 +364,7 @@ private:
 
  uint32_t timestampBits=0;float timestampPeriod=0;
  VkPhysicalDeviceMemoryProperties memory{}; uint32_t family{};
- bool orderedColorAccess=false;bool hostImport=false;VkDeviceSize hostAlignment{};VkFormatFeatureFlags linearFeatures{},optimalFeatures{};
+ bool orderedColorAccess=false;bool hostImport=false,explicitPitch=false;uint64_t explicitPitchImports=0;VkDeviceSize hostAlignment{};VkFormatFeatureFlags linearFeatures{},optimalFeatures{};
  PFN_vkGetPhysicalDeviceFormatProperties GetPhysicalDeviceFormatProperties{};
  PFN_vkGetPhysicalDeviceExternalBufferProperties GetPhysicalDeviceExternalBufferProperties{};
  PFN_vkGetMemoryHostPointerPropertiesEXT GetMemoryHostPointerPropertiesEXT{};
@@ -521,6 +521,10 @@ public:
     if(hostAlignment!=NativeAdrenoAbiHostPageBytes)throw std::runtime_error("NativeAdreno ABI 2 HostImport requires 16K pages");
 #endif
     enabledExtensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    // An IOSurface whose 64-byte aligned row is not Turnip's linear pitch is imported at its own row (importTexture).
+    for(const auto &ext:extensions)if(!strcmp(ext.extensionName,VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME))explicitPitch=true;
+    if(explicitPitch)enabledExtensions.push_back(VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME);
+    fprintf(stderr,"FUXI MTL: IOSurface explicit row pitch import %s\n",explicitPitch?"enabled":"unavailable");
    }
    di.enabledExtensionCount=enabledExtensions.size();di.ppEnabledExtensionNames=enabledExtensions.data();
    check(CreateDevice(physical,&di,nullptr,&device));
@@ -745,6 +749,7 @@ public:
   }}limits.release(t->charged);destroyUnlocked(t->backingBuffer);if(!t->backingBuffer)rtForget(t);delete t;return !poisoned;
  }
  bool supportsHostImport() const {return hostImport && hostAlignment && GetMemoryHostPointerPropertiesEXT && GetPhysicalDeviceImageFormatProperties2;}
+ bool supportsExplicitPitch() const {return supportsHostImport() && explicitPitch;}
  void destroySamplerUnlocked(Sampler *s) {if(s && !--s->references){if(!poisoned && s->sampler)DestroySampler(device,s->sampler,nullptr);delete s;}}
  void destroy(Sampler *s) {std::lock_guard<std::mutex> guard(mutex);destroySamplerUnlocked(s);}
  // address: Metal MTLSamplerAddressMode per axis (0 clamp-to-edge, 2 repeat, 3 mirror repeat, 4 clamp-to-zero,
@@ -804,6 +809,19 @@ public:
    ii.extent={width,height,1};ii.mipLevels=1;ii.arrayLayers=1;ii.samples=VK_SAMPLE_COUNT_1_BIT;ii.tiling=info.tiling;ii.usage=info.usage;ii.initialLayout=t->layout;
    check(CreateImage(device,&ii,nullptr,&t->image));VkMemoryRequirements req{};GetImageMemoryRequirements(device,t->image,&req);
    VkImageSubresource sub{VK_IMAGE_ASPECT_COLOR_BIT,0,0};VkSubresourceLayout layout{};GetImageSubresourceLayout(device,t->image,&sub,&layout);
+   // Turnip picks a 256-byte pitch for a plain linear BGRA8 image; Apple's IOSurface rows are 64-byte aligned and the
+   // clients that fill them keep the row they asked for (the switcher's decoded snapshot cards, 3 Nov). Then the image is
+   // made again as an explicit DRM_FORMAT_MOD_LINEAR layout at the surface's own row, which Turnip allows for 64-byte rows.
+   if(layout.rowPitch!=row && explicitPitch && row%64==0 && row>=size_t(width)*4) {
+    DestroyImage(device,t->image,nullptr);t->image=VK_NULL_HANDLE;
+    VkSubresourceLayout plane{};plane.rowPitch=row;
+    VkImageDrmFormatModifierExplicitCreateInfoEXT ex{};ex.sType=VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT;
+    ex.drmFormatModifier=0;ex.drmFormatModifierPlaneCount=1;ex.pPlaneLayouts=&plane;ei.pNext=&ex;   // 0: DRM_FORMAT_MOD_LINEAR
+    ii.tiling=VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+    check(CreateImage(device,&ii,nullptr,&t->image));GetImageMemoryRequirements(device,t->image,&req);
+    sub.aspectMask=VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT;GetImageSubresourceLayout(device,t->image,&sub,&layout);
+    if(++explicitPitchImports<=16)fprintf(stderr,"FUXI MTL: IOSurface import at its own row %zu (%ux%u; Vulkan linear pitch would differ)\n",row,width,height);
+   }
    if(!req.alignment || offset%req.alignment || layout.offset || layout.rowPitch!=row || req.size>bytes-offset || layout.size>bytes-offset)throw std::runtime_error("IOSurface/Vulkan linear image layout mismatch");
    VkMemoryHostPointerPropertiesEXT hp{};hp.sType=VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT;
    check(GetMemoryHostPointerPropertiesEXT(device,external.handleType,base,&hp));

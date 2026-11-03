@@ -77,6 +77,7 @@ public:
  static inline bool modelHostImport=false;
  static inline void *importBase=nullptr;static inline size_t importBytes=0,importRow=0,importOffset=0;
  bool supportsHostImport() const {return modelHostImport;}
+ bool supportsExplicitPitch() const {return false;}
  Texture *importTexture(void *base,size_t bytes,size_t row,uint32_t width=256,uint32_t height=256,size_t offset=0,uint64_t=0) {
   if(!modelHostImport || !base || !limits.rows(width,height,4,row,offset,bytes))throw std::runtime_error("modeled host import bounds");
   importBase=base;importBytes=bytes;importRow=row;importOffset=offset;

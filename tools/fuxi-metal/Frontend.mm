@@ -1764,7 +1764,11 @@ static NSString *surfaceDescriptorText(IOSurfaceRef surface,NSUInteger plane){
 - (NSUInteger)deviceLinearReadOnlyTextureAlignmentBytes {CENSUS();return 16;}
 - (NSUInteger)minimumLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)format {CENSUS();(void)format;return 16;}
 - (NSUInteger)minimumTextureBufferAlignmentForPixelFormat:(MTLPixelFormat)format {CENSUS();(void)format;return 16;}
-- (NSUInteger)iosurfaceReadOnlyTextureAlignmentBytes {CENSUS();return 256;}
+// 64, Apple's IOSurface row alignment, when the backend can import a linear image at the surface's own row (explicit
+// DRM_FORMAT_MOD_LINEAR layout); otherwise 256, Turnip's own linear pitch. QuartzCore does not wrap a surface whose row
+// misses this: at 256 the 64-aligned material snapshots (App Library, switcher background) stayed black (3 Nov).
+- (NSUInteger)iosurfaceReadOnlyTextureAlignmentBytes {CENSUS();auto *b=owner(self)->backend;return b && b->supportsExplicitPitch()?64:256;}
+- (NSUInteger)iosurfaceTextureAlignmentBytes {CENSUS();auto *b=owner(self)->backend;return b && b->supportsExplicitPitch()?64:256;}
 - (NSUInteger)maxFragmentTextures {CENSUS();return fuxi::resourceSlots;}
 - (NSUInteger)maxFragmentSamplers {CENSUS();return fuxi::resourceSlots;}
 - (NSUInteger)maxTextureWidth2D {CENSUS();return owner(self)->backend?owner(self)->backend->maxTextureDimension():0;}
