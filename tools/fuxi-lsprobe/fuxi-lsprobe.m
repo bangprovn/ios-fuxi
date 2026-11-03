@@ -44,6 +44,13 @@
 - (id)allInstalledApplications;
 - (id)allApplications;
 - (void)setErrorHandler:(void (^)(NSError *))handler;
+- (id)initWithURL:(NSURL *)url flags:(NSUInteger)flags error:(NSError **)error;
+- (BOOL)isVolume;
+- (BOOL)isDirectory;
+- (BOOL)isResolvable;
+- (NSString *)nameWithError:(NSError **)error;
+- (NSString *)extensionWithError:(NSError **)error;
+- (NSString *)canonicalPathWithError:(NSError **)error;
 @end
 
 /* LaunchServices' C functions, found with dlsym (unslid addresses of 24A446's dyld cache) */
@@ -100,6 +107,94 @@ show_volume(const char *path)
 	    NSURLVolumeURLKey, NSURLVolumeNameKey, NSURLIsPackageKey] error:NULL];
 	for (NSString *key in v) {
 		fprintf(stderr, "lsprobe:   %s = %s\n", key.UTF8String, [[v[key] description] UTF8String]);
+	}
+}
+
+/*
+ * How LaunchServices' registration sees a bundle (each step of _LSRegisterBundleNode): getattrlist's name and
+ * mount status (the bundle class comes from the name's extension; a mount point is class 0), the attribute set
+ * CoreServicesInternal asks for, FSNode's getters, _LSGetBundleClassForNode and, with register set, a
+ * registration in this process (_LSRegisterBundleURL), whose error names the step that fails.
+ */
+typedef uint32_t (*bundle_class_t)(void *, id);                                 /* _LSGetBundleClassForNode 0x186de6958 */
+typedef BOOL (*register_url_t)(void *, NSURL *, uint32_t, id, NSError **);      /* _LSRegisterBundleURL 0x186f368b0 */
+
+static void *
+ls_function(uintptr_t unslid)
+{
+	void *anchor = dlsym(RTLD_DEFAULT, "_LSBindingSetLogFile");
+
+	if (anchor == NULL) {
+		return NULL;
+	}
+	return ptrauth_sign_unauthenticated((void *)(unslid + (uintptr_t)ptrauth_strip(anchor, ptrauth_key_function_pointer) -
+	    0x186e8d3e8), ptrauth_key_function_pointer, 0);
+}
+
+static void
+show_registration(const char *path, bool reg)
+{
+	struct {
+		uint32_t length;
+		attrreference_t name;
+		uint32_t mntstatus;
+		char buf[MAXPATHLEN];
+	} __attribute__((packed)) nb;
+	struct attrlist al = { .bitmapcount = ATTR_BIT_MAP_COUNT, .commonattr = ATTR_CMN_NAME, .dirattr = ATTR_DIR_MOUNTSTATUS };
+	/* CoreServicesInternal's group 0 (common 0xd01f9e0d, dir 5, file 1, extended common 0x240), options 0x25 */
+	struct attrlist csi = { .bitmapcount = ATTR_BIT_MAP_COUNT, .commonattr = 0xd01f9e0d, .dirattr = 0x5, .fileattr = 0x1,
+		                .forkattr = 0x240 };
+	static char big[8192];
+	NSURL *url = [NSURL fileURLWithPath:@(path)];
+	Class fsnode = NSClassFromString(@"FSNode");
+	bundle_class_t bundle_class = (bundle_class_t)ls_function(0x186de6958);
+	register_url_t register_url = (register_url_t)ls_function(0x186f368b0);
+	NSError *e = nil;
+	id node;
+
+	if (getattrlist(path, &al, &nb, sizeof(nb), 0) == 0) {
+		fprintf(stderr, "lsprobe: registration %s: getattrlist name '%.*s' (length %u), mount status 0x%x\n", path,
+		    (int)nb.name.attr_length, (char *)&nb.name + nb.name.attr_dataoffset, nb.name.attr_length, nb.mntstatus);
+	} else {
+		fprintf(stderr, "lsprobe: registration %s: getattrlist name: %s\n", path, strerror(errno));
+	}
+	for (int k = 0; k < 4; k++) {
+		static const uint32_t more[4] = { 0, 0x06000000, 0x08000000, 0x4000 };      /* groups 0, 5, 7, 2 */
+		struct attrlist a = csi;
+		int r;
+
+		a.commonattr |= more[k];
+		if (k == 1) {
+			a.forkattr |= 0x110;
+		}
+		r = getattrlist(path, &a, big, sizeof(big), 0x25);
+		fprintf(stderr, "lsprobe:   getattrlist CoreServices group %d (common 0x%x): %s\n", k == 0 ? 0 : k == 1 ? 5 : k == 2 ? 7 : 2,
+		    a.commonattr, r == 0 ? "ok" : strerror(errno));
+	}
+	node = fsnode == nil ? nil : [[fsnode alloc] initWithURL:url flags:0 error:&e];
+	if (node == nil) {
+		fprintf(stderr, "lsprobe:   FSNode: %s\n", fsnode == nil ? "no class" : e.description.UTF8String);
+		return;
+	}
+	{
+		NSError *e1 = nil, *e2 = nil, *e3 = nil;
+		NSString *name = [node nameWithError:&e1], *ext = [node extensionWithError:&e2], *canon = [node canonicalPathWithError:&e3];
+
+		fprintf(stderr, "lsprobe:   FSNode volume %d directory %d resolvable %d name %s ext %s canonical %s\n", [node isVolume],
+		    [node isDirectory], [node isResolvable], name ? name.UTF8String : e1.description.UTF8String,
+		    ext ? ext.UTF8String : e2.description.UTF8String, canon ? canon.UTF8String : e3.description.UTF8String);
+	}
+	if (bundle_class != NULL) {
+		fprintf(stderr, "lsprobe:   _LSGetBundleClassForNode = %u (2, 11, 13, 14, 16 may register)\n", bundle_class(NULL, node));
+	}
+	if (reg && register_url != NULL) {
+		NSError *re = nil;
+		BOOL ok = register_url(NULL, url, 0x18000001, nil, &re);
+
+		fprintf(stderr, "lsprobe:   _LSRegisterBundleURL = %d %s\n", ok, re == nil ? "" : re.description.UTF8String);
+		if (re.userInfo != nil) {
+			fprintf(stderr, "lsprobe:   error userInfo %s\n", re.userInfo.description.UTF8String);
+		}
 	}
 }
 
@@ -230,6 +325,8 @@ probe(NSString *bid, NSString *path)
 	show_tables();
 	show_volume("/System/Library/CoreServices/SpringBoard.app");
 	show_volume("/System/Library/CoreServices/MobileCoreTypes.bundle");
+	show_registration("/System/Library/CoreServices/MobileCoreTypes.bundle", getenv("FUXI_LSPROBE_REGISTER") != NULL);
+	show_registration("/System/Library/CoreServices/SpringBoard.app", getenv("FUXI_LSPROBE_REGISTER") != NULL);
 
 	r = [[record alloc] initWithBundleIdentifier:bid allowPlaceholder:NO error:&error];
 	show(@"record (no placeholder)", r, recordKeys);

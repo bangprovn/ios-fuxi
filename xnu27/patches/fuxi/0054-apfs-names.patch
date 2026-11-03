@@ -1,0 +1,113 @@
+diff --git a/bsd/miscfs/apfs/apfs_vfsops.c b/bsd/miscfs/apfs/apfs_vfsops.c
+index df9e791..6052dc9 100644
+--- a/bsd/miscfs/apfs/apfs_vfsops.c
++++ b/bsd/miscfs/apfs/apfs_vfsops.c
+@@ -490,6 +490,86 @@ apfs_hash_index(uint64_t obj_id)
+ 	return (uint32_t)((obj_id ^ (obj_id >> 17)) % APFS_HASH_BUCKETS);
+ }
+ 
++#if defined(FUXI)
++struct apfs_name_ctx {
++	uint64_t id;
++	char name[MAXNAMLEN + 1];
++	size_t len;
++};
++
++static int
++apfs_name_cb(void *ctx, const char *name, size_t name_len, uint64_t file_id, uint8_t d_type)
++{
++	struct apfs_name_ctx *nc = ctx;
++
++	(void)d_type;
++	if (file_id != nc->id || name_len > MAXNAMLEN) {
++		return 0;
++	}
++	memcpy(nc->name, name, name_len);
++	nc->name[name_len] = '\0';
++	nc->len = name_len;
++	return EEXIST;          /* found: stop the walk */
++}
++
++/*
++ * A vnode made without a lookup (by its number: VFS_VGET, fsgetpath, ".."; or the root's) has no
++ * name and no parent, and a later lookup that finds it in the hash only enters it in the name
++ * cache, which leaves both unset.  getattrlist's ATTR_CMN_NAME then comes back empty, and
++ * LaunchServices, which takes a bundle's class from its name's extension, registers no bundle
++ * at all.  Give it its name (from its parent directory's records) and its parent's vnode.
++ */
++static void
++apfs_node_identify(struct apfs_mount *am, vnode_t vp, vnode_t dvp, struct componentname *cnp)
++{
++	struct apfs_node *an = APFS_VP(vp);
++	struct apfs_name_ctx *nc;
++	vnode_t pvp = NULLVP;
++	const char *have;
++	int error = 0;
++
++	have = vnode_getname(vp);
++	if (have != NULL) {
++		vnode_putname(have);
++		return;
++	}
++	if (vnode_isvroot(vp) || an->an_id == am->am_root_id) {
++		return;
++	}
++	if (dvp != NULLVP && cnp != NULL) {
++		vnode_update_identity(vp, dvp, cnp->cn_nameptr, cnp->cn_namelen, cnp->cn_hash,
++		    VNODE_UPDATE_NAME | VNODE_UPDATE_PARENT);
++		os_atomic_inc(&am->am_node_named, relaxed);
++		return;
++	}
++	nc = kalloc_type(struct apfs_name_ctx, Z_WAITOK | Z_ZERO);
++	if (nc == NULL) {
++		return;
++	}
++	nc->id = an->an_id;
++	apfs_lock(am);
++	if (an->an_id >= APFS_SYNTH_BASE) {
++		uint32_t i;
++
++		for (i = 0; i < am->am_nsynth; i++) {
++			if (am->am_synth[i].id == an->an_id && !am->am_synth[i].alias) {
++				nc->len = strlcpy(nc->name, am->am_synth[i].name, sizeof(nc->name));
++			}
++		}
++	} else if (an->an_parent < APFS_SYNTH_BASE) {
++		error = apfs_readdir(&am->am_vol, an->an_parent, apfs_name_cb, nc);
++	}
++	apfs_unlock(am);
++	if ((error == 0 || error == EEXIST) && nc->len > 0 &&
++	    apfs_node_vnode(am, an->an_parent, NULLVP, NULL, &pvp) == 0) {
++		vnode_update_identity(vp, pvp, nc->name, (int)nc->len, 0, VNODE_UPDATE_NAME | VNODE_UPDATE_PARENT);
++		vnode_put(pvp);
++		os_atomic_inc(&am->am_node_named, relaxed);
++	}
++	kfree_type(struct apfs_name_ctx, nc);
++}
++#endif /* FUXI */
++
+ /* The vnode for an object, making one if there is not one already. */
+ int
+ apfs_node_vnode(struct apfs_mount *am, uint64_t obj_id, vnode_t dvp,
+@@ -521,6 +601,9 @@ apfs_node_vnode(struct apfs_mount *am, uint64_t obj_id, vnode_t dvp,
+ 				 * adding one purges its directory's entries.)  The name cache keeps
+ 				 * one name per vnode and leaves one that has a name already as it is.
+ 				 */
++#if defined(FUXI)
++				apfs_node_identify(am, vp, dvp, cnp);
++#endif
+ 				if (dvp != NULLVP && cnp != NULL && (cnp->cn_flags & MAKEENTRY)) {
+ 					cache_enter(dvp, vp, cnp);
+ 					os_atomic_inc(&am->am_node_named, relaxed);
+@@ -628,6 +711,11 @@ apfs_node_vnode(struct apfs_mount *am, uint64_t obj_id, vnode_t dvp,
+ 	apfs_unlock(am);
+ 	os_atomic_inc(&am->am_node_made, relaxed);
+ 
++#if defined(FUXI)
++	if (cnp == NULL) {
++		apfs_node_identify(am, an->an_vp, NULLVP, NULL);
++	}
++#endif
+ 	*vpp = an->an_vp;
+ 	return 0;
+ }
