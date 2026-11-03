@@ -862,12 +862,15 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
 	}
 	uint32_t rows = sweet_div_up(s->height, s->elementHeight);
 	bool gpu_rows = s->bytesPerElement == 4 && props->getObject("IOSurfacePlaneInfo") == NULL && sweet_surface_gpu_rows();
-	if (gpu_rows && (s->bytesPerRow & (SWEET_SURFACE_GPU_ROW_ALIGN - 1)) != 0 && !sweet_surface_round_row((uint32_t)s->bytesPerRow)) {
-		sweet_surface_row_log(s, (uint32_t)s->bytesPerRow, props);   /* kept as asked */
-		gpu_rows = false;
+	bool keep_row = gpu_rows && (s->bytesPerRow & (SWEET_SURFACE_GPU_ROW_ALIGN - 1)) != 0 &&
+	    !sweet_surface_round_row((uint32_t)s->bytesPerRow);
+	if (keep_row) {
+		/* Kept as asked: FuxiMetal imports a 64-byte aligned row at the row itself (explicit
+		 * DRM_FORMAT_MOD_LINEAR layout), so only the height padding below still applies. */
+		sweet_surface_row_log(s, (uint32_t)s->bytesPerRow, props);
 	}
 	if (gpu_rows) {
-		if ((s->bytesPerRow & (SWEET_SURFACE_GPU_ROW_ALIGN - 1)) != 0) {
+		if (!keep_row && (s->bytesPerRow & (SWEET_SURFACE_GPU_ROW_ALIGN - 1)) != 0) {
 			uint32_t asked = (uint32_t)s->bytesPerRow;
 			s->bytesPerRow = (s->bytesPerRow + SWEET_SURFACE_GPU_ROW_ALIGN - 1) & ~(uint32_t)(SWEET_SURFACE_GPU_ROW_ALIGN - 1);
 			sweet_surface_row_log(s, asked, props);
