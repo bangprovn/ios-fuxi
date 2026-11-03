@@ -25,10 +25,10 @@
  * SpringBoard without CommCenter: no CoreTelephony reconnect every second.
  *
  * The root has no com.apple.CommCenter job: tools/sweet-root-tweaks.py takes both of them out (the cellular one and
- * com.apple.CommCenter-noncellular). The noncellular one is the job launchd picks without a /baseband node, but
- * CommCenter takes its radio from the hardware model (libTelephonyUtilDynamic's radio table, D22AP), and on a kernel
- * without AppleIPAppender and AppleBaseband it dies every 15 s or so (HakiOS, the same iPhone10,3 identity: SIGSEGV
- * after "Could not find AppleIPAppender service", SIGABRT after "Unable to communicate with AppleBaseband driver").
+ * com.apple.CommCenter-noncellular). The noncellular one is the job launchd picks without a /baseband node, yet on a
+ * kernel without AppleIPAppender and AppleBaseband it still died every 15 s or so on HakiOS, with the same iPhone10,3
+ * identity and no /baseband node (SIGSEGV after "Could not find AppleIPAppender service", SIGABRT after "Unable to
+ * communicate with AppleBaseband driver"). Not tried on this port; each of those restarts would reset the idle timer too.
  *
  * Without the daemon, SpringBoard 20H392 loops for ever, once a second:
  *   -[SBTelephonyManager _serverConnectionDidError:]  logs "CTServerConnection returned error", then always
