@@ -1,0 +1,42 @@
+diff --git a/iokit/Kernel/arm/FuxiFramebuffer.cpp b/iokit/Kernel/arm/FuxiFramebuffer.cpp
+index 3ea67a6..a3a9709 100644
+--- a/iokit/Kernel/arm/FuxiFramebuffer.cpp
++++ b/iokit/Kernel/arm/FuxiFramebuffer.cpp
+@@ -59,6 +59,9 @@ extern "C" void fuxi_debug_sync_report(void);       /* osfmk/arm/model_dep.c */
+ extern volatile uint32_t armcpu_core_timer[8], armcpu_core_sgi[8];   /* ArmCpu.cpp: per logical core */
+ extern volatile uint64_t armcpu_ipi_sent;
+ extern "C" void sched_perfcontrol_update_recommended_cores(uint32_t recommended_cores);
++/* osfmk/kern/processor.c: user, system, idle, nice ticks of one processor (declared loosely: C linkage) */
++extern "C" struct processor *cpu_to_processor(int cpu);
++extern "C" void processor_cpu_load_info(struct processor *processor, unsigned int ticks[4]);
+ 
+ /* IOConnectCallMethod selectors of the framebuffer user client (iOS 16.5; hakios found them unchanged in iOS 26) */
+ enum {
+@@ -1270,6 +1273,27 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			    gVSyncTicks, gVSyncLate1ms, gVSyncLateMost / 1000);
+ 			gVSyncTicks = gVSyncLate1ms = 0;
+ 			gVSyncLateMost = 0;
++			{
++				/* how busy each core was since the last summary: (user + system) / (user + system + idle) */
++				static unsigned int previous[8][4];
++				char busy[64];
++				int at = 0;
++
++				for (int cpu = 0; cpu < 8 && at < (int)sizeof(busy) - 6; cpu++) {
++					struct processor *processor = cpu_to_processor(cpu);
++					unsigned int ticks[4] = { 0, 0, 0, 0 }, work, all;
++
++					if (processor == NULL) {
++						continue;
++					}
++					processor_cpu_load_info(processor, ticks);
++					work = ticks[0] - previous[cpu][0] + ticks[1] - previous[cpu][1];
++					all = work + ticks[2] - previous[cpu][2];
++					memcpy(previous[cpu], ticks, sizeof(ticks));
++					at += snprintf(busy + at, sizeof(busy) - at, " %u", all != 0 ? work * 100 / all : 0);
++				}
++				IOLog("FuxiFramebuffer: busy %% per core%s\n", busy);
++			}
+ 			IOLog("FuxiFramebuffer: IPIs sent %llu; per core SGI/timer interrupts %u/%u %u/%u %u/%u %u/%u %u/%u %u/%u %u/%u %u/%u\n",
+ 			    armcpu_ipi_sent, armcpu_core_sgi[0], armcpu_core_timer[0], armcpu_core_sgi[1], armcpu_core_timer[1],
+ 			    armcpu_core_sgi[2], armcpu_core_timer[2], armcpu_core_sgi[3], armcpu_core_timer[3],

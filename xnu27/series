@@ -129,3 +129,4 @@ fuxi/0061-stackshot-abort-on-silent-core.patch
 fuxi/0062-fb-ipi-counts.patch
 fuxi/0063-fb-vsync-critical.patch
 fuxi/0064-fb-recommended-cores.patch
+fuxi/0065-fb-core-busy.patch
