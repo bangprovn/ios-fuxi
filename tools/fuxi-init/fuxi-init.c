@@ -17,7 +17,8 @@
  *      launchd.plist) over /System/Library/xpc;
  *   5. merges the OS cryptex's /usr/lib into /usr/lib (merge_dir) and makes the system proxy
  *      personas launchd asks for (personas);
- *   6. leaves a child that copies the non-root jobs' output (JOB_LOGS) and DAEMON_LOGS to the console.
+ *   6. leaves a child that copies the non-root jobs' output (JOB_LOGS, and the pseudo terminals
+ *      of TTYS) and DAEMON_LOGS to the console.
  *
  * The approach -- a process 1 of our own that prepares a writable /private/var and a chosen
  * job set and then execs launchd -- is that of HakiOS / hakios-arm64e-dada (userland init.c
@@ -38,6 +39,8 @@
 #include <sys/sysctl.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/select.h>
+#include <termios.h>
 #include <signal.h>
 #include <unistd.h>
 
@@ -49,6 +52,9 @@
 #define CRASH_LOGS      "/private/var/mobile/Library/Logs/CrashReporter"
 #define CRASH_PREFIX    "SpringBoard"    /* the crash reports copied: SpringBoard's */
 #define MAX_JOB_LOGS    512
+/* fuxi-initdisk's TTYS: the labels whose standard error is /dev/ttys<n>, n their line's index. */
+#define TTYS            DISK "/jobs/ttys"
+#define MAX_TTYS        32
 /* What usermanagerd's boot task (fuxi-initdisk's BOOT_TASKS) prints last. */
 #define UM_TASK_LOG     "fuxi.boottask.usermanagerd.out"
 #define UM_TASK_DONE    "DONE UMD_INIT"
@@ -540,7 +546,85 @@ restart_usermanagerd(void)
  * process, which stays when the parent becomes launchd, copies what they write to the console,
  * each chunk headed by the file name. It copies DAEMON_LOGS too, where some daemons (usermanagerd)
  * write their own log files, and SpringBoard's crash reports (CRASH_LOGS, with the exception's backtrace).
+ *
+ * The labels in TTYS write their standard error to a pseudo terminal instead (os_log reaches
+ * standard error only when it is a terminal, it seems): one each, opened here before launchd
+ * starts so that the n-th is /dev/ttys<n>, writable by every user and copied the same way.
  */
+static struct {
+	char label[128];
+	int master, slave;
+} ttys[MAX_TTYS];
+static unsigned nttys;
+
+static void
+open_ttys(void)
+{
+	FILE *f = fopen(TTYS, "r");
+	char line[128];
+
+	while (f != NULL && nttys < MAX_TTYS && fgets(line, sizeof(line), f) != NULL) {
+		struct termios t;
+		const char *name;
+		int m, sl;
+
+		line[strcspn(line, "\n")] = '\0';
+		if ((m = posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC)) < 0 || grantpt(m) != 0 ||
+		    unlockpt(m) != 0 || (name = ptsname(m)) == NULL) {
+			say("pseudo terminal for %s: %s", line, strerror(errno));
+			break;
+		}
+		/* kept open, so that the master reads no end of file between the job's runs */
+		if ((sl = open(name, O_RDWR | O_NOCTTY | O_CLOEXEC)) < 0 || chmod(name, 0666) != 0) {
+			say("%s for %s: %s", name, line, strerror(errno));
+			break;
+		}
+		if (tcgetattr(sl, &t) == 0) {
+			cfmakeraw(&t);
+			(void)tcsetattr(sl, TCSANOW, &t);
+		}
+		(void)fcntl(m, F_SETFL, O_NONBLOCK);
+		strlcpy(ttys[nttys].label, line, sizeof(ttys[0].label));
+		ttys[nttys].master = m;
+		ttys[nttys].slave = sl;
+		say("%s: standard error of %s", name, line);
+		nttys++;
+	}
+	if (f != NULL) {
+		fclose(f);
+	}
+}
+
+/* Copy what the TTYS jobs wrote, waiting up to timeout microseconds for it. */
+static void
+relay_ttys(long timeout)
+{
+	static char buf[4096];
+	struct timeval tv = { timeout / 1000000, timeout % 1000000 };
+	fd_set fds;
+	int maxfd = -1;
+
+	FD_ZERO(&fds);
+	for (unsigned i = 0; i < nttys; i++) {
+		FD_SET(ttys[i].master, &fds);
+		maxfd = MAX(maxfd, ttys[i].master);
+	}
+	if (select(maxfd + 1, &fds, NULL, NULL, &tv) <= 0) {
+		return;
+	}
+	for (unsigned i = 0; i < nttys; i++) {
+		ssize_t n;
+
+		while (FD_ISSET(ttys[i].master, &fds) && (n = read(ttys[i].master, buf, sizeof(buf))) > 0) {
+			dprintf(2, "fuxi-log %s.tty: ", ttys[i].label);
+			(void)write(2, buf, (size_t)n);
+			if (buf[n - 1] != '\n') {
+				(void)write(2, "\n", 1);
+			}
+		}
+	}
+}
+
 static void
 log_relay(void)
 {
@@ -552,15 +636,35 @@ log_relay(void)
 	static char buf[4096];
 	unsigned nseen = 0;
 	int um_task = 0;        /* 1: its last line seen, 2..: waited that many rounds, -1: restarted */
+	struct timeval next = { 0, 0 };
 
 	if (mkdir(JOB_LOGS, 01777) != 0 || chmod(JOB_LOGS, 01777) != 0) {
 		say("mkdir %s: %s", JOB_LOGS, strerror(errno));
 		return;
 	}
+	open_ttys();
 	if (fork() != 0) {
+		for (unsigned i = 0; i < nttys; i++) {
+			close(ttys[i].master);
+			close(ttys[i].slave);
+		}
 		return;
 	}
 	for (;;) {
+		struct timeval now;
+
+		/* the terminals at once, the files every half second */
+		relay_ttys(nttys > 0 ? 100 * 1000 : 500 * 1000);
+		gettimeofday(&now, NULL);
+		if (timercmp(&now, &next, <)) {
+			continue;
+		}
+		next = now;
+		next.tv_usec += 500 * 1000;
+		if (next.tv_usec >= 1000000) {
+			next.tv_sec++;
+			next.tv_usec -= 1000000;
+		}
 		for (unsigned k = 0; k < sizeof(dirs) / sizeof(dirs[0]); k++) {
 			DIR *d = opendir(dirs[k]);
 			struct dirent *e;
@@ -610,7 +714,6 @@ log_relay(void)
 			restart_usermanagerd();
 			um_task = -1;
 		}
-		usleep(500 * 1000);
 	}
 }
 

@@ -10,6 +10,7 @@ OUT_DIR gets:
   mnt/usrlib/               where it binds /usr/lib before merging the OS cryptex's /usr/lib into it
   jobs/LaunchDaemons/       the job set bound over /System/Library/LaunchDaemons
   jobs/empty/               bound over LaunchAngels and NanoLaunchDaemons
+  jobs/ttys                 the --log labels, one a line: the n-th gets /dev/ttys<n> as standard error
   jobs/xpc/                 bound over /System/Library/xpc: its files except launchd.plist(.sig), so that
                             launchd reads the job directory, not the prebuilt job cache
   var/mobile/Library/Preferences/com.apple.migration.plist
@@ -49,6 +50,7 @@ START_KEYS = ('RunAtLoad', 'KeepAlive', 'StartInterval', 'StartCalendarInterval'
 STDERR_LOG = {'OS_ACTIVITY_DT_MODE': 'YES', 'ACTIVITY_LOG_STDERR': '1', 'CFLOG_FORCE_STDERR': '1'}
 JOBS = '/System/Library/LaunchDaemons'
 JOB_LOGS = '/private/var/fuxi/log'   # fuxi-init's JOB_LOGS
+TTYS = 'jobs/ttys'                   # fuxi-init's TTYS: the labels whose standard error is a terminal
 # launchd's own boot tasks that set up /private/var/keybags (usermanagerd's persona manifest among it). launchd
 # skips them on this boot, and AMFI's launch constraints kill them when anything but launchd starts them, so
 # they become jobs that run once at load.
@@ -84,7 +86,7 @@ def program_of(job):
     return job.get('Program') or (job.get('ProgramArguments') or [''])[0]
 
 
-def to_console(job, label, log):
+def to_console(job, label, log, ttys):
     # Only root may open the console: for any other user xpcproxy's open fails with EACCES (the node
     # is 0622, so a policy refuses it), and a job without UserName may still run as mobile (its domain
     # is user/501). Every job writes to a file in JOB_LOGS, which fuxi-init's log relay copies to the
@@ -96,6 +98,11 @@ def to_console(job, label, log):
     job.pop('_LimitLoadToDeviceTree', None)
     if 'all' in log or label in log:
         job.setdefault('EnvironmentVariables', {}).update(STDERR_LOG)
+    # libsystem_trace may print os_log to standard error only when it is a terminal (HakiOS points
+    # it at the console): a label named in --log gets its own pseudo terminal, which fuxi-init opens
+    # before launchd, in the order of TTYS, and copies to the console.
+    if label in ttys:
+        job['StandardErrorPath'] = '/dev/ttys%03d' % ttys.index(label)
 
 
 def main():
@@ -111,6 +118,7 @@ def main():
     a = ap.parse_args()
     labels = a.labels or list(DEFAULT_LABELS)
     deny = tuple(w for w in DENY if w not in a.allow)
+    ttys = [l for l in a.log if l != 'all']
     vols = Volumes(a.os, a.system_os, a.app_os)
     root = vols.root
 
@@ -145,9 +153,11 @@ def main():
             for key in START_KEYS:
                 job.pop(key, None)
             on_demand += 1
-        to_console(job, label, a.log)
+        to_console(job, label, a.log, ttys)
         with open(os.path.join(a.out, 'jobs/LaunchDaemons', name), 'wb') as f:
             plistlib.dump(job, f, fmt=plistlib.FMT_BINARY)
+    with open(os.path.join(a.out, TTYS), 'w') as f:
+        f.write(''.join(l + '\n' for l in ttys))
     build = plistlib.loads(root.read('/System/Library/CoreServices/SystemVersion.plist'))['ProductBuildVersion']
     os.makedirs(os.path.dirname(os.path.join(a.out, MIGRATION_PLIST)), exist_ok=True)
     with open(os.path.join(a.out, MIGRATION_PLIST), 'wb') as f:
@@ -156,7 +166,7 @@ def main():
     for task, argv in BOOT_TASKS.items():
         label = f'fuxi.boottask.{task}'
         job = {'Label': label, 'ProgramArguments': argv, 'RunAtLoad': True, 'LaunchOnlyOnce': True, 'UserName': 'root'}
-        to_console(job, label, a.log)
+        to_console(job, label, a.log, ttys)
         with open(os.path.join(a.out, 'jobs/LaunchDaemons', label + '.plist'), 'wb') as f:
             plistlib.dump(job, f, fmt=plistlib.FMT_BINARY)
     missing = [l for l in labels if f'{l}.plist' not in names]
