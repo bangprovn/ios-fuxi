@@ -119,3 +119,4 @@ fuxi/0051-lcskip.patch
 fuxi/0052-iomfb-ios27.patch
 fuxi/0053-trace-quiet.patch
 fuxi/0054-apfs-names.patch
+fuxi/0055-sandbox-check-allow.patch

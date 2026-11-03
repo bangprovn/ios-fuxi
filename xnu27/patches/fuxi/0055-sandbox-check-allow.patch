@@ -1,0 +1,41 @@
+diff --git a/security/mac_base.c b/security/mac_base.c
+index ae334c2..8290d5d 100644
+--- a/security/mac_base.c
++++ b/security/mac_base.c
+@@ -1653,6 +1653,36 @@ __mac_syscall(proc_t p, struct __mac_syscall_args *uap, int *retv __unused)
+ 			if (error != 0 && uap->call == 4) {
+ 				error = fuxi_mac_permit(mpc, "policy_syscall 4 (container path)", error);
+ 			}
++			/*
++			 * Sandbox request 2 is sandbox_check(): the verdict goes to the 64-bit word the
++			 * arguments' first pointer names (0 allowed). A refusal is a successful call, so
++			 * fuxi_sandbox_permissive does not see it, and daemons that ask before acting refuse
++			 * themselves: lsd asks "file-read-data" of every bundle before reading it
++			 * (-[FSNode copyCFBundleWithError:]) and registers none. fuxi_sandbox_check_allow=1:
++			 * every check is answered "allowed" (the first 100 refusals are printed).
++			 */
++			if (error == 0 && uap->call == 2 && strcmp(target, "Sandbox") == 0) {
++				static int allow = -1, logged;
++				user_addr_t result_p = 0;
++				uint64_t verdict = 0;
++
++				if (allow < 0) {
++					int on = 0;
++
++					allow = PE_parse_boot_argn("fuxi_sandbox_check_allow", &on, sizeof(on)) && on == 1;
++				}
++				if (allow && copyin(uap->arg, &result_p, sizeof(result_p)) == 0 && result_p != 0 &&
++				    copyin(result_p, &verdict, sizeof(verdict)) == 0 && verdict != 0) {
++					char name[32];
++
++					verdict = 0;
++					(void)copyout(&verdict, result_p, sizeof(verdict));
++					if (logged++ < 100) {
++						proc_selfname(name, sizeof(name));
++						printf("fuxi: sandbox_check refused %s[%d]: allowed\n", name, proc_selfpid());
++					}
++				}
++			}
+ #endif
+ 			goto done;
+ 		}
