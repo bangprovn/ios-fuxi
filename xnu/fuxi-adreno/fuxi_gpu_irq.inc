@@ -7,8 +7,11 @@
  * no SPI is configured and nothing installs cpu_data's interrupt_handler, so sleh_irq's SWEET branch hands every other INTID >= 16
  * to a NULL handler and EOIs it. Here, once, at the first WaitFence that has to wait: ml_install_interrupt_handler on every CPU
  * (bound in turn, last CPU 0), then armcpu_spi_attach's distributor sequence: ICENABLER + RWP, IGROUPR group 1 NS, IPRIORITYR 0xa0
- * (the SGI/PPI priority), ICFGR level, IROUTER = CPU 0's MPIDR affinity (mode 0, never core 1: it runs the loader's USB monitor),
- * ISENABLER, readback. sleh EOIs after the handler (EOImode 0). Neither the redistributor nor any per-CPU startup is touched.
+ * (the SGI/PPI priority), ICFGR level, IROUTER = one gold core's MPIDR affinity (mode 0, see fg_irq_rank; never core 1: it runs the
+ * loader's USB monitor), ISENABLER, readback. sleh EOIs after the handler (EOImode 0). Neither the redistributor nor any per-CPU
+ * startup is touched: every CPU's interface already takes SGI1 at the same priority 0xa0 with PMR 0xff and Group 1 enabled
+ * (PE_init_cpu -> pe_init_fiq on each CPU, xnu-8796.141.3 arm_init.c:607,742; "SGI1 OK" per CPU in boot.log), sleh_irq acks and
+ * EOIs on the CPU it runs on, and ml_install_interrupt_handler fills that CPU's cpu_data slot (machine_routines.c:801-819).
  *
  * Source. SPI 300 (kgsl_3d0_irq, level high) = INTID 332. Only RBBM_INT_0 bit 20, CP_CACHE_FLUSH_TS, is unmasked: a client frame's
  * BR fence is CP_EVENT_WRITE7 CACHE_CLEAN|WRITE|IRQ (fg_abi_frame, 0x88000031); the present copy's fence asks for no interrupt. The
@@ -24,12 +27,29 @@
 #define FG_IRQ_EMPTY_MAX 1000u
 #define FG_IRQ_BURST_MAX 5000u
 #define FG_IRQ_NODELIVERY 64u
+/* Route. Not CPU 0 (a Cortex-A510) but a gold core: HakiOS measured a window-server frame on a small core taking 2-3x as long
+ * (hakios-sm7325 a8e7a87) and routes its SPIs to its boot core, the biggest (gic_v3_irq.c:262-263, loader.c:775-783). The target is
+ * SM8550 physical core 6 (MPIDR Aff1 6, logical 5 here: cpu@100 is the loader's), the last core of the gold cluster (cpu@300..@600):
+ * - backboardd's Metal commits run on every recommended core alike (fuxicores=0x7c; d-ft1 cpu_hist for logical 2-6:
+ *   4881/4907/4670/4698/4607), so no big core is free of render work, and the handler is a few MMIO accesses and a wakeup;
+ * - a thread whose last core is busy goes to the lowest-numbered idle core (xnu-8796.141.3 sched_prim.c:5249 lsb_first for
+ *   timeshare, :8311 for realtime), so the highest gold core is the one most often idle when the line fires;
+ * - not the X3 (Aff1 7): fuxi_compile_bind binds backboardd's shader-compile lease there first.
+ * Rank by Aff1: 6, 5, 4, 3 (a cpus= boot without core 6 takes the highest gold core it has), else CPU 0 as before; nothing else.
+ * The handler stays on every CPU, so a line that lands elsewhere is still cleared (and counted: FG_IRQ_AWAY). */
+#define FG_IRQ_AFF1 6u
+static unsigned fg_irq_rank(uint64_t affinity, unsigned cpu)
+{
+ unsigned aff1 = (unsigned)(affinity >> 8) & 0xffu;
+ return aff1 >= 3 && aff1 <= FG_IRQ_AFF1 ? aff1 : cpu ? 0u : 1u;
+}
 extern kern_return_t thread_wakeup_prim(event_t, boolean_t, wait_result_t);
 static struct fg_window fg_irq_gicd = {FG_IRQ_GICD, 0x10000, 0};
 static volatile uint32_t *fg_irq_status, *fg_irq_clear;
 static unsigned fg_irq_state, fg_irq_ok, fg_irq_inside, fg_irq_why; /* state: 0 untried, 1 armed, 2 attach failed, 3 masked, 4 attaching */
+static unsigned fg_irq_cpu = ~0u; /* logical CPU the line is routed to */
 static uint32_t fg_irq_seq, fg_irq_empty_run, fg_irq_burst, fg_irq_mask_was;
-static uint64_t fg_irq_window, fg_irq_stats[FG_IRQ_STATS];
+static uint64_t fg_irq_window, fg_irq_at, fg_irq_stats[FG_IRQ_STATS];
 static int fg_irq_event;
 static volatile uint32_t *fg_gicd(unsigned off) { return (volatile uint32_t *)(fg_irq_gicd.va + off); }
 static void fg_spi_mask(unsigned id)
@@ -51,6 +71,9 @@ static void fg_irq_handler(void *target, void *refcon, void *nub, int source)
  (void)target; (void)refcon; (void)nub;
  unsigned id = (unsigned)source;
  if (id != FG_IRQ_INTID) { fg_spi_mask(id); __atomic_fetch_add(&fg_irq_stats[FG_IRQ_FOREIGN], 1, __ATOMIC_RELAXED); return; }
+ __atomic_store_n(&fg_irq_at, mach_absolute_time(), __ATOMIC_RELAXED);
+ if ((unsigned)ml_get_cpu_number_local() != __atomic_load_n(&fg_irq_cpu, __ATOMIC_RELAXED))
+  __atomic_fetch_add(&fg_irq_stats[FG_IRQ_AWAY], 1, __ATOMIC_RELAXED);
  uint32_t st = 0;
  __atomic_fetch_add(&fg_irq_inside, 1, __ATOMIC_SEQ_CST);
  if (__atomic_load_n(&fg_irq_ok, __ATOMIC_SEQ_CST) && !fg_access_failed) {
@@ -101,7 +124,7 @@ static const char *fg_spi_on(unsigned id, uint64_t affinity, uint32_t *readback,
 }
 static const char *fg_irq_attach(void)
 {
- unsigned id = FG_IRQ_INTID, cpus = ml_get_cpu_count();
+ unsigned id = FG_IRQ_INTID, cpus = ml_get_cpu_count(), target = ~0u, best = 0;
  uint32_t readback = 0;
  uint64_t mpidr = UINT64_MAX, router = UINT64_MAX;
  const char *fail = NULL;
@@ -121,19 +144,24 @@ static const char *fg_irq_attach(void)
   }
  }
  if (fail) return fail;
- /* The handler on every CPU, so a line that lands elsewhere is still cleared; CPU 0 last, whose affinity the line is routed to. */
+ /* The handler on every CPU, so a line that lands elsewhere is still cleared; on each, its own MPIDR (read while bound there, and
+  * only if the bind took) is ranked for the route (fg_irq_rank). */
  for (unsigned i = cpus; i-- > 0;) {
   processor_t p = cpu_to_processor((int)i);
   if (!p) continue;
   processor_t previous = thread_bind(p);
   (void)thread_block(THREAD_CONTINUE_NULL);
   ml_install_interrupt_handler(NULL, (int)id, NULL, fg_irq_handler, NULL);
-  if (!i) mpidr = rsr("mpidr_el1") & 0xff00ffffffULL;
+  uint64_t affinity = rsr("mpidr_el1") & 0xff00ffffffULL;
+  unsigned rank = (unsigned)ml_get_cpu_number_local() == i ? fg_irq_rank(affinity, i) : 0;
+  if (rank > best) { best = rank; mpidr = affinity; target = i; }
   (void)thread_bind(previous);
  }
- fail = mpidr == UINT64_MAX ? "no CPU 0" : fg_spi_on(id, mpidr, &readback, &router);
- printf("FUXI GPU IRQ: attach INTID %u cpus %u mpidr %#llx router %#llx readback %#x (grp|en<<1|edge<<2|prio<<8) int0_mask %#x->%#x %s\n",
-     id, cpus, mpidr, router, readback, fg_irq_mask_was, FG_IRQ_BITS, fail ? fail : "armed");
+ /* Before the line is enabled, so the first interrupt is not counted away. */
+ __atomic_store_n(&fg_irq_cpu, target, __ATOMIC_RELAXED);
+ fail = mpidr == UINT64_MAX ? "no route CPU" : fg_spi_on(id, mpidr, &readback, &router);
+ printf("FUXI GPU IRQ: attach INTID %u cpus %u route cpu %u mpidr %#llx router %#llx readback %#x (grp|en<<1|edge<<2|prio<<8) int0_mask %#x->%#x %s\n",
+     id, cpus, target, mpidr, router, readback, fg_irq_mask_was, FG_IRQ_BITS, fail ? fail : "armed");
  if (fail) {
   fg_spi_mask(id); __atomic_store_n(&fg_irq_ok, 0, __ATOMIC_SEQ_CST);
   FG_GUARD;
@@ -161,7 +189,7 @@ int fuxi_gpu_irq_sleep(uint32_t seq0, uint64_t fence, unsigned us)
   __atomic_fetch_add(&fg_irq_stats[FG_IRQ_WRITTEN], 1, __ATOMIC_RELAXED);
   return -2;
  }
- uint64_t deadline;
+ uint64_t deadline, asleep = mach_absolute_time();
  clock_interval_to_deadline(us, NSEC_PER_USEC, &deadline);
  (void)assert_wait_deadline((event_t)&fg_irq_event, THREAD_UNINT, deadline);
  if (__atomic_load_n(&fg_irq_seq, __ATOMIC_ACQUIRE) != seq0) {
@@ -170,7 +198,19 @@ int fuxi_gpu_irq_sleep(uint32_t seq0, uint64_t fence, unsigned us)
   __atomic_fetch_add(&fg_irq_stats[FG_IRQ_RACES], 1, __ATOMIC_RELAXED);
   return 1;
  }
- if (thread_block(THREAD_CONTINUE_NULL) != THREAD_TIMED_OUT) { __atomic_fetch_add(&fg_irq_stats[FG_IRQ_WAKES], 1, __ATOMIC_RELAXED); return 1; }
+ if (thread_block(THREAD_CONTINUE_NULL) != THREAD_TIMED_OUT) {
+  /* Interrupt entry (on the routed core) to this thread running again: the wakeup, an IPI and a switch. Only an interrupt that
+   * arrived during this sleep counts; a quiesce wake or an older one does not. */
+  uint64_t at = __atomic_load_n(&fg_irq_at, __ATOMIC_RELAXED), now = mach_absolute_time();
+  __atomic_fetch_add(&fg_irq_stats[FG_IRQ_WAKES], 1, __ATOMIC_RELAXED);
+  if (at > asleep && now >= at) {
+   uint64_t d = now - at, top = __atomic_load_n(&fg_irq_stats[FG_IRQ_LAT_MAX], __ATOMIC_RELAXED);
+   __atomic_fetch_add(&fg_irq_stats[FG_IRQ_LAT_N], 1, __ATOMIC_RELAXED);
+   __atomic_fetch_add(&fg_irq_stats[FG_IRQ_LAT_SUM], d, __ATOMIC_RELAXED);
+   while (d > top && !__atomic_compare_exchange_n(&fg_irq_stats[FG_IRQ_LAT_MAX], &top, d, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+  }
+  return 1;
+ }
  if (__atomic_add_fetch(&fg_irq_stats[FG_IRQ_TIMEOUTS], 1, __ATOMIC_RELAXED) >= FG_IRQ_NODELIVERY && !__atomic_load_n(&fg_irq_stats[FG_IRQ_N], __ATOMIC_RELAXED) &&
      __atomic_load_n(&fg_irq_state, __ATOMIC_ACQUIRE) == 1) {
   fg_irq_dead(4);

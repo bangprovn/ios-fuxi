@@ -181,7 +181,7 @@
   * ABI and framing credit: UniXNU NativeAdreno contributors (MIT).
   * See NativeAdrenoABI.h and LICENSE.NativeAdreno for copied material.
   */
-@@ -8,74 +8,279 @@
+@@ -8,74 +8,284 @@
  #include <IOKit/IOPlatformExpert.h>
  #include <IOKit/IOUserClient.h>
  #include <IOKit/IOBufferMemoryDescriptor.h>
@@ -296,10 +296,15 @@
 + IOLockUnlock(openLock);
 + if (!report) return;
 + unsigned state=fuxi_gpu_irq_stats(irq,&why);
++ /* away: handled off the routed core; wake: interrupt entry to the woken waiter running, boot totals. */
++ uint64_t latAvg=0, latMax=0;
++ absolutetime_to_nanoseconds(irq[FG_IRQ_LAT_N] ? irq[FG_IRQ_LAT_SUM]/irq[FG_IRQ_LAT_N] : 0,&latAvg);
++ absolutetime_to_nanoseconds(irq[FG_IRQ_LAT_MAX],&latMax);
 + IOLog("FUXI ABI: fence pending per 600 waits us <250 %llu <500 %llu <1000 %llu <2000 %llu <4000 %llu <8000 %llu <16000 %llu <32000 %llu more %llu untimed %llu ready %llu"
-+     " irq state %u why %u n %llu empty %llu foreign %llu wakes %llu timeouts %llu races %llu written %llu maskfix %llu\n",
++     " irq state %u why %u n %llu empty %llu foreign %llu wakes %llu timeouts %llu races %llu written %llu maskfix %llu away %llu wake n %llu avg_us %llu.%llu max_us %llu\n",
 +     bins[0],bins[1],bins[2],bins[3],bins[4],bins[5],bins[6],bins[7],bins[8],bins[9],bins[10],state,why,irq[FG_IRQ_N],irq[FG_IRQ_EMPTY],
-+     irq[FG_IRQ_FOREIGN],irq[FG_IRQ_WAKES],irq[FG_IRQ_TIMEOUTS],irq[FG_IRQ_RACES],irq[FG_IRQ_WRITTEN],irq[FG_IRQ_MASKFIX]);
++     irq[FG_IRQ_FOREIGN],irq[FG_IRQ_WAKES],irq[FG_IRQ_TIMEOUTS],irq[FG_IRQ_RACES],irq[FG_IRQ_WRITTEN],irq[FG_IRQ_MASKFIX],irq[FG_IRQ_AWAY],
++     irq[FG_IRQ_LAT_N],latAvg/1000,(latAvg%1000)/100,latMax/1000);
 +}
  static bool connected;
 +/* A refused submit waits for the state change that admits it (a present copy submitted or retired, a client job retired) instead of
@@ -483,7 +488,7 @@
   }
   IOReturn drop(Bo &b) {
    if (b.iova) {
-@@ -86,6 +291,7 @@
+@@ -86,6 +296,7 @@
    if (b.importMemory && b.importMap->wireRange(kIODirectionNone,0,b.bytes)!=kIOReturnSuccess)
     return kIOReturnIOError;
    wired_-=b.allocated;
@@ -491,7 +496,7 @@
    if (b.importMemory) {
     b.importMap->release();
     b.importMemory->complete(); b.importMemory->release();
-@@ -93,50 +299,66 @@
+@@ -93,50 +304,66 @@
     b.view->release(); /* view owns the matched prepare + backing retain */
     b.memory->release();
    }
@@ -580,7 +585,7 @@
    out.handle=b->handle;
    return kIOReturnSuccess;
   }
-@@ -144,51 +366,97 @@
+@@ -144,51 +371,97 @@
    * COW resolution, before wiring. Never translate a user VA with kernel_pmap,
    * change its WIMG/cache mode, or manufacture a physical descriptor alias. */
   IOReturn importHost(const NativeAdrenoAbiBoImport &r, NativeAdrenoAbiBoAllocReply &out) {
@@ -697,7 +702,7 @@
    }
    if (method==NativeAdrenoMethodBoCpuUnmap) {
     const auto &r=*static_cast<const NativeAdrenoAbiBoCpuUnmap *>(in);
-@@ -210,16 +478,26 @@
+@@ -210,16 +483,26 @@
    if (method==NativeAdrenoMethodBoMap) {
     const auto &r=*static_cast<const NativeAdrenoAbiBoMap *>(in);
     Bo *b=find(r.handle);
@@ -727,7 +732,7 @@
     if (s) return s==1 ? kIOReturnBusy : kIOReturnBadArgument;
     b->iova=r.iova; static_cast<NativeAdrenoAbiBoMapReply *>(out)->iova=r.iova; return kIOReturnSuccess;
    }
-@@ -231,22 +509,53 @@
+@@ -231,22 +514,53 @@
    }
    if (method==NativeAdrenoMethodSubmit) {
     const auto &r=*static_cast<const NativeAdrenoAbiSubmit *>(in);
@@ -792,7 +797,7 @@
     }
    }
    if (method==NativeAdrenoMethodSetMetadata || method==NativeAdrenoMethodGetMetadata) {
-@@ -254,8 +563,9 @@
+@@ -254,8 +568,9 @@
     if (!b || r.reserved || r.bytes>64) return kIOReturnBadArgument;
     if (method==NativeAdrenoMethodSetMetadata) { bcopy(r.text,b->metadata,r.bytes); b->metadataBytes=r.bytes; }
     else {
@@ -803,7 +808,7 @@
      bcopy(b->metadata,reply.text,reply.bytes);
     }
     return kIOReturnSuccess;
-@@ -277,34 +587,58 @@
+@@ -277,34 +592,58 @@
   bool initWithTask(task_t task, void *securityID, UInt32 type) override {
    if (!IOUserClient::initWithTask(task,securityID,type)) return false;
    task_=task; task_reference(task_);
@@ -870,7 +875,7 @@
   }
   IOReturn clientClose() override {
    if (!lock_) return kIOReturnSuccess;
-@@ -321,24 +655,40 @@
+@@ -321,24 +660,40 @@
     IOLockLock(openLock); connected=false; IOLockUnlock(openLock);
    }
    IOLockUnlock(lock_);
@@ -914,7 +919,7 @@
    if (!handler) return kIOReturnBadArgument;
    *handler=nullptr;
    if (type!=0x4147 && type!=0) return kIOReturnUnsupported;
-@@ -351,10 +701,92 @@
+@@ -351,10 +706,92 @@
    *handler=uc; return kIOReturnSuccess;
   }
  };
@@ -1009,7 +1014,7 @@
   auto *service=new NativeAdrenoGpuPublished;
   if (!openLock || !service) { if (service) service->release(); return; }
   if (!service->init() || !service->attach(IOService::getPlatform()) || !service->start(IOService::getPlatform())) {
-@@ -362,7 +794,29 @@
+@@ -362,7 +799,29 @@
   }
   service->setName("NativeAdrenoGpu");
   service->setProperty("NativeAdrenoABI",(uint64_t)NativeAdrenoAbiVersion,32);

@@ -5,6 +5,7 @@ Compiles the actual stat helpers from fuxi_abi_wire.h and FuxiAdrenoUserClient.c
 with minimal kernel stubs. No hardware or Apple SDK; device timing is not observed.
 """
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 
@@ -34,9 +35,10 @@ static void IOLog(const char *fmt,...) {va_list ap;va_start(ap,fmt);assert(logCo
 static uint32_t splitWhy[5]={1,2,3,4,5};
 static int ccOn;static int fuxi_gpu_abi_cached_coherent(int probe) {assert(!probe);return ccOn;}
 static IOLock *openLock;
-enum { FG_IRQ_N, FG_IRQ_EMPTY, FG_IRQ_FOREIGN, FG_IRQ_WAKES, FG_IRQ_TIMEOUTS, FG_IRQ_RACES, FG_IRQ_MASKFIX, FG_IRQ_WRITTEN, FG_IRQ_STATS };
+IRQ_ENUM
 static unsigned irqStatCalls;
-static unsigned fuxi_gpu_irq_stats(uint64_t s[FG_IRQ_STATS],unsigned *why) {assert(!openLock->held);irqStatCalls++;for(unsigned i=0;i<FG_IRQ_STATS;i++)s[i]=i+1;*why=4;return 3;}
+static unsigned fuxi_gpu_irq_stats(uint64_t s[FG_IRQ_STATS],unsigned *why) {assert(!openLock->held);irqStatCalls++;for(unsigned i=0;i<FG_IRQ_STATS;i++)s[i]=i+1;
+ s[FG_IRQ_LAT_N]=4;s[FG_IRQ_LAT_SUM]=4*25300;s[FG_IRQ_LAT_MAX]=91000;*why=4;return 3;}
 static void fuxi_gpu_abi_submit_split(uint64_t ns[8],uint32_t why[5],uint32_t n[2],uint64_t *lm,uint64_t kib[2]) {for(int i=0;i<8;i++)ns[i]=(i+1)*600000;memcpy(why,splitWhy,sizeof(splitWhy));n[0]=900;n[1]=600;*lm=6400000;kib[0]=1200*600;kib[1]=0;}
 static void fuxi_gpu_abi_clean_split(struct fuxi_gpu_clean_split *o) {memset(o,0,sizeof(*o));o->kib[0]=100*600;o->kib[1]=300*600;o->ns[0]=1000*600;o->ns[1]=2500*600;o->go_kib=50*600;o->imports=40;o->go_imports=9;o->mapped_kib=300<<10;
  o->bkt_kib[0]=10*600;o->bkt_ns[0]=100*600;o->bkt_kib[3]=390*600;o->bkt_ns[3]=3400*600;o->top_kib[0]=65536;o->top_perm[0]=3|16;o->top_kib[1]=16384;o->top_perm[1]=1;o->dty_state=2;o->dty_imports=7;o->submits=600;o->dty_checked=3300*600;o->dty_dirty=40*600;o->dty_kib=640*600;o->dty_full_kib=0;o->dty_check_ns=900000ull*600;o->dty_clean_ns=100000ull*600;o->ivac_ns=300000ull*600;}
@@ -115,7 +117,7 @@ int main() {
  for(unsigned i=0;i<600;i++){assert(!logCount);pendStat(pendNs[i%%6]?5:0,5+pendNs[i%%6],i%%6==2 && i<300);}
  assert(logCount==1 && irqStatCalls==1 && !pendLock.held);
  assert(!strcmp(logs[0],"FUXI ABI: fence pending per 600 waits us <250 100 <500 100 <1000 100 <2000 0 <4000 100 <8000 0 <16000 0 <32000 0 more 100 untimed 100 ready 50"
-  " irq state 3 why 4 n 1 empty 2 foreign 3 wakes 4 timeouts 5 races 6 written 8 maskfix 7\n"));
+  " irq state 3 why 4 n 1 empty 2 foreign 3 wakes 4 timeouts 5 races 6 written 8 maskfix 7 away 9 wake n 4 avg_us 25.3 max_us 91\n"));
  pendStat(5,4,false);assert(logCount==1); // window restarted; a retire stamp before the submit stamp counts as untimed
  puts("PASS: ABI stat aggregation/window reset/log format, sleep slices and sleep accounting, submit_split report (cached-BO line), fence pending histogram");
 }
@@ -127,9 +129,12 @@ def main():
     stats = src[src.index('static IOLock *statLock;'):src.index('static bool connected;')]
     step = src[src.index('static const char *abiStep('):src.index('class FuxiAdrenoUserClient :')]
     log = src[src.index('extern "C" void fuxi_gpu_abi_stats_log(void)'):src.index('extern "C" void fuxi_gpu_abi_publish(void)')]
+    # The interrupt counter slots, exactly as the kernel declares them.
+    header = (ROOT/'xnu/fuxi-adreno/fuxi_gpu_abi.h').read_text()
+    irq_enum = re.search(r'^enum \{ FG_IRQ_N,.*?\};\n', header, re.M | re.S)[0]
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp)/'perf.cpp'
-        path.write_text(MODEL % (stats, step, log))
+        path.write_text(MODEL.replace('IRQ_ENUM', irq_enum) % (stats, step, log))
         exe = path.with_suffix('')
         subprocess.run(['clang++', '-std=c++17', '-O1', '-g', '-Wall', '-Wextra', '-Werror', '-Wno-format',
                         '-fsanitize=address,undefined', '-I'+str(ROOT/'xnu/fuxi-adreno'), str(path), '-o', str(exe)], check=True)

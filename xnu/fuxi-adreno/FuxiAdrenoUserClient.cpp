@@ -107,10 +107,15 @@ static void pendStat(uint64_t submitted, uint64_t retired, bool first) {
  IOLockUnlock(openLock);
  if (!report) return;
  unsigned state=fuxi_gpu_irq_stats(irq,&why);
+ /* away: handled off the routed core; wake: interrupt entry to the woken waiter running, boot totals. */
+ uint64_t latAvg=0, latMax=0;
+ absolutetime_to_nanoseconds(irq[FG_IRQ_LAT_N] ? irq[FG_IRQ_LAT_SUM]/irq[FG_IRQ_LAT_N] : 0,&latAvg);
+ absolutetime_to_nanoseconds(irq[FG_IRQ_LAT_MAX],&latMax);
  IOLog("FUXI ABI: fence pending per 600 waits us <250 %llu <500 %llu <1000 %llu <2000 %llu <4000 %llu <8000 %llu <16000 %llu <32000 %llu more %llu untimed %llu ready %llu"
-     " irq state %u why %u n %llu empty %llu foreign %llu wakes %llu timeouts %llu races %llu written %llu maskfix %llu\n",
+     " irq state %u why %u n %llu empty %llu foreign %llu wakes %llu timeouts %llu races %llu written %llu maskfix %llu away %llu wake n %llu avg_us %llu.%llu max_us %llu\n",
      bins[0],bins[1],bins[2],bins[3],bins[4],bins[5],bins[6],bins[7],bins[8],bins[9],bins[10],state,why,irq[FG_IRQ_N],irq[FG_IRQ_EMPTY],
-     irq[FG_IRQ_FOREIGN],irq[FG_IRQ_WAKES],irq[FG_IRQ_TIMEOUTS],irq[FG_IRQ_RACES],irq[FG_IRQ_WRITTEN],irq[FG_IRQ_MASKFIX]);
+     irq[FG_IRQ_FOREIGN],irq[FG_IRQ_WAKES],irq[FG_IRQ_TIMEOUTS],irq[FG_IRQ_RACES],irq[FG_IRQ_WRITTEN],irq[FG_IRQ_MASKFIX],irq[FG_IRQ_AWAY],
+     irq[FG_IRQ_LAT_N],latAvg/1000,(latAvg%1000)/100,latMax/1000);
 }
 static bool connected;
 /* A refused submit waits for the state change that admits it (a present copy submitted or retired, a client job retired) instead of
