@@ -1848,7 +1848,8 @@ static NSString *surfaceDescriptorText(IOSurfaceRef surface,NSUInteger plane){
     (storage!=MTLStorageModeShared && storage!=MTLStorageModePrivate) || cache>MTLCPUCacheModeWriteCombined ||
     (hazard!=MTLHazardTrackingModeDefault && hazard!=MTLHazardTrackingModeTracked)){failureLog("FUXI MTL: buffer reject options %lu length=%lu\n",(unsigned long)options,(unsigned long)n);return nil;}
  FuxiBuffer *b=[FuxiBuffer new];b->_device=[self retain];b->_storage=(MTLStorageMode)storage;b->_cacheMode=(MTLCPUCacheMode)cache;
- try {b->_buffer=owner(self)->backend->allocate(n);}
+ // Memory past the buffer: CA makes linear textures over its buffers (newLinearTextureWithDescriptor), ending at the rows.
+ try {b->_buffer=owner(self)->backend->allocate(n,true);}
  catch(const std::exception &e) {failureLog("FUXI MTL: buffer FAIL %s\n",e.what());[b release];return nil;}
  return b;
 }
@@ -1868,7 +1869,7 @@ static NSString *surfaceDescriptorText(IOSurfaceRef surface,NSUInteger plane){
   // Page-aligned or enclosing-page imports are tried first; log each refusal reason (bounded) with the running outcome counters.
   static std::atomic<unsigned> refusals{0};unsigned n=refusals.fetch_add(1);
   if(n<12 || !(n&511))fprintf(stderr,"FUXI MTL: no-copy buffer shadowed (%s) len=%lu import attempts=%llu aligned=%llu enclosed=%llu plan_refused=%llu vulkan_refused=%llu\n",e.what(),(unsigned long)length,(unsigned long long)fuxi::HostImportStats::attempts.load(),(unsigned long long)fuxi::HostImportStats::aligned.load(),(unsigned long long)fuxi::HostImportStats::enclosed.load(),(unsigned long long)fuxi::HostImportStats::refusedPlan.load(),(unsigned long long)fuxi::HostImportStats::refusedVulkan.load());
-  try {b->_buffer=owner(self)->backend->allocate(length);}
+  try {b->_buffer=owner(self)->backend->allocate(length,true);}
   catch(const std::exception &a){failureLog("FUXI MTL: no-copy buffer FAIL %s\n",a.what());[b release];return nil;}
   memcpy(b->_buffer->contents,pointer,length);b->_shadow=YES;
  }

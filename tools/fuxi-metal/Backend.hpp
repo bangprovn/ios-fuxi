@@ -40,6 +40,7 @@
 #include "ObjectCache.hpp"
 #include "HostImportRange.hpp"
 #include "MemoryTypes.hpp"
+#include "LinearLayout.hpp"
 #include <functional>
 #include <memory>
 #include <optional>
@@ -97,7 +98,7 @@ inline void importCheck(VkResult r,int line=__builtin_LINE()) {
  X(CreatePipelineLayout) X(DestroyPipelineLayout) X(CreateGraphicsPipelines) X(DestroyPipeline) \
  X(CreatePipelineCache) X(DestroyPipelineCache) X(GetPipelineCacheData) \
  X(CmdBindVertexBuffers) X(CmdBindIndexBuffer) X(CmdDrawIndexed) X(CmdSetViewport) X(CmdSetScissor) X(CmdPushConstants) X(CmdBeginRenderPass) X(CmdEndRenderPass) X(CmdBindPipeline) X(CmdDraw) X(CmdCopyImageToBuffer) X(CmdPipelineBarrier) X(CreateFence) X(DestroyFence) X(QueueSubmit) X(WaitForFences)
-struct Buffer { VkBuffer buffer{}; VkDeviceMemory memory{}; void *contents{};void *key{};Buffer *spare{};void *shadowKey() const{return key?key:contents;}bool shadowBacking=false,directUse=false,spareFailed=false,aliased=false; size_t length{}, allocated{},charged{},memoryBytes{},memoryOffset{},references=1;uint32_t memoryType{};bool imported=false,upload=false,poolable=false,gpuWritten=false,daWritten=false;uint64_t planStamp=0; }; // planStamp: FUXI_MTL_SUBMIT_LEAN per-submit dedupe mark
+struct Buffer { VkBuffer buffer{}; VkDeviceMemory memory{}; void *contents{};void *key{};Buffer *spare{};void *shadowKey() const{return key?key:contents;}bool shadowBacking=false,directUse=false,spareFailed=false,aliased=false; size_t length{}, allocated{},charged{},memoryBytes{},memoryOffset{},references=1;uint32_t memoryType{};bool imported=false,upload=false,poolable=false,gpuWritten=false,daWritten=false,linearTail=false;uint64_t planStamp=0; }; // planStamp: FUXI_MTL_SUBMIT_LEAN per-submit dedupe mark; linearTail: memory past the buffer (Backend::allocate)
 // Host ranges a submit's prepare callback will write; absent means unknown (full drain).
 struct PrepareWrite {Buffer *buffer;uint64_t offset,bytes;};
 struct Texture : TextureLevels {VkImage image{};VkDeviceMemory memory{};VkImageView view{};size_t allocated{},charged{},memoryBytes{},references=1;
@@ -192,9 +193,11 @@ class Backend {
    checkpoint=true;cacheCheckpoint=CacheClock::now();
   }
   artifactCache.report();
-  fprintf(stderr,"FUXI MTL: cache period driver hits=%llu misses=%llu unknown=%llu objects hits=%llu misses=%llu live=%zu evictions=%zu bytes=%zu blobs=%zu blob_shared=%llu mesa_cache=%s\n",
+  // linear_textures: cumulative linearTexture outcomes (own_row: explicit row, tail: aliased past the buffer's bytes); tail_pad_kb: live.
+  fprintf(stderr,"FUXI MTL: cache period driver hits=%llu misses=%llu unknown=%llu objects hits=%llu misses=%llu live=%zu evictions=%zu bytes=%zu blobs=%zu blob_shared=%llu mesa_cache=%s linear_textures=own_row:%llu,tail:%llu,shadow:%llu,shadow_kinds:%zu tail_pad_kb=%zu\n",
    (unsigned long long)driverHits,(unsigned long long)driverMisses,(unsigned long long)driverUnknown,
-   (unsigned long long)objectHits,(unsigned long long)objectMisses,objects.count(),objects.evictions,objects.totalBytes(),blobShare.size(),(unsigned long long)blobSharedHits,mesaStatus[0]?mesaStatus:"off");
+   (unsigned long long)objectHits,(unsigned long long)objectMisses,objects.count(),objects.evictions,objects.totalBytes(),blobShare.size(),(unsigned long long)blobSharedHits,mesaStatus[0]?mesaStatus:"off",
+   (unsigned long long)linearOwnRows,(unsigned long long)linearTailUses,(unsigned long long)linearShadows,linearShadowKinds.size(),tailPadBytes>>10);
   {size_t variants=0,largest=0,largestVariants=0;objects.each([&](Pipeline *p,size_t n){variants+=p->variants.size();if(n>largest){largest=n;largestVariants=p->variants.size();}});
    fprintf(stderr,"FUXI MTL: cache period object bytes live=%zu variants=%zu avg_kb=%zu largest_kb=%zu largest_variants=%zu (entry bytes include runtime variants: each variant is a full pipeline, up to 8 per entry)\n",objects.count(),variants,objects.count()?objects.totalBytes()/objects.count()/1024:0,largest/1024,largestVariants);}
   driverHits=driverMisses=driverUnknown=objectHits=objectMisses=0;return checkpoint;
@@ -214,7 +217,7 @@ private:
  // Small plain host buffers are kept for exact-size reuse (CA recreates the same vertex/uniform sizes every frame); bounded, idle-trimmed, charged against the budget while pooled.
  struct PooledBuffer {VkBuffer buffer;VkDeviceMemory memory;void *contents;size_t classSize,allocated,memoryBytes,charged;uint32_t memoryType;uint64_t idleSince;};
  std::vector<PooledBuffer> bufferPool;size_t bufferPoolUsed=0;
- void freePooledBuffer(const PooledBuffer &e){frameKernelCall([&]{return UnmapMemory(device,e.memory);});DestroyBuffer(device,e.buffer,nullptr);frameKernelCall([&]{FreeMemory(device,e.memory,nullptr);});--liveMemoryObjects;liveMemoryBytes-=e.memoryBytes;limits.release(e.charged);bufferPoolUsed-=e.classSize;bufferPoolBytes=bufferPoolUsed;++bufferPoolTrims;}
+ void freePooledBuffer(const PooledBuffer &e){frameKernelCall([&]{return UnmapMemory(device,e.memory);});DestroyBuffer(device,e.buffer,nullptr);frameKernelCall([&]{FreeMemory(device,e.memory,nullptr);});--liveMemoryObjects;liveMemoryBytes-=e.memoryBytes;tailPadBytes-=e.memoryBytes-e.allocated;limits.release(e.charged);bufferPoolUsed-=e.classSize;bufferPoolBytes=bufferPoolUsed;++bufferPoolTrims;}
  size_t trimBuffers(uint64_t now,bool all,size_t want=SIZE_MAX){
   size_t freed=0;for(size_t i=0;i<bufferPool.size() && freed<want;){if(all || want!=SIZE_MAX || now-bufferPool[i].idleSince>bufferPoolIdleNs){freed+=bufferPool[i].charged;auto e=bufferPool[i];bufferPool.erase(bufferPool.begin()+i);freePooledBuffer(e);}else ++i;}
   return freed;
@@ -394,6 +397,9 @@ public:
  static inline std::atomic<uint64_t> splitWindow{0},splitSubmits{0},splitChunks{0},splitFirstNs{0},splitLastNs{0},splitGapNs{0},splitGapSamples{0},splitFewPasses{0},splitUnsplit{0},splitDrained{0};
  static inline std::atomic<uint64_t> flushCalls{0},invalidateCalls{0},emptySubmits{0},submitObjectCreates{0},submitPoolCreates{0},submitFrameCreates{0},submitViewCreates{0};
  std::map<std::array<uint64_t,8>,Texture *> imports;
+ // Linear textures over buffers (linearTexture): aliased at their own row, aliased only thanks to the tail pad or an import's
+ // enclosing pages, shadowed, and the kinds of shadow logged; the live tail pad bytes of owned buffers. Under the mutex.
+ uint64_t linearOwnRows=0,linearTailUses=0,linearShadows=0;std::set<std::string> linearShadowKinds;size_t tailPadBytes=0;
  struct ReuseCounts {uint64_t commandPools{},commandBuffers{},fences{},queries{},descriptors{},frames{},views{};} reuseCounts;
 #ifdef FUXI_MTL_HOST_TEST
  // Test-only reference mode and deterministic recording failure; no production environment switches.
@@ -591,22 +597,23 @@ public:
  }
  ~Backend() {close();}
  void requireLive() {if(poisoned || backboardGate.refusesResources()) throw std::runtime_error("device poisoned or backboardd failure latched");}
- Buffer *allocate(size_t length) {
+ // linearTail: a client's MTLBuffer, which may back a linear texture: its memory runs past the buffer (linearTailPad).
+ Buffer *allocate(size_t length,bool linearTail=false) {
   std::lock_guard<std::mutex> guard(mutex);requireLive();
-  return allocateUnlocked(length);
+  return allocateUnlocked(length,linearTail);
  }
- Buffer *allocateUnlocked(size_t length) {
+ Buffer *allocateUnlocked(size_t length,bool linearTail=false) {
   if(!length || length>maxBufferLength) throw std::runtime_error("buffer length outside resource limit");
   size_t classSize=(length+15)&~size_t(15);
   if(buffersPooled && classSize<=bufferPoolMaxBuffer){
-   for(size_t i=bufferPool.size();i-->0;)if(bufferPool[i].classSize==classSize){
+   for(size_t i=bufferPool.size();i-->0;)if(bufferPool[i].classSize==classSize && bufferPool[i].memoryBytes-bufferPool[i].allocated==(linearTail?linearTailPad(classSize,bufferPool[i].allocated):0)){
     auto e=bufferPool[i];bufferPool.erase(bufferPool.begin()+i);bufferPoolUsed-=e.classSize;bufferPoolBytes=bufferPoolUsed;++bufferPoolHits;
-    auto *b=new Buffer{};b->length=length;b->buffer=e.buffer;b->memory=e.memory;b->contents=e.contents;b->key=e.contents;b->allocated=e.allocated;b->memoryBytes=e.memoryBytes;b->charged=e.charged;b->memoryType=e.memoryType;b->poolable=true;
+    auto *b=new Buffer{};b->length=length;b->buffer=e.buffer;b->memory=e.memory;b->contents=e.contents;b->key=e.contents;b->allocated=e.allocated;b->memoryBytes=e.memoryBytes;b->charged=e.charged;b->memoryType=e.memoryType;b->poolable=true;b->linearTail=linearTail;
     memset(b->contents,0,classSize);return b;
    }
    ++bufferPoolMisses;
   }
-  auto *b=new Buffer{};b->length=length;b->poolable=buffersPooled && classSize<=bufferPoolMaxBuffer;
+  auto *b=new Buffer{};b->length=length;b->poolable=buffersPooled && classSize<=bufferPoolMaxBuffer;b->linearTail=linearTail;
   try {
    VkBufferCreateInfo ci{};ci.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;ci.size=(length+15)&~size_t(15);
    ci.usage=VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT|VK_BUFFER_USAGE_VERTEX_BUFFER_BIT|VK_BUFFER_USAGE_INDEX_BUFFER_BIT|VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT|VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
@@ -615,9 +622,12 @@ public:
    auto flagsOf=[&](uint32_t t){return uint32_t(memory.memoryTypes[t].propertyFlags);};const bool cachedPref=systemTranslationPolicy().bufferCached;
    uint32_t type=bufferMemoryType(memory.memoryTypeCount,req.memoryTypeBits,cachedPref,flagsOf);logBufferMemoryType(stderr,cachedPref,memory.memoryTypeCount,flagsOf,type);
    if(type==memory.memoryTypeCount) throw std::runtime_error("no host-visible memory");
-   VkMemoryAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;ai.allocationSize=req.size;ai.memoryTypeIndex=type;b->memoryType=type;
+   // The memory runs past the buffer (linearTailPad): a linear texture CA puts at the end of the buffer keeps Turnip's
+   // 4-row padding inside the memory it is bound to (linearTexture). The buffer itself, and allocatedSize, are unchanged.
+   const size_t tail=linearTail?linearTailPad(ci.size,req.size):0;
+   VkMemoryAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;ai.allocationSize=req.size+tail;ai.memoryTypeIndex=type;b->memoryType=type;
    reserveMemoryUnlocked(ai.allocationSize);b->charged=ai.allocationSize;
-   check(frameKernelCall([&]{return AllocateMemory(device,&ai,nullptr,&b->memory);}));if(systemTranslationPolicy().frameTrace)++frameCounts.allocations;++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;b->memoryBytes=ai.allocationSize;check(frameKernelCall([&]{return BindBufferMemory(device,b->buffer,b->memory,0);}));
+   check(frameKernelCall([&]{return AllocateMemory(device,&ai,nullptr,&b->memory);}));if(systemTranslationPolicy().frameTrace)++frameCounts.allocations;++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;b->memoryBytes=ai.allocationSize;tailPadBytes+=tail;check(frameKernelCall([&]{return BindBufferMemory(device,b->buffer,b->memory,0);}));
    check(frameKernelCall([&]{return MapMemory(device,b->memory,0,VK_WHOLE_SIZE,0,&b->contents);}));b->key=b->contents;memset(b->contents,0,(length+15)&~size_t(15));return b;
   } catch(...) {destroyUnlocked(b);throw;}
  }
@@ -680,7 +690,10 @@ public:
     if(t->image)DestroyImage(device,t->image,nullptr);delete t;t=nullptr;
     auto *shadow=allocateTextureUnlocked(format,1,width,height);
     shadow->shadow=true;b->shadowBacking=true;shadow->backingBuffer=b;++b->references;shadow->backingOffset=offset;shadow->backingRow=row;
-    if(reason[0]!='s')fprintf(stderr,"FUXI MTL: linear texture shadow format=%u %ux%u offset=%zu row=%zu reason=%s\n",format,width,height,offset,row,reason.c_str());return shadow;
+    // One line per kind of fallback (its reason without the numbers), not per texture; the cache period line counts them all.
+    if(reason[0]!='s'){++linearShadows;const bool fresh=linearShadowKinds.size()<64 && linearShadowKinds.insert(linearShadowKind(reason)).second;
+     if(fresh)fprintf(stderr,"FUXI MTL: linear texture shadow format=%u %ux%u offset=%zu row=%zu count=%llu kinds=%zu reason=%s\n",format,width,height,offset,row,(unsigned long long)linearShadows,linearShadowKinds.size(),reason.c_str());}
+    return shadow;
    };
    if((formatProperties.linearTilingFeatures&required)!=(uint32_t)required)return fallback("linear texture format features unavailable");
    // A shadowed buffer's bytes are rewritten each frame; sampling it in place would pin the buffer to every flight reading it. A copy through a shadow image lets the storage be renamed.
@@ -709,8 +722,32 @@ public:
    }
    auto result=CreateImage(device,&ci,nullptr,&t->image);if(result==VK_ERROR_FORMAT_NOT_SUPPORTED)return fallback("linear texture image format unavailable");check(result);VkMemoryRequirements req{};GetImageMemoryRequirements(device,t->image,&req);
    VkImageSubresource sub{VK_IMAGE_ASPECT_COLOR_BIT,0,0};VkSubresourceLayout layout{};GetImageSubresourceLayout(device,t->image,&sub,&layout);
-   auto mismatch=linearAliasMismatch(req,layout,b->memoryType,b->allocated,offset,row,b->memoryOffset);
+   // The image may use the memory from its binding to the end of the buffer's memory: an owned buffer's tail pad
+   // (allocateUnlocked), an import's enclosing host pages (importBuffer).
+   const size_t span=b->memoryBytes>b->memoryOffset?b->memoryBytes-b->memoryOffset:b->allocated;
+   auto mismatch=linearAliasMismatch(req,layout,b->memoryType,span,offset,row,b->memoryOffset);
+   // Turnip's plain linear pitch is 64 texels (256 bytes for BGRA8) and its size is rounded up to 4 KiB, while CA's rows are
+   // 64-byte aligned and its buffers end at the rows (d-ft-v27: 1128 shadows, 6.8 MB copied and 37 barriers a frame). As for an
+   // IOSurface (importTexture), the image is made again as an explicit DRM_FORMAT_MOD_LINEAR layout at the buffer's own row.
+   // A refusal there is not a device failure (no check()): the shadow stays the fallback.
+   if(!mismatch.empty() && explicitPitch && explicitRowFits(row,width,texelBytes(format))){
+    const VkDeviceSize plainPitch=layout.rowPitch,plainSize=req.size;
+    VkSubresourceLayout plane{};plane.rowPitch=row;
+    VkImageDrmFormatModifierExplicitCreateInfoEXT ex{};ex.sType=VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT;ex.pNext=ci.pNext;
+    ex.drmFormatModifier=0;ex.drmFormatModifierPlaneCount=1;ex.pPlaneLayouts=&plane;   // 0: DRM_FORMAT_MOD_LINEAR
+    VkImageCreateInfo own=ci;own.pNext=&ex;own.tiling=VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;VkImage image{};
+    if(CreateImage(device,&own,nullptr,&image)==VK_SUCCESS){
+     VkMemoryRequirements ownReq{};GetImageMemoryRequirements(device,image,&ownReq);
+     VkImageSubresource ownSub{VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT,0,0};VkSubresourceLayout ownLayout{};GetImageSubresourceLayout(device,image,&ownSub,&ownLayout);
+     auto ownMismatch=linearAliasMismatch(ownReq,ownLayout,b->memoryType,span,offset,row,b->memoryOffset);
+     if(ownMismatch.empty()){DestroyImage(device,t->image,nullptr);t->image=image;req=ownReq;mismatch.clear();++linearOwnRows;
+      if(linearOwnRows<=8)fprintf(stderr,"FUXI MTL: linear texture at its own row %zu format=%u %ux%u offset=%zu (Vulkan linear pitch=%llu size=%llu, own row size=%llu, memory=%zu) count=%llu\n",
+       row,format,width,height,offset,(unsigned long long)plainPitch,(unsigned long long)plainSize,(unsigned long long)ownReq.size,span,(unsigned long long)linearOwnRows);}
+     else {DestroyImage(device,image,nullptr);mismatch+="; at its own row: "+ownMismatch;}
+    }else mismatch+="; own row refused";
+   }
    if(!mismatch.empty())return fallback("linear texture Vulkan memory/layout mismatch: "+mismatch);
+   if(offset>b->allocated || req.size>b->allocated-offset)++linearTailUses; // fits only past the buffer's own bytes
    check(frameKernelCall([&]{return BindImageMemory(device,t->image,b->memory,b->memoryOffset+offset);}));t->memory=b->memory;t->memoryType=b->memoryType;t->borrowedMemory=true;b->aliased=true;t->allocated=req.size;
    t->mapped=(uint8_t *)b->contents+offset;t->layout=ci.initialLayout;t->defined=true;t->usage=ci.usage;
    VkImageViewCreateInfo vi{};vi.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;vi.image=t->image;vi.viewType=VK_IMAGE_VIEW_TYPE_2D;vi.format=t->vkFormat;vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
@@ -731,7 +768,7 @@ public:
   if(!poisoned) {
    if(b->contents) frameKernelCall([&]{return UnmapMemory(device,b->memory);});
    if(b->buffer) DestroyBuffer(device,b->buffer,nullptr);
-   if(b->memory) {frameKernelCall([&]{return FreeMemory(device,b->memory,nullptr);});--liveMemoryObjects;liveMemoryBytes-=b->memoryBytes;}
+   if(b->memory) {frameKernelCall([&]{return FreeMemory(device,b->memory,nullptr);});--liveMemoryObjects;liveMemoryBytes-=b->memoryBytes;if(!b->imported)tailPadBytes-=b->memoryBytes-b->allocated;}
   }
   limits.release(b->charged);delete b;
  }
@@ -1876,7 +1913,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
   unsigned declinedSeen=0;if(currentFrame)for(auto &w:prepared)if(busyUse(w)){ // why a conflicting write cannot be renamed, once per submit and cause
    auto *x=w.buffer;unsigned c=!renaming?0:x->aliased?3:!x->shadowBacking?1:x->directUse?2:x->spareFailed?4:5;if(c==5 && renameable(x))continue;if(!(declinedSeen>>c&1)){declinedSeen|=1u<<c;++currentFrame->renameDeclined[c];}}
   if(renaming)for(auto &w:prepared)if(renameable(w.buffer) && !w.buffer->spare && busyUse(w)){ // first conflict: create the spare storage
-   try{w.buffer->spare=allocateUnlocked(w.buffer->length);}catch(const std::exception &){w.buffer->spareFailed=true;}}
+   try{w.buffer->spare=allocateUnlocked(w.buffer->length,w.buffer->linearTail);}catch(const std::exception &){w.buffer->spareFailed=true;}}
   auto indexHazard=[&](bool uploadOnly=false){for(auto &op:ops)if(op.indices && (!uploadOnly || op.indices->upload))for(auto &pending:slots)if(pending.busy)for(auto old:pending.writes)if(aliases(old,{op.indices->memory,op.indices->contents,op.indices->length}))return true;return false;};
   // Coherent index reads need only exclude real GPU writers. Noncoherent cache
   // maintenance still excludes every shared allocation; undeclared prepare drains.

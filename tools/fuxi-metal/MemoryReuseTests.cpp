@@ -118,6 +118,25 @@ int main(int argc,char **){
   rb.destroy(copy.sourceTexture);rb.destroy(dst);rb.destroy(buf);rb.close();
   puts("PASS: shadow storage rename (no wait, bytes preserved, old storage untouched, direct use refused, conflict kind reported)");
  }
+ // A client buffer's memory runs past it (linearTailPad): a linear texture ending at the buffer's rows (d-ft-v27's A8 labels,
+ // 256x61 at offset 64 in 16 KiB) keeps the image's 4-row padding inside that memory and aliases; an internal buffer shadows.
+ {
+  Backend lb;
+  auto *inner=lb.allocate(16384),*client=lb.allocate(16384,true);
+  assert(inner->memoryBytes==inner->allocated && client->allocated==inner->allocated && client->memoryBytes==client->allocated+4096 && lb.tailPadBytes==4096);
+  for(size_t i=0;i<16384;++i)((uint8_t *)client->contents)[i]=uint8_t(i*7+3);
+  auto *shadowed=lb.linearTexture(inner,1,1,256,61,64,256),*aliased=lb.linearTexture(client,1,1,256,61,64,256);
+  assert(shadowed->shadow && !aliased->shadow && aliased->borrowedMemory && lb.linearTailUses==1 && lb.linearShadows==1 && lb.linearShadowKinds.size()==1);
+  auto *copy=lb.allocateTexture(1,1,256,61);auto *out=lb.allocate(256*61);
+  Operation c{};c.texture=copy;c.sourceTexture=aliased;c.width=256;c.height=61;Operation r{};r.texture=copy;r.dst=out;lb.submit({c,r});
+  for(unsigned y=0;y<61;++y)for(unsigned x=0;x<256;++x)assert(((uint8_t *)out->contents)[y*256+x]==uint8_t((64+y*256+x)*7+3));
+  // Pooled, the padded memory goes back only to a client buffer of its class.
+  lb.destroy(shadowed);lb.destroy(aliased);lb.destroy(inner);lb.destroy(client);auto hits=bufferPoolHits.load();
+  auto *again=lb.allocate(16384);assert(bufferPoolHits==hits+1 && again->memoryBytes==again->allocated);
+  auto *clientAgain=lb.allocate(16384,true);assert(bufferPoolHits==hits+2 && clientAgain->memoryBytes==clientAgain->allocated+4096);
+  lb.destroy(again);lb.destroy(clientAgain);lb.destroy(copy);lb.destroy(out);lb.trimMemory();assert(!lb.tailPadBytes && !lb.resourceBytes());lb.close();
+  puts("PASS: client buffer tail pad (256x61 A8 at offset 64 in 16 KiB aliases with its pixels, internal buffers unpadded, pool keeps the pad)");
+ }
  assert(frameCounts.allocations>before);
  printf("PASS: image memory reuse after fence only, new-image layout/defined state, pixels, cap/idle/pressure/charge/close; Operation=%zu BufferBind=%zu bindings=%zu\n",sizeof(Operation),sizeof(BufferBind),sizeof(Operation::buffers));
 }
