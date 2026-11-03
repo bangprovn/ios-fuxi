@@ -118,6 +118,13 @@ SweetPlatformExpert::start(IOService *provider)
 		return false;
 	}
 	fuxi_find_boot_epoch();
+	/*
+	 * IOKitInitializeTime() waits up to 30 s for an "IORTC" resource before it sets the calendar, unless the
+	 * kernel is built for BCM2837 (IOStartIOKit.cpp:80-84, the Raspberry Pi config HakiOS builds). We have no
+	 * RTC driver: this platform expert is the time of day (getGMTTimeOfDay above), so it answers for one.
+	 * r-v21..r-v23: CPUs up at about 8.9 s, calendar set at 38.9 s, every boot.
+	 */
+	publishResource("IORTC");
 	registerService();
 	IOLog("SWEET: platform expert registered\n");
 	return true;
