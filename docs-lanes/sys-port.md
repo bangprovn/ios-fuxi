@@ -12,6 +12,7 @@ boot-arg, ADT option or root-edit option, the kernel, ADT and root are unchanged
 | Container path for an uncontained process | same | boot-arg `fuxisbpath=1` | same |
 | Sandbox extensions issued and consumed | same | boot-arg `fuxisbext=1` | Fuxi; HackiOS only returns success |
 | SpringBoard's frame rates: its in-process animations' display link, its animations through the window server | `tools/fuxi-sb/FuxiRates.c`, in `libfuxi-sb.dylib` | on where the library is installed; boot-arg `fxrate=0` turns it off, `1` and `2` one at a time | `hakios-xnu-kernel userland/src/inject_sb.c` (MIT) |
+| Every application above 60 a second (`CADisableMinimumFrameDurationOnPhone`), its Info.plist untouched | `tools/fuxi-sb/FuxiAppRate.c`, `libfuxi-app.dylib` | `fuxi-sys-root.py --app-rate` installs it; boot-arg `fxinj=1` (patch 0121) inserts it | Fuxi; the key from `hakios-xnu-kernel userland/mkhighrate.py`, kernel insertion as `xnu/hakios.patch` `kern.exec_inject` (MIT) |
 | HAL devices Speaker/Hawking/Actuator/Codec | `tools/fuxi-audio/` | `fuxi-sys-root.py --audio-plugin` (+ `--restore-virtualaudio`) | `hackios-xnu-userland userland/src/audio_plugin.c`, `audio_plugin.plist` (MIT) |
 | `/product/haptics`, `/product/camera` | `tools/mkadt-fuxi.py` | `--product-haptics`, `--product-camera` | `hackios-xnu-userland` loader/identity notes (MIT); values from the local D22AP tree |
 | App snapshots as JPEG/PNG, not ATX | `tools/fuxi-sb/` | `fuxi-sys-root.py --sb-snapshots`; boot-arg `fuxisbjpeg=0` turns it off again | `hackios-xnu-userland userland/src/inject_sb.c` (MIT) |
@@ -119,14 +120,44 @@ name, through the ObjC runtime. It returns 3 (JPEG) if `-[snapshot isImageOpaque
 never ATX/ASTC. Both selectors are present in the 20H392 shared cache. HackiOS checks the original
 implementation against a 16.5 address before replacing it. This port finds the method by name, and if
 the method is missing it logs `NOT changed` and leaves SpringBoard alone. If SplashBoard loads after
-the library, the hook is installed from a `_dyld_register_func_for_add_image` callback. The library is
-loaded through `DYLD_INSERT_LIBRARIES` in SpringBoard's job in the launchd cache. H1 AMFI answers dyld
-policy query 0x5a with all features allowed, so dyld honours the variable.
+the library, the hook is installed from a `_dyld_register_func_for_add_image` callback. H1 AMFI answers
+dyld policy query 0x5a with all features allowed, so dyld honours `DYLD_INSERT_LIBRARIES`, but **the entry in
+SpringBoard's launchd job never reaches it**: launchd (20H392) drops every `DYLD_` variable except
+`DYLD_PRINT_*` from a job's `EnvironmentVariables` ("Disallowing environment variable", launchd 0x1000092e8 and
+the test at 0x10001a720) unless the label does not start with `com.apple.` (0x100008b34). So this library (and
+FuxiRates) has not run in any root so far. Boot-arg `fxinj=2` (patch 0121) inserts it from the kernel instead.
 
 - HackiOS: ATX compression on the CPU takes seconds per picture, and the app waits for it until the
   10-second scene-update watchdog kills it: "no application survived going to the background".
 - Guess: on Fuxi, apps that go to the background (home gesture or app switch) are killed the same way
   once apps launch reliably. No Fuxi log has shown this yet, because app switching has not been tested.
+
+### libfuxi-app.dylib (applications at the panel's rate)
+
+Measured in 20H392's shared cache: QuartzCore reads the key once per process, in the application's own
+process, with `CFDictionaryGetValue(CFBundleGetInfoDictionary(CFBundleGetMainBundle()), key)` (a
+`dispatch_once` block at QuartzCore+0x247c94, cfstring at 0x1d5b5f400, result byte at 0x1dcdfbee8). Without
+it, CADisplayLink's frame-rate client (+0x8ab00, "CAFrameRateClient: update", reached from
+`-[CADisplayLink setPreferredFrameRateRange:]`, `setPreferredFramesPerSecond:`, `setPaused:`),
+`CADynamicFrameRateSource` (+0x1be1ac, from its `setPreferredFrameRateRange:` and `setHighFrameRateReasons:count:`),
+`-[CAMetalDrawable present]` and `-[CAAnimation _setCARenderAnimation:layer:]` hold the process to 60 a
+second before anything reaches backboardd, so a window-server hook cannot lift it. UIKitCore never names
+the key. It is the Info.plist dictionary, not the localized one, so `InfoPlist.loctable` did nothing (root
+v23, r-v25), and editing Info.plist breaks the signature SplashBoard checks (roots v13-v22).
+
+CFBundle parses Info.plist with `kCFPropertyListMutableContainers` (CoreFoundation+0x559d0), so the
+library sets the key in that dictionary from its constructor, which dyld runs before the application's
+and QuartzCore's initializers, then takes itself out of `DYLD_INSERT_LIBRARIES`. Lines go to stderr (the
+kernel log for the names in boot-arg `sweetnull`) and to the unified log.
+
+The kernel inserts it (patch 0121, `xnu/fuxi-inject/`, `tools/sync-fuxi-inject.py`): with boot-arg `fxinj=1`,
+`exec_extract_strings` adds `DYLD_INSERT_LIBRARIES=/usr/local/lib/fuxi/libfuxi-app.dylib` after the environment
+of every exec whose path is `.../NAME.app/EXECUTABLE` (not `.appex`, not helpers deeper in the bundle, not
+SpringBoard); `fxinj=2` gives SpringBoard `libfuxi-sb.dylib`, `fxinj=3` both. It logs
+`FUXI INJECT: fxinj=N: ...` once and `FUXI INJECT: NAME <- LIBRARY` for the first 24 programs. Root v26 tried
+runningboardd's launchd job instead (the library hooking `-[RBLaunchdJobManager
+_generateDataWithIdentity:context:error:]`); launchd dropped the variable (above), so nothing loaded (r-v26: no
+line from runningboardd or any application, Settings' double-vsync share unchanged against `fxapp=0`).
 
 ### Respawn-storm jobs (`--quiet-jobs`)
 
@@ -161,13 +192,14 @@ policy query 0x5a with all features allowed, so dyld honours the variable.
 ## Build and install
 
 ```
-tools/build-fuxi-sys.sh [OUT]                  # macOS + Xcode: FuxiAudio.driver, libfuxi-sb.dylib (ad-hoc signed)
+tools/build-fuxi-sys.sh [OUT]                  # macOS + Xcode: FuxiAudio.driver, libfuxi-sb.dylib, libfuxi-app.dylib
 sudo tools/fuxi-sys-root.py --dry-run --audio-plugin OUT/FuxiAudio.driver \
-     --sb-snapshots OUT/libfuxi-sb.dylib --quiet-jobs observed MOUNTED_ROOT
+     --sb-snapshots OUT/libfuxi-sb.dylib --app-rate OUT/libfuxi-app.dylib --quiet-jobs observed MOUNTED_ROOT
 tools/mkadt-fuxi.py ... --product-haptics [--product-camera]
 ```
 
-Undo options: `--remove-audio-plugin`, `--disable-virtualaudio`, `--no-sb-snapshots`, `--unquiet-jobs`.
+Undo options: `--remove-audio-plugin`, `--disable-virtualaudio`, `--no-sb-snapshots`, `--no-app-rate`,
+`--unquiet-jobs`.
 The plug-in and library are ad-hoc signed. Fuxi's AMFI policy accepts them as it accepts the other
 lane binaries. Not tested on device yet.
 
@@ -206,6 +238,12 @@ console with `tools/fuxi-xnu-monitor.py` and compare against the m9j baseline.
    missing, the library prints `... NOT changed` instead.
 8. **`--quiet-jobs observed`.** Expected: `nanotimekitcompaniond` no longer appears in exec lines (55
    execs per boot before). Undo with `--unquiet-jobs`.
+9. **`--app-rate` with the 0121 kernel and `fxinj=1`.** With `sweetnull=backboardd,Preferences`. Expected:
+   `FUXI INJECT: fxinj=1: applications get /usr/local/lib/fuxi/libfuxi-app.dylib;` once, then on opening
+   Settings `FUXI INJECT: Preferences <- /usr/local/lib/fuxi/libfuxi-app.dylib` and
+   `|Preferences| fuxi: Preferences: CADisableMinimumFrameDurationOnPhone = YES, frames up to the panel's rate`
+   (all applications log it to the unified log too). Scrolling Settings should lose its excess of
+   double-vsync frames (gaps b in `FUXI SCANOUT: waits per 600 starts`). Without `fxinj` nothing is inserted.
 
 ## Tests
 
@@ -226,7 +264,12 @@ console with `tools/fuxi-xnu-monitor.py` and compare against the m9j baseline.
   missing tree or `/product` raises an error.
 - fuxi-sys-root.py: uses a synthetic root. It covers dry run, install modes, the merged
   `DYLD_INSERT_LIBRARIES`, presets with markers, idempotence, and undo that keeps foreign libraries
-  and pre-disabled jobs.
+  and pre-disabled jobs, and `--app-rate` (the file, and v26's runningboardd entry taken out) and back.
+
+`tools/test-fuxi-apprate.py` compiles `FuxiAppRate.c` against a stub CF: the key set (also over NO), the
+library leaving `DYLD_INSERT_LIBRARIES`, no bundle. `tools/test-fuxi-inject.py` compiles `fuxi_exec_inject.h`:
+which paths count as applications (not `.appex`, helpers, daemons), the `fxinj` bits, SpringBoard, the
+environment string, and that 0121, the libraries and `fuxi-sys-root.py` use the same paths.
 
 The local cross-compile (`tools/xnu-cc.py` against the CI build tree) of `bsd/kern/sweet_amfi.c` with
 0107 applied: 0 of 1 files failed.

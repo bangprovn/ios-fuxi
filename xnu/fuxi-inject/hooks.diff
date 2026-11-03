@@ -1,0 +1,71 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5667,6 +5667,37 @@
+  * Note:	The argument and environment vectors are user space pointers
+  *		to arrays of user space pointers.
+  */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include "fuxi_exec_inject.h"
++/* Boot-arg fxinj (fuxi_exec_inject.h), read on every exec: nothing cached, nothing to race on. */
++static unsigned
++fuxi_inject_mode(void)
++{
++	unsigned mode = 0;
++
++	if (!PE_parse_boot_argn("fxinj", &mode, sizeof(mode))) {
++		mode = 0;
++	}
++	return mode & FUXI_INJECT_ALL;
++}
++
++/* The mode once, then the first programs that get a library. */
++static void
++fuxi_inject_said(unsigned mode, const char *name, const char *library)
++{
++	static volatile SInt32 said;
++	SInt32 n = OSIncrementAtomic(&said);
++
++	if (n == 0) {
++		printf("FUXI INJECT: fxinj=%u:%s%s\n", mode,
++		    (mode & FUXI_INJECT_APPS) ? " applications get " FUXI_INJECT_APP_LIB ";" : "",
++		    (mode & FUXI_INJECT_SPRINGBOARD) ? " SpringBoard gets " FUXI_INJECT_SB_LIB : "");
++	}
++	if (n < FUXI_INJECT_SAID) {
++		printf("FUXI INJECT: %s <- %s\n", name, library);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+ __attribute__((noinline))
+ static int
+ exec_extract_strings(struct image_params *imgp)
+@@ -5840,6 +5871,30 @@
+ 		imgp->ip_envc++;
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* fxinj: launchd drops DYLD_ variables from com.apple jobs; the library is added here, after the own environment */
++	if (imgp->ip_ndp != NULL) {
++		unsigned mode = fuxi_inject_mode();
++		const char *library = mode != 0 ? fuxi_inject_library(mode, imgp->ip_ndp->ni_cnd.cn_pnbuf,
++		    imgp->ip_ndp->ni_cnd.cn_nameptr) : NULL;
++		char inject_env[FUXI_INJECT_ENV_MAX];
++
++		if (fuxi_inject_env(library, inject_env, sizeof(inject_env))) {
++			error = exec_add_user_string(imgp, CAST_USER_ADDR_T(inject_env), UIO_SYSSPACE, TRUE);
++			if (error) {
++				goto bad;
++			}
++			if (imgp->ip_argspace < new_ptr_size) {
++				error = E2BIG;
++				goto bad;
++			}
++			imgp->ip_argspace -= new_ptr_size;
++			imgp->ip_envc++;
++			fuxi_inject_said(mode, imgp->ip_ndp->ni_cnd.cn_nameptr, library);
++		}
++	}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ 	/* Save space for envv[] NULL terminator */
+ 	if (imgp->ip_argspace < new_ptr_size) {
+ 		error = E2BIG;
