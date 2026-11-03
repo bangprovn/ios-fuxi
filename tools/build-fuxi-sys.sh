@@ -1,7 +1,8 @@
 #!/bin/bash
 # Build the P-SYS userland pieces on a Mac with Xcode (iPhoneOS SDK):
 #   OUT/FuxiAudio.driver   AudioServerPlugIn bundle for mediaserverd's HAL
-#   OUT/libfuxi-sb.dylib   SpringBoard snapshot-format library
+#   OUT/libfuxi-sb.dylib   SpringBoard (inserted by the kernel, fxinj bit 1): snapshot format, frame rates, no CoreTelephony
+#                          reconnect loop without CommCenter
 #   OUT/libfuxi-app.dylib  every application (inserted by the kernel, fxinj=1): CADisableMinimumFrameDurationOnPhone = YES
 # Install them with tools/fuxi-sys-root.py (see docs-lanes/sys-port.md).
 set -euo pipefail
@@ -16,7 +17,7 @@ rm -rf "$bundle"
 mkdir -p "$bundle"
 cp tools/fuxi-audio/Info.plist "$bundle/Info.plist"
 "$cc" "${flags[@]}" -bundle tools/fuxi-audio/FuxiAudio.c -framework CoreFoundation -o "$bundle/FuxiAudio"
-"$cc" "${flags[@]}" -dynamiclib tools/fuxi-sb/FuxiSnapshots.c tools/fuxi-sb/FuxiRates.c -lobjc \
+"$cc" "${flags[@]}" -dynamiclib tools/fuxi-sb/FuxiSnapshots.c tools/fuxi-sb/FuxiRates.c tools/fuxi-sb/FuxiTelephony.c -lobjc \
  -install_name /usr/local/lib/fuxi/libfuxi-sb.dylib -o "$out/libfuxi-sb.dylib"
 "$cc" "${flags[@]}" -dynamiclib tools/fuxi-sb/FuxiAppRate.c -framework CoreFoundation \
  -install_name /usr/local/lib/fuxi/libfuxi-app.dylib -o "$out/libfuxi-app.dylib"
