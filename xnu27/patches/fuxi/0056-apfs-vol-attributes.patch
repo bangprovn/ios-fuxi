@@ -1,0 +1,58 @@
+diff --git a/bsd/miscfs/apfs/apfs_vfsops.c b/bsd/miscfs/apfs/apfs_vfsops.c
+index 79e9025..53fd67e 100644
+--- a/bsd/miscfs/apfs/apfs_vfsops.c
++++ b/bsd/miscfs/apfs/apfs_vfsops.c
+@@ -1600,6 +1600,39 @@ apfs_vfs_getattr(mount_t mp, struct vfs_attr *fsap, __unused vfs_context_t ctx)
+ 		    VOL_CAP_INT_EXTENDED_ATTR;
+ 		VFSATTR_SET_SUPPORTED(fsap, f_capabilities);
+ 	}
++	if (VFSATTR_IS_ACTIVE(fsap, f_attributes)) {
++		vol_attributes_attr_t *attrp = &fsap->f_attributes;
++
++		/*
++		 * What getattrlist(2) gives for objects here.  Without it the kernel's defaults
++		 * apply, and they leave out the creation and access times and the full path.
++		 * CoreServicesInternal asks "/" for this once per process and stops asking for
++		 * anything missing from it; without the access time it reports no file
++		 * properties at all, so every NSURLCanonicalPathKey is nil and LaunchServices
++		 * registers no bundle.
++		 */
++		bzero(attrp, sizeof(*attrp));
++		attrp->validattr.commonattr = ATTR_CMN_NAME | ATTR_CMN_DEVID | ATTR_CMN_FSID | ATTR_CMN_OBJTYPE |
++		    ATTR_CMN_OBJTAG | ATTR_CMN_OBJID | ATTR_CMN_OBJPERMANENTID | ATTR_CMN_PAROBJID | ATTR_CMN_SCRIPT |
++		    ATTR_CMN_CRTIME | ATTR_CMN_MODTIME | ATTR_CMN_CHGTIME | ATTR_CMN_ACCTIME | ATTR_CMN_FNDRINFO |
++		    ATTR_CMN_OWNERID | ATTR_CMN_GRPID | ATTR_CMN_ACCESSMASK | ATTR_CMN_FLAGS | ATTR_CMN_GEN_COUNT |
++		    ATTR_CMN_DOCUMENT_ID | ATTR_CMN_USERACCESS | ATTR_CMN_FILEID | ATTR_CMN_PARENTID |
++		    ATTR_CMN_FULLPATH | ATTR_CMN_DATA_PROTECT_FLAGS | ATTR_CMN_RETURNED_ATTRS;
++		attrp->validattr.volattr = ATTR_VOL_FSTYPE | ATTR_VOL_FSTYPENAME | ATTR_VOL_SIGNATURE | ATTR_VOL_SIZE |
++		    ATTR_VOL_SPACEFREE | ATTR_VOL_QUOTA_SIZE | ATTR_VOL_RESERVED_SIZE | ATTR_VOL_SPACEAVAIL |
++		    ATTR_VOL_MINALLOCATION | ATTR_VOL_ALLOCATIONCLUMP | ATTR_VOL_IOBLOCKSIZE | ATTR_VOL_OBJCOUNT |
++		    ATTR_VOL_MOUNTPOINT | ATTR_VOL_NAME |
++		    ATTR_VOL_MOUNTFLAGS | ATTR_VOL_MOUNTEDDEVICE | ATTR_VOL_ENCODINGSUSED | ATTR_VOL_CAPABILITIES |
++		    ATTR_VOL_UUID | ATTR_VOL_ATTRIBUTES | ATTR_VOL_MOUNTEXTFLAGS | ATTR_VOL_INFO;
++		attrp->validattr.dirattr = ATTR_DIR_LINKCOUNT | ATTR_DIR_ENTRYCOUNT | ATTR_DIR_MOUNTSTATUS;
++		attrp->validattr.fileattr = ATTR_FILE_LINKCOUNT | ATTR_FILE_TOTALSIZE | ATTR_FILE_ALLOCSIZE |
++		    ATTR_FILE_IOBLOCKSIZE | ATTR_FILE_DEVTYPE | ATTR_FILE_DATALENGTH | ATTR_FILE_DATAALLOCSIZE |
++		    ATTR_FILE_RSRCLENGTH | ATTR_FILE_RSRCALLOCSIZE;
++		attrp->validattr.forkattr = ATTR_CMNEXT_PRIVATESIZE | ATTR_CMNEXT_LINKID | ATTR_CMNEXT_NOFIRMLINKPATH |
++		    ATTR_CMNEXT_REALDEVID | ATTR_CMNEXT_REALFSID | ATTR_CMNEXT_CLONEID | ATTR_CMNEXT_EXT_FLAGS;
++		attrp->nativeattr = attrp->validattr;
++		VFSATTR_SET_SUPPORTED(fsap, f_attributes);
++	}
+ 	if (VFSATTR_IS_ACTIVE(fsap, f_vol_name)) {
+ 		strlcpy(fsap->f_vol_name, am->am_vol.name, MAXPATHLEN);
+ 		VFSATTR_SET_SUPPORTED(fsap, f_vol_name);
+diff --git a/bsd/miscfs/apfs/apfs_vnops.c b/bsd/miscfs/apfs/apfs_vnops.c
+index bd7ef4a..116aeaf 100644
+--- a/bsd/miscfs/apfs/apfs_vnops.c
++++ b/bsd/miscfs/apfs/apfs_vnops.c
+@@ -394,6 +394,9 @@ apfs_vnop_getattr(struct vnop_getattr_args *ap)
+ 	VATTR_RETURN(vap, va_filerev, 0);
+ 	VATTR_RETURN(vap, va_gen, 0);
+ 	VATTR_RETURN(vap, va_type, vnode_vtype(vp));
++	if (vnode_isdir(vp)) {
++		VATTR_RETURN(vap, va_nchildren, (uint32_t)(ino.nchildren > 0 ? ino.nchildren : 0));
++	}
+ 
+ 	/* the times are nanoseconds since the Unix epoch */
+ 	if (VATTR_IS_ACTIVE(vap, va_access_time)) {
