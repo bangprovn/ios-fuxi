@@ -25,6 +25,8 @@ def main():
             if not a.compile_only:subprocess.run([str(d/name)],check=True,timeout=15)
             if not a.compile_only and name == 'FrameTraceTests':
                 subprocess.run([str(d/name)],env=dict(os.environ,FUXI_MTL_TEST_BOOTARGS='fuxigpuoverlap=1'),check=True,timeout=15)
+            if not a.compile_only and name == 'BackboardGateTests':
+                subprocess.run([str(d/name)],env=dict(os.environ,FUXI_MTL_LATE_FRAMES='1'),check=True,timeout=15)
             if not a.compile_only and name == 'TranslationPolicyTests':
                 # FUXI_MTL_HALF_ROUND: modes 1-3 only; lossy for every pipeline unless FUXI_MTL_HALF_ROUND_PIPES lists fh hashes (a malformed entry ends the list)
                 for mode,pipes,fh,want in (('0',None,'1','1'),('1',None,'1','1'),('3',None,'abc','1'),('4',None,'1','1'),('2','abc,0x12','12','1'),('2','abc,12','13','0'),('3','abc,zz,12','12','0'),('3','abc,zz','abc','1')):
@@ -46,6 +48,13 @@ def main():
                         e.pop(k,None)
                         if v is not None:e[k]=v
                     subprocess.run([str(d/name),'split',*want],env=e,check=True,timeout=15)
+                # FUXI_MTL_LATE_FRAMES: exactly "1"; _US 1000..100000 (default 12500), _MAX 1..1000 (default 8); malformed values keep the default
+                for on,us,mx,want in ((None,None,None,('0','12500','8')),('1',None,None,('1','12500','8')),('2','999','0',('0','12500','8')),('1','1000','1000',('1','1000','1000')),('1','100001','1001',('1','12500','8')),('1 ','20000x','16',('0','12500','16'))):
+                    e=dict(os.environ)
+                    for k,v in (('FUXI_MTL_LATE_FRAMES',on),('FUXI_MTL_LATE_FRAMES_US',us),('FUXI_MTL_LATE_FRAMES_MAX',mx)):
+                        e.pop(k,None)
+                        if v is not None:e[k]=v
+                    subprocess.run([str(d/name),'late',*want],env=e,check=True,timeout=15)
                 for env,want in ((None,'0'),('1','1'),('0','0'),('2','0'),('1 ','0'),('','0')):
                     e=dict(os.environ);e.pop('FUXI_MTL_BUFFER_CACHED',None)
                     if env is not None:e['FUXI_MTL_BUFFER_CACHED']=env

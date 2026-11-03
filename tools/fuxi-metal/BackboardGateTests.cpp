@@ -61,5 +61,16 @@ int main(){
  }
  {auto gate=std::make_unique<fuxi::BackboardGate>();auto &g=*gate;assert(!g.admit(bootB,storage(path)));}
  clear(path);close(dir);assert(!rmdir(path));
+ if(fuxi::systemTranslationPolicy().lateFrames){ // FUXI_MTL_LATE_FRAMES: a late frame's line leaves the gate on stderr, in pieces of at most 200 chars
+  char late[]="/tmp/fuxi-backboard-late-XXXXXX";assert(mkdtemp(late));
+  {auto gate=std::make_unique<fuxi::BackboardGate>();auto &g=*gate;assert(g.admit(bootA,storage(late)));
+   fflush(stderr);int saved=dup(2);FILE *log=tmpfile();assert(log && saved>=0);dup2(fileno(log),2);
+   auto s=std::make_unique<fuxi::FrameSample>();s->createdNs=1000000000;s->wall=7000000;g.completed(1,7,s.get());
+   s->createdNs+=16666667;g.completed(1,7,s.get());s->createdNs+=8333333;g.completed(1,7,s.get());g.completed(1,7); // no sample: no line
+   fflush(stderr);dup2(saved,2);close(saved);rewind(log);char line[512];unsigned first=0,cont=0;static const char want[]="FUXI MTL: late frame n=2 interval=16.67 wall=7.00 ";
+   while(fgets(line,sizeof line,log)){assert(strlen(line)<=201);if(!strncmp(line,want,sizeof want-1))++first;else if(!strncmp(line,"FUXI MTL: late frame+ ",22))++cont;else assert(!strstr(line,"late frame"));}
+   fclose(log);assert(first==1 && cont>=2);}
+  clear(late);assert(!rmdir(late));
+ }
  puts("PASS: backboardd boot reset, crash strike/deny, good/rearm, runtime fault, exclusive lease, private record integrity and write failure");
 }

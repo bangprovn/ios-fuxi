@@ -362,3 +362,37 @@ failure. Script runs only compare; a hand decides the limit.
   with about 950 copies replaced by a newer one per run. Copies finish in pairs
   within one period (CA swap interval p10 7.2, p90 9.3 ms), and the FIFO is what
   absorbs that. `fuxiearly=5` stays.
+
+## `fmtl` tokens OR together; late-frame lines (bit 22)
+
+Before 4 Nov `applyBootOptions` stopped at the first `fmtl=` token, so a test
+that appended its own token to the base one changed nothing (d-lean-b1/b2 logged
+`boot options fmtl=40001` and `submit_lean=0` with `fmtl=40811` on the line).
+All tokens now OR together, and the line says `fmtl=<mask> tokens=N` when there
+was more than one. A test can add `fmtl=400000` beside the base `fmtl=40001`.
+
+Bit 22 (`400000`) is `FUXI_MTL_LATE_FRAMES=1`. With the frame trace on
+(`fuxigpuframetrace=1` or `2`; without it there are no samples and the policy
+line says so), every backboardd surface frame whose interval (its command
+buffer's creation after the previous surface frame's) is over 12.5 ms gets one
+line of its own stages, at most 8 per 5 s (`FUXI_MTL_LATE_FRAMES_US`,
+`FUXI_MTL_LATE_FRAMES_MAX`):
+
+    FUXI MTL: late frame n=4 interval=16.67 wall=7.30 cpu_before_commit=1.50 ...
+    FUXI MTL: late frame+ ... gpu_exec=6.38 gpu_wait=6.23 retire_queue=... retire_lock=1.81 ...
+    FUXI MTL: late frame+ ... top=plan_bounds:0.81,record:0.40,descriptors:0.30 prev=wall:7.20,... late=1/4 dropped=0
+
+The fields carry the window line's names, in ms, for this one frame:
+`cpu_before_commit` (CoreAnimation's encode, creation to commit),
+`submit_queue`, `backend_lock`, `slot_wait`, `backend_submit` with `record`,
+`desc`, `pipe`, `queue_submit`, `gpu_exec`, `gpu_wait`, `retire_queue`,
+`retire_lock`, `surface_release`, and counts (`draws`, `passes`,
+`pipeline_barriers`, `image_barriers`, `plan_misses`, `pipelines`,
+`descriptors`, `allocations`, process-wide `sync_compiles` since the previous
+frame). `top=` names the frame's three longest submit phases (the fence wait
+left out; it is `gpu_wait`). A frame mostly starts late because the one before
+it ended late, so `prev=` gives that frame's wall, encode, submit, GPU, retire
+lock and surface release. `late=L/F` counts late and all frames since start,
+`dropped=` the late frames the rate limit left out since the line before. The
+line is cut at 200 characters like the window line: delete every
+`\nFUXI MTL: late frame+` to rejoin it. Printed after the gate lock.

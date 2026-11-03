@@ -21,6 +21,7 @@ class BackboardGate {
  // completed() adds to frameTrace under the mutex. report() swaps in spareTrace there and formats the full window after
  // unlocking, so a retiring frame never waits for the sorting and printing (reportMutex: one report at a time).
  std::unique_ptr<FrameTraceWindow> frameTrace=std::make_unique<FrameTraceWindow>(),spareTrace;std::mutex reportMutex;
+ LateFrameLog lateFrames; // FUXI_MTL_LATE_FRAMES: not swapped with the windows, so its rate limit and previous frame span reports
  uint64_t frames=0,late=0,failures=0,gpu=0,lastFrames=0,lastGPU=0;
  double began=0,lastReport=0;
  static double now(){return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();}
@@ -97,14 +98,18 @@ public:
  }
  void completed(uint64_t gpuNanos,double wallMS,const FrameSample *sample=nullptr) {
   if(!active.load())return;
-  std::lock_guard<std::mutex> guard(mutex);if(!active || failed)return;
-  if(sample)frameTrace->add(*sample);
+  char lateText[1536];bool lateLine=false;
+  {std::lock_guard<std::mutex> guard(mutex);if(!active || failed)return;
+  if(sample){uint64_t interval=frameTrace->add(*sample);if(systemTranslationPolicy().lateFrames)lateLine=lateFrames.note(*sample,interval,lateText,sizeof lateText);}
   ++frames;gpu+=gpuNanos;if(wallMS>1000.0/60.0)++late;
   if(frames==1)fprintf(stderr,"FUXI MTL: backboardd first_frame_ms=%.3f gpu_ms=%.3f\n",(now()-began)*1000,gpuNanos/1e6);
   if(!good && frames>=goodFrames) {
    if(store("good")){good=true;fprintf(stderr,"FUXI MTL: backboardd gate good frames=%llu\n",(unsigned long long)frames);}
    else {failed=true;strikes=strikeLimit;bool saved=persistDenied();fprintf(stderr,"FUXI MTL: backboardd gate deny reason=good-write next-respawn=CPU persisted=%u\n",unsigned(saved));}
   }
+  }
+  // After the gate lock, as report() prints: a retiring frame never waits for stderr's lock under it. Pieces of 200 chars, as the window line.
+  if(lateLine){flockfile(stderr);wrapLine(stderr,lateText,"FUXI MTL: late frame+");funlockfile(stderr);}
  }
  // log2 bucket:count pairs for non-zero buckets, or "-".
  static std::string classCounts(const std::array<std::atomic<uint64_t>,40> &a){std::string r;char b[40];for(size_t i=0;i<a.size();++i)if(auto v=a[i].load()){snprintf(b,sizeof b,"%s%zu:%llu",r.empty()?"":",",i,(unsigned long long)v);r+=b;}return r.empty()?"-":r;}

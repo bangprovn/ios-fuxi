@@ -225,7 +225,8 @@ class FrameTraceWindow {
  // Frame cadence vs 60 Hz ticks: <=1, <=2, <=3, >3 intervals of 16.7 ms.
  uint64_t lastCreated=0;std::array<uint64_t,4> cadence{};
 public:
- void add(const FrameSample &s) {
+ // Returns the frame's interval (0: first frame, or after an idle pause), which LateFrameLog reads.
+ uint64_t add(const FrameSample &s) {
   auto &stored=samples[count%capacity];stored=s;
   // Gaps over 100 ms are idle pauses, not cadence; they do not enter the histogram.
   if(s.createdNs && lastCreated && s.createdNs>lastCreated && s.createdNs-lastCreated<100000000){stored.interval=s.createdNs-lastCreated;uint64_t ticks=(stored.interval+8333333)/16666667;++cadence[ticks<=1?0:ticks==2?1:ticks==3?2:3];}
@@ -243,6 +244,7 @@ public:
   totals.indexUploadSubmits+=s.indexUploadSubmits;totals.indexReadOnlySubmits+=s.indexReadOnlySubmits;totals.indexGPUWritableSubmits+=s.indexGPUWritableSubmits;
   totals.snapshotReusedBytes+=s.snapshotReusedBytes;totals.shadowSkippedBytes+=s.shadowSkippedBytes;totals.shadowHashSkipped+=s.shadowHashSkipped;totals.shadowHashCopied+=s.shadowHashCopied;totals.shadowHashBytes+=s.shadowHashBytes;totals.shadowHashNs+=s.shadowHashNs;totals.renderAreaPasses+=s.renderAreaPasses;totals.renderAreaShrunk+=s.renderAreaShrunk;totals.renderAreaPixels+=s.renderAreaPixels;totals.renderAreaFullPixels+=s.renderAreaFullPixels;totals.passReorders+=s.passReorders;totals.sampleOptimal+=s.sampleOptimal;totals.sampleLinear+=s.sampleLinear;totals.sampleShadow+=s.sampleShadow;totals.sampleLinearBytes+=s.sampleLinearBytes;totals.sampleShadowBytes+=s.sampleShadowBytes;totals.sampleOptimalBytes+=s.sampleOptimalBytes;totals.sampleLinearImported+=s.sampleLinearImported;totals.sampleLinearImportedBytes+=s.sampleLinearImportedBytes;totals.sampleLinearLarge+=s.sampleLinearLarge;totals.rtIn+=s.rtIn;totals.rtInSkipped+=s.rtInSkipped;totals.rtOut+=s.rtOut;totals.rtSyncs+=s.rtSyncs;totals.rtEligible+=s.rtEligible;totals.rtLinearLarge+=s.rtLinearLarge;totals.rtBytes+=s.rtBytes;
   gpuUnavailable+=!s.gpuSamples;++cpus[s.cpu<8?s.cpu:8];encodeUnknown+=s.encodeCountsUnknown;
+  return stored.interval;
  }
  uint64_t size() const{return count;}
  // A window taking over from `previous` (BackboardGate swaps two): the next frame's interval spans the swap.
@@ -332,6 +334,50 @@ public:
   stage("pipe_cpu",&FrameSample::pipeCPU);stage("desc_cpu",&FrameSample::descCPU);stage("record_cpu",&FrameSample::recordCPU);stage("flush_cpu",&FrameSample::flushCPU);stage("kernel_io_cpu",&FrameSample::kernelIOCPU);stage("queue_submit_cpu",&FrameSample::queueSubmitCPU);
   fprintf(out," cpu_sampled_submits/frame=%.2f cpu_omitted_submits/frame=%.2f",totals.cpuSampledSubmits/n,totals.cpuOmittedSubmits/n);
   fputc('\n',out);
+ }
+};
+// FUXI_MTL_LATE_FRAMES=1 (fmtl bit 22, needs fuxigpuframetrace=1|2). The window line holds percentiles only, so which frames miss a vsync, and
+// why, was a guess from p90s (d-ft-v27). A surface frame whose interval (its command buffer's creation after the previous surface frame's: the
+// window's cadence) exceeds lateFrameUs gets a line of its own stages, in ms, under the window's field names; counts are this frame's.
+// At most lateFrameMax lines per 5 s of frame time; dropped= counts the late frames left out since the line before, late=L/F all of them.
+// A frame mostly starts late because the one before it ended late, so prev= carries that frame's main stages. sync_compiles: process-wide
+// draw-path compiles since the previous surface frame completed. top=: the frame's three longest exclusive submit phases (fence left out: it is
+// gpu_wait). Only BackboardGate calls note(), under its lock; the line is formatted into the caller's buffer and printed after the lock.
+class LateFrameLog {
+ struct Prev {uint64_t wall=0,cpuBeforeCommit=0,backendSubmit=0,gpuExec=0,retireLock=0,surfaceRelease=0;} prev;
+ uint64_t frames=0,late=0,dropped=0,windowStart=0,shown=0,compiles=0,compileNs=0;bool started=false;
+public:
+ bool note(const FrameSample &s,uint64_t interval,char *text,size_t size) {
+  const auto &policy=systemTranslationPolicy();
+  uint64_t c=syncCompiles.load(std::memory_order_relaxed),cns=syncCompileNs.load(std::memory_order_relaxed),dc=started?c-compiles:0,dns=started?cns-compileNs:0;compiles=c;compileNs=cns;
+  ++frames;bool print=false;
+  if(interval>uint64_t(policy.lateFrameUs)*1000){++late;
+   if(!shown || s.createdNs<windowStart || s.createdNs-windowStart>=5000000000ull){windowStart=s.createdNs;shown=0;}
+   if(shown<policy.lateFrameMax){++shown;print=true;}else ++dropped;
+  }
+  if(print && text && size){
+   auto ms=[](uint64_t ns){return double(ns)/1e6;};auto u=[](uint64_t v){return (unsigned long long)v;};
+   size_t top[3]={SIZE_MAX,SIZE_MAX,SIZE_MAX};
+   for(size_t i=0;i<size_t(SubPhase::count);++i){if(i==size_t(SubPhase::fence) || !s.subNs[i])continue;
+    for(size_t k=0;k<3;++k)if(top[k]==SIZE_MAX || s.subNs[i]>s.subNs[top[k]]){for(size_t j=2;j>k;--j)top[j]=top[j-1];top[k]=i;break;}}
+   int len=snprintf(text,size,"FUXI MTL: late frame n=%llu interval=%.2f wall=%.2f cpu_before_commit=%.2f frontend_wall=%.2f commit_call=%.2f admission_wait=%.2f submit_queue=%.2f"
+    " backend_lock=%.2f slot_wait=%.2f lease_lock=%.2f shadow_copy=%.2f flush=%.2f backend_submit=%.2f record=%.2f desc=%.2f pipe=%.2f queue_submit=%.2f gpu_exec=%.2f gpu_wait=%.2f"
+    " retire_queue=%.2f retire_lock=%.2f retire_host=%.2f surface_release=%.2f completion=%.2f draws=%llu passes=%llu merged_draws=%llu pipeline_barriers=%llu image_barriers=%llu"
+    " submits=%llu plan_misses=%llu pipelines=%llu descriptors=%llu allocations=%llu sync_compiles=%llu sync_compile_ms=%.1f waits=drain:%llu,conflict:%llu,slots:%llu"
+    " depth=%llu worker_depth=%llu cpu=%u top=",
+    u(frames),ms(interval),ms(s.wall),ms(s.cpuBeforeCommit),ms(s.frontendWall),ms(s.commitCall),ms(s.admissionWait),ms(s.submitQueue),
+    ms(s.backendLock),ms(s.slotWait),ms(s.leaseLock),ms(s.shadowCopy),ms(s.flush),ms(s.backendSubmit),ms(s.record),ms(s.desc),ms(s.pipe),ms(s.queueSubmit),ms(s.gpuExec),ms(s.gpuWait),
+    ms(s.retireQueue),ms(s.retireLock),ms(s.retireHost),ms(s.surfaceRelease),ms(s.completionLatency),u(s.draws),u(s.passes),u(s.mergedDraws),u(s.pipelineBarriers),u(s.imageBarriers),
+    u(s.queueSubmits),u(s.planMisses),u(s.counts.pipelines),u(s.counts.descriptors),u(s.counts.allocations),u(dc),dns/1e6,u(s.drainWaits),u(s.conflictWaits),u(s.slotWaits),
+    u(s.inflight),u(s.workerDepth),s.cpu);
+   auto more=[&](const char *format,auto... a){if(len>=0 && size_t(len)<size)len+=snprintf(text+len,size-size_t(len),format,a...);};
+   if(top[0]==SIZE_MAX)more("%s","-");
+   for(size_t k=0;k<3 && top[k]!=SIZE_MAX;++k)more("%s%s:%.2f",k?",":"",subPhaseNames[top[k]],ms(s.subNs[top[k]]));
+   more(" prev=wall:%.2f,cpu_before_commit:%.2f,backend_submit:%.2f,gpu_exec:%.2f,retire_lock:%.2f,surface_release:%.2f late=%llu/%llu dropped=%llu\n",
+    ms(prev.wall),ms(prev.cpuBeforeCommit),ms(prev.backendSubmit),ms(prev.gpuExec),ms(prev.retireLock),ms(prev.surfaceRelease),u(late),u(frames),u(dropped));
+   dropped=0;
+  }
+  prev={s.wall,s.cpuBeforeCommit,s.backendSubmit,s.gpuExec,s.retireLock,s.surfaceRelease};started=true;return print;
  }
 };
 }
