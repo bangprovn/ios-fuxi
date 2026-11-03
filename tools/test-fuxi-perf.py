@@ -27,6 +27,8 @@ register_functions = "static uint64_t fp_duty_used(uint64_t);\nstatic void fp_wo
     submit.function(actual, n) for n in ('fp_compile_domain','fp_compile_failed','fp_compile_cut','fp_compile_forget','fp_compile_poll','fp_compile_admitted','fp_compile_command')) + register_functions
 register_functions += actual[actual.index('static int fp_compile_sysctl SYSCTL_HANDLER_ARGS'):actual.index('SYSCTL_PROC(_kern')]
 register_functions += actual[actual.index('static int fp_pressure_sysctl SYSCTL_HANDLER_ARGS'):actual.index('SYSCTL_PROC(_kern, OID_AUTO, fuxipressure')]
+# The fwi census: its globals and functions as one block, before the start that calls it.
+register_functions += actual[actual.index('#define FWI_PROCS'):actual.index('void fuxi_perf_start(void)')]
 register_functions += submit.function(actual, 'fuxi_perf_start')
 # Audit the loader's zero-based wire slots and execute the host decoder without
 # importing its USB dependencies. The C model below records the governor reads.
@@ -877,9 +879,54 @@ int main(void) {
  ticks=200;fuxi_perf_launch("Preferences");fp_worker(0,0);
  assert(fp_launch_high && !fp_boosted && regs[5][0x90/4]==14);
  ticks=2201;fp_worker(0,0);assert(!fp_launch_high && regs[5][0x90/4]==12 && l3_writes==2);
+ /* fwi census: off counts nothing; exact 1 starts it once, without fuxiperf
+  * and without touching the governor; by process and op (6/7/8 and unknown
+  * ops included), CREATE2/NOTIFY types, NOTIFY deadline means and late
+  * finishes; the 60 s report clears and re-arms, backboardd is always
+  * reported, a full table counts drops. Only its own lock is taken. */
+ reset();fp_enabled=0;process_name="backboardd";
+ fuxi_wi_census(3);fuxi_wi_census_notify(2u<<28,1000,1002,1008);fuxi_wi_census_flags(2u<<28);
+ assert(!fwi_on && !fwi_table[0].name[0] && !wlocked);
+ for(unsigned i=0;i<4;i++) {
+  if(tp_args[i]==1)continue;
+  arg_name="fwi";arg_value=tp_args[i];fuxi_perf_start();assert(!fwi_on && !wi_setups);
+ }
+ arg_name="fwi";arg_value=1;log_count=0;fuxi_perf_start();
+ assert(fwi_on && fwi_started && wi_setups==1 && wi_scheduled==ticks+60000);
+ assert(!fp_started && !fp_enabled && log_count==1 && strstr(last_log,"FUXI WI: census on (fwi=1)"));
+ assert(!strcmp(fwi_table[0].name,"backboardd"));
+ fuxi_perf_start();assert(wi_setups==1 && log_count==1); /* once */
+ arg_name=0;
+ for(unsigned i=0;i<240;i++) {
+  fuxi_wi_census(3);fuxi_wi_census_notify(2u<<28,1000,i<12?1010:1002,1008);
+ }
+ fuxi_wi_census(4);fuxi_wi_census_flags((2u<<28)|0x5);fuxi_wi_census(5);
+ for(unsigned op=6;op<=8;op++)fuxi_wi_census(op);
+ fuxi_wi_census(0);fuxi_wi_census(42);
+ process_name="mediaserverd";fuxi_wi_census(6);fuxi_wi_census(6);fuxi_wi_census(8);fuxi_wi_census_flags(1u<<28);
+ process_name="";fuxi_wi_census(3);fuxi_wi_census_notify(0,5,4,0); /* no name; no deadline */
+ assert(!wlocked && !locked && fwi_table[0].ops[3]==240 && fwi_table[0].deadlines==240 && fwi_table[0].missed==12);
+ assert(!strcmp(fwi_table[1].name,"mediaserverd") && !strcmp(fwi_table[2].name,"?") && !fwi_dropped);
+ ticks+=60000;all_len=0;all_log[0]=0;unsigned wi_logs=log_count;fwi_report(0,0);
+ assert(wi_scheduled==ticks+60000 && log_count==wi_logs+4 && !wlocked);
+ assert(strstr(all_log,"FUXI WI: census 60000 ms: 251 calls from 3 processes, 0 dropped (table 24)\n"
+     "FUXI WI: backboardd other 2 notify 240 create2 1 join 1 start 1 update 1 finish 1 types 0x4 deadline 240 budget_us 8000 used_us 2400 missed 12\n"
+     "FUXI WI: mediaserverd start 2 finish 1 types 0x2\n"
+     "FUXI WI: ? notify 1 types 0x1\n"));
+ assert(!fwi_table[0].ops[3] && !fwi_table[0].types && !strcmp(fwi_table[0].name,"backboardd") && !fwi_table[1].name[0]);
+ ticks+=60000;all_len=0;all_log[0]=0;fwi_report(0,0);
+ assert(!strcmp(all_log,"FUXI WI: census 60000 ms: 0 calls from 0 processes, 0 dropped (table 24)\nFUXI WI: backboardd none\n"));
+ char wi_name[16];
+ for(unsigned i=0;i<30;i++){snprintf(wi_name,sizeof(wi_name),"p%u",i);process_name=wi_name;fuxi_wi_census(3);}
+ assert(fwi_dropped==7 && !strcmp(fwi_table[23].name,"p22"));
+ ticks+=60000;all_len=0;all_log[0]=0;fwi_report(0,0);
+ assert(strstr(all_log,"FUXI WI: census 60000 ms: 23 calls from 23 processes, 7 dropped (table 24)\nFUXI WI: backboardd none\nFUXI WI: p0 notify 1\n"));
+ assert(strstr(all_log,"FUXI WI: p22 notify 1\n") && !strstr(all_log,"p23") && !fwi_dropped);
+ process_name="backboardd";
  arg_name=arg_name2=0;
 #undef printf
  puts("PASS: fpk default off, 1401..cap bounds (fpc), base rows 1401/1800/2400 on real LUTs, raised only with valid sample and no thermal latch, compiled cool when hot/no quorum, 500 ms recovery, boost/silver unchanged, fast samples only while active, window line");
+ puts("PASS: fwi census default off/exact 1/once, independent of fuxiperf; per process and op incl. 6/7/8/unknown, create2/notify types, deadline budget/used means and late count, 60 s report clears and re-arms, backboardd always reported, full-table drops, own lock only");
  puts("PASS: fsf floor rows on real LUTs (60/90/55/50/30 %), input-only 1.5 s window, cool-only, hot veto, duty-cut fallback, silver unchanged; fla 2 s launch high outside the touch duty, start refusal once per exec, thermal end, exec log limit, L3 with fl3, boot-arg bounds and off = no wake");
  puts("PASS: fl3 default off/exact 1; L3 read once at ready, boot vote checked against state and LUT before any write; boost row while touch/compile high, boot row on unboost and thermal cut; one ready and one first-boost line; refusals, faults, lost enable and readback mismatch end voting with the boot row");
  puts("PASS: thermal pressure opt-in, read-only sysctl/readiness/no-MMIO, guard/quorum integration, Apple wire values, rising trips/falling hysteresis and no sleeping");
@@ -921,6 +968,13 @@ static int PE_parse_boot_argn(const char *name,void *value,unsigned size) {
  return 0;
 }
 typedef void *thread_call_param_t;
+typedef int thread_call_data_t;
+#define MAXCOMLEN 16
+#define LCK_MTX_DECLARE(name,group) int name
+static unsigned wi_setups,wlocked;
+static uint64_t wi_scheduled;
+static char all_log[32768];
+static size_t all_len;
 struct sysctl_req {void *newptr,*oldptr;size_t newlen,oldlen;};
 #define SYSCTL_HANDLER_ARGS (struct sysctl_req *req)
 static int copyin_error,copyout_error;
@@ -930,9 +984,12 @@ static int model_sysctl_out(struct sysctl_req *req,const void *in,size_t n){if(c
 #define SYSCTL_OUT model_sysctl_out
 static int fp_call;
 #define THREAD_CALL_PRIORITY_KERNEL 0
+#define THREAD_CALL_PRIORITY_LOW 3
 #define THREAD_CALL_OPTIONS_ONCE 1
 static void thread_call_setup_with_options(int *call,void (*worker)(thread_call_param_t,thread_call_param_t),void *arg,int priority,int options) {
- assert(call==&fp_call && worker && !arg && !priority && options==1);
+ assert(worker && !arg && options==1);
+ if(call==&fp_call)assert(!priority);
+ else {assert(priority==THREAD_CALL_PRIORITY_LOW);wi_setups++;} /* the fwi census */
 }
 typedef uintptr_t thread_t;
 #define THREAD_NULL 0
@@ -948,8 +1005,8 @@ static void proc_selfname(char *out,unsigned n){snprintf(out,n,"%s",process_name
 static proc_t proc_self(void){return proc_present;}
 static int csproc_get_platform_binary(proc_t p){assert(p==1);return platform;}
 static void proc_rele(proc_t p){assert(p==1);}
-static void lck_mtx_lock(int *p){assert(p==&fp_lock && !locked);locked=1;}
-static void lck_mtx_unlock(int *p){assert(p==&fp_lock && locked);locked=0;}
+static void lck_mtx_lock(int *p){if(p!=&fp_lock){assert(!wlocked);wlocked=1;return;}assert(!locked);locked=1;}
+static void lck_mtx_unlock(int *p){if(p!=&fp_lock){assert(wlocked);wlocked=0;return;}assert(locked);locked=0;}
 static thread_t current_thread(void){return caller;}
 static void thread_reference(thread_t t){assert(t);refs++;}
 static void thread_deallocate(thread_t t){assert(t && refs>0);refs--;}
@@ -968,7 +1025,7 @@ static uint64_t mach_absolute_time(void) { return ticks; }
 static void absolutetime_to_nanoseconds(uint64_t t,uint64_t *ns) { *ns=t*NSEC_PER_MSEC; }
 static void nanoseconds_to_absolutetime(uint64_t ns,uint64_t *t) { *t=ns/NSEC_PER_MSEC; }
 static void clock_interval_to_deadline(unsigned n,unsigned unit,uint64_t *t) { *t=ticks+(uint64_t)n*unit/NSEC_PER_MSEC; }
-static int thread_call_enter_delayed(int *call,uint64_t t) { (void)call;scheduled=t;return 0; }
+static int thread_call_enter_delayed(int *call,uint64_t t) { if(call!=&fp_call)wi_scheduled=t;else scheduled=t;return 0; }
 static int thread_call_enter(int *call) { (void)call;scheduled=ticks;return 0; }
 static int fault_block=-1;
 static unsigned fault_off,fault_write_only,drop_after;
@@ -987,7 +1044,10 @@ static uintptr_t ml_io_map(uint64_t pa,unsigned size) {
  return 0x100000+0x4000*d+offset;
 }
 static int model_printf(const char *fmt,...) {
- va_list ap;va_start(ap,fmt);vsnprintf(last_log,sizeof(last_log),fmt,ap);va_end(ap);log_count++;return 0;
+ va_list ap;va_start(ap,fmt);vsnprintf(last_log,sizeof(last_log),fmt,ap);va_end(ap);log_count++;
+ size_t n=strlen(last_log);
+ if(all_len+n<sizeof(all_log)){memcpy(all_log+all_len,last_log,n+1);all_len+=n;}
+ return 0;
 }
 #define printf model_printf
 static unsigned fuxi_gpu_access(uintptr_t address,uint64_t *v,unsigned wr,unsigned wide) {
@@ -1091,6 +1151,14 @@ assert '#include "fuxi_compile_sched.h"' in patch
 assert 'CTLFLAG_ANYBODY | CTLFLAG_LOCKED' in actual
 assert 'CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED' in actual
 assert patch.count('+\tfuxi_perf_input();') == 1 and '+\t\t\t\tfuxi_perf_input();' in patch
+# fwi: three FUXI-only census calls in work_interval_ctl, none of which changes its result.
+wi = re.search(r'^--- a/bsd/kern/sys_work_interval\.c\n.*?(?=^--- a/)', patch, re.M | re.S)[0]
+for hook in ('+\tfuxi_wi_census(operation);\n', '+\t\tfuxi_wi_census_flags(create_params.wicp_create_flags);\n',
+             '+\t\tfuxi_wi_census_notify(notification.create_flags, notification.start,\n'):
+    assert wi.count(hook) == 1, hook
+assert wi.count('+#if defined(FUXI)\n') == 4 and wi.count('+#endif\n') == 4
+assert not re.search(r'^\+.*\b(return|error|kret)\b', wi, re.M), 'census hooks must not touch the result'
+assert ' \tswitch (operation) {\n' in wi and wi.index('+\tfuxi_wi_census(operation);') < wi.index(' \tswitch (operation) {')
 with tempfile.TemporaryDirectory() as d:
     source, exe = Path(d)/'perf.c', Path(d)/'perf'
     source.write_text(TEST)

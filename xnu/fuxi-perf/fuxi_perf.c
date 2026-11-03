@@ -860,8 +860,163 @@ static void fp_worker(thread_call_param_t arg, thread_call_param_t result)
  fp_worker_locked(arg,result);
  lck_mtx_unlock(&fp_lock);
 }
+/* fwi=1 (default off, independent of fuxiperf): a census of work_interval_ctl
+ * (bsd/kern/sys_work_interval.c hooks in 0097), diagnostic only. Each call is
+ * counted by caller process and operation; CREATE2 and NOTIFY also record the
+ * interval type, NOTIFY whether it carries a deadline (deadline > start), the
+ * mean deadline-start and finish-start and how many finished late. A 60 s
+ * thread call prints and clears it; backboardd keeps row 0. Arguments,
+ * results and scheduling are unchanged. Ops 6/7/8 are the os_workgroup
+ * instance start/update/finish (UniXNU 8b6a0f5); xnu-8796 refuses them with
+ * ENOTSUP before reading their argument, so only their count is known.
+ * types: bit N for WORK_INTERVAL_TYPE N<<28 (0x1 default, 0x2 CoreAudio,
+ * 0x4 CA render server, 0x8 CA client, 0x10 HID delivery, 0x20 CoreMedia,
+ * 0x40 ARKit, 0x80 frame compositor). */
+#define FWI_PROCS 24
+#define FWI_OPS 12
+static const char * const fwi_op[FWI_OPS] = {"other","create","destroy","notify","create2",
+    "join","start","update","finish","flags","name","wlid"};
+struct fwi_proc {
+ char name[MAXCOMLEN+1];
+ uint32_t ops[FWI_OPS], types, deadlines, missed;
+ uint64_t budget, used;
+};
+static struct fwi_proc fwi_table[FWI_PROCS], fwi_copy[FWI_PROCS];
+static uint32_t fwi_dropped;
+static unsigned fwi_on, fwi_started;
+static uint64_t fwi_window_start;
+static thread_call_data_t fwi_call;
+static LCK_MTX_DECLARE(fwi_lock, &fp_group);
+static void fwi_clear_locked(void)
+{
+ memset(fwi_table,0,sizeof(fwi_table));
+ snprintf(fwi_table[0].name,sizeof(fwi_table[0].name),"%s","backboardd");
+ fwi_dropped = 0;
+}
+/* The caller's row, or -1 with the table full (counted as dropped). */
+static int fwi_row_locked(const char *name)
+{
+ for (unsigned i = 0; i < FWI_PROCS; i++) {
+  if (!fwi_table[i].name[0]) {
+   snprintf(fwi_table[i].name,sizeof(fwi_table[i].name),"%s",name);
+   return (int)i;
+  }
+  if (!strcmp(fwi_table[i].name,name)) return (int)i;
+ }
+ fwi_dropped++;
+ return -1;
+}
+static void fwi_self(char *name, int size)
+{
+ proc_selfname(name,size);
+ if (!name[0]) snprintf(name,(size_t)size,"%s","?");
+}
+void fuxi_wi_census(uint32_t operation)
+{
+ if (!__atomic_load_n(&fwi_on,__ATOMIC_ACQUIRE)) return;
+ char name[MAXCOMLEN+1] = {};
+ fwi_self(name,sizeof(name));
+ lck_mtx_lock(&fwi_lock);
+ int row = fwi_row_locked(name);
+ if (row >= 0) fwi_table[row].ops[operation < FWI_OPS ? operation : 0]++;
+ lck_mtx_unlock(&fwi_lock);
+}
+void fuxi_wi_census_flags(uint32_t create_flags)
+{
+ if (!__atomic_load_n(&fwi_on,__ATOMIC_ACQUIRE)) return;
+ char name[MAXCOMLEN+1] = {};
+ fwi_self(name,sizeof(name));
+ lck_mtx_lock(&fwi_lock);
+ int row = fwi_row_locked(name);
+ if (row >= 0) fwi_table[row].types |= 1u << (create_flags >> 28);
+ lck_mtx_unlock(&fwi_lock);
+}
+void fuxi_wi_census_notify(uint32_t create_flags, uint64_t start, uint64_t finish, uint64_t deadline)
+{
+ if (!__atomic_load_n(&fwi_on,__ATOMIC_ACQUIRE)) return;
+ char name[MAXCOMLEN+1] = {};
+ fwi_self(name,sizeof(name));
+ lck_mtx_lock(&fwi_lock);
+ int row = fwi_row_locked(name);
+ if (row >= 0) {
+  struct fwi_proc *p = &fwi_table[row];
+  p->types |= 1u << (create_flags >> 28);
+  if (deadline > start) {
+   p->deadlines++;
+   p->budget += deadline-start;
+   if (finish > start) p->used += finish-start;
+   if (finish > deadline) p->missed++;
+  }
+ }
+ lck_mtx_unlock(&fwi_lock);
+}
+static unsigned long long fwi_us(uint64_t sum, uint32_t n)
+{
+ uint64_t ns;
+ absolutetime_to_nanoseconds(sum,&ns);
+ return n ? ns/n/1000 : 0;
+}
+static void fwi_report(thread_call_param_t arg, thread_call_param_t result)
+{
+ (void)arg; (void)result;
+ lck_mtx_lock(&fwi_lock);
+ memcpy(fwi_copy,fwi_table,sizeof(fwi_copy));
+ uint32_t dropped = fwi_dropped;
+ fwi_clear_locked();
+ lck_mtx_unlock(&fwi_lock);
+ uint64_t now = mach_absolute_time(), span_ns, calls = 0;
+ unsigned procs = 0;
+ absolutetime_to_nanoseconds(now-fwi_window_start,&span_ns);
+ fwi_window_start = now;
+ for (unsigned i = 0; i < FWI_PROCS; i++) {
+  uint64_t n = 0;
+  for (unsigned o = 0; o < FWI_OPS; o++) n += fwi_copy[i].ops[o];
+  procs += n != 0;
+  calls += n;
+ }
+ printf("FUXI WI: census %llu ms: %llu calls from %u processes, %u dropped (table %u)\n",
+     span_ns/1000000,calls,procs,dropped,FWI_PROCS);
+ for (unsigned i = 0; i < FWI_PROCS; i++) {
+  struct fwi_proc *p = &fwi_copy[i];
+  char line[320];
+  size_t k = (size_t)snprintf(line,sizeof(line),"FUXI WI: %s",p->name);
+  int any = 0;
+  for (unsigned o = 0; o < FWI_OPS; o++) if (p->ops[o] && k < sizeof(line)) {
+   k += (size_t)snprintf(line+k,sizeof(line)-k," %s %u",fwi_op[o],p->ops[o]);
+   any = 1;
+  }
+  if (!any && i) continue; /* backboardd prints every window, even idle */
+  if (!any && k < sizeof(line)) k += (size_t)snprintf(line+k,sizeof(line)-k," none");
+  if (p->types && k < sizeof(line)) k += (size_t)snprintf(line+k,sizeof(line)-k," types %#x",p->types);
+  if (p->deadlines && k < sizeof(line))
+   k += (size_t)snprintf(line+k,sizeof(line)-k," deadline %u budget_us %llu used_us %llu missed %u",
+       p->deadlines,fwi_us(p->budget,p->deadlines),fwi_us(p->used,p->deadlines),p->missed);
+  printf("%s\n",line);
+ }
+ uint64_t deadline;
+ clock_interval_to_deadline(60,NSEC_PER_SEC,&deadline);
+ (void)thread_call_enter_delayed(&fwi_call,deadline);
+}
+static void fp_wi_start(void)
+{
+ unsigned on = 0;
+ if (fwi_started || !PE_parse_boot_argn("fwi",&on,sizeof(on)) || on != 1) return;
+ fwi_started = 1;
+ lck_mtx_lock(&fwi_lock);
+ fwi_clear_locked();
+ lck_mtx_unlock(&fwi_lock);
+ thread_call_setup_with_options(&fwi_call,fwi_report,NULL,
+     THREAD_CALL_PRIORITY_LOW,THREAD_CALL_OPTIONS_ONCE);
+ fwi_window_start = mach_absolute_time();
+ uint64_t deadline;
+ clock_interval_to_deadline(60,NSEC_PER_SEC,&deadline);
+ (void)thread_call_enter_delayed(&fwi_call,deadline);
+ __atomic_store_n(&fwi_on,1,__ATOMIC_RELEASE);
+ printf("FUXI WI: census on (fwi=1): work_interval_ctl by process and op every 60 s; calls and scheduling unchanged\n");
+}
 void fuxi_perf_start(void)
 {
+ fp_wi_start();
  unsigned enable = 0;
  (void)PE_parse_boot_argn("fuxiperf",&enable,sizeof(enable));
  if (enable != 1 || fp_started) return;
