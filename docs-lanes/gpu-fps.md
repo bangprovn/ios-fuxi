@@ -433,3 +433,35 @@ split submits; no set made in a steady frame; texture, sampler, uniform buffer
 and pipeline destroyed and remade under kept sets; two pending flights across
 rotations. Without ASan's quarantine the swapped objects get the old handles,
 and with the destroy-time rule disabled the test draws two scenes wrong.
+
+## Repeated push constants and vertex/index binds left out (bit 24)
+
+Bit 24 (`1000000`) is `FUXI_MTL_BIND_SKIP=1`, the analogue for our recording
+of hakios-metal b576ed1/8c54e65 (they drop register writes that repeat within
+a pass in their own command stream). Push constants and vertex/index buffer
+bindings are command buffer state: Vulkan keeps them across render passes and
+pipeline binds, and Turnip keeps `cmd->push_constants`, `state.vb` and the index
+state and re-emits them as draw state for each pass and pipeline (every pass end
+marks all draw state dirty; a pipeline bind marks the constants dirty). So
+`BindTracker.hpp` works per command buffer (reset with each one, split-submit
+chunks too), not per pass, which also helps with merging off (one draw a pass).
+A call is left out only when it would set exactly what was set last:
+
+- `vkCmdPushConstants`: same pipeline layout handle as every tracked push (a
+  push with another layout clears them all), same stages, offset and size, same
+  bytes; a push that is recorded first drops every tracked range it overlaps;
+- `vkCmdBindVertexBuffers`: same binding, buffer handle and offset;
+- `vkCmdBindIndexBuffer`: same buffer handle, offset and index type.
+
+Untracked cases (a fifth push range, a ninth binding, a push over 128 bytes)
+are always recorded. Draws, pipelines, descriptor sets and barriers are
+unchanged. In Turnip a skipped push saves the memcpy and the constant
+re-emission only while the pipeline stays bound (FuxiMetal rebinds the
+pipeline at every pass start); a skipped vertex bind saves a draw-state
+allocation and its register writes. The backboardd line (only with the knob)
+ends with `bind_skip=push:S/T,vertex:S/T,index:S/T` (skipped / asked,
+cumulative), the frame trace line with `binds_skipped/frame=push:,vertex:,index:`.
+Test: `tools/test-fuxi-metal-reuse.py`: same pixels, draws, indexed draws and
+set binds as the knob off, alone and with `DESC_REUSE`; the fixture's steady
+frame goes from 22/11/4 push/vertex/index calls to 8/4/3. A tracker that
+ignores the vertex offset or the push bytes fails it (checked by hand).

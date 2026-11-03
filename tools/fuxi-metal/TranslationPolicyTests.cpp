@@ -9,6 +9,7 @@ int main(int argc,char **argv){
  if(argc==5 && !strcmp(argv[1],"split")){auto p=fuxi::systemTranslationPolicy();assert(p.splitSubmit==(argv[2][0]=='1') && p.splitSubmitUs==unsigned(atoi(argv[3])) && p.splitSubmitMax==unsigned(atoi(argv[4])));return 0;} // FUXI_MTL_SPLIT_SUBMIT(_US/_MAX)
  if(argc==5 && !strcmp(argv[1],"late")){auto p=fuxi::systemTranslationPolicy();assert(p.lateFrames==(argv[2][0]=='1') && p.lateFrameUs==unsigned(atoi(argv[3])) && p.lateFrameMax==unsigned(atoi(argv[4])));return 0;} // FUXI_MTL_LATE_FRAMES(_US/_MAX)
  if(argc==3 && !strcmp(argv[1],"descreuse")){assert(fuxi::systemTranslationPolicy().descReuse==(argv[2][0]=='1'));return 0;} // FUXI_MTL_DESC_REUSE: exactly "1"
+ if(argc==3 && !strcmp(argv[1],"bindskip")){assert(fuxi::systemTranslationPolicy().bindSkip==(argv[2][0]=='1'));return 0;} // FUXI_MTL_BIND_SKIP: exactly "1"
  if(argc==3 && !strcmp(argv[1],"fetchsplit")){assert(fuxi::systemTranslationPolicy().fetchSplit==(argv[2][0]=='1'));return 0;} // FUXI_MTL_FETCH_SPLIT: exactly "1"
  if(argc==3 && !strcmp(argv[1],"cached")){assert(fuxi::systemTranslationPolicy().bufferCached==(argv[2][0]=='1'));return 0;} // FUXI_MTL_BUFFER_CACHED: exactly "1"
  if(argc==3 && !strcmp(argv[1],"rename")){assert(fuxi::systemTranslationPolicy().shadowRename==(argv[2][0]=='1'));return 0;}

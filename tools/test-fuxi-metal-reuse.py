@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""FUXI_MTL_DESC_REUSE pixel A/B on the production backend (lavapipe, ReuseBindBridge); no downloads.
+"""FUXI_MTL_DESC_REUSE and FUXI_MTL_BIND_SKIP pixel A/B on the production backend (lavapipe, ReuseBindBridge); no downloads.
 
 Every PIXELS line with a knob on must equal the knob-off line of the same boot arguments; the COUNTS lines show the kept sets doing the
 work (no set made in a steady frame, sets dropped when a texture, sampler, buffer or pipeline they name is destroyed, the second pool
-rotation refused while a flight that bound its sets is pending)."""
+rotation refused while a flight that bound its sets is pending) and the skipped binds (same draws, fewer push/vertex/index calls)."""
 import argparse
 import os
 from pathlib import Path
@@ -99,6 +99,22 @@ def main():
                     assert 'needs fuxigpusubmit=1' in plain_on.stderr and 'KEPT 0' in plain_on.stdout
                 info = [line for line in on.stdout.splitlines() if line.startswith(('INFO', 'ROTATIONS', 'KEPT'))]
                 print('PASS: desc reuse pixels identical %r %r; %s; steady reused/frame=%s' % (args, extra, ' '.join(info), steady[-1]['reused']))
+                # FUXI_MTL_BIND_SKIP, alone and with the kept sets: the same pixels and draws, fewer push/vertex/index calls.
+                skip = invoke(args, FUXI_MTL_BIND_SKIP='1', **extra)
+                both = invoke(args, FUXI_MTL_BIND_SKIP='1', FUXI_MTL_DESC_REUSE='1', **extra)
+                for run in (skip, both):
+                    assert pixels(run.stdout) == pixels(ref.stdout), (args, extra, pixels(ref.stdout), pixels(run.stdout))
+                    assert 'FUXI MTL: policy bind_skip=1' in run.stderr
+                cr, cs = counts(ref.stdout), counts(skip.stdout)
+                assert cr.keys() == cs.keys()
+                for label in cr:
+                    for r, s in zip(cr[label], cs[label]):
+                        assert r['draws'] == s['draws'] and r['indexed'] == s['indexed'] and r['set_binds'] == s['set_binds'], (label, r, s)
+                        assert int(s['pushes']) <= int(r['pushes']) and int(s['vertex']) <= int(r['vertex']) and int(s['index']) <= int(r['index']), (label, r, s)
+                r, s = cr['steady-2'][0], cs['steady-2'][0]
+                assert int(s['pushes']) < int(r['pushes']) and int(s['vertex']) < int(r['vertex']) and int(s['index']) < int(r['index']) and int(s['index']) > 0, (r, s)
+                print('PASS: bind skip pixels identical %r %r; steady frame pushes %s->%s vertex %s->%s index %s->%s'
+                      % (args, extra, r['pushes'], s['pushes'], r['vertex'], s['vertex'], r['index'], s['index']))
         # Without ASan's quarantine a destroyed object's address (lavapipe's handle) goes to the next object of that size at once, so the
         # swaps above hand a kept set's handles to new objects. The destroy-time rule must keep the pixels; with it disabled (negative
         # control) a stale set draws the old sampler or buffer.

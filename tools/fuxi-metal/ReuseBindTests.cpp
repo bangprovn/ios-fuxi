@@ -28,7 +28,7 @@ int main(int argc,char **argv){
  // One CA-shaped encoder: repeated and changing push values, a second pipeline layout with the same values, indexed draws switching index
  // offsets, vertex offsets switching back and forth.
  auto frame=[&]{std::vector<Operation> f{draw(p,src,1,0,0),draw(p,src,1,0,0),draw(p,src,2,0,0),draw(p2,src,2,0,0),draw(p,other,2,1,1,0),draw(p,other,3,1,2,1,1),draw(p,other,3,1,2,0,1),
-  draw(p,src,3,1,2,-1,1),draw(p,src,3,1,2,-1,0),draw(p,src,3,1,2,-1,1)};f[0].load=2;return f;};
+  draw(p,src,3,1,2,0,1),draw(p,src,3,1,2,-1,1),draw(p,src,3,1,2,-1,0),draw(p,src,3,1,2,-1,1)};f[0].load=2;return f;};
  auto pixels=[&](const char *label){Operation get{};get.texture=dst;get.dst=read;b.submit({get});uint64_t h=0xcbf29ce484222325ull;for(size_t i=0;i<16*16*4;++i)h=(h^((uint8_t *)read->contents)[i])*0x100000001b3ull;
   printf("PIXELS %s %016llx\n",label,(unsigned long long)h);};
  const char *names[]={"render_merge_push_calls","render_merge_vertex_binds","render_merge_index_binds","render_merge_set_allocations","render_merge_set_binds","render_merge_indexed_draws","render_merge_draws"};

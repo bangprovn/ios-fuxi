@@ -64,6 +64,7 @@
 #include "FramebufferFetch.hpp"
 #include "VertexProfile.hpp"
 #include "DescriptorReuse.hpp"
+#include "BindTracker.hpp"
 #include "../../xnu/fuxi-adreno/NativeAdrenoABI.h"
 static_assert(NativeAdrenoAbiVersion==2,"FuxiMetal HostImport requires NativeAdreno ABI 2");
 #ifndef FUXI_MTL_ICD
@@ -2521,6 +2522,8 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
    // per pass: recorded fetch / non-fetch draws, fetch/non-fetch runs, FUXI_MTL_FETCH_SPLIT barriers; fsUnordered: a non-fetch draw wrote since the pass began or the last such barrier
    uint32_t fsFetch=0,fsNofetch=0,fsRuns=0,fsBarriers=0;int fsLast=-1;bool fsUnordered=false;const bool fsOn=systemTranslationPolicy().fetchSplit && orderedColorAccess;
    VkViewport boundViewport{};VkRect2D boundScissor{};bool dynamicBound=false;
+   // FUXI_MTL_BIND_SKIP: what this command buffer holds (BindTracker.hpp), reset with every command buffer; calls asked for and left out.
+   BindTracker binds;const bool bindSkip=systemTranslationPolicy().bindSkip;uint64_t askPush=0,skipPush=0,askVertex=0,skipVertex=0,askIndex=0,skipIndex=0;
    setupPhase.reset();auto loopPhase=std::make_unique<PhaseTimer>(SubPhase::recLoop);
    for(size_t opIndex=0;opIndex<ops.size();++opIndex) {diagnosticOp=opIndex;const auto &op=ops[opIndex];const auto &draw=draws[opIndex];
     size_t passEnd=mergeEnds.empty()?opIndex:mergeEnds[opIndex];const bool culledOp=occPlan && occPlan->culled[opIndex];
@@ -2687,9 +2690,14 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
        if(currentFrame){if(kind==1){++currentFrame->sampleLinear;currentFrame->sampleLinearBytes+=bytes;if(t->imported || (t->backingBuffer && t->backingBuffer->imported)){++currentFrame->sampleLinearImported;currentFrame->sampleLinearImportedBytes+=bytes;}if(uint64_t(t->width)*t->height>=(1u<<20))++currentFrame->sampleLinearLarge;}else if(kind==2){++currentFrame->sampleShadow;currentFrame->sampleShadowBytes+=bytes;}else{++currentFrame->sampleOptimal;currentFrame->sampleOptimalBytes+=bytes;}}
        if(di.texCount<4){di.tex[di.texCount++]={t->width,t->height,t->format,kind,uint8_t(t->backingBuffer!=nullptr),uint8_t(t->imported || (t->backingBuffer && t->backingBuffer->imported))};}}}
      bindPhase.reset();
-     {PhaseTimer phase(SubPhase::record);for(unsigned i=0;i<draw.pushCount;++i){auto &w=draw.pushes[i];CmdPushConstants(cmd,op.pipeline->layout,w.stages,w.offset,w.size,w.bytes);}
+     if(!bindSkip){PhaseTimer phase(SubPhase::record);for(unsigned i=0;i<draw.pushCount;++i){auto &w=draw.pushes[i];CmdPushConstants(cmd,op.pipeline->layout,w.stages,w.offset,w.size,w.bytes);}
      for(unsigned i=0;i<draw.vertexCount;++i){auto b=op.buffers[0][draw.vertexSlots[i]].buffer;VkDeviceSize offset=draw.vertexOffsets[i];CmdBindVertexBuffers(cmd,draw.vertexBindings[i],1,&b->buffer,&offset);}
      if(draw.indexed){CmdBindIndexBuffer(cmd,op.indices->buffer,draw.indexOffset,op.indexWidth==2?VK_INDEX_TYPE_UINT16:VK_INDEX_TYPE_UINT32);CmdDrawIndexed(cmd,draw.count,1,draw.first,0,0);}else CmdDraw(cmd,draw.count,1,draw.first,0);}
+     else {PhaseTimer phase(SubPhase::record); // FUXI_MTL_BIND_SKIP: the same calls, less those that would set what cmd already holds
+      for(unsigned i=0;i<draw.pushCount;++i){auto &w=draw.pushes[i];++askPush;if(binds.push(handleKey(op.pipeline->layout),w.stages,w.offset,w.size,w.bytes)){++skipPush;continue;}CmdPushConstants(cmd,op.pipeline->layout,w.stages,w.offset,w.size,w.bytes);}
+      for(unsigned i=0;i<draw.vertexCount;++i){auto b=op.buffers[0][draw.vertexSlots[i]].buffer;VkDeviceSize offset=draw.vertexOffsets[i];++askVertex;if(binds.vertexBuffer(draw.vertexBindings[i],handleKey(b->buffer),offset)){++skipVertex;continue;}CmdBindVertexBuffers(cmd,draw.vertexBindings[i],1,&b->buffer,&offset);}
+      if(draw.indexed){const VkIndexType type=op.indexWidth==2?VK_INDEX_TYPE_UINT16:VK_INDEX_TYPE_UINT32;++askIndex;if(binds.indexBufferBind(handleKey(op.indices->buffer),draw.indexOffset,uint32_t(type)))++skipIndex;else CmdBindIndexBuffer(cmd,op.indices->buffer,draw.indexOffset,type);
+       CmdDrawIndexed(cmd,draw.count,1,draw.first,0,0);}else CmdDraw(cmd,draw.count,1,draw.first,0);}
      if(drawQ && drawInfos.size()<passStampLimit){drawInfos.push_back(di);CmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,drawQ,uint32_t(drawInfos.size()));}
      }
      if(opIndex==passEnd){PhaseTimer phase(SubPhase::passes);CmdEndRenderPass(cmd);}
@@ -2779,6 +2787,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
      if(slot.chunkCommands.size()<chunk){Measure measure{objectNanos,SubPhase::objects};VkCommandBufferAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;ai.commandPool=commandPool;ai.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY;ai.commandBufferCount=1;
       VkCommandBuffer extra{};check(AllocateCommandBuffers(device,&ai,&extra));slot.chunkCommands.push_back(extra);++reuseCounts.commandBuffers;++submitObjectCreates;}
      cmd=slot.chunkCommands[chunk-1];{PhaseTimer phase(SubPhase::cmdBegin);check(BeginCommandBuffer(cmd,&bi));}if(chunkQ)CmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,chunkQ,2*chunk);
+     binds.reset(); // a new command buffer holds no bound state
      chunkStart=FrameClock::now();
 #ifdef FUXI_MTL_HOST_TEST
      if(failAfterChunk){failAfterChunk=false;throw std::runtime_error("injected failure after a queued chunk");}
@@ -2786,6 +2795,8 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
     }
    }
    loopPhase.reset();PhaseTimer tailPhase(SubPhase::tail);
+   if(bindSkip){bindPushCalls+=askPush;bindPushSkips+=skipPush;bindVertexCalls+=askVertex;bindVertexSkips+=skipVertex;bindIndexCalls+=askIndex;bindIndexSkips+=skipIndex;
+    if(currentFrame){currentFrame->pushSkips+=skipPush;currentFrame->vertexSkips+=skipVertex;currentFrame->indexSkips+=skipIndex;}}
    barrier.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_HOST_READ_BIT;
    pb(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&barrier,0,nullptr,0,nullptr);
    if(timestamps)CmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,timestamps,1);
