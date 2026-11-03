@@ -98,6 +98,19 @@ extern "C" uint64_t render_merge_pass_barriers(){return passBarriers;}
 static void barrier(VkCommandBuffer c,VkPipelineStageFlags a,VkPipelineStageFlags b,VkDependencyFlags f,uint32_t nm,const VkMemoryBarrier *m,uint32_t nb,const VkBufferMemoryBarrier *bb,uint32_t ni,const VkImageMemoryBarrier *ib){
  if(inside){assert(selfDeps.count(activePass) && a==VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT && b==VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT && f==VK_DEPENDENCY_BY_REGION_BIT && nm==1 && !nb && !ni && m[0].srcAccessMask==VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT && m[0].dstAccessMask==VK_ACCESS_INPUT_ATTACHMENT_READ_BIT);++passBarriers;passUnordered=false;pipelineBarrier(c,a,b,f,nm,m,nb,bb,ni,ib);return;}
  ++barrierCalls;imageBarrierCalls+=ni!=0;imageBarriers+=ni;for(unsigned x=0;x<ni;++x)for(unsigned l=ib[x].subresourceRange.baseMipLevel;l<ib[x].subresourceRange.baseMipLevel+ib[x].subresourceRange.levelCount;++l)imageLayouts[ib[x].image].at(l)=ib[x].newLayout;pipelineBarrier(c,a,b,f,nm,m,nb,bb,ni,ib);}
+// FUXI_MTL_DESC_REUSE / FUXI_MTL_BIND_SKIP controls (ReuseBindTests): calls that record state, sets made, indexed draws.
+static PFN_vkCmdPushConstants pushConstants;static PFN_vkCmdBindVertexBuffers bindVertex;static PFN_vkCmdBindIndexBuffer bindIndex;static PFN_vkCmdDrawIndexed drawIndexed;static PFN_vkAllocateDescriptorSets allocateSets;
+static uint64_t pushCalls,vertexBinds,indexBinds,indexedDraws,setAllocations;
+extern "C" uint64_t render_merge_push_calls(){return pushCalls;}
+extern "C" uint64_t render_merge_vertex_binds(){return vertexBinds;}
+extern "C" uint64_t render_merge_index_binds(){return indexBinds;}
+extern "C" uint64_t render_merge_indexed_draws(){return indexedDraws;}
+extern "C" uint64_t render_merge_set_allocations(){return setAllocations;}
+static void pushed(VkCommandBuffer c,VkPipelineLayout l,VkShaderStageFlags s,uint32_t o,uint32_t n,const void *v){++pushCalls;pushConstants(c,l,s,o,n,v);}
+static void vertexBound(VkCommandBuffer c,uint32_t first,uint32_t n,const VkBuffer *b,const VkDeviceSize *o){vertexBinds+=n;bindVertex(c,first,n,b,o);}
+static void indexBound(VkCommandBuffer c,VkBuffer b,VkDeviceSize o,VkIndexType t){++indexBinds;bindIndex(c,b,o,t);}
+static void drawnIndexed(VkCommandBuffer c,uint32_t n,uint32_t i,uint32_t f,int32_t v,uint32_t fi){assert(inside);++indexedDraws;drawIndexed(c,n,i,f,v,fi);}
+static VkResult allocated(VkDevice d,const VkDescriptorSetAllocateInfo *i,VkDescriptorSet *s){auto r=allocateSets(d,i,s);if(r==VK_SUCCESS)setAllocations+=i->descriptorSetCount;return r;}
 static void drawn(VkCommandBuffer c,uint32_t n,uint32_t i,uint32_t f,uint32_t fi){assert(inside);bool fetch=false;if(activeSet)for(auto view:inputViews[activeSet]){auto &views=frameViews.at(activeFrame);assert(!views.empty() && view==views[0]);fetch=true;}
  if(fetch && passUnordered)++fetchHazards;if(!orderedPipelines.at(activePipeline))passUnordered=true;++draws;draw(c,n,i,f,fi);}
 static VkResult start(VkCommandBuffer c,const VkCommandBufferBeginInfo *i){inside=false;return beginCommand(c,i);}
@@ -107,6 +120,7 @@ static PFN_vkVoidFunction getDevice(VkDevice d,const char *name){auto f=devicePr
  WRAP(CmdSetViewport,setViewport,viewport);WRAP(CmdSetScissor,setScissor,scissor);
  WRAP(QueueSubmit,queueSubmit,submit);WRAP(WaitForFences,waitFences,waited);WRAP(CmdBeginRenderPass,beginPass,begin);WRAP(CmdEndRenderPass,endPass,end);WRAP(CmdPipelineBarrier,pipelineBarrier,barrier);WRAP(CmdDraw,draw,drawn);WRAP(BeginCommandBuffer,beginCommand,start);WRAP(EndCommandBuffer,endCommand,finish);WRAP(CreateRenderPass,createPass,create);
  WRAP(CreateGraphicsPipelines,createPipelines,pipelines);WRAP(CreateFramebuffer,createFramebuffer,framebuffer);WRAP(CmdBindPipeline,bindPipeline,boundPipeline);WRAP(UpdateDescriptorSets,updateSets,updated);WRAP(CmdBindDescriptorSets,bindSets,boundSets);WRAP(CmdCopyBufferToImage,copyImage,copied);
+ WRAP(CmdPushConstants,pushConstants,pushed);WRAP(CmdBindVertexBuffers,bindVertex,vertexBound);WRAP(CmdBindIndexBuffer,bindIndex,indexBound);WRAP(CmdDrawIndexed,drawIndexed,drawnIndexed);WRAP(AllocateDescriptorSets,allocateSets,allocated);
  return f;
 }
 extern "C" PFN_vkVoidFunction vk_icdGetInstanceProcAddr(VkInstance i,const char *name){

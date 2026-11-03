@@ -396,3 +396,40 @@ lock and surface release. `late=L/F` counts late and all frames since start,
 `dropped=` the late frames the rate limit left out since the line before. The
 line is cut at 200 characters like the window line: delete every
 `\nFUXI MTL: late frame+` to rejoin it. Printed after the gate lock.
+
+## Descriptor sets kept across submits (bit 23)
+
+Bit 23 (`800000`) is `FUXI_MTL_DESC_REUSE=1`, used with `fuxigpusubmit=1`
+(the per-submit set dedupe; without it the policy line says the knob does
+nothing). d-ft-v27 made 85.5 new sets a frame from a pool reset every submit.
+With the knob a set is kept after its submit and bound again by any later draw
+whose written values are the same (`DescriptorReuse.hpp`, `Backend::reuseSet`):
+
+- identity: same set layout handle, same binding count, and per binding the
+  same binding, type, sampler, image view, image layout, buffer, offset and
+  range, compared in full (the hash only picks candidates);
+- lifetime: every handle a kept set names is indexed, and each of the eleven
+  `Destroy{Buffer,ImageView,Sampler,DescriptorSetLayout}` calls in
+  `Backend.hpp` first drops the sets that name it, so an object that later gets
+  the same handle value (lavapipe and Turnip both reuse addresses) never
+  matches a set written for the old one. A pooled `VkBuffer` handed to a new
+  `Buffer` is not destroyed and describes the same memory, so its sets stay;
+- pending use: sets are made into two pools of 512 taken in turn and are never
+  updated after they are written. A pool is reset only when its last bind is
+  older than every busy flight and the submit being recorded (submit serials);
+  rotating drops every kept set first. A set the pools cannot take (full and
+  the other pool still pending, another type, a failed allocation) is made in
+  the submit pool as before.
+
+The backboardd line (every 5 s, only with the knob) ends with
+`desc_reuse=hits:H,new:N,fallbacks:F,forgotten:G,rotations:R,blocked:B`
+(cumulative: bound from the kept sets, made into them, left to the submit
+pool, dropped because a handle they name was destroyed, pool rotations, and
+rotation attempts refused while the other pool may be pending). The frame trace
+line adds `desc_reuse/frame=hits:..,new:..`, and its `descriptors/frame` counts
+sets made either way. Test: `tools/test-fuxi-metal-reuse.py` (lavapipe):
+pixels equal to the knob off over five boot-argument sets, with and without
+split submits; no set made in a steady frame; texture, sampler, uniform buffer
+and pipeline destroyed and remade under kept sets; two pending flights across
+rotations. Without ASan's quarantine the swapped objects get the old handles,
+and with the destroy-time rule disabled the test draws two scenes wrong.

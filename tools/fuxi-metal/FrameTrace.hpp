@@ -65,6 +65,9 @@ struct FrameCounts {uint64_t pipelines=0,descriptors=0,allocations=0;};
 inline thread_local FrameCounts frameCounts;
 // Pipelines compiled on the draw path (not by the background prewarm) and the time they blocked the caller; process-wide.
 inline std::atomic<uint64_t> syncCompiles{0},syncCompileNs{0};
+// FUXI_MTL_DESC_REUSE (Backend): sets bound from the cross-submit cache, made into it, left to the submit pool, forgotten when a handle they
+// name was destroyed, pool rotations and rotations refused while the other pool may be pending; process-wide, for the backboardd line.
+inline std::atomic<uint64_t> descReuseHits{0},descReuseNew{0},descReuseFallbacks{0},descReuseForgotten{0},descReuseRotations{0},descReuseBlocked{0};
 enum class MergeSplit : size_t {none,encoder,attachments,area,actions,attachmentSample,storage,shadow,fetch,nonDraw,bufferAlias,count};
 inline constexpr const char *mergeSplitNames[]={"none","encoder","attachments","area","actions","attachment_sample","storage","shadow","fetch","non_draw","buffer_alias"};
 // Exclusive per-phase wall time (nested phases pause their parent). Encode phases cover the frontend entry-point families on the calling thread and
@@ -115,6 +118,7 @@ struct FrameSample {
  uint64_t createdNs=0,interval=0;
  uint64_t mergedDraws=0;std::array<uint64_t,size_t(MergeSplit::count)> mergeSplits{};
  uint64_t draws=0,passes=0,gpuSamples=0;FrameCounts counts{};unsigned cpu=4096;bool encodeCountsUnknown=false;
+ uint64_t descReuseHits=0,descReuseNew=0; // FUXI_MTL_DESC_REUSE: sets bound from the cross-submit cache, sets made into it
 };
 inline thread_local FrameSample *currentFrame=nullptr;
 struct EncAccum {std::array<uint64_t,size_t(EncPhase::count)> ns{},calls{};};
@@ -237,7 +241,7 @@ public:
   totals.textureShadowBytes+=s.textureShadowBytes;totals.textureRepitchedBytes+=s.textureRepitchedBytes;for(size_t i=0;i<totals.textureShadowUses.size();++i)totals.textureShadowUses[i]+=s.textureShadowUses[i];
   totals.snapshotBytes+=s.snapshotBytes;totals.shadowCopyBytes+=s.shadowCopyBytes;totals.shadowScannedIndices+=s.shadowScannedIndices;for(size_t i=0;i<totals.shadowFullReasons.size();++i)totals.shadowFullReasons[i]+=s.shadowFullReasons[i];
   totals.frontendDrawSamples+=s.frontendDrawSamples;totals.leaseWrites+=s.leaseWrites;totals.leaseReads+=s.leaseReads;
-  totals.planHits+=s.planHits;totals.planMisses+=s.planMisses;
+  totals.planHits+=s.planHits;totals.planMisses+=s.planMisses;totals.descReuseHits+=s.descReuseHits;totals.descReuseNew+=s.descReuseNew;
   totals.queueSubmits+=s.queueSubmits;totals.imageBarriers+=s.imageBarriers;totals.readBarriersSkipped+=s.readBarriersSkipped;totals.crossEncoderMerges+=s.crossEncoderMerges;totals.pipelineBarriers+=s.pipelineBarriers;totals.shadowRefreshSkipped+=s.shadowRefreshSkipped;totals.postBarriersSkipped+=s.postBarriersSkipped;for(size_t i=0;i<totals.layoutKinds.size();++i)totals.layoutKinds[i]+=s.layoutKinds[i];
   for(size_t i=0;i<totals.conflictKinds.size();++i)totals.conflictKinds[i]+=s.conflictKinds[i];for(size_t i=0;i<totals.renameDeclined.size();++i)totals.renameDeclined[i]+=s.renameDeclined[i];totals.shadowRenames+=s.shadowRenames;totals.shadowRenameBytes+=s.shadowRenameBytes;totals.drainWaits+=s.drainWaits;totals.conflictWaits+=s.conflictWaits;totals.slotWaits+=s.slotWaits;
   totals.shadowWaits+=s.shadowWaits;totals.drainSubmits+=s.drainSubmits;totals.prepareDrains+=s.prepareDrains;totals.prepareUnknownDrains+=s.prepareUnknownDrains;totals.prepareConflictWaits+=s.prepareConflictWaits;totals.indexUploadDrains+=s.indexUploadDrains;totals.indexGPUWritableDrains+=s.indexGPUWritableDrains;
@@ -312,6 +316,7 @@ public:
   fprintf(out," conflict_kinds=buffer:%llu,shadow:%llu,texture:%llu,surface:%llu,index:%llu conflict_wait_for=gpu_flight display_lease_wait_ms/frame=%.3f shadow_renames/frame=%.2f shadow_rename_bytes/frame=%.0f rename_declined=off:%llu,not_backing:%llu,direct_use:%llu,texture:%llu,budget:%llu,other:%llu",(unsigned long long)totals.conflictKinds[0],(unsigned long long)totals.conflictKinds[1],(unsigned long long)totals.conflictKinds[2],(unsigned long long)totals.conflictKinds[3],(unsigned long long)totals.conflictKinds[4],totals.leaseExclWait/n/1e6,totals.shadowRenames/n,totals.shadowRenameBytes/n,(unsigned long long)totals.renameDeclined[0],(unsigned long long)totals.renameDeclined[1],(unsigned long long)totals.renameDeclined[2],(unsigned long long)totals.renameDeclined[3],(unsigned long long)totals.renameDeclined[4],(unsigned long long)totals.renameDeclined[5]);
   fprintf(out," pipeline_barriers/frame=%.2f shadow_refresh_skipped/frame=%.2f post_barriers_skipped/frame=%.2f layout_transitions/frame=",totals.pipelineBarriers/n,totals.shadowRefreshSkipped/n,totals.postBarriersSkipped/n);{static const char *k[]={"und","gen","ro","dst"};bool any=false;for(size_t i=0;i<16;++i)if(totals.layoutKinds[i]){fprintf(out,"%s%s>%s:%.2f",any?",":"",k[i/4],k[i%4],totals.layoutKinds[i]/n);any=true;}if(!any)fputc('-',out);}
   fprintf(out," plan_hits/frame=%.2f plan_misses/frame=%.2f",totals.planHits/n,totals.planMisses/n);
+  if(systemTranslationPolicy().descReuse)fprintf(out," desc_reuse/frame=hits:%.2f,new:%.2f",totals.descReuseHits/n,totals.descReuseNew/n);
   fprintf(out," snapshot_bytes/frame=%.2f shadow_copy_bytes/frame=%.2f",totals.snapshotBytes/n,totals.shadowCopyBytes/n);
   fprintf(out," shadow_hash_skipped/frame=%.2f shadow_hash_copied/frame=%.2f shadow_hash_skipped_bytes/frame=%.0f shadow_hash_ms/frame=%.3f",totals.shadowHashSkipped/n,totals.shadowHashCopied/n,totals.shadowHashBytes/n,totals.shadowHashNs/n/1e6);
   fprintf(out," rt_shadow_in/frame=%.2f rt_shadow_in_skipped/frame=%.2f rt_shadow_out/frame=%.2f rt_shadow_syncs/frame=%.2f rt_shadow_mb/frame=%.2f rt_shadow_eligible/frame=%.2f rt_linear_large_targets/frame=%.2f",totals.rtIn/n,totals.rtInSkipped/n,totals.rtOut/n,totals.rtSyncs/n,totals.rtBytes/n/1048576.0,totals.rtEligible/n,totals.rtLinearLarge/n);

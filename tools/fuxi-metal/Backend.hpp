@@ -63,6 +63,7 @@
 #include "BackboardGate.hpp"
 #include "FramebufferFetch.hpp"
 #include "VertexProfile.hpp"
+#include "DescriptorReuse.hpp"
 #include "../../xnu/fuxi-adreno/NativeAdrenoABI.h"
 static_assert(NativeAdrenoAbiVersion==2,"FuxiMetal HostImport requires NativeAdreno ABI 2");
 #ifndef FUXI_MTL_ICD
@@ -139,6 +140,12 @@ struct Operation {
  void setColor(unsigned i,const ColorTarget &c){if(i){colors[i-1]=c;return;}texture=c.texture;dstLevel=c.level;load=c.load;store=c.store;memcpy(clear,c.clear,sizeof(clear));}
 
 };
+// What one binding of a descriptor set was written with (Backend::submit's per-submit dedupe and FUXI_MTL_DESC_REUSE compare these).
+struct DescriptorValue {
+ uint32_t binding{},type{};VkDescriptorImageInfo image{};VkDescriptorBufferInfo buffer{};
+ bool operator==(const DescriptorValue &b) const {return binding==b.binding && type==b.type && image.sampler==b.image.sampler && image.imageView==b.image.imageView && image.imageLayout==b.image.imageLayout && buffer.buffer==b.buffer.buffer && buffer.offset==b.buffer.offset && buffer.range==b.buffer.range;}
+};
+template<class H> inline uint64_t handleKey(H h){return uint64_t(uintptr_t(h));}
 class Backend {
  // A device loss from another API must poison flights before its cleanup runs.
  void check(VkResult result,int line=__builtin_LINE()) {
@@ -220,7 +227,7 @@ private:
  // Small plain host buffers are kept for exact-size reuse (CA recreates the same vertex/uniform sizes every frame); bounded, idle-trimmed, charged against the budget while pooled.
  struct PooledBuffer {VkBuffer buffer;VkDeviceMemory memory;void *contents;size_t classSize,allocated,memoryBytes,charged;uint32_t memoryType;uint64_t idleSince;};
  std::vector<PooledBuffer> bufferPool;size_t bufferPoolUsed=0;
- void freePooledBuffer(const PooledBuffer &e){frameKernelCall([&]{return UnmapMemory(device,e.memory);});DestroyBuffer(device,e.buffer,nullptr);frameKernelCall([&]{FreeMemory(device,e.memory,nullptr);});--liveMemoryObjects;liveMemoryBytes-=e.memoryBytes;tailPadBytes-=e.memoryBytes-e.allocated;limits.release(e.charged);bufferPoolUsed-=e.classSize;bufferPoolBytes=bufferPoolUsed;++bufferPoolTrims;}
+ void freePooledBuffer(const PooledBuffer &e){frameKernelCall([&]{return UnmapMemory(device,e.memory);});reuseForget(handleKey(e.buffer));DestroyBuffer(device,e.buffer,nullptr);frameKernelCall([&]{FreeMemory(device,e.memory,nullptr);});--liveMemoryObjects;liveMemoryBytes-=e.memoryBytes;tailPadBytes-=e.memoryBytes-e.allocated;limits.release(e.charged);bufferPoolUsed-=e.classSize;bufferPoolBytes=bufferPoolUsed;++bufferPoolTrims;}
  size_t trimBuffers(uint64_t now,bool all,size_t want=SIZE_MAX){
   size_t freed=0;for(size_t i=0;i<bufferPool.size() && freed<want;){if(all || want!=SIZE_MAX || now-bufferPool[i].idleSince>bufferPoolIdleNs){freed+=bufferPool[i].charged;auto e=bufferPool[i];bufferPool.erase(bufferPool.begin()+i);freePooledBuffer(e);}else ++i;}
   return freed;
@@ -293,8 +300,55 @@ private:
   Buffer *aliasScratch=nullptr;VkDescriptorPool descriptorPool{};uint32_t descriptorSets{};
   std::vector<VkDescriptorPoolSize> descriptorCapacity;std::vector<HostUse> hostUses,writes,uses;bool busy=false;
   std::vector<VkCommandBuffer> chunkCommands;VkQueryPool chunkPool{}; // FUXI_MTL_SPLIT_SUBMIT: chunks 2.. (from commandPool) and TOP/BOTTOM stamps per chunk
+  uint64_t serial=0; // the submit serial of the flight while busy (FUXI_MTL_DESC_REUSE's pool-reset rule)
  } slots[2];
  std::condition_variable submitWake;
+ // FUXI_MTL_DESC_REUSE: sets kept across submits in two pools taken in turn (rules in DescriptorReuse.hpp). Every submit takes a serial;
+ // a pool's lastUse is the serial of the last submit that bound one of its sets. All of it under the mutex.
+ DescriptorReuse<DescriptorValue,VkDescriptorSet> reuse;std::array<VkDescriptorPool,2> reusePools{};uint64_t submitSerial=0;
+ static constexpr uint32_t reuseSetLimit=512;
+ // Types the reuse pools hold; a set with another type keeps the submit pool.
+ static constexpr VkDescriptorPoolSize reuseSizes[]={{VK_DESCRIPTOR_TYPE_SAMPLER,512},{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1024},{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,512},
+  {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1024},{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,512},{VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,512}};
+ // Called before a buffer, image view, sampler or set layout is destroyed: drops the kept sets that name it, so a later object that gets
+ // the same handle value never matches a set written for this one.
+ void reuseForget(uint64_t handle){
+#ifdef FUXI_MTL_HOST_TEST
+  if(!reuseForgetForTest)return; // negative control: ReuseBindTests shows a stale set draws wrong pixels without this rule
+#endif
+  if(!reuse.byHandle.empty())descReuseForgotten+=reuse.forget(handle);}
+ uint64_t oldestPending(uint64_t recording) const {uint64_t o=recording;for(auto &s:slots)if(s.busy)o=std::min(o,s.serial);return o;}
+ bool reuseMakePool(unsigned i){
+  VkDescriptorPoolCreateInfo ci{};ci.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;ci.maxSets=reuseSetLimit;ci.poolSizeCount=uint32_t(sizeof reuseSizes/sizeof *reuseSizes);ci.pPoolSizes=reuseSizes;
+  if(CreateDescriptorPool(device,&ci,nullptr,&reusePools[i])!=VK_SUCCESS){reusePools[i]={};return false;} // no gate fault: the draw keeps the submit pool
+  reuse.pools[i]={true,0,0};return true;
+ }
+ // Makes the other pool current once no pending command buffer can hold its sets; every entry is dropped first. False: not yet idle.
+ bool reuseRotate(uint64_t serial){
+  unsigned next=reuse.current^1;auto &p=reuse.pools[next];
+  if(p.made && !decltype(reuse)::idle(p,oldestPending(serial))){++descReuseBlocked;return false;}
+  if(!p.made){if(!reuseMakePool(next))return false;}else if(ResetDescriptorPool(device,reusePools[next],0)!=VK_SUCCESS)return false;
+  reuse.clear();reuse.current=next;p.sets=0;p.lastUse=0;++descReuseRotations;return true;
+ }
+ // The kept set for these written values, or a new one made and written in the current pool; VK_NULL_HANDLE leaves the draw to the
+ // submit pool, as with the knob off. made: the set was written here.
+ VkDescriptorSet reuseSet(VkDescriptorSetLayout layout,unsigned count,uint64_t hash,const DescriptorValue *values,VkWriteDescriptorSet *writes,uint64_t serial,uint64_t &probes,bool &made){
+  made=false;const uint64_t key=handleKey(layout);
+  if(auto *e=reuse.find(key,count,hash,values,probes)){reuse.pools[reuse.current].lastUse=serial;++descReuseHits;return e->set;}
+  for(unsigned i=0;i<count;++i)if(std::none_of(std::begin(reuseSizes),std::end(reuseSizes),[&](const VkDescriptorPoolSize &z){return z.type==values[i].type;})){++descReuseFallbacks;return VK_NULL_HANDLE;}
+  if(!reuse.pools[reuse.current].made && !reuseMakePool(reuse.current)){++descReuseFallbacks;return VK_NULL_HANDLE;}
+  if(reuse.pools[reuse.current].sets>=reuseSetLimit && !reuseRotate(serial)){++descReuseFallbacks;return VK_NULL_HANDLE;}
+  VkDescriptorSetAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;ai.descriptorPool=reusePools[reuse.current];ai.descriptorSetCount=1;ai.pSetLayouts=&layout;
+  VkDescriptorSet set{};VkResult r=AllocateDescriptorSets(device,&ai,&set);
+  if((r==VK_ERROR_OUT_OF_POOL_MEMORY || r==VK_ERROR_FRAGMENTED_POOL) && reuseRotate(serial)){ai.descriptorPool=reusePools[reuse.current];r=AllocateDescriptorSets(device,&ai,&set);}
+  if(r!=VK_SUCCESS){++descReuseFallbacks;return VK_NULL_HANDLE;}
+  for(unsigned i=0;i<count;++i)writes[i].dstSet=set;UpdateDescriptorSets(device,count,writes,0,nullptr);
+  uint64_t handles[1+3*16];size_t n=0;handles[n++]=key;
+  for(unsigned i=0;i<count && i<16;++i){handles[n++]=handleKey(values[i].image.sampler);handles[n++]=handleKey(values[i].image.imageView);handles[n++]=handleKey(values[i].buffer.buffer);}
+  reuse.insert(key,count,hash,values,set,handles,n);reuse.pools[reuse.current].lastUse=serial;++descReuseNew;made=true;return set;
+ }
+ // Device teardown or a test's reference mode: no flight is pending.
+ void clearReuse(){for(auto &pool:reusePools)if(pool)DestroyDescriptorPool(device,pool,nullptr);reusePools={};reuse.clear();reuse.pools={};reuse.current=0;}
  static constexpr size_t aliasScratchLimit=1024*1024;
  struct FrameEntry {std::array<Texture *,8> textures;VkRenderPass render;std::array<uint32_t,8> levels;VkFramebuffer frame;};
  struct ViewEntry {Texture *texture;VkFormat format;std::array<uint32_t,4> components;uint32_t base,count;VkImageView view;};
@@ -362,7 +416,7 @@ private:
  }
  void clearViews(Texture *texture=nullptr) {
   for(auto i=viewCache.begin();i!=viewCache.end();) {
-   if(!texture || i->texture==texture){DestroyImageView(device,i->view,nullptr);i=viewCache.erase(i);}else ++i;
+   if(!texture || i->texture==texture){reuseForget(handleKey(i->view));DestroyImageView(device,i->view,nullptr);i=viewCache.erase(i);}else ++i;
   }
   viewIndex.clear();for(size_t n=0;n<viewCache.size();++n)viewIndex.emplace(viewKey(viewCache[n].texture,viewCache[n].format,viewCache[n].components,viewCache[n].base,viewCache[n].count),n);
  }
@@ -406,7 +460,7 @@ public:
  struct ReuseCounts {uint64_t commandPools{},commandBuffers{},fences{},queries{},descriptors{},frames{},views{};} reuseCounts;
 #ifdef FUXI_MTL_HOST_TEST
  // Test-only reference mode and deterministic recording failure; no production environment switches.
- bool reuseSubmitObjects=true,reuseDrawPlans=true,captureDrawPlans=false,failBeforeQueue=false,failQueueAttempt=false,failAfterChunk=false,failChunkAttempt=false;
+ bool reuseSubmitObjects=true,reuseDrawPlans=true,captureDrawPlans=false,failBeforeQueue=false,failQueueAttempt=false,failAfterChunk=false,failChunkAttempt=false,reuseForgetForTest=true;
  std::vector<std::pair<Pipeline *,DrawOutput>> drawPlansForTest;
  void loseWhileInFlightForTest(){std::lock_guard<std::mutex> lock(mutex);check(VK_ERROR_DEVICE_LOST);}
  struct ImageTransition {Texture *texture;uint32_t level;VkImageLayout before,after;};
@@ -416,7 +470,9 @@ public:
  size_t cachedFrames() const{return frameCache.size();}
  size_t cachedViews() const{return viewCache.size();}
  void dropPipelineCacheForTest(){std::lock_guard<std::mutex> guard(mutex);requireLive();objects.clear([&](Pipeline *p){drawPlans.invalidate(p);destroyPipelineUnlocked(p);});}
- void discardReuseForTest(){std::lock_guard<std::mutex> guard(mutex);requireLive();for(auto &slot:slots)clearSubmitObjects(slot);clearFrames();clearViews();}
+ void discardReuseForTest(){std::lock_guard<std::mutex> guard(mutex);requireLive();for(auto &slot:slots)clearSubmitObjects(slot);clearReuse();clearFrames();clearViews();}
+ uint64_t keptDescriptorSets() const{return reuse.live();}
+ uint64_t sampleViewForTest(const Texture *t) const{for(auto &v:viewCache)if(v.texture==t)return handleKey(v.view);return 0;}
 #endif
  void trimMemory(){std::lock_guard<std::mutex> guard(mutex);trimMemoryUnlocked(true);}
  uint32_t maxTextureDimension() const{return limits.dimension;}
@@ -589,7 +645,7 @@ public:
   cachePeriodUnlocked(true);
   if(!backboardGate.blocked())artifactCache.checkpoint();
   artifactCache.close();
-  for(auto &slot:slots)clearSubmitObjects(slot);clearFrames();clearViews();for(auto &slot:slots){destroyUnlocked(slot.aliasScratch);slot.aliasScratch=nullptr;}
+  for(auto &slot:slots)clearSubmitObjects(slot);clearReuse();clearFrames();clearViews();for(auto &slot:slots){destroyUnlocked(slot.aliasScratch);slot.aliasScratch=nullptr;}
   objects.clear([&](Pipeline *p){drawPlans.invalidate(p);destroyPipelineUnlocked(p);});
   releaseRtShadows();releaseRenamePool();releaseSampleShadows();
   pipelineCache.close();trimMemoryUnlocked(true);reportRtCounters();passTimes.report(stderr);
@@ -771,7 +827,7 @@ public:
   }
   if(!poisoned) {
    if(b->contents) frameKernelCall([&]{return UnmapMemory(device,b->memory);});
-   if(b->buffer) DestroyBuffer(device,b->buffer,nullptr);
+   if(b->buffer){reuseForget(handleKey(b->buffer));DestroyBuffer(device,b->buffer,nullptr);}
    if(b->memory) {frameKernelCall([&]{return FreeMemory(device,b->memory,nullptr);});--liveMemoryObjects;liveMemoryBytes-=b->memoryBytes;if(!b->imported)tailPadBytes-=b->memoryBytes-b->allocated;}
   }
   limits.release(b->charged);delete b;
@@ -783,7 +839,7 @@ public:
  bool destroyTextureUnlocked(Texture *t) {
   if(!t || --t->references)return !poisoned;
   if(t->importCached)imports.erase(t->importKey);
-  if(!poisoned) {clearFrames(t);clearViews(t);if(t->mapped && !t->borrowedMemory)frameKernelCall([&]{return UnmapMemory(device,t->memory);});for(auto v:t->attachmentViews)if(v)DestroyImageView(device,v,nullptr);if(t->view)DestroyImageView(device,t->view,nullptr);if(t->image)DestroyImage(device,t->image,nullptr);if(t->memory && !t->borrowedMemory){
+  if(!poisoned) {clearFrames(t);clearViews(t);if(t->mapped && !t->borrowedMemory)frameKernelCall([&]{return UnmapMemory(device,t->memory);});for(auto v:t->attachmentViews)if(v){reuseForget(handleKey(v));DestroyImageView(device,v,nullptr);}if(t->view){reuseForget(handleKey(t->view));DestroyImageView(device,t->view,nullptr);}if(t->image)DestroyImage(device,t->image,nullptr);if(t->memory && !t->borrowedMemory){
    if(t->slabbed)slabMemory.release(t->slabBlock,memoryNow());
    else if(t->recyclable && textureMemory.put(t->recycleKey,t->memory,memoryNow()))t->charged=0;
    else {frameKernelCall([&]{return FreeMemory(device,t->memory,nullptr);});--liveMemoryObjects;liveMemoryBytes-=t->memoryBytes;}
@@ -791,7 +847,7 @@ public:
  }
  bool supportsHostImport() const {return hostImport && hostAlignment && GetMemoryHostPointerPropertiesEXT && GetPhysicalDeviceImageFormatProperties2;}
  bool supportsExplicitPitch() const {return supportsHostImport() && explicitPitch;}
- void destroySamplerUnlocked(Sampler *s) {if(s && !--s->references){if(!poisoned && s->sampler)DestroySampler(device,s->sampler,nullptr);delete s;}}
+ void destroySamplerUnlocked(Sampler *s) {if(s && !--s->references){if(!poisoned && s->sampler){reuseForget(handleKey(s->sampler));DestroySampler(device,s->sampler,nullptr);}delete s;}}
  void destroy(Sampler *s) {std::lock_guard<std::mutex> guard(mutex);destroySamplerUnlocked(s);}
  // address: Metal MTLSamplerAddressMode per axis (0 clamp-to-edge, 2 repeat, 3 mirror repeat, 4 clamp-to-zero,
  // 5 clamp-to-border with border 0/1/2 = transparent black/opaque black/opaque white). Mirror clamp-to-edge (1) is refused.
@@ -983,8 +1039,8 @@ public:
    for(auto line:p->linePipelines)if(line)DestroyPipeline(device,line,nullptr);
    for(auto nf:p->nfPipelines)if(nf)DestroyPipeline(device,nf,nullptr);
    if(p->layout)DestroyPipelineLayout(device,p->layout,nullptr);
-   if(p->setLayout)DestroyDescriptorSetLayout(device,p->setLayout,nullptr);
-   for(auto sampler:p->bakedSamplers)if(sampler)DestroySampler(device,sampler,nullptr);
+   if(p->setLayout){reuseForget(handleKey(p->setLayout));DestroyDescriptorSetLayout(device,p->setLayout,nullptr);}
+   for(auto sampler:p->bakedSamplers)if(sampler){reuseForget(handleKey(sampler));DestroySampler(device,sampler,nullptr);}
    for(size_t i=0;i<p->constantBlobs.size();++i){auto *b=p->constantBlobs[i];if(i<p->blobKeys.size()){auto it=blobShare.find(p->blobKeys[i]);if(it!=blobShare.end() && it->second.first==b){if(--it->second.second==0){blobShare.erase(it);destroyUnlocked(b);}continue;}}destroyUnlocked(b);}
    for(auto entry:p->renders)if(auto render=entry.second){clearFrames(nullptr,render);DestroyRenderPass(device,render,nullptr);}
   }
@@ -1943,7 +1999,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
     std::swap(b->buffer,sp->buffer);std::swap(b->memory,sp->memory);std::swap(b->contents,sp->contents);std::swap(b->allocated,sp->allocated);std::swap(b->charged,sp->charged);std::swap(b->memoryBytes,sp->memoryBytes);std::swap(b->memoryType,sp->memoryType);
     renamed.push_back(b);if(currentFrame){++currentFrame->shadowRenames;currentFrame->shadowRenameBytes+=b->length;}}
    if(!renamed.empty()){collectUses();collectPrepared();}}
-  auto &slot=slots[slots[0].busy?1:0];
+  auto &slot=slots[slots[0].busy?1:0];const uint64_t serial=++submitSerial;
   auto &commandPool=slot.commandPool;auto &command=slot.command;auto &submitFence=slot.submitFence;auto &queryPool=slot.queryPool;
   auto &descriptorPool=slot.descriptorPool;auto &descriptorSets=slot.descriptorSets;auto &descriptorCapacity=slot.descriptorCapacity;auto &aliasScratch=slot.aliasScratch;
 #ifdef FUXI_MTL_HOST_TEST
@@ -1972,7 +2028,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
   struct TextureState {Texture *texture;VkImageLayout layout;std::array<VkImageLayout,32> levelLayouts;bool defined;uint32_t definedLevels;uint64_t shadowHash;bool shadowHashed;};std::vector<TextureState> oldTextures;
   size_t diagnosticOp=0;Buffer *neutralBuffer=nullptr,*aliasBuffer=nullptr;size_t aliasBytes=0;
   std::vector<bool> aliasCopies(ops.size(),false);
-  auto cleanup=[&] {if(aliasBuffer!=aliasScratch)destroyUnlocked(aliasBuffer);destroyUnlocked(neutralBuffer);for(auto v:sampleViews)DestroyImageView(device,v,nullptr);for(auto frame:frames)DestroyFramebuffer(device,frame,nullptr);for(auto render:emptyRenders)DestroyRenderPass(device,render,nullptr);};
+  auto cleanup=[&] {if(aliasBuffer!=aliasScratch)destroyUnlocked(aliasBuffer);destroyUnlocked(neutralBuffer);for(auto v:sampleViews){reuseForget(handleKey(v));DestroyImageView(device,v,nullptr);}for(auto frame:frames)DestroyFramebuffer(device,frame,nullptr);for(auto render:emptyRenders)DestroyRenderPass(device,render,nullptr);};
   // Exclusive prepare phases: object API/cache time is subtracted from recording.
   uint64_t objectNanos=0,descriptorNanos=0;
   struct Measure {
@@ -2377,10 +2433,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
     }else if(descriptorPool)check(ResetDescriptorPool(device,descriptorPool,0));
     submitPool=descriptorPool;
    }
-   struct BindingValue {
-    uint32_t binding{},type{};VkDescriptorImageInfo image{};VkDescriptorBufferInfo buffer{};
-    bool operator==(const BindingValue &b) const {return binding==b.binding && type==b.type && image.sampler==b.image.sampler && image.imageView==b.image.imageView && image.imageLayout==b.image.imageLayout && buffer.buffer==b.buffer.buffer && buffer.offset==b.buffer.offset && buffer.range==b.buffer.range;}
-   };
+   using BindingValue=DescriptorValue;const bool descReuse=systemTranslationPolicy().descReuse;
    struct BoundSet {VkDescriptorSetLayout layout;unsigned count;uint64_t hash;std::array<BindingValue,16> bindings;VkDescriptorSet set;};
    std::vector<BoundSet> boundSets;std::unordered_multimap<uint64_t,size_t> boundIndex;static constexpr size_t boundSetLimit=4096;if(systemTranslationPolicy().submitFast){boundSets.reserve(std::min<size_t>(ops.size(),boundSetLimit));boundIndex.reserve(std::min<size_t>(ops.size(),boundSetLimit)*2);}
    auto copyShadow=[&](Texture *t){
@@ -2601,7 +2654,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
          uint64_t viewProbes=0;auto found=viewCache.end();{auto range=viewIndex.equal_range(viewKey(t,vi.format,components,base,count));for(auto it=range.first;it!=range.second;++it){++viewProbes;auto &c=viewCache[it->second];if(c.texture==t && c.format==vi.format && c.components==components && c.base==base && c.count==count){found=viewCache.begin()+it->second;break;}}}
          scanAdd(ScanKind::viewProbes,viewProbes);if(found!=viewCache.end())view=found->view;
          else {check(CreateImageView(device,&vi,nullptr,&view));++reuseCounts.views;++submitObjectCreates;++submitViewCreates;
-          try {if(viewCache.size()<viewCacheLimit){viewCache.push_back({t,vi.format,components,base,count,view});viewIndex.emplace(viewKey(t,vi.format,components,base,count),viewCache.size()-1);}else sampleViews.push_back(view);}catch(...){if(!viewCache.empty() && viewCache.back().view==view)viewCache.pop_back();DestroyImageView(device,view,nullptr);throw;}}
+          try {if(viewCache.size()<viewCacheLimit){viewCache.push_back({t,vi.format,components,base,count,view});viewIndex.emplace(viewKey(t,vi.format,components,base,count),viewCache.size()-1);}else sampleViews.push_back(view);}catch(...){if(!viewCache.empty() && viewCache.back().view==view)viewCache.pop_back();reuseForget(handleKey(view));DestroyImageView(device,view,nullptr);throw;}}
          }image={d.type==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && sam?sam->sampler:VK_NULL_HANDLE,view,sampleGeneral(opIndex,d.slot)?VK_IMAGE_LAYOUT_GENERAL:VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};write.pImageInfo=&image;
 #ifdef FUXI_MTL_HOST_TEST
         sampleViewUses.push_back({t,base,count,image.imageLayout});
@@ -2611,12 +2664,18 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
        else {Measure measure{descriptorNanos,SubPhase::descriptors};UpdateDescriptorSets(device,1,&write,0,nullptr);}
       }
       if(fast){Measure measure{descriptorNanos,SubPhase::descriptors};uint64_t probes=0,compares=0,hash=0xcbf29ce484222325ull;for(unsigned i=0;i<draw.descriptorCount;++i){auto &v=(*bindings)[i];for(uint64_t x:{uint64_t(v.binding)<<32|v.type,uint64_t(uintptr_t(v.image.sampler)),uint64_t(uintptr_t(v.image.imageView))^uint64_t(v.image.imageLayout)<<56,uint64_t(uintptr_t(v.buffer.buffer)),uint64_t(v.buffer.offset),uint64_t(v.buffer.range)})hash=(hash^x)*0x100000001b3ull;}hash^=uint64_t(uintptr_t(op.pipeline->setLayout));
+       // FUXI_MTL_DESC_REUSE: a set kept from this or an earlier submit, or made into the reuse pool; none falls through to the submit pool.
+       if(descReuse){bool made=false;set=reuseSet(op.pipeline->setLayout,draw.descriptorCount,hash,bindings->data(),writes.data(),serial,probes,made);compares=probes;
+        if(set){if(made && systemTranslationPolicy().frameTrace)++frameCounts.descriptors;if(currentFrame)++(made?currentFrame->descReuseNew:currentFrame->descReuseHits);}}
+       if(set){scanAdd(ScanKind::boundSetProbes,probes);scanAdd(ScanKind::boundSetCompares,compares);scanMax(ScanKind::boundSetMax,reuse.live());}
+       else {
        auto found=boundSets.end();{auto range=boundIndex.equal_range(hash);for(auto it=range.first;it!=range.second;++it){++probes;auto &entry=boundSets[it->second];++compares;if(entry.layout==op.pipeline->setLayout && entry.count==draw.descriptorCount && std::equal(bindings->begin(),bindings->begin()+draw.descriptorCount,entry.bindings.begin())){found=boundSets.begin()+it->second;break;}}}
        scanAdd(ScanKind::boundSetProbes,probes);scanAdd(ScanKind::boundSetCompares,compares);scanMax(ScanKind::boundSetMax,boundSets.size());
        if(found!=boundSets.end())set=found->set;
        else {check(AllocateDescriptorSets(device,&sai,&set));if(systemTranslationPolicy().frameTrace)++frameCounts.descriptors;
         for(unsigned i=0;i<draw.descriptorCount;++i)writes[i].dstSet=set;UpdateDescriptorSets(device,draw.descriptorCount,writes.data(),0,nullptr);
         if(boundSets.size()<boundSetLimit){boundIndex.emplace(hash,boundSets.size());boundSets.push_back({op.pipeline->setLayout,draw.descriptorCount,hash,*bindings,set});}
+       }
        }
       }
       if(set!=boundSet || op.pipeline->layout!=boundLayout){CmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,op.pipeline->layout,0,1,&set,0,nullptr);boundSet=set;boundLayout=op.pipeline->layout;}
@@ -2831,7 +2890,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
      for(auto *b:pinnedBuffers)if(!coherent(b->memoryType)){VkMappedMemoryRange r{};r.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;r.memory=b->memory;r.size=VK_WHOLE_SIZE;++invalidateCalls;check(InvalidateMappedMemoryRanges(device,1,&r));}
      {auto ns=frameNanos(invalidateStart);submitInvalidateNanos+=ns;if(currentFrame)currentFrame->invalidate+=ns;}
      if(aliasBuffer!=slot.aliasScratch)destroyUnlocked(aliasBuffer);destroyUnlocked(neutralBuffer);
-     for(auto v:sampleViews)DestroyImageView(device,v,nullptr);for(auto f:frames)DestroyFramebuffer(device,f,nullptr);for(auto r:emptyRenders)DestroyRenderPass(device,r,nullptr);
+     for(auto v:sampleViews){reuseForget(handleKey(v));DestroyImageView(device,v,nullptr);}for(auto f:frames)DestroyFramebuffer(device,f,nullptr);for(auto r:emptyRenders)DestroyRenderPass(device,r,nullptr);
      for(auto *b:pinnedBuffers)destroyUnlocked(b);for(auto *t:pinnedTextures)destroyTextureUnlocked(t);for(auto *p:pinnedPipelines)destroyPipelineUnlocked(p);for(auto *s:pinnedSamplers)destroySamplerUnlocked(s);
 #ifdef FUXI_MTL_HOST_TEST
      if(!reuseSubmitObjects){clearSubmitObjects(slot);clearFrames();clearViews();}
@@ -2840,7 +2899,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
     }catch(...){poisoned=true;releaseSlot();throw;} // Quarantine all pinned GPU objects on uncertain ownership.
    };
    for(auto *b:pinnedBuffers)++b->references;for(auto *t:pinnedTextures)++t->references;for(auto *p:pinnedPipelines)++p->references;for(auto *s:pinnedSamplers)++s->references;
-   slot.hostUses=std::move(hostUses);slot.uses=std::move(uses);slot.writes=std::move(writes);slot.busy=true;
+   slot.hostUses=std::move(hostUses);slot.uses=std::move(uses);slot.writes=std::move(writes);slot.busy=true;slot.serial=serial;
    retireBuildPhase.reset();submitToQueue();if(scheduled)scheduled();
    submitted=false;completed=true;
    *retirement=std::move(finish);
