@@ -1,0 +1,43 @@
+diff --git a/iokit/Kernel/arm/FuxiFramebuffer.cpp b/iokit/Kernel/arm/FuxiFramebuffer.cpp
+index 417d736..0d4a511 100644
+--- a/iokit/Kernel/arm/FuxiFramebuffer.cpp
++++ b/iokit/Kernel/arm/FuxiFramebuffer.cpp
+@@ -106,6 +106,8 @@ enum {
+ #define FOURCC(a, b, c, d) ((uint32_t)(a) << 24 | (uint32_t)(b) << 16 | (uint32_t)(c) << 8 | (uint32_t)(d))
+ 
+ static uint64_t gFBLogged[2];           /* selectors already reported */
++static uint32_t gFBTotal[128];          /* calls of each selector since the last summary */
++static uint64_t gFBSummaryAt;           /* when the last summary was logged */
+ static uint8_t  gFBCalls[128];          /* how many calls of each selector were traced */
+ static uint32_t gFBSwapSizeSaid;        /* a swap request size that is neither iOS 16.5's nor iOS 26's, said once */
+ 
+@@ -1217,6 +1219,29 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		    args->structureInputSize, args->structureOutputSize);
+ 	}
+ 
++	/* every 10 s, how often each selector was called: shows where CA's frames stop */
++	if (selector < 128) {
++		uint64_t now = mach_absolute_time(), nanos;
++
++		gFBTotal[selector]++;
++		absolutetime_to_nanoseconds(now - gFBSummaryAt, &nanos);
++		if (gFBSummaryAt == 0) {
++			gFBSummaryAt = now;
++		} else if (nanos >= 10ULL * NSEC_PER_SEC) {
++			char line[256];
++			int len = 0;
++
++			for (uint32_t i = 0; i < 128 && len < (int)sizeof(line) - 16; i++) {
++				if (gFBTotal[i] != 0) {
++					len += snprintf(line + len, sizeof(line) - len, " %u:%u", i, gFBTotal[i]);
++					gFBTotal[i] = 0;
++				}
++			}
++			gFBSummaryAt = now;
++			IOLog("FuxiFramebuffer: calls in %llu ms (selector:count)%s\n", nanos / NSEC_PER_MSEC, line);
++		}
++	}
++
+ 	switch (selector) {
+ 	case kFBMethodGetDisplaySize:                   /* out: width, height */
+ 		if (args->scalarOutputCount < 2) {

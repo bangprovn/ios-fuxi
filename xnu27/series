@@ -121,3 +121,4 @@ fuxi/0053-trace-quiet.patch
 fuxi/0054-apfs-names.patch
 fuxi/0055-sandbox-check-allow.patch
 fuxi/0056-apfs-vol-attributes.patch
+fuxi/0057-fb-call-summary.patch
