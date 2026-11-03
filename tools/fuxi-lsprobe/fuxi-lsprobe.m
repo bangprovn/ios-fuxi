@@ -37,7 +37,7 @@
 + (id)defaultWorkspace;
 + (id)coreTypesBundleRecord;
 + (id)typeWithIdentifier:(NSString *)identifier;
-- (BOOL)getKnowledgeUUID:(NSUUID **)uuid andSequenceNumber:(unsigned long long *)number;
+- (void)getKnowledgeUUID:(NSUUID **)uuid andSequenceNumber:(NSNumber **)number;
 - (id)allInstalledApplications;
 - (id)allApplications;
 - (void)setErrorHandler:(void (^)(NSError *))handler;
@@ -47,7 +47,6 @@
 typedef void (*set_log_file_t)(FILE *);                  /* _LSBindingSetLogFile 0x186e8d3e8 */
 typedef void (*set_reasons_t)(bool);                     /* _LSBindingSetReasonTrackingEnabled 0x186e8d3dc */
 typedef CFURLRef (*copy_url_for_user_t)(uid_t);          /* _LSDatabaseCopyURLForUser 0x186f02aa4 */
-typedef Boolean (*display_data_t)(FILE *, const char *, const uid_t *, NSArray *, NSArray *, id, uint32_t, NSError **);
 
 /* the volume as LaunchServices sees it: statfs, getattrlist's identifiers, and NSURL's resource values */
 static void
@@ -90,7 +89,7 @@ show_store(void)
 	Class workspace = NSClassFromString(@"LSApplicationWorkspace");
 	Class uttype = NSClassFromString(@"UTType");
 	NSUUID *uuid = nil;
-	unsigned long long seq = 0;
+	NSNumber *seq = nil;
 	char path[1024] = "";
 
 	if (copy_url != NULL) {
@@ -108,9 +107,8 @@ show_store(void)
 		}
 	}
 	@try {
-		BOOL ok = [[workspace defaultWorkspace] getKnowledgeUUID:&uuid andSequenceNumber:&seq];
-
-		fprintf(stderr, "lsprobe: knowledge %d uuid %s sequence %llu\n", ok, uuid.UUIDString.UTF8String, seq);
+		[[workspace defaultWorkspace] getKnowledgeUUID:&uuid andSequenceNumber:&seq];
+		fprintf(stderr, "lsprobe: knowledge uuid %s sequence %s\n", uuid.UUIDString.UTF8String, seq.description.UTF8String);
 		fprintf(stderr, "lsprobe: allInstalledApplications %lu, allApplications %lu\n",
 		    (unsigned long)[[[workspace defaultWorkspace] allInstalledApplications] count],
 		    (unsigned long)[[[workspace defaultWorkspace] allApplications] count]);
@@ -139,49 +137,46 @@ show(NSString *what, id obj, NSArray<NSString *> *keys)
 	}
 }
 
-/* _LSDisplayData (lsregister -dump), last as it may take long (K8o: 3 minutes and more): its counts and head */
+/*
+ * The units of each table of this process's store (lsd's database, mapped once lsd has seeded it):
+ * _LSContextInit gives the database, whose store is at +0x28; _CSStoreEnumerateTables names the
+ * tables and CSStoreGetUnitCount counts them. A store without app bundles has a near empty Bundle table.
+ */
+typedef int (*context_init_t)(void **);                         /* _LSContextInit 0x186dd6800 */
+typedef void (*context_destroy_t)(void **);                     /* _LSContextDestroy 0x186dd5aa0 */
+typedef void (*enumerate_tables_t)(void *, void (^)(uint32_t, CFStringRef, const void *, uint32_t, bool *));
+typedef uint32_t (*unit_count_t)(void *, uint32_t);
+
 static void
-show_dump(void)
+show_tables(void)
 {
-	display_data_t display = (display_data_t)dlsym(RTLD_DEFAULT, "_LSDisplayData");
-	copy_url_for_user_t copy_url = (copy_url_for_user_t)dlsym(RTLD_DEFAULT, "_LSDatabaseCopyURLForUser");
-	char path[1024] = "";
+	context_init_t init = (context_init_t)dlsym(RTLD_DEFAULT, "_LSContextInit");
+	context_destroy_t destroy = (context_destroy_t)dlsym(RTLD_DEFAULT, "_LSContextDestroy");
+	enumerate_tables_t enumerate = (enumerate_tables_t)dlsym(RTLD_DEFAULT, "_CSStoreEnumerateTables");
+	unit_count_t count = (unit_count_t)dlsym(RTLD_DEFAULT, "CSStoreGetUnitCount");
+	void *ctx = NULL, *store;
+	int r;
 
-	if (copy_url != NULL) {
-		CFURLRef u = copy_url(getuid());
-
-		if (u != NULL) {
-			(void)CFURLGetFileSystemRepresentation(u, true, (UInt8 *)path, sizeof(path));
-			CFRelease(u);
-		}
+	if (init == NULL || destroy == NULL || enumerate == NULL || count == NULL) {
+		fprintf(stderr, "lsprobe: tables: missing %s%s%s%s\n", init ? "" : "_LSContextInit ", destroy ? "" : "_LSContextDestroy ",
+		    enumerate ? "" : "_CSStoreEnumerateTables ", count ? "" : "CSStoreGetUnitCount");
+		return;
 	}
-	fprintf(stderr, "lsprobe: dump starts\n");
-	for (int k = 0; k < 2 && display != NULL; k++) {
-		char *buf = NULL, *line, *save;
-		size_t len = 0;
-		FILE *f = open_memstream(&buf, &len);
-		NSError *e = nil;
-		Boolean ok;
-		unsigned lines = 0, bundles = 0, types = 0;
-
-		if (k == 1 && path[0] == '\0') {
-			fclose(f);
-			free(buf);
-			break;
-		}
-		ok = display(f, k == 0 ? NULL : path, NULL, nil, nil, nil, 0, &e);
-		fclose(f);
-		for (line = strtok_r(buf, "\n", &save); line != NULL; line = strtok_r(NULL, "\n", &save)) {
-			if (lines++ < 30) {
-				fprintf(stderr, "lsprobe: dump%d: %.150s\n", k, line);
-			}
-			bundles += strstr(line, "bundle id:") != NULL;
-			types += strstr(line, "type id:") != NULL;
-		}
-		fprintf(stderr, "lsprobe: dump%d (%s): ok %d, %zu bytes, %u lines, %u 'bundle id:', %u 'type id:', error %s\n",
-		    k, k == 0 ? "this process's store" : path, ok, len, lines, bundles, types, e.description.UTF8String);
-		free(buf);
+	if ((r = init(&ctx)) != 0 || ctx == NULL) {
+		fprintf(stderr, "lsprobe: tables: _LSContextInit %d\n", r);
+		return;
 	}
+	store = *(void **)((char *)ctx + 0x28);
+	fprintf(stderr, "lsprobe: tables: database %p, store %p\n", ctx, store);
+	if (store != NULL) {
+		enumerate(store, ^(uint32_t table, CFStringRef name, const void *bytes, uint32_t size, bool *stop) {
+			(void)bytes;
+			(void)stop;
+			fprintf(stderr, "lsprobe: table %s (%u): %u units, %u bytes\n", [(__bridge NSString *)name UTF8String], table,
+			    count(store, table), size);
+		});
+	}
+	destroy(&ctx);
 }
 
 static void
@@ -202,6 +197,7 @@ probe(NSString *bid, NSString *path)
 
 	fprintf(stderr, "lsprobe: pid %d uid %d, %s at %s\n", getpid(), getuid(), bid.UTF8String, path.UTF8String);
 	show_store();
+	show_tables();
 	show_volume("/System/Library/CoreServices/SpringBoard.app");
 	show_volume("/System/Library/CoreServices/MobileCoreTypes.bundle");
 
@@ -300,7 +296,6 @@ main(int argc, char **argv)
 				d++;
 			}
 		}
-		show_dump();
 		fprintf(stderr, "lsprobe: DONE\n");
 	}
 	return 0;
