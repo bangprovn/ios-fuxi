@@ -1,5 +1,5 @@
 diff --git a/bsd/miscfs/apfs/apfs_vfsops.c b/bsd/miscfs/apfs/apfs_vfsops.c
-index df9e791..6052dc9 100644
+index df9e791..79e9025 100644
 --- a/bsd/miscfs/apfs/apfs_vfsops.c
 +++ b/bsd/miscfs/apfs/apfs_vfsops.c
 @@ -490,6 +490,86 @@ apfs_hash_index(uint64_t obj_id)
@@ -9,7 +9,7 @@ index df9e791..6052dc9 100644
 +#if defined(FUXI)
 +struct apfs_name_ctx {
 +	uint64_t id;
-+	char name[MAXNAMLEN + 1];
++	char name[NAME_MAX + 1];
 +	size_t len;
 +};
 +
@@ -19,7 +19,7 @@ index df9e791..6052dc9 100644
 +	struct apfs_name_ctx *nc = ctx;
 +
 +	(void)d_type;
-+	if (file_id != nc->id || name_len > MAXNAMLEN) {
++	if (file_id != nc->id || name_len > NAME_MAX) {
 +		return 0;
 +	}
 +	memcpy(nc->name, name, name_len);
