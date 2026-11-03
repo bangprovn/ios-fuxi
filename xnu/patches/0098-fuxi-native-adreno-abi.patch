@@ -5296,7 +5296,7 @@
 +}
 --- a/bsd/dev/fuxi_gpu_irq.inc
 +++ b/bsd/dev/fuxi_gpu_irq.inc
-@@ -0,0 +1,323 @@
+@@ -0,0 +1,329 @@
 +/* GPU fence interrupt: WaitFence sleeps until the GPU says a fence landed (opt-in, fuxigpuncimport bit 26 = 67108864, default off).
 + * Adapted from UniXNU-sheng package/GpuPowerProbe.cpp gpuIrq/ringIdle/irqAndTimer (b0ccf61, 36ec562) and UniXNU ArmCpu
 + * armcpu_spi_attach (1951cc8), both BSD-2-Clause-Patent: Copyright (c) 2026, UniXNU contributors (LICENSE.UniXNU-sheng) and
@@ -5307,8 +5307,8 @@
 + * to a NULL handler and EOIs it. Here, once, at the first WaitFence that has to wait: the shared dispatcher in every CPU's slot
 + * (fuxi_spi_*, below; bound in turn, last CPU 0) with INTID 332 registered, then armcpu_spi_attach's distributor sequence:
 + * ICENABLER + RWP, IGROUPR group 1 NS, IPRIORITYR 0xa0
-+ * (the SGI/PPI priority), ICFGR level, IROUTER = one gold core's MPIDR affinity (mode 0, see fg_irq_rank; never core 1: it runs the
-+ * loader's USB monitor), ISENABLER, readback. sleh EOIs after the handler (EOImode 0). Neither the redistributor nor any per-CPU
++ * (the SGI/PPI priority), ICFGR level, IROUTER = CPU 0's MPIDR affinity (mode 0; see Route below), ISENABLER, readback (the route
++ * as fuxi_spi_route_ok accepts it). sleh EOIs after the handler (EOImode 0). Neither the redistributor nor any per-CPU
 + * startup is touched: every CPU's interface already takes SGI1 at the same priority 0xa0 with PMR 0xff and Group 1 enabled
 + * (PE_init_cpu -> pe_init_fiq on each CPU, xnu-8796.141.3 arm_init.c:607,742; "SGI1 OK" per CPU in boot.log), sleh_irq acks and
 + * EOIs on the CPU it runs on, and ml_install_interrupt_handler fills that CPU's cpu_data slot (machine_routines.c:801-819).
@@ -5328,22 +5328,10 @@
 +#define FG_IRQ_EMPTY_MAX 1000u
 +#define FG_IRQ_BURST_MAX 5000u
 +#define FG_IRQ_NODELIVERY 64u
-+/* Route. Not CPU 0 (a Cortex-A510) but a gold core: HakiOS measured a window-server frame on a small core taking 2-3x as long
-+ * (hakios-sm7325 a8e7a87) and routes its SPIs to its boot core, the biggest (gic_v3_irq.c:262-263, loader.c:775-783). The target is
-+ * SM8550 physical core 6 (MPIDR Aff1 6, logical 5 here: cpu@100 is the loader's), the last core of the gold cluster (cpu@300..@600):
-+ * - backboardd's Metal commits run on every recommended core alike (fuxicores=0x7c; d-ft1 cpu_hist for logical 2-6:
-+ *   4881/4907/4670/4698/4607), so no big core is free of render work, and the handler is a few MMIO accesses and a wakeup;
-+ * - a thread whose last core is busy goes to the lowest-numbered idle core (xnu-8796.141.3 sched_prim.c:5249 lsb_first for
-+ *   timeshare, :8311 for realtime), so the highest gold core is the one most often idle when the line fires;
-+ * - not the X3 (Aff1 7): fuxi_compile_bind binds backboardd's shader-compile lease there first.
-+ * Rank by Aff1: 6, 5, 4, 3 (a cpus= boot without core 6 takes the highest gold core it has), else CPU 0 as before; nothing else.
-+ * The handler stays on every CPU, so a line that lands elsewhere is still cleared (and counted: FG_IRQ_AWAY). */
-+#define FG_IRQ_AFF1 6u
-+static unsigned fg_irq_rank(uint64_t affinity, unsigned cpu)
-+{
-+ unsigned aff1 = (unsigned)(affinity >> 8) & 0xffu;
-+ return aff1 >= 3 && aff1 <= FG_IRQ_AFF1 ? aff1 : cpu ? 0u : 1u;
-+}
++/* Route: CPU 0. A gold core was tried (5b577cb, MPIDR 0x600, after HakiOS a8e7a87): on this phone the GIC is virtualized by
++ * Qualcomm's hypervisor and ignores IROUTER writes; it read back 0 (d-irq-b1, d-irq-b2), the strict check failed the attach and
++ * WaitFence polled. Kernels up to 7a708b4 routed to CPU 0, read 0 back and took 25327 interrupts. The dispatcher is in every CPU's
++ * slot, so wherever the GIC delivers the line it is served (and counted away from the routed CPU: FG_IRQ_AWAY). */
 +extern kern_return_t thread_wakeup_prim(event_t, boolean_t, wait_result_t);
 +static struct fg_window fg_irq_gicd = {FG_IRQ_GICD, 0x10000, 0};
 +static volatile uint32_t *fg_irq_status, *fg_irq_clear;
@@ -5367,12 +5355,14 @@
 + * with release, so the dispatcher reads the table without a lock. fuxi_spi_busy serializes the install and the registrations. */
 +#define FUXI_SPI_MAX 4u
 +#define FUXI_SPI_CPUS 16u
++#define FUXI_SPI_ANY 0xfffeu /* a route of IRM 1 (any participating CPU) */
 +typedef void (*fuxi_spi_fn)(unsigned intid);
 +static struct { unsigned intid, cpu; fuxi_spi_fn fn; } fuxi_spi[FUXI_SPI_MAX];
 +static unsigned fuxi_spi_busy, fuxi_spi_installed, fuxi_spi_cpus;
 +static uint64_t fuxi_spi_aff[FUXI_SPI_CPUS], fuxi_spi_foreign; /* MPIDR affinity per logical CPU, UINT64_MAX where the bind did not take */
 +uint64_t fuxi_spi_affinity(unsigned cpu);
 +const char *fuxi_spi_register(unsigned intid, fuxi_spi_fn fn, unsigned cpu);
++const char *fuxi_spi_route_ok(uint32_t readback, uint64_t wanted, uint64_t router, unsigned *cpu);
 +/* Interrupt context, interrupts masked, before sleh's EOI. */
 +static void fuxi_spi_dispatch(void *target, void *refcon, void *nub, int source)
 +{
@@ -5425,33 +5415,51 @@
 + fuxi_spi_enter(); fuxi_spi_install(); fuxi_spi_leave();
 + return cpu < fuxi_spi_cpus ? fuxi_spi_aff[cpu] : UINT64_MAX;
 +}
-+/* intid -> fn (cpu: where the lane routes it, for the log). NULL, or why not. Registering an INTID again with the same handler
-+ * only updates its CPU. A new entry logs the setup line with every registered INTID and its CPU. */
++/* intid -> fn (cpu: where the GIC routes it, for the log; FUXI_SPI_ANY for 1-of-N). NULL, or why not. Registering an INTID again
++ * with the same handler only updates its CPU. A new entry or a changed CPU logs the setup line with every registered INTID. */
 +const char *fuxi_spi_register(unsigned intid, fuxi_spi_fn fn, unsigned cpu)
 +{
 + if (intid < 32 || intid >= 1020 || !fn) return "bad INTID";
 + const char *fail = NULL;
 + char line[120];
 + size_t n = 0;
-+ unsigned i = 0, known = 0;
++ unsigned i = 0, known = 0, changed = 0;
 + line[0] = 0;
 + fuxi_spi_enter();
 + fuxi_spi_install();
 + while (i < FUXI_SPI_MAX && fuxi_spi[i].intid && fuxi_spi[i].intid != intid) i++;
 + if (i == FUXI_SPI_MAX) fail = "dispatcher table full";
 + else if (fuxi_spi[i].intid && fuxi_spi[i].fn != fn) fail = "INTID registered by another handler";
-+ else if (fuxi_spi[i].intid) fuxi_spi[i].cpu = cpu;
++ else if (fuxi_spi[i].intid) { changed = fuxi_spi[i].cpu != cpu; fuxi_spi[i].cpu = cpu; }
 + else {
-+  fuxi_spi[i].fn = fn; fuxi_spi[i].cpu = cpu;
++  fuxi_spi[i].fn = fn; fuxi_spi[i].cpu = cpu; changed = 1;
 +  __atomic_store_n(&fuxi_spi[i].intid, intid, __ATOMIC_RELEASE);
-+  for (unsigned k = 0; k < FUXI_SPI_MAX && fuxi_spi[k].intid && n < sizeof(line); k++)
-+   n += (size_t)snprintf(line + n, sizeof(line) - n, "%s INTID %u -> cpu %u", k ? "," : "", fuxi_spi[k].intid, fuxi_spi[k].cpu);
++ }
++ if (changed) {
++  for (unsigned k = 0; k < FUXI_SPI_MAX && fuxi_spi[k].intid && n < sizeof(line); k++) {
++   if (fuxi_spi[k].cpu == FUXI_SPI_ANY)
++    n += (size_t)snprintf(line + n, sizeof(line) - n, "%s INTID %u -> any cpu", k ? "," : "", fuxi_spi[k].intid);
++   else n += (size_t)snprintf(line + n, sizeof(line) - n, "%s INTID %u -> cpu %u", k ? "," : "", fuxi_spi[k].intid, fuxi_spi[k].cpu);
++  }
 +  for (unsigned k = 0; k < fuxi_spi_cpus; k++) known += fuxi_spi_aff[k] != UINT64_MAX;
 + }
 + fuxi_spi_leave();
 + if (n) printf("FUXI SPI: one dispatcher in every CPU's handler slot (%u CPUs, %u MPIDRs read);%s; foreign masked %llu\n",
 +     fuxi_spi_cpus, known, line, __atomic_load_n(&fuxi_spi_foreign, __ATOMIC_RELAXED));
 + return fail;
++}
++/* A lane's GICD readback after enabling its SPI. Group 1, enabled and level (readback bits 0-2) must have taken: anything else is a
++ * real failure. The route need not be the one written: the hypervisor's GIC on this phone ignores IROUTER writes (reads 0). It is
++ * accepted when it names a CPU the dispatcher was installed on (cpu: that logical CPU), or 1-of-N (IRM, cpu FUXI_SPI_ANY); a route
++ * to any other affinity (core 1, the loader's, is not XNU's) fails. */
++const char *fuxi_spi_route_ok(uint32_t readback, uint64_t wanted, uint64_t router, unsigned *cpu)
++{
++ *cpu = ~0u;
++ if ((readback & 7u) != 3u) return "GICD readback";
++ if (router & (1ULL << 31)) { *cpu = FUXI_SPI_ANY; return NULL; }
++ uint64_t affinity = router & 0xff00ffffffULL;
++ for (unsigned k = 0; k < fuxi_spi_cpus; k++) if (fuxi_spi_aff[k] == affinity) { *cpu = k; return NULL; }
++ return affinity == wanted ? "GICD route (no dispatcher on that CPU)" : "GICD route";
 +}
 +static void fg_irq_dead(unsigned why)
 +{
@@ -5514,11 +5522,11 @@
 + *readback = ((*fg_gicd(0x80 + word) & bit) ? 1u : 0) | ((*fg_gicd(0x100 + word) & bit) ? 2u : 0) |
 +     (((*fg_gicd(cfg) >> shift) & 1u) << 2) | ((uint32_t)*(volatile uint8_t *)(fg_irq_gicd.va + 0x400 + id) << 8);
 + *router = *(volatile uint64_t *)(fg_irq_gicd.va + 0x6000 + 8*id);
-+ return (*readback & 7u) != 3u || *router != affinity ? "GICD readback" : NULL;
++ return NULL; /* the caller judges the readback (fuxi_spi_route_ok) */
 +}
 +static const char *fg_irq_attach(void)
 +{
-+ unsigned id = FG_IRQ_INTID, cpus = ml_get_cpu_count(), target = ~0u, best = 0;
++ unsigned id = FG_IRQ_INTID, cpus = ml_get_cpu_count(), routed = ~0u;
 + uint32_t readback = 0;
 + uint64_t mpidr = UINT64_MAX, router = UINT64_MAX;
 + const char *fail = NULL;
@@ -5539,18 +5547,16 @@
 + }
 + if (fail) return fail;
 + /* The shared dispatcher is in every CPU's slot (fuxi_spi_affinity installs it once, binding to each CPU in turn), so a line that
-+  * lands elsewhere is still cleared; each CPU's MPIDR, read there if the bind took, is ranked for the route (fg_irq_rank). */
-+ for (unsigned i = cpus; i-- > 0;) {
-+  uint64_t affinity = fuxi_spi_affinity(i);
-+  unsigned rank = affinity != UINT64_MAX ? fg_irq_rank(affinity, i) : 0;
-+  if (rank > best) { best = rank; mpidr = affinity; target = i; }
-+ }
++  * lands elsewhere is still cleared. Routed to CPU 0, whose MPIDR is read there; the GIC's route is the one read back. */
++ mpidr = fuxi_spi_affinity(0);
 + /* Before the line is enabled, so the first interrupt is not counted away. */
-+ __atomic_store_n(&fg_irq_cpu, target, __ATOMIC_RELAXED);
-+ fail = mpidr == UINT64_MAX ? "no route CPU" : fuxi_spi_register(id, fg_irq_handler, target);
++ __atomic_store_n(&fg_irq_cpu, 0u, __ATOMIC_RELAXED);
++ fail = mpidr == UINT64_MAX ? "no CPU 0" : fuxi_spi_register(id, fg_irq_handler, 0);
 + if (!fail) fail = fg_spi_on(id, mpidr, &readback, &router);
-+ printf("FUXI GPU IRQ: attach INTID %u cpus %u route cpu %u mpidr %#llx router %#llx readback %#x (grp|en<<1|edge<<2|prio<<8) int0_mask %#x->%#x %s\n",
-+     id, cpus, target, mpidr, router, readback, fg_irq_mask_was, FG_IRQ_BITS, fail ? fail : "armed");
++ if (!fail) fail = fuxi_spi_route_ok(readback, mpidr, router, &routed);
++ if (!fail && routed) { __atomic_store_n(&fg_irq_cpu, routed, __ATOMIC_RELAXED); fail = fuxi_spi_register(id, fg_irq_handler, routed); }
++ printf("FUXI GPU IRQ: attach INTID %u cpus %u route cpu 0 mpidr %#llx router %#llx (gic cpu %d) readback %#x (grp|en<<1|edge<<2|prio<<8) int0_mask %#x->%#x %s\n",
++     id, cpus, mpidr, router, routed == FUXI_SPI_ANY ? -2 : (int)routed, readback, fg_irq_mask_was, FG_IRQ_BITS, fail ? fail : "armed");
 + if (fail) {
 +  fg_spi_mask(id); __atomic_store_n(&fg_irq_ok, 0, __ATOMIC_SEQ_CST);
 +  FG_GUARD;

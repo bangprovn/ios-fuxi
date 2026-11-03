@@ -66,6 +66,7 @@ extern bool fuxi_keys_touch_wake(void); /* bsd/dev/fuxi_keys.c */
 /* The shared SPI dispatcher (bsd/dev/fuxi_gpu_irq.inc, built into fuxi_adreno.c): one handler in every CPU's slot, by INTID. */
 extern uint64_t fuxi_spi_affinity(unsigned cpu);
 extern const char *fuxi_spi_register(unsigned intid, void (*fn)(unsigned intid), unsigned cpu);
+extern const char *fuxi_spi_route_ok(uint32_t readback, uint64_t wanted, uint64_t router, unsigned *cpu);
 void fuxi_touch_init(void);
 
 #define FT_SE_PA     0x00a90000u
@@ -639,9 +640,11 @@ ft_poll(bool deliver)
  *
  * Routing. sleh_irq (patch 0004) calls one handler per CPU (cpu_data interrupt_handler), so this registers INTID 240
  * with the shared SPI dispatcher (fuxi_gpu_irq.inc, which also serves the GPU fence's INTID 332): one handler in every
- * CPU's slot that calls this one for INTID 240 and masks any INTID nobody registered. INTID 240 is routed to FT_IRQ_CPU
- * (the GPU's goes to a gold core). Should the watchdog still find INTID 240 disabled with the line low, it registers
- * and enables it again (FT_REPAIRS times at most).
+ * CPU's slot that calls this one for INTID 240 and masks any INTID nobody registered. INTID 240 is routed to CPU 0, as
+ * the GPU's: Qualcomm's hypervisor GIC on this phone ignores IROUTER writes and reads 0 back (CPU 1 was tried in
+ * 76a11ff: "router 0 ... failed, polling: GICD readback"), so the route read back is accepted when the dispatcher covers
+ * that CPU (fuxi_spi_route_ok); a group/enable/level readback that did not take still fails to polling. Should the
+ * watchdog still find INTID 240 disabled with the line low, it registers and enables it again (FT_REPAIRS times at most).
  *
  * Fallback to polling, logged once, for the rest of the boot: setup failed; FT_SPUR_MAX interrupts in a row with
  * GPIO25's status clear or FT_BURST_MAX within 100 ms (the handler masks the SPI); the line low and the pin armed
@@ -650,7 +653,7 @@ ft_poll(bool deliver)
  */
 #define FT_INTID         240u          /* TLMM summary interrupt, GIC SPI 208 */
 #define FT_GICD_PA       0x17100000u
-#define FT_IRQ_CPU       1             /* logical CPU 1 (setup logs its MPIDR); the GPU fence SPI goes to a gold core */
+#define FT_IRQ_CPU       0             /* logical CPU 0 (setup logs its MPIDR): the only route this GIC keeps */
 #define FT_IC_EN         (1u << 0)
 #define FT_IC_POL        (1u << 1)
 #define FT_IC_DET        (3u << 2)
@@ -752,23 +755,24 @@ ft_irq_handler(unsigned id)
 	}
 }
 
+/* The CPU the GIC routes INTID 240 to, as read back (fuxi_spi_route_ok); FT_IRQ_CPU until then. */
+static unsigned ft_routed = FT_IRQ_CPU;
+
 /* INTID 240 -> this handler in the shared dispatcher (which goes into every CPU's slot the first time); FT_IRQ_CPU's
  * affinity, read on that CPU by the dispatcher's install. */
 static const char *
 ft_irq_install(uint64_t *mpidr)
 {
-	if (ml_get_cpu_count() <= FT_IRQ_CPU) {
-		return "no second CPU";
-	}
 	uint64_t affinity = fuxi_spi_affinity(FT_IRQ_CPU);
 	if (affinity == UINT64_MAX) {
 		return "no processor for the CPU";
 	}
 	*mpidr = affinity;
-	return fuxi_spi_register(FT_INTID, ft_irq_handler, FT_IRQ_CPU);
+	return fuxi_spi_register(FT_INTID, ft_irq_handler, ft_routed);
 }
 
-/* fg_spi_on's sequence: level, group 1 NS, priority 0xa0, routed to one affinity; readback grp|en<<1|edge<<2|prio<<8. */
+/* fg_spi_on's sequence: level, group 1 NS, priority 0xa0, routed to one affinity; readback grp|en<<1|edge<<2|prio<<8 and the
+ * router as read back, which the caller judges (fuxi_spi_route_ok). */
 static const char *
 ft_spi_on(unsigned id, uint64_t affinity, uint32_t *readback, uint64_t *router)
 {
@@ -792,7 +796,7 @@ ft_spi_on(unsigned id, uint64_t affinity, uint32_t *readback, uint64_t *router)
 	*readback = (ft_spi_bit(0x80, id) ? 1u : 0) | (ft_spi_bit(0x100, id) ? 2u : 0) |
 	    (((*ft_gicd(cfg) >> shift) & 1u) << 2) | ((uint32_t)*(volatile uint8_t *)(fi.gicd + 0x400 + id) << 8);
 	*router = *(volatile uint64_t *)(fi.gicd + 0x6000 + 8 * id);
-	return (*readback & 7u) != 3u || *router != affinity ? "GICD readback" : NULL;
+	return NULL;
 }
 
 /* One line either way; returns whether interrupts are armed. */
@@ -803,6 +807,7 @@ ft_irq_setup(void)
 	uint64_t router = 0;
 	unsigned pending = 0;
 	const char *fail = NULL;
+	unsigned routed = ~0u;
 	fi.pin = ft.tlmm + FT_GPIO(FT_IRQ);
 	nanoseconds_to_absolutetime(100 * NSEC_PER_MSEC, &fi.burst_abs);
 	fi.gicd = ml_io_map(FT_GICD_PA, 0x10000);
@@ -829,6 +834,13 @@ ft_irq_setup(void)
 			__atomic_store_n(&fi.state, 1u, __ATOMIC_RELEASE);
 			fail = ft_spi_on(FT_INTID, fi.mpidr, &readback, &router);
 		}
+		if (!fail) {
+			fail = fuxi_spi_route_ok(readback, fi.mpidr, router, &routed);
+		}
+		if (!fail && routed != ft_routed) {
+			ft_routed = routed;
+			fail = fuxi_spi_register(FT_INTID, ft_irq_handler, routed);
+		}
 		if (fail) {
 			__atomic_store_n(&fi.state, 0u, __ATOMIC_RELEASE);
 			ft_spi_mask(FT_INTID);
@@ -837,9 +849,9 @@ ft_irq_setup(void)
 			ft_wr(fi.pin, 0x8, cfg | FT_IC_EN);   /* unmasked: a line already low latches now */
 		}
 	}
-	printf("FUXI TOUCH IRQ: GPIO%u level low -> TLMM summary SPI 208 (INTID %u) -> cpu %d mpidr %#llx router %#llx, "
-	    "gicd %#x (grp|en<<1|edge<<2|prio<<8), intr_cfg %#x->%#x read %#x (+enable), pending %u: %s%s\n", FT_IRQ,
-	    FT_INTID, FT_IRQ_CPU, fi.mpidr, router, readback, was, cfg, got, pending,
+	printf("FUXI TOUCH IRQ: GPIO%u level low -> TLMM summary SPI 208 (INTID %u) -> cpu %d mpidr %#llx router %#llx "
+	    "(gic cpu %d), gicd %#x (grp|en<<1|edge<<2|prio<<8), intr_cfg %#x->%#x read %#x (+enable), pending %u: %s%s\n", FT_IRQ,
+	    FT_INTID, FT_IRQ_CPU, fi.mpidr, router, routed == 0xfffeu ? -2 : (int)routed, readback, was, cfg, got, pending,
 	    fail ? "failed, polling: " : "interrupt-driven", fail ? fail : "");
 	return !fail;
 }
