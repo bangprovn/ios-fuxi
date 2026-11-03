@@ -1,0 +1,92 @@
+diff --git a/osfmk/arm/model_dep.c b/osfmk/arm/model_dep.c
+index 0e4dfd2..4b9c095 100644
+--- a/osfmk/arm/model_dep.c
++++ b/osfmk/arm/model_dep.c
+@@ -1095,8 +1095,8 @@ DebuggerPatchupThreadState(
+ 
+ #if defined(FUXI)
+ /*
+- * Fuxi: a core that does not answer a stackshot's SIGPdebug within the timeout is left out of
+- * that stackshot instead of panicking ("Debugger synch pending on cpu N", spindump at boot with
++ * Fuxi: a stackshot that a core does not answer (SIGPdebug) within the timeout fails with
++ * KERN_OPERATION_TIMED_OUT instead of panicking ("Debugger synch pending on cpu N", spindump at boot with
+  * several cores). Its bit in fuxi_debug_excused makes it return at once when the IPI is finally
+  * taken; the next DebuggerXCallEnter() clears the bits, as it signals every core again.
+  * fuxi_debug_sync_report() logs, from an ordinary context, what was seen of such cores.
+@@ -1113,6 +1113,7 @@ static struct {
+ } fuxi_debug_excuse_last;
+ 
+ void fuxi_debug_sync_report(void);
++extern void fuxi_stackshot_abort(kern_return_t error);   /* kern_stackshot.c */
+ void
+ fuxi_debug_sync_report(void)
+ {
+@@ -1122,7 +1123,7 @@ fuxi_debug_sync_report(void)
+ 		return;
+ 	}
+ 	fuxi_debug_reported = count;
+-	printf("fuxi: stackshot went on without a core %u times (late answers %u); last cpu %d signal 0x%x "
++	printf("fuxi: stackshot given up %u times, a core did not answer (late answers %u); last cpu %d signal 0x%x "
+ 	    "state %d thread %llu waited %llu us, while signalled irq %llu->%llu ipi %llu->%llu timer %llu->%llu\n",
+ 	    count, fuxi_debug_late_count, fuxi_debug_excuse_last.cpu, fuxi_debug_excuse_last.signal,
+ 	    fuxi_debug_excuse_last.state, fuxi_debug_excuse_last.tid, fuxi_debug_excuse_last.waited_ns / 1000,
+@@ -1323,6 +1324,8 @@ DebuggerXCallEnter(
+ 
+ #if defined(FUXI)
+ 		if (is_stackshot) {
++			int fuxi_excused_now = 0;
++
+ 			for (cpu = 0; cpu <= max_cpu && cpu < MAX_CPUS; cpu++) {
+ 				target_cpu_datap = (cpu_data_t *)CpuDataEntries[cpu].cpu_data_vaddr;
+ 				if ((target_cpu_datap == NULL) || (target_cpu_datap == cpu_data_ptr) ||
+@@ -1346,6 +1349,17 @@ DebuggerXCallEnter(
+ 				fuxi_debug_excuse_last.timer[0] = fuxi_timer0[cpu];
+ 				fuxi_debug_excuse_last.timer[1] = target_cpu_datap->cpu_stat.timer_cnt;
+ 				fuxi_debug_excuse_count++;
++				fuxi_excused_now++;
++			}
++			if (fuxi_excused_now != 0) {
++				/*
++				 * The stackshot is given up rather than taken while that core runs on (K9k: it took a
++				 * page fault meanwhile and asserted not_in_kdp). The cores that answered leave
++				 * stackshot_aux_cpu_entry() on the error and are released here; the caller gets the error.
++				 */
++				fuxi_stackshot_abort(KERN_OPERATION_TIMED_OUT);
++				DebuggerXCallReturn();
++				return KERN_OPERATION_TIMED_OUT;
+ 			}
+ 		}
+ #endif
+diff --git a/osfmk/kern/kern_stackshot.c b/osfmk/kern/kern_stackshot.c
+index 970a39a..f705382 100644
+--- a/osfmk/kern/kern_stackshot.c
++++ b/osfmk/kern/kern_stackshot.c
+@@ -695,6 +695,18 @@ stackshot_set_error(kern_return_t error)
+ 	}
+ }
+ 
++#if defined(FUXI)
++/* osfmk/arm/model_dep.c: a core did not answer the stackshot's SIGPdebug, so the stackshot is given up. */
++void fuxi_stackshot_abort(kern_return_t error);
++void
++fuxi_stackshot_abort(kern_return_t error)
++{
++	stackshot_set_error(error);
++}
++
++extern void fuxi_debug_sync_report(void);
++#endif
++
+ /* Returns an error code if the current stackshot context has errored out.
+  * Also functions as a panic guard.
+  */
+@@ -1287,6 +1299,9 @@ stack_snapshot_from_kernel(int pid, void *buf, uint32_t size, uint64_t flags, ui
+ 	SOCD_TRACE_XNU_END(STACKSHOT);
+ 
+ 	ml_set_interrupts_enabled(istate);
++#if defined(FUXI)
++	fuxi_debug_sync_report();
++#endif
+ 
+ #if CONFIG_EXCLAVES
+ 	/* stackshot trap should only finish successfully or with no pending Exclave threads */
