@@ -126,7 +126,7 @@ void main() {color=textureLod(image,vec2(0.5),constants.lod);}
             if 'SKIP:' in ref.stdout:
                 print(ref.stdout.strip())
                 break
-            assert len(fetch_pixels(ref.stdout)) == 7 and all(' issued=0 in_pass=0' in l for l in ref.stdout.splitlines() if l.startswith('FETCHSPLIT '))
+            assert len(fetch_pixels(ref.stdout)) == 8 and all(' issued=0 in_pass=0' in l and ' hazards=0 refused=0' in l for l in ref.stdout.splitlines() if l.startswith('FETCHSPLIT '))
             assert 'blend_order_flag=0' not in ref.stderr
             for nofetch in ('0', '1'):
                 for extra in ({}, dict(FUXI_MTL_GPU_PASS_TIMES='1', FUXI_MTL_GPU_DRAW_TIMES='1')):
@@ -138,6 +138,22 @@ void main() {color=textureLod(image,vec2(0.5),constants.lod);}
                     if nofetch == '0':
                         assert fetch_pixels(fetch_split(args, '0', '1').stdout) == fetch_pixels(ref.stdout)
             print('PASS: FUXI_MTL_FETCH_SPLIT pixels identical %r (alone, with NOFETCH_RP, with pass/draw times); in-pass barriers=%d' % (args, issued))
+            # FUXI_MTL_ORDER_FETCH_ONLY=1 (fmtl bit 0, the phone since 3 Nov): ordinary pipelines lose the rasterization-order flag. Merged, a fetch
+            # draw after one of them read that write unordered (proxy hazards; on the A740 one triangle of each CA backdrop quad and black materials).
+            # Without FETCH_SPLIT it must begin a new pass (refused=, the log line); with it the in-pass barrier keeps one pass. Pixels equal the reference.
+            refusals = 0
+            for split in ('0', '1'):
+                for nofetch in ('0', '1'):
+                    p = fetch_split(args, split, nofetch, FUXI_MTL_ORDER_FETCH_ONLY='1')
+                    assert fetch_pixels(p.stdout) == fetch_pixels(ref.stdout), 'order-fetch-only changed pixels: %r split=%s nofetch=%s' % (args, split, nofetch)
+                    assert 'policy shadow_hash' in p.stderr and 'order_fetch_only=1' in p.stderr and 'framebuffer fetch plan mask=0 ordered=1 blend_order_flag=0' in p.stderr
+                    lines = [l for l in p.stdout.splitlines() if l.startswith('FETCHSPLIT ')]
+                    refused = sum(int(x) for l in lines for x in re.findall(r' refused=(\d+)', l))
+                    assert all(' hazards=0 ' in l for l in lines), lines
+                    assert (refused > 0) == ('fuxigpumerge=1' in args and split == '0'), (args, split, refused)
+                    assert ('FUXI MTL: merge split before fetch draw' in p.stderr) == (refused > 0)
+                    refusals = max(refusals, refused)
+            print('PASS: FUXI_MTL_ORDER_FETCH_ONLY=1 %r: no unordered fetch read; fetch draws after unflagged writes start a pass (refused=%d) unless FETCH_SPLIT' % (args, refusals))
         for extra in ('', 'fuxigpumerge=1 fuxigpuoverlap=1 fuxigpusubmit=1 fuxigpufeedback=1 fuxigpuperf=7'):
             assert invoke(d/'test', extra, FUXI_MTL_FETCH_SPLIT='1') == invoke(d/'test', extra), 'fetch split changed render merge output: '+extra
             assert pixels(invoke(d/'barriers', extra, FUXI_MTL_FETCH_SPLIT='1')) == pixels(invoke(d/'barriers', extra)), 'fetch split changed barrier fixture pixels: '+extra

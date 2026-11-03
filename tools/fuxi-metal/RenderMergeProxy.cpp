@@ -65,6 +65,13 @@ extern "C" uint64_t render_merge_load(){return lastLoad;}
 extern "C" uint64_t render_merge_store(){return lastStore;}
 extern "C" uint64_t render_merge_copies(){return copies;}
 static std::unordered_set<VkRenderPass> selfDeps;
+// Framebuffer-fetch hazard: inside one pass, a draw that binds an input attachment (fetch) after a draw whose pipeline lacks the
+// RASTERIZATION_ORDER blend flag, with no in-pass barrier between, reads those color writes with no dependency (spec: undefined; Turnip: stale texels).
+static std::unordered_map<VkPipeline,bool> orderedPipelines;
+static VkPipeline activePipeline;
+static bool passUnordered;
+static uint64_t fetchHazards;
+extern "C" uint64_t render_merge_fetch_hazards(){return fetchHazards;}
 static VkResult create(VkDevice d,const VkRenderPassCreateInfo *i,const VkAllocationCallbacks *a,VkRenderPass *p){auto r=createPass(d,i,a,p);if(r==VK_SUCCESS && i->attachmentCount){actions[*p]={i->pAttachments[0].loadOp,i->pAttachments[0].storeOp};
  auto &key=layouts[*p];key.clear();for(unsigned n=0;n<i->attachmentCount;++n){key.push_back(i->pAttachments[n].format);key.push_back(i->pAttachments[n].samples);}
  assert(i->subpassCount==1);auto &s=i->pSubpasses[0];key.push_back(s.flags);key.push_back(s.colorAttachmentCount);key.push_back(s.inputAttachmentCount);
@@ -74,22 +81,25 @@ static VkResult create(VkDevice d,const VkRenderPassCreateInfo *i,const VkAlloca
  for(unsigned n=0;n<i->dependencyCount;++n){auto &e=i->pDependencies[n];for(uint32_t x:{e.srcSubpass,e.dstSubpass,uint32_t(e.srcStageMask),uint32_t(e.dstStageMask),uint32_t(e.srcAccessMask),uint32_t(e.dstAccessMask),uint32_t(e.dependencyFlags)})key.push_back(x);
   if(!e.srcSubpass && !e.dstSubpass)selfDeps.insert(*p);}
  }return r;}
-static VkResult pipelines(VkDevice d,VkPipelineCache cache,uint32_t n,const VkGraphicsPipelineCreateInfo *i,const VkAllocationCallbacks *a,VkPipeline *p){auto r=createPipelines(d,cache,n,i,a,p);if(r==VK_SUCCESS)for(unsigned x=0;x<n;++x)pipelinePasses[p[x]]=i[x].renderPass;return r;}
+static VkResult pipelines(VkDevice d,VkPipelineCache cache,uint32_t n,const VkGraphicsPipelineCreateInfo *i,const VkAllocationCallbacks *a,VkPipeline *p){auto r=createPipelines(d,cache,n,i,a,p);
+ if(r==VK_SUCCESS)for(unsigned x=0;x<n;++x){pipelinePasses[p[x]]=i[x].renderPass;orderedPipelines[p[x]]=i[x].pColorBlendState && (i[x].pColorBlendState->flags&VK_PIPELINE_COLOR_BLEND_STATE_CREATE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_BIT_EXT);}
+ return r;}
 static VkResult framebuffer(VkDevice d,const VkFramebufferCreateInfo *i,const VkAllocationCallbacks *a,VkFramebuffer *p){auto r=createFramebuffer(d,i,a,p);if(r==VK_SUCCESS)frameViews[*p]={i->pAttachments,i->pAttachments+i->attachmentCount};return r;}
-static void boundPipeline(VkCommandBuffer c,VkPipelineBindPoint b,VkPipeline p){assert(inside && layouts.at(activePass)==layouts.at(pipelinePasses.at(p)));++pipelineBinds;bindPipeline(c,b,p);}
+static void boundPipeline(VkCommandBuffer c,VkPipelineBindPoint b,VkPipeline p){assert(inside && layouts.at(activePass)==layouts.at(pipelinePasses.at(p)));activePipeline=p;++pipelineBinds;bindPipeline(c,b,p);}
 static void updated(VkDevice d,uint32_t n,const VkWriteDescriptorSet *w,uint32_t nc,const VkCopyDescriptorSet *cp){for(unsigned x=0;x<n;++x)inputViews[w[x].dstSet].clear();for(unsigned x=0;x<n;++x)if(w[x].descriptorType==VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT){assert(w[x].descriptorCount==1 && w[x].pImageInfo->imageLayout==VK_IMAGE_LAYOUT_GENERAL);inputViews[w[x].dstSet].push_back(w[x].pImageInfo->imageView);}updateSets(d,n,w,nc,cp);}
 static void boundSets(VkCommandBuffer c,VkPipelineBindPoint b,VkPipelineLayout l,uint32_t first,uint32_t n,const VkDescriptorSet *s,uint32_t nd,const uint32_t *o){assert(first==0 && n==1);activeSet=*s;++setBinds;bindSets(c,b,l,first,n,s,nd,o);}
 static void copied(VkCommandBuffer c,VkBuffer b,VkImage i,VkImageLayout l,uint32_t n,const VkBufferImageCopy *r){assert(!inside);for(unsigned x=0;x<n;++x)assert(imageLayouts.at(i).at(r[x].imageSubresource.mipLevel)==l);++copies;copyImage(c,b,i,l,n,r);}
 static void formats(VkPhysicalDevice d,VkFormat f,VkFormatProperties *p){++formatQueries;formatProperties(d,f,p);if(getenv("MERGE_TEST_SHADOW"))p->linearTilingFeatures&=~VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;}
 static VkResult extensions(VkPhysicalDevice d,const char *layer,uint32_t *n,VkExtensionProperties *p){auto r=enumerateExtensions(d,layer,n,p);if(p && getenv("MERGE_TEST_NO_ORDER")){for(unsigned x=0;x<*n;)if(!strcmp(p[x].extensionName,VK_EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME)){p[x]=p[--*n];}else ++x;}return r;}
-static void begin(VkCommandBuffer c,const VkRenderPassBeginInfo *i,VkSubpassContents s){assert(!inside);inside=true;activePass=i->renderPass;activeFrame=i->framebuffer;activeSet={};++passes;auto a=actions.at(i->renderPass);lastLoad=a.first;lastStore=a.second;beginPass(c,i,s);}
+static void begin(VkCommandBuffer c,const VkRenderPassBeginInfo *i,VkSubpassContents s){assert(!inside);inside=true;activePass=i->renderPass;activeFrame=i->framebuffer;activeSet={};passUnordered=false;++passes;auto a=actions.at(i->renderPass);lastLoad=a.first;lastStore=a.second;beginPass(c,i,s);}
 static void end(VkCommandBuffer c){assert(inside);inside=false;endPass(c);}
 static uint64_t passBarriers; // FUXI_MTL_FETCH_SPLIT: the only barrier allowed inside a pass is a by-region color-write -> input-attachment-read memory barrier
 extern "C" uint64_t render_merge_pass_barriers(){return passBarriers;}
 static void barrier(VkCommandBuffer c,VkPipelineStageFlags a,VkPipelineStageFlags b,VkDependencyFlags f,uint32_t nm,const VkMemoryBarrier *m,uint32_t nb,const VkBufferMemoryBarrier *bb,uint32_t ni,const VkImageMemoryBarrier *ib){
- if(inside){assert(selfDeps.count(activePass) && a==VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT && b==VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT && f==VK_DEPENDENCY_BY_REGION_BIT && nm==1 && !nb && !ni && m[0].srcAccessMask==VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT && m[0].dstAccessMask==VK_ACCESS_INPUT_ATTACHMENT_READ_BIT);++passBarriers;pipelineBarrier(c,a,b,f,nm,m,nb,bb,ni,ib);return;}
+ if(inside){assert(selfDeps.count(activePass) && a==VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT && b==VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT && f==VK_DEPENDENCY_BY_REGION_BIT && nm==1 && !nb && !ni && m[0].srcAccessMask==VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT && m[0].dstAccessMask==VK_ACCESS_INPUT_ATTACHMENT_READ_BIT);++passBarriers;passUnordered=false;pipelineBarrier(c,a,b,f,nm,m,nb,bb,ni,ib);return;}
  ++barrierCalls;imageBarrierCalls+=ni!=0;imageBarriers+=ni;for(unsigned x=0;x<ni;++x)for(unsigned l=ib[x].subresourceRange.baseMipLevel;l<ib[x].subresourceRange.baseMipLevel+ib[x].subresourceRange.levelCount;++l)imageLayouts[ib[x].image].at(l)=ib[x].newLayout;pipelineBarrier(c,a,b,f,nm,m,nb,bb,ni,ib);}
-static void drawn(VkCommandBuffer c,uint32_t n,uint32_t i,uint32_t f,uint32_t fi){assert(inside);if(activeSet)for(auto view:inputViews[activeSet]){auto &views=frameViews.at(activeFrame);assert(!views.empty() && view==views[0]);}++draws;draw(c,n,i,f,fi);}
+static void drawn(VkCommandBuffer c,uint32_t n,uint32_t i,uint32_t f,uint32_t fi){assert(inside);bool fetch=false;if(activeSet)for(auto view:inputViews[activeSet]){auto &views=frameViews.at(activeFrame);assert(!views.empty() && view==views[0]);fetch=true;}
+ if(fetch && passUnordered)++fetchHazards;if(!orderedPipelines.at(activePipeline))passUnordered=true;++draws;draw(c,n,i,f,fi);}
 static VkResult start(VkCommandBuffer c,const VkCommandBufferBeginInfo *i){inside=false;return beginCommand(c,i);}
 static VkResult finish(VkCommandBuffer c){assert(!inside);return endCommand(c);}
 static PFN_vkVoidFunction getDevice(VkDevice d,const char *name){auto f=deviceProc(d,name);
