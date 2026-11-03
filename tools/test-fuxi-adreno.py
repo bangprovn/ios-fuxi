@@ -76,6 +76,10 @@ static unsigned fg_abi_inflight(void) { return inflight_model; } static void fg_
 enum { FG_PK_COPY, FG_PK_IDLE, FG_PK_CAP, FG_PK_SUBMIT, FG_PK_NOTDUE, FG_PK_OTHER, FG_PK_REASONS };
 static unsigned fg_pk_n, pk_flushes, pk_flush_why, pk_wptr_at_flush; static unsigned g3_wptr; /* tentative; defined with the ring model below */
 static int fg_pk_flush(unsigned why) { pk_flushes++; pk_flush_why=why; pk_wptr_at_flush=g3_wptr; fg_pk_n=0; return 0; } /* model: the backend rings it (test-fuxi-metal covers fg_pk_flush) */
+enum { FG_CQ_COPY, FG_CQ_SUBMIT, FG_CQ_OBSERVE, FG_CQ_REASONS };
+static unsigned fg_cq_n, cq_tries, cq_why, cq_busy_at_try;
+static unsigned fg_busy; /* tentative; defined with the copy model below */
+static int fg_cq_try(unsigned why) { cq_tries++; cq_why=why; cq_busy_at_try=fg_busy; fg_cq_n=0; return 0; } /* model: the backend rings it (test-fuxi-metal covers fg_cq_try) */
 #define FG_INL_FB_VA 0xa0000000u
 static unsigned fg_abi_inline, fg_inl_ready, fg_root_client, fg_inl_busy, fg_inl_fbmask, inl_usable_model, inl_present_calls;
 enum { FG_INL_NOROOT, FG_INL_WINDOW, FG_INL_RING, FG_INL_BUFFERS, FG_INL_CLIENT, FG_INL_SWITCH, FG_INL_REASONS };
@@ -354,7 +358,12 @@ int main(void)
  assert(fuxi_gpu_copy(0,1,(uintptr_t)source_buf,4352*10,4352,0,0,0,0,10,10,&times)==2);
  assert(!fuxi_gpu_poll(&times) && !times.sleeps && fg_busy);
  ticks+=200000;
- assert(fuxi_gpu_poll(&times)==1 && !fg_busy && !isolated);
+ assert(fuxi_gpu_poll(&times)==1 && !fg_busy && !isolated && !cq_tries);
+ /* fuxigpuncimport bit 30: a client job deferred behind the copy is rung by its retirement, once the copy no longer holds the GPU. */
+ assert(fuxi_gpu_map(0,1,(uintptr_t)source_buf,4352*10,&times) || fg_generation[0]);
+ assert(fuxi_gpu_copy(0,1,(uintptr_t)source_buf,4352*10,4352,0,0,0,0,10,10,&times)==2 && fg_busy); fg_cq_n=40;
+ assert(!fuxi_gpu_poll(&times) && fg_cq_n && !cq_tries); /* still running: stays deferred */
+ ticks+=200000; assert(fuxi_gpu_poll(&times)==1 && !fg_busy && !fg_cq_n && cq_tries==1 && cq_why==FG_CQ_COPY && !cq_busy_at_try); cq_tries=0;
  /* fuxigpuncimport bit 20: SweetSurface pre-cleaned the source, so the locked copy path does not clean again. */
  reset(); assert(fuxi_gpu_map(0,1,(uintptr_t)source_buf,4352*10,&times)); fg_scanout_preclean=1;
  CleanPoC_DcacheRegion_Force((uintptr_t)source_buf,4352*10); { uint64_t cleaned=clean_bytes; /* the caller's pre-clean */

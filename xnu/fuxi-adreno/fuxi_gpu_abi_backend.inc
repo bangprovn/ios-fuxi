@@ -28,7 +28,9 @@ static unsigned fg_abi_hold;
 static unsigned fg_abi_cf, fg_cf_holding; /* bit 16 copy priority, see fg_abi_copy_first */
 static unsigned fg_abi_pk; /* bit 27 park instead of refuse, see fg_pk_park */
 #define FG_PK_IDLE_US 1500u
-static void fg_cf_reset(void), fg_pk_reset(void);
+static unsigned fg_abi_cq; /* bit 30 classic defer instead of refuse, see fg_cq_defer */
+static uint32_t fg_cq_fence; /* the deferred job's fence while fg_cq_n (always the newest, fg_abi_seq) */
+static void fg_cf_reset(void), fg_pk_reset(void), fg_cq_reset(void);
 static int fg_pk_check(void);
 /* Hook the userclient installs: wakes submits waiting out a refusal (NULL in host tests, where the macro is defined here). */
 void (*fuxi_gpu_abi_wake_hook)(void);
@@ -48,7 +50,8 @@ static uint64_t fg_abi_map_work;
  * (scanout copy-source pre-clean) is parsed by fuxi_gpu_scanout_configure. 67108864 (bit 26): WaitFence sleeps on the GPU fence interrupt (fuxi_gpu_irq.inc).
  * 134217728 (bit 27, needs 16): park the job copy priority would refuse and ring it behind the copy (fg_pk_park). 268435456 (bit 28, with 8):
  * the frame log starts at the first burst of not-shown frames (parsed by SweetFramebuffer). 536870912 (bit 29, needs 64): cached-coherent BOs
- * (fuxi_gpu_abi_cached_coherent). */
+ * (fuxi_gpu_abi_cached_coherent). 1073741824 (bit 30, needs 512, classic path only: ignored with 2097152): a submit the copy or a waiting
+ * present would refuse is deferred in the kernel and rung when the GPU is free of them (fg_cq_defer). */
 static unsigned fg_irq_want;
 static unsigned fg_abi_coh_wb; /* the passing variant mapped the data page cacheable write-back, inner-shareable: imports are then mapped that way */
 static unsigned fg_abi_coh, fg_abi_coh_tries; /* coh: 0 untested, 1 proven coherent, 2 refused */
@@ -421,7 +424,7 @@ static int fg_abi_fault(const char *why)
   if (!fg_access_failed && f>fg_abi_completed && f<=fg_abi_seq) fg_abi_completed=f;
  }
  fg_abi_hang_dump(why);
- fg_abi_poisoned = 1; fg_pk_n = 0; /* a parked job never reaches the ring; its fence fails with the client */
+ fg_abi_poisoned = 1; fg_pk_n = 0; fg_cq_n = 0; /* a parked or deferred job never reaches the ring; its fence fails with the client */
  fg_fail(why,0x701);
  fg_abi_drained = fg_isolate();
  if (!fg_abi_drained && fg_scanout_owned) (void)fg_scanout_stop("GPU DMA drain failed");
@@ -536,22 +539,25 @@ static int fg_abi_observe(void)
  if (!fuxi_gpu_ready()) return -1;
  if (fg_access_failed || g3_faulted()) return fg_abi_fault("client GPU fault");
  if (fg_pk_n) { int r=fg_pk_check(); if (r) return r; } /* bit 27: release a parked job whose copy is not coming */
+ if (fg_cq_n) { int r=fg_cq_try(FG_CQ_OBSERVE); if (r) return r; } /* bit 30: ring a deferred job nothing refuses any more (then busy below) */
  if (!fg_client_busy) return 0;
+ /* Bit 30: a deferred job holds the newest fence but is not in the ring; the rung chain retires up to the fence before it. */
+ const uint32_t rung=fg_cq_n ? fg_cq_fence-1 : fg_abi_seq;
  /* Inline root (bit 21): the root stays, and a present copy may sit behind this job, so its fence alone retires it. */
- if (g3_read(G3_FENCE_PA+FG_ABI_FENCE_OFF+4)==fg_abi_seq &&
+ if (g3_read(G3_FENCE_PA+FG_ABI_FENCE_OFF+4)==rung &&
      (fg_root_client || (g3_gr(0x806)==g3_wptr && g3_gr(0x807)==g3_wptr && !(g3_gr(0x210)&~1u)))) {
   if (!fg_root_client && !fg_abi_switch(G3_PT)) return fg_abi_fault("client restore TTBR");
   fg_abi_import_cache(1); /* before fence success, even without a user wait */
   if (fg_abi_stage) fg_abi_stall_done();
-  if (fg_js_on) fg_js_retire(fg_abi_completed, fg_abi_seq);
-  fg_abi_completed = fg_abi_seq;
+  if (fg_js_on) fg_js_retire(fg_abi_completed, rung);
+  fg_abi_completed = rung;
   FG_ABI_WAKE(); fg_client_busy = 0; if (!fg_abi_hold) fg_abi_present_wait = 0; /* hold: the waiting present, not the next client job, takes the idle GPU */
   return 0;
  }
  /* Queue mode: the ring is in order with a WFI after every frame, so a fence below the newest job's means every job up to it has
   * finished while the next runs. Retire those (cache handoff included) and give the next job its own 100 ms. */
  { uint32_t f;
-   if (fg_abi_queue && (f=g3_read(G3_FENCE_PA+FG_ABI_FENCE_OFF+4))>fg_abi_completed && f<fg_abi_seq) {
+   if (fg_abi_queue && (f=g3_read(G3_FENCE_PA+FG_ABI_FENCE_OFF+4))>fg_abi_completed && f<rung) {
     fg_abi_import_cache(1); fg_abi_host_handoff=1; /* the newer job's handoff is still open */
     if (fg_abi_stage) fg_abi_stall_done();
     if (fg_js_on) fg_js_retire(fg_abi_completed, f);
@@ -569,7 +575,7 @@ static void fg_abi_watch(thread_call_param_t arg, thread_call_param_t unused)
 {
  (void)arg; (void)unused;
  FG_GUARD;
- if (fg_abi_observe()==1 || fg_pk_n) { /* a parked job keeps the watchdog: fg_pk_check runs from here when no one waits */
+ if (fg_abi_observe()==1 || fg_pk_n || fg_cq_n) { /* a parked or deferred job keeps the watchdog: its release check runs from here when no one waits */
   uint64_t deadline;
   clock_interval_to_deadline(2,NSEC_PER_MSEC,&deadline);
   (void)thread_call_enter_delayed(&fg_client_watchdog,deadline);
@@ -579,8 +585,10 @@ static int fg_abi_init(void)
 {
  unsigned bits=0;
  (void)PE_parse_boot_argn("fuxigpuncimport",&bits,sizeof(bits));
- fg_abi_ncimport=bits&1; fg_wptr_fence=(bits>>1)&1; fg_abi_unstick=(bits>>2)&1; fg_abi_cohtest=(bits>>6)&1; fg_abi_tlbpages=(bits>>7)&1; fg_abi_mapwait=(bits>>8)&1; fg_abi_queue=(bits>>9)&1; fg_abi_roimport=(bits>>10)&1; fg_abi_pace=(bits>>11)&1; fg_abi_hold=(bits>>12)&1; fg_abi_start=(bits>>13)&1; fg_abi_probe=(bits>>14)&1; fg_abi_spin=(bits>>15)&1; fg_abi_mid=(bits>>16)&1; fg_abi_ar=(bits>>17)&1; fg_abi_hard=(bits>>18)&1; fg_abi_dirty=(bits>>19)&1; fg_abi_cbo=(bits>>29)&1; fg_abi_cbo_on=0; fg_abi_cbo_said=NULL; fg_abi_inline=((bits>>21)&1) && ((bits>>9)&1); fg_abi_cf=fg_abi_inline && ((bits>>4)&1); fg_abi_pk=fg_abi_cf && ((bits>>27)&1); fg_irq_want=(bits>>26)&1; fg_cf_reset(); fg_pk_reset(); fg_inl_ready=fg_root_client=fg_inl_busy=fg_inl_fbmask=0; fg_abi_hold_since=0; fg_abi_present_wait=0; memset(fg_abi_q_stats,0,sizeof(fg_abi_q_stats));
+ fg_abi_ncimport=bits&1; fg_wptr_fence=(bits>>1)&1; fg_abi_unstick=(bits>>2)&1; fg_abi_cohtest=(bits>>6)&1; fg_abi_tlbpages=(bits>>7)&1; fg_abi_mapwait=(bits>>8)&1; fg_abi_queue=(bits>>9)&1; fg_abi_roimport=(bits>>10)&1; fg_abi_pace=(bits>>11)&1; fg_abi_hold=(bits>>12)&1; fg_abi_start=(bits>>13)&1; fg_abi_probe=(bits>>14)&1; fg_abi_spin=(bits>>15)&1; fg_abi_mid=(bits>>16)&1; fg_abi_ar=(bits>>17)&1; fg_abi_hard=(bits>>18)&1; fg_abi_dirty=(bits>>19)&1; fg_abi_cbo=(bits>>29)&1; fg_abi_cbo_on=0; fg_abi_cbo_said=NULL; fg_abi_inline=((bits>>21)&1) && ((bits>>9)&1); fg_abi_cf=fg_abi_inline && ((bits>>4)&1); fg_abi_pk=fg_abi_cf && ((bits>>27)&1); fg_abi_cq=((bits>>30)&1) && fg_abi_queue && !fg_abi_inline; fg_irq_want=(bits>>26)&1; fg_cf_reset(); fg_pk_reset(); fg_cq_reset(); fg_inl_ready=fg_root_client=fg_inl_busy=fg_inl_fbmask=0; fg_abi_hold_since=0; fg_abi_present_wait=0; memset(fg_abi_q_stats,0,sizeof(fg_abi_q_stats));
  if (fg_abi_pk) printf("FUXI GPU: copy_first_park=1 idle_us=%u cap=2 periods (fuxigpuncimport 134217728 with 16, inline mode)\n", FG_PK_IDLE_US);
+ if ((bits>>30)&1) printf("FUXI GPU ABI: classic_defer=%u (fuxigpuncimport 1073741824%s)\n", fg_abi_cq,
+     fg_abi_cq ? ", classic path: refused submits are deferred in the kernel" : fg_abi_inline ? "; off: inline mode 2097152 never refuses" : "; off: needs queue mode 512");
  { unsigned early=0; fg_js_on=PE_parse_boot_argn("fuxiearly",&early,sizeof(early)) && (early&8u); fg_js_n=fg_js_bad=0; memset(fg_js_sum,0,sizeof(fg_js_sum)); memset(fg_js_max,0,sizeof(fg_js_max));
    if (fg_js_on) printf("FUXI GPU ABI: job_stamps on (fuxiearly bit 8): 12 ring words per job\n"); }
  fg_abi_coh=fg_abi_coh_tries=0;
@@ -820,7 +828,7 @@ static int fg_abi_unmap_locked(uint64_t iova, uint64_t bytes)
   fg_abi_import_remove(iova,bytes); fg_abi_map_forget(iova,bytes); return 0;
  }
  if (!fg_abi_live || !fg_abi_range(iova,bytes)) return -1;
- if (fg_client_busy) return 1;
+ if (fg_client_busy || (fg_cq_n && fuxi_gpu_ready())) return 1; /* bit 30: a deferred job is in flight although not in the ring yet (a lost GPU never rings it) */
  volatile uint64_t *leaf=NULL;
  for (uint64_t off=0;off<bytes;off+=4096) {
   if (!leaf || !((iova+off)&0x1fffff)) leaf=fg_abi_leaf(iova+off); else leaf++;
@@ -847,6 +855,91 @@ static int fg_abi_present_held(void)
  if (!fg_abi_hold_since) fg_abi_hold_since=now;
  if (now-fg_abi_hold_since>rsr("cntfrq_el0")*4/1000) { fg_abi_present_wait=0; fg_abi_hold_since=0; fg_abi_q_stats[5]++; return 0; }
  return 1;
+}
+/* Classic defer (fuxigpuncimport bit 30, value 1073741824, default off; needs queue mode 512; classic path only, ignored with inline mode
+ * 2097152, which never refuses). Without bit 21 the present copy runs in the present root, so it and the client's jobs take turns on an idle
+ * GPU, and a client submit is refused while a copy runs or is reserved (busy) and, with the hold 4096, while a present waits (hold).
+ * Device d-ft-v27, d-sb-a1..b2, d-k268-a1..b2 (202161776, scripted swipe): 16-18 % of submit attempts refused, about half each; a hold
+ * wait 1.3 ms, a copy wait 0.5 ms (submit_split). FuxiMetal sleeps out each refusal inside QueueSubmit with its backend mutex held
+ * (Backend::submit), and the retirement of the frame before it takes that mutex before its surface lease ends: retire-lock waits 0.43-0.49
+ * ms avg against 0.31-0.40 with bit 21, and finished frames reach the display late and in bursts, so it finds two ready swaps and drops
+ * the older: superseded 28-32/600 against ~1/600 with bit 21 (over 294 windows r=+0.49 with hold refusals; swap-to-ready r=+0.43 with
+ * them). Defer: the submit those refusals would turn away (reasons 0, 1 and 3) is built and fenced (frame words, fence = ++fg_abi_seq,
+ * job stamps) and returns at once; the kernel rings it once nothing would refuse it: the copy's retirement (fuxi_gpu_poll), the next
+ * submit, a WaitFence poll or the 2 ms watchdog (so the hold's own 4 ms bound still ends it). Ringing does what an immediate submit
+ * does: an idle GPU gets the client root with its full-ASID invalidate, a running job (hold expired under it) gets the job queued behind
+ * it with the TLBI after a map; the import clean runs then, right before the doorbell. GPU order stays that of refuse-and-retry: the
+ * waiting copy still takes the idle GPU first and a root switch still needs an idle ring. One job at most (a second submit meanwhile is
+ * refused as today, counted). Unmap answers busy while a job is deferred. A fault or a lost GPU discards it: its fence fails with the
+ * client. Counters every 600 rung deferred jobs: 'FUXI GPU ABI: classic_defer'. Not yet observed on device. */
+enum { FG_CQ_ST_BUSY, FG_CQ_ST_HOLD, FG_CQ_ST_PW, FG_CQ_ST_REL, FG_CQ_ST_BEHIND=FG_CQ_ST_REL+FG_CQ_REASONS, FG_CQ_ST_RING, FG_CQ_ST_DROP, FG_CQ_ST_N };
+static uint32_t fg_cq_words[FG_ABI_JOB_WORDS];
+static uint32_t fg_cq_stats[FG_CQ_ST_N], fg_cq_rung; /* deferred per reason, rung per release, later submits refused behind it, ring not idle or full at a try, dropped */
+static uint64_t fg_cq_since, fg_cq_sum, fg_cq_max;
+static void fg_cq_reset(void) { fg_cq_n=fg_cq_fence=fg_cq_rung=0; fg_cq_since=fg_cq_sum=fg_cq_max=0; memset(fg_cq_stats,0,sizeof(fg_cq_stats)); }
+/* Under the GPU lock: a submit now would still be refused for the copy or a waiting present (fg_abi_submit_locked's reasons 0, 1, 3). */
+static int fg_cq_blocked(void) { return fg_busy || fg_scanout_reserved || fg_abi_present_held() || (fg_client_busy && fg_abi_present_wait); }
+static void fg_cq_log(void)
+{
+ const uint64_t f=rsr("cntfrq_el0") ? rsr("cntfrq_el0") : 1, r=fg_cq_stats[FG_CQ_ST_REL+FG_CQ_COPY]+fg_cq_stats[FG_CQ_ST_REL+FG_CQ_SUBMIT]+fg_cq_stats[FG_CQ_ST_REL+FG_CQ_OBSERVE];
+ printf("FUXI GPU ABI: classic_defer per %u rung deferred busy=%u hold=%u present_wait=%u rung_by copy=%u submit=%u observe=%u refused_behind=%u ring_wait=%u dropped=%u deferred_us avg=%llu max=%llu\n",
+     fg_cq_rung, fg_cq_stats[FG_CQ_ST_BUSY], fg_cq_stats[FG_CQ_ST_HOLD], fg_cq_stats[FG_CQ_ST_PW], fg_cq_stats[FG_CQ_ST_REL+FG_CQ_COPY],
+     fg_cq_stats[FG_CQ_ST_REL+FG_CQ_SUBMIT], fg_cq_stats[FG_CQ_ST_REL+FG_CQ_OBSERVE], fg_cq_stats[FG_CQ_ST_BEHIND], fg_cq_stats[FG_CQ_ST_RING],
+     fg_cq_stats[FG_CQ_ST_DROP], (unsigned long long)(r ? fg_cq_sum*1000000/f/r : 0), (unsigned long long)(fg_cq_max*1000000/f));
+ fg_cq_rung=0; fg_cq_sum=fg_cq_max=0; memset(fg_cq_stats,0,sizeof(fg_cq_stats));
+}
+/* Under the GPU lock, from fg_abi_submit_locked with refusal reason k (0, 1 or 3): 1 deferred (*fence set), 0 refuse as before, -1 bad frame. */
+static int fg_cq_defer(unsigned k, const uint64_t *iovas, const uint64_t *sizes, unsigned count, uint64_t *fence)
+{
+ if (!fg_abi_cq || fg_cq_n || fg_pk_n || fg_inl_usable()) return 0;
+ if (fg_abi_seq-fg_abi_completed>=FG_ABI_QUEUE_MAX) return 0; /* the deferred job counts as in flight */
+ unsigned n=fg_abi_frame(fg_cq_words+(fg_js_on ? 4 : 0),iovas,sizes,count,G3_FENCE_VA+FG_ABI_FENCE_OFF,fg_abi_seq,fg_abi_seq+1,1);
+ if (!n) return -1;
+ if (fg_js_on) n=fg_js_wrap(fg_cq_words,n,fg_abi_seq+1); /* the stamp keeps the submit time: the deferral is part of the job's wait */
+ fg_abi_ibs[0]++; fg_abi_ibs[1]+=count; if (count>fg_abi_ibs[2]) fg_abi_ibs[2]=count; if (count>16) fg_abi_ibs[3]++;
+ fg_cq_n=n; fg_cq_fence=*fence=++fg_abi_seq; fg_cq_since=rsr("cntpct_el0");
+ fg_cq_stats[k==0 ? FG_CQ_ST_BUSY : k==1 ? FG_CQ_ST_HOLD : FG_CQ_ST_PW]++;
+ if (!fg_client_busy) { uint64_t deadline; clock_interval_to_deadline(2,NSEC_PER_MSEC,&deadline); (void)thread_call_enter_delayed(&fg_client_watchdog,deadline); }
+ return 1;
+}
+/* Under the GPU lock: ring the deferred job if nothing refuses it now. 0 rung, still deferred or none; <0 fault, or the GPU went away
+ * (the job is dropped; its fence fails with the client). */
+static int fg_cq_try(unsigned why)
+{
+ if (!fg_cq_n) return 0;
+ if (!fg_abi_live || !fuxi_gpu_ready() || fg_abi_poisoned) { fg_cq_n=0; fg_cq_stats[FG_CQ_ST_DROP]++; return -1; }
+ if (fg_cq_blocked()) return 0;
+ if (g3_faulted() || fg_access_failed) return fg_abi_fault("client deferred pre-ring fault");
+ const unsigned n=fg_cq_n, queued=fg_client_busy;
+ if (queued) {
+  /* Behind a running job (the hold ended under it): same root, appended in order as a queued submit is. */
+  uint32_t used=(g3_wptr-g3_gr(0x806))&8191, tlb[128]={0};
+  if (fg_access_failed) return fg_abi_fault("client deferred ring read");
+  if (used+n+64>8191) { fg_cq_stats[FG_CQ_ST_RING]++; return 0; }
+  if (fg_abi_map_seq!=fg_abi_submit_map_seq && (g4_tlb(tlb) || fg_access_failed)) return fg_abi_fault("client deferred queue TLB");
+ } else {
+  /* Idle: nothing of the client's runs and no copy (fg_busy is clear), so the ring is empty; a ring still draining waits for the next try. */
+  if (g3_gr(0x806)!=g3_wptr || g3_gr(0x807)!=g3_wptr || (g3_gr(0x210)&~1u)) { if (fg_access_failed) return fg_abi_fault("client deferred idle read"); fg_cq_stats[FG_CQ_ST_RING]++; return 0; }
+  if (!fg_abi_switch(FG_ABI_PT)) return fg_abi_fault("client deferred install TTBR");
+ }
+ fg_cq_n=0;
+ fg_abi_import_cache(0);
+ __asm__ volatile("dsb sy" ::: "memory");
+ for (unsigned i=0;i<n;i++) g3_emit(fg_cq_words[i]);
+ g3_wptr &= 8191;
+ __asm__ volatile("dsb sy" ::: "memory");
+ const uint64_t now=rsr("cntpct_el0"), d=now-fg_cq_since;
+ if (!queued) { fg_client_deadline=now+rsr("cntfrq_el0")/10; fg_abi_stage=0; }
+ fg_client_busy=1;
+ fg_dcvs_kick();
+ fg_abi_submit_map_seq=fg_abi_map_seq;
+ if (!fg_ring_doorbell() || fg_access_failed) return fg_abi_fault("client deferred doorbell");
+ fg_cq_stats[FG_CQ_ST_REL+(why<FG_CQ_REASONS ? why : FG_CQ_OBSERVE)]++; fg_cq_sum+=d; if (d>fg_cq_max) fg_cq_max=d;
+ if (queued) { fg_abi_q_stats[0]++; if (fg_abi_seq-fg_abi_completed>fg_abi_q_stats[1]) fg_abi_q_stats[1]=fg_abi_seq-fg_abi_completed; }
+ else { uint64_t deadline; clock_interval_to_deadline(2,NSEC_PER_MSEC,&deadline); (void)thread_call_enter_delayed(&fg_client_watchdog,deadline); }
+ if (++fg_cq_rung>=600) fg_cq_log();
+ FG_ABI_WAKE(); /* a submit refused behind the deferred job may follow it now */
+ return 0;
 }
 /* Copy priority (fuxigpuncimport bit 4, value 16; needs inline mode 512|2097152). In inline mode a present copy is queued only after
  * its frame's writer lease ends in userland, by which time the next frame's client job is usually already in the ring, so copy N runs
@@ -1019,14 +1112,18 @@ static uint64_t fg_abi_ss_t[FG_SS_N], fg_abi_ss_cur[FG_SS_N], fg_abi_ss_lockmax,
 static uint32_t fg_abi_ss_att, fg_abi_ss_ok, fg_abi_ss_why[5]; /* why: busy/reserved, hold, idle without queue, present waits, chain or ring full */
 #define FG_SS(i) do { uint64_t n_=rsr("cntpct_el0"); fg_abi_ss_cur[i]+=n_-m; m=n_; } while (0)
 #define FG_REFUSE(k) do { fg_abi_ss_why[k]++; return 1; } while (0)
+/* Bit 30: the refusal with reason k becomes a deferral (returns success with the fence) when fg_cq_defer takes the job. */
+#define FG_CQ_DEFER(k) do { if (fg_cq_n) fg_cq_stats[FG_CQ_ST_BEHIND]++; int d_=fg_cq_defer((k),iovas,sizes,count,fence); if (d_) return d_>0 ? 0 : -1; } while (0)
 static int fg_abi_submit_locked(const uint64_t *iovas, const uint64_t *sizes,
     unsigned count, uint64_t *fence)
 {
  uint64_t m=rsr("cntpct_el0");
  if (!fg_abi_live || !fuxi_gpu_ready() || fg_abi_poisoned || fg_abi_seq==UINT32_MAX) return -1;
  const unsigned inl=fg_inl_usable(); /* bit 21: client root installed for good; a copy never refuses or delays a client job */
- if (!inl && (fg_busy || fg_scanout_reserved)) FG_REFUSE(0);
- if (!inl && fg_abi_present_held()) { fg_abi_q_stats[4]++; FG_REFUSE(1); }
+ if (fg_cq_n) { int r=fg_cq_try(FG_CQ_SUBMIT); if (r<0) return r; } /* bit 30: the deferred job keeps its place, ahead of this one */
+ if (!inl && (fg_busy || fg_scanout_reserved)) { FG_CQ_DEFER(0); FG_REFUSE(0); }
+ if (!inl && fg_abi_present_held()) { FG_CQ_DEFER(1); fg_abi_q_stats[4]++; FG_REFUSE(1); }
+ if (fg_cq_n) { fg_cq_stats[FG_CQ_ST_BEHIND]++; FG_REFUSE(0); } /* bit 30: still deferred (its ring is draining or full): this one waits behind it */
  if (fg_pk_n) { int r=fg_pk_flush(FG_PK_SUBMIT); if (r) return r; } /* bit 27: the parked job keeps its place, ahead of this one */
  if (inl && !fg_abi_pk && fg_abi_copy_first()) FG_REFUSE(1); /* bit 16: the due copy goes first (bit 27 parks below instead) */
  /* Why a submit needed an idle GPU: (1) it installs the client root with a full-ASID invalidate, which would pull the page tables from
@@ -1038,7 +1135,7 @@ static int fg_abi_submit_locked(const uint64_t *iovas, const uint64_t *sizes,
  if (idle<0) return -1;
  if (idle || inl) {
   if (!fg_abi_queue) FG_REFUSE(2);
-  if (!inl && fg_abi_present_wait) { fg_abi_q_stats[2]++; FG_REFUSE(3); }
+  if (!inl && fg_abi_present_wait) { FG_CQ_DEFER(3); fg_abi_q_stats[2]++; FG_REFUSE(3); }
   uint32_t used=(g3_wptr-g3_gr(0x806))&8191;
   if (fg_access_failed) return fg_abi_fault("client queue ring read");
   if (fg_abi_seq-fg_abi_completed>=FG_ABI_QUEUE_MAX || used+(fg_js_on ? FG_ABI_JOB_WORDS : FG_ABI_FRAME_WORDS)+64>8191) { fg_abi_q_stats[3]++; FG_REFUSE(4); }
