@@ -11,7 +11,7 @@
  #include <libkern/c++/OSDictionary.h>
  #include <libkern/c++/OSNumber.h>
  #include <libkern/c++/OSUnserialize.h>
-@@ -63,7 +66,17 @@
+@@ -63,7 +66,18 @@
  #define SWEET_SURFACE_MAX_ALLOC         (256u << 20)
  #define SWEET_SURFACE_MAX_PROPS         (64u << 10)
  #define SWEET_SURFACE_ROW_ALIGN         64
@@ -20,8 +20,9 @@
 + * for CGBitmapGetAlignedBytesPerRow (32-byte) rows, so CARenderServerSnapshot
 + * left them unrendered and the opaque App Library background stayed black.
 + * Explicit rows are a minimum (clients query the row back), and the allocation
-+ * covers the height padded to 4 rows that a Turnip linear import requires;
-+ * sweetsurfrow=0 keeps the requested layout. */
++ * covers the height padded to 4 rows that a Turnip linear import requires.
++ * sweetsurfrow: 2 (the default since 3 Nov) rounds only rows that are not
++ * 64-byte aligned, 1 rounds every row, 0 keeps the requested layout. */
 +#define SWEET_SURFACE_GPU_ROW_ALIGN     256
  #define SWEET_SURFACE_TIMESTAMPS        0x800   /* offset in the state page */
 +#define SWEET_SURFACE_STATE_USE         0x18
@@ -29,7 +30,7 @@
  #define SWEET_SURFACE_STATE_SEED        0xc     /* u32 in the state page */
  #define kIOSurfaceLockReadOnly          0x1
  
-@@ -72,8 +85,43 @@
+@@ -72,8 +86,43 @@
  static uint32_t      sweet_surface_users[SWEET_SURFACE_MAX_ID];
  static uint32_t      sweet_surface_next_id = 1;
  static uint32_t      sweet_surface_creates_logged;
@@ -73,7 +74,7 @@
  
  OSDefineMetaClassAndStructors(SweetSurface, OSObject);
  
-@@ -86,19 +134,40 @@
+@@ -86,19 +135,40 @@
   uint64_t length, pageGeneration, generation, age;
   bool quarantine;
  };
@@ -115,7 +116,7 @@
   }
   return true;
  }
-@@ -134,7 +203,31 @@
+@@ -134,7 +204,31 @@
   uint64_t cpu = thread_get_runtime_self(), start = mach_absolute_time();
   IOLockLock(sweet_gpu_lock);
   if (sweet_gpu_inflight) { IOLockUnlock(sweet_gpu_lock); return 2; }
@@ -148,7 +149,7 @@
   unsigned slot = FG_CACHE_SLOTS, victim = 0, replacement = FG_CACHE_SLOTS;
   uint64_t length = s->memory->getLength()-s->offset;
   uintptr_t source = src+s->offset;
-@@ -174,6 +267,12 @@
+@@ -174,6 +268,12 @@
   sweet_gpu_cache[slot].age = ++sweet_gpu_age;
   result = fuxi_gpu_copy(slot, sweet_gpu_cache[slot].generation, source, length,
       s->bytesPerRow, sx, sy, dx, dy, width, height, &sweet_gpu_times);
@@ -161,7 +162,7 @@
   if (result == 2) {
    s->retain();
    sweet_gpu_inflight = s;
-@@ -182,10 +281,14 @@
+@@ -182,10 +282,14 @@
   }
   if (result < 0) {
    sweet_gpu_cache[slot].quarantine = true;
@@ -177,7 +178,7 @@
   sweet_gpu_times.cpu += thread_get_runtime_self()-cpu;
   IOLockUnlock(sweet_gpu_lock);
   return result;
-@@ -203,14 +306,16 @@
+@@ -203,14 +307,16 @@
    result = fuxi_gpu_poll(&sweet_gpu_times);
    if (result) {
     *elapsed = mach_absolute_time()-sweet_gpu_begin;
@@ -196,7 +197,7 @@
    }
   }
   sweet_gpu_times.cpu += thread_get_runtime_self()-cpu;
-@@ -218,21 +323,221 @@
+@@ -218,21 +324,221 @@
   if (release) release->release(); /* free() takes the cache lock */
   return result;
  }
@@ -429,7 +430,7 @@
  }
  void sweet_surface_gpu_stats(struct fg_times *t)
  {
-@@ -241,7 +546,30 @@
+@@ -241,7 +547,30 @@
   IOLockLock(sweet_gpu_lock);
   *t = sweet_gpu_times;
   bzero(&sweet_gpu_times, sizeof(sweet_gpu_times));
@@ -460,7 +461,7 @@
  }
  #endif
  
-@@ -447,6 +775,68 @@
+@@ -447,6 +776,68 @@
  	return (uint32_t)((row + SWEET_SURFACE_ROW_ALIGN - 1) & ~(uint64_t)(SWEET_SURFACE_ROW_ALIGN - 1));
  }
  
@@ -469,9 +470,9 @@
 +{
 +	static int mode = -1;
 +	if (mode < 0) {
-+		uint32_t v = 1;
++		uint32_t v = 2;
 +		(void)PE_parse_boot_argn("sweetsurfrow", &v, sizeof(v));
-+		mode = v <= 2 ? (int)v : 1;
++		mode = v <= 2 ? (int)v : 2;
 +	}
 +	return (uint32_t)mode;
 +}
@@ -529,7 +530,7 @@
  /* Geometry from the creation properties (IOSurface.h keys). */
  static IOReturn
  sweet_surface_layout(SweetSurface *s, OSDictionary *props)
-@@ -470,7 +860,26 @@
+@@ -470,7 +861,26 @@
  	if (s->bytesPerRow < (uint64_t)sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement) {
  		return kIOReturnBadArgument;
  	}
@@ -557,7 +558,7 @@
  
  	OSArray *planes = OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
  	s->planeCount = 0;
-@@ -528,6 +937,7 @@
+@@ -528,6 +938,7 @@
  	IOMemoryMap  *data;
  	IOMemoryMap  *state;
  	uint32_t      count;
@@ -565,7 +566,7 @@
  
  	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
  	void free() APPLE_KEXT_OVERRIDE;
-@@ -541,6 +951,10 @@
+@@ -541,6 +952,10 @@
  	OSSafeReleaseNULL(data);
  	OSSafeReleaseNULL(state);
  	if (surface != NULL) {
@@ -576,7 +577,7 @@
  		sweet_surface_put(surface);
  		surface->release();
  		surface = NULL;
-@@ -591,7 +1005,9 @@
+@@ -591,7 +1006,9 @@
  	    void *reference) APPLE_KEXT_OVERRIDE;
  	IOExternalTrap *getTargetAndTrapForIndex(IOService **targetP, UInt32 index) APPLE_KEXT_OVERRIDE;
  
@@ -587,7 +588,7 @@
  	IOReturn trapLock(void *id, void *options, void *seedOut, void *, void *, void *);
  	IOReturn trapUnlock(void *id, void *options, void *seedOut, void *, void *, void *);
  	IOReturn trapRelease(void *id, void *, void *, void *, void *, void *);
-@@ -882,6 +1298,20 @@
+@@ -882,6 +1299,20 @@
  		    name, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
  		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), ret);
  	}
@@ -608,7 +609,7 @@
  	props->release();
  	if (ret != kIOReturnSuccess) {
  		s->release();
-@@ -956,11 +1386,34 @@
+@@ -956,11 +1387,34 @@
  	}
  }
  
@@ -648,7 +649,7 @@
  }
  
  static IOReturn
-@@ -1001,7 +1454,7 @@
+@@ -1001,7 +1455,7 @@
  		return kIOReturnNotFound;
  	}
  #if defined(FUXI)
@@ -657,7 +658,7 @@
    s->release(); return kIOReturnNotReady;
   }
  #endif
-@@ -1041,8 +1494,8 @@
+@@ -1041,8 +1495,8 @@
  }
  
  static IOExternalTrap sweet_surface_traps[] = {

@@ -71,8 +71,9 @@ enum {
  * for CGBitmapGetAlignedBytesPerRow (32-byte) rows, so CARenderServerSnapshot
  * left them unrendered and the opaque App Library background stayed black.
  * Explicit rows are a minimum (clients query the row back), and the allocation
- * covers the height padded to 4 rows that a Turnip linear import requires;
- * sweetsurfrow=0 keeps the requested layout. */
+ * covers the height padded to 4 rows that a Turnip linear import requires.
+ * sweetsurfrow: 2 (the default since 3 Nov) rounds only rows that are not
+ * 64-byte aligned, 1 rounds every row, 0 keeps the requested layout. */
 #define SWEET_SURFACE_GPU_ROW_ALIGN     256
 #define SWEET_SURFACE_TIMESTAMPS        0x800   /* offset in the state page */
 #define SWEET_SURFACE_STATE_USE         0x18
@@ -780,9 +781,9 @@ sweet_surface_row_mode(void)
 {
 	static int mode = -1;
 	if (mode < 0) {
-		uint32_t v = 1;
+		uint32_t v = 2;
 		(void)PE_parse_boot_argn("sweetsurfrow", &v, sizeof(v));
-		mode = v <= 2 ? (int)v : 1;
+		mode = v <= 2 ? (int)v : 2;
 	}
 	return (uint32_t)mode;
 }
