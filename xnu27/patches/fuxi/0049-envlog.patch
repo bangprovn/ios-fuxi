@@ -1,0 +1,29 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index b65a271..f499c01 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -3128,6 +3128,24 @@ bad:
+ 		printf("fuxi: exec pid %d %s: %d persona %d uid %d\n", proc_getpid(p), excpath != NULL ? excpath : "?", error,
+ 		    (int)proc_persona_id(p), (int)kauth_getuid());
+ 	}
++	{
++		/* boot-arg fuxi_envlog=WORD: the environment of the programs whose path holds WORD */
++		static char fuxi_envlog[64];
++		static int fuxi_envlog_read;
++
++		if (!fuxi_envlog_read) {
++			if (!PE_parse_boot_argn("fuxi_envlog", fuxi_envlog, sizeof(fuxi_envlog))) {
++				fuxi_envlog[0] = '\0';
++			}
++			fuxi_envlog_read = 1;
++		}
++		if (fuxi_envlog[0] != '\0' && excpath != NULL && strnstr(excpath, fuxi_envlog, MAXPATHLEN) != NULL &&
++		    imgp->ip_endargv != NULL && imgp->ip_endenvv != NULL) {
++			for (char *e = imgp->ip_endargv; e < imgp->ip_endenvv; e += strnlen(e, imgp->ip_endenvv - e) + 1) {
++				printf("fuxi: env pid %d: %.*s\n", proc_getpid(p), (int)strnlen(e, MIN(imgp->ip_endenvv - e, 200)), e);
++			}
++		}
++	}
+ #endif
+ 	proc_transend(p, 0);
+ 
