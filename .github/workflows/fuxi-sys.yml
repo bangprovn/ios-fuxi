@@ -16,6 +16,7 @@ jobs:
         run: |
           python3 tools/test-fuxi-rates.py
           python3 tools/test-fuxi-apprate.py
+          python3 tools/test-fuxi-telephony.py
       - name: Build FuxiAudio.driver, libfuxi-sb.dylib and libfuxi-app.dylib
         run: bash tools/build-fuxi-sys.sh out/sys
       - uses: actions/upload-artifact@v4
