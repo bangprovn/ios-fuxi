@@ -27,12 +27,12 @@
  * SplashBoard checks, and the applications open black).
  *
  * QuartzCore of iOS 16.7 reads the key once, in the application's own process (dispatch_once block at
- * QuartzCore+0x247c94): CFDictionaryGetValue(CFBundleGetInfoDictionary(CFBundleGetMainBundle()), key). Without it the
- * frame-rate client (QuartzCore+0x8ab00), the display link (+0x1be1ac), -[CAMetalDrawable present] and
- * -[CAAnimation _setCARenderAnimation:layer:] hold the process to 60 a second before anything reaches backboardd, so
- * the window server cannot lift it. It is the Info.plist dictionary, not the localized one: InfoPlist.loctable
- * (root v23) did nothing. CFBundle parses Info.plist with kCFPropertyListMutableContainers (CoreFoundation+0x559d0),
- * so the dictionary every caller gets can take the key.
+ * QuartzCore+0x247c94): CFDictionaryGetValue(CFBundleGetInfoDictionary(CFBundleGetMainBundle()), key). Without it
+ * CADisplayLink's frame-rate client (QuartzCore+0x8ab00), CADynamicFrameRateSource (+0x1be1ac),
+ * -[CAMetalDrawable present] and -[CAAnimation _setCARenderAnimation:layer:] hold the process to 60 a second
+ * before anything reaches backboardd, so the window server cannot lift it. It is the Info.plist dictionary, not
+ * the localized one: InfoPlist.loctable (root v23) did nothing. CFBundle parses Info.plist with
+ * kCFPropertyListMutableContainers (CoreFoundation+0x559d0), so the dictionary every caller gets can take the key.
  *
  * One library, two programs:
  *   runningboardd   every application job it builds for launchd (-[RBLaunchdJobManager

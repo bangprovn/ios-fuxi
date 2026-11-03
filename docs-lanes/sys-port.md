@@ -134,7 +134,9 @@ policy query 0x5a with all features allowed, so dyld honours the variable.
 Measured in 20H392's shared cache: QuartzCore reads the key once per process, in the application's own
 process, with `CFDictionaryGetValue(CFBundleGetInfoDictionary(CFBundleGetMainBundle()), key)` (a
 `dispatch_once` block at QuartzCore+0x247c94, cfstring at 0x1d5b5f400, result byte at 0x1dcdfbee8). Without
-it, the frame-rate client (+0x8ab00, "CAFrameRateClient: update"), the display link (+0x1be1ac),
+it, CADisplayLink's frame-rate client (+0x8ab00, "CAFrameRateClient: update", reached from
+`-[CADisplayLink setPreferredFrameRateRange:]`, `setPreferredFramesPerSecond:`, `setPaused:`),
+`CADynamicFrameRateSource` (+0x1be1ac, from its `setPreferredFrameRateRange:` and `setHighFrameRateReasons:count:`),
 `-[CAMetalDrawable present]` and `-[CAAnimation _setCARenderAnimation:layer:]` hold the process to 60 a
 second before anything reaches backboardd, so a window-server hook cannot lift it. UIKitCore never names
 the key. It is the Info.plist dictionary, not the localized one, so `InfoPlist.loctable` did nothing (root
