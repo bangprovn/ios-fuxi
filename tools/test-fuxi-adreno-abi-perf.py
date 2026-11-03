@@ -43,6 +43,15 @@ static unsigned fuxi_gpu_irq_stats(uint64_t s[FG_IRQ_STATS],unsigned *why) {asse
 static void fuxi_gpu_abi_submit_split(uint64_t ns[8],uint32_t why[5],uint32_t n[2],uint64_t *lm,uint64_t kib[2]) {for(int i=0;i<8;i++)ns[i]=(i+1)*600000;memcpy(why,splitWhy,sizeof(splitWhy));n[0]=900;n[1]=600;*lm=6400000;kib[0]=1200*600;kib[1]=0;}
 static void fuxi_gpu_abi_clean_split(struct fuxi_gpu_clean_split *o) {memset(o,0,sizeof(*o));o->kib[0]=100*600;o->kib[1]=300*600;o->ns[0]=1000*600;o->ns[1]=2500*600;o->go_kib=50*600;o->imports=40;o->go_imports=9;o->mapped_kib=300<<10;
  o->bkt_kib[0]=10*600;o->bkt_ns[0]=100*600;o->bkt_kib[3]=390*600;o->bkt_ns[3]=3400*600;o->top_kib[0]=65536;o->top_perm[0]=3|16;o->top_kib[1]=16384;o->top_perm[1]=1;o->dty_state=2;o->dty_imports=7;o->submits=600;o->dty_checked=3300*600;o->dty_dirty=40*600;o->dty_kib=640*600;o->dty_full_kib=0;o->dty_check_ns=900000ull*600;o->dty_clean_ns=100000ull*600;o->ivac_ns=300000ull*600;}
+/* The EPSS L3 page for abiL3Report: any write fails the test; one offset can abort. */
+typedef uintptr_t vm_offset_t;typedef uintptr_t vm_size_t;
+static uint32_t l3regs[0x400];static unsigned l3MapFail,l3FaultOff=~0u,l3Writes;static uint64_t l3MappedPa;
+extern "C" vm_offset_t ml_io_map(vm_offset_t pa,vm_size_t n) {assert(n==0x1000);l3MappedPa=pa;return l3MapFail?0:(vm_offset_t)l3regs;}
+extern "C" unsigned fuxi_gpu_access(uintptr_t va,uint64_t *v,unsigned wr,unsigned wide) {
+ assert(!wide);if(wr){l3Writes++;return 1;}
+ uintptr_t off=va-(uintptr_t)l3regs;assert(off<0x1000 && !(off&3));
+ if(off==l3FaultOff)return 1;*v=l3regs[off/4];return 0;
+}
 %s
 %s
 %s
@@ -129,7 +138,21 @@ int main() {
  fuxi_gpu_abi_stats_log();
  assert(logCount==1 && !strcmp(logs[0],"FUXI GPU ABI: outside lock_ n/avg/max us alloc 2/2.0/2 free 1/0.7/0 contig tried 2 served 1 failed 1 backoff_skips 1\n"));
  fuxi_gpu_abi_stats_log();assert(logCount==1); // window restarted
- puts("PASS: ABI stat aggregation/window reset/log format, sleep slices and sleep accounting, submit_split report (cached-BO line), fence pending histogram, outside-lock_/contiguous line");
+ // CPU L3 report: reads only (no write ever), the LUT up to its repeated row, the vote's row, the raw state; an abort or a failed map
+ // is reported instead.
+ #define L3R(l) ((1u<<30)|(l))
+ const uint32_t lut[]={0,L3R(20),L3R(32),L3R(52),L3R(84),L3R(84),L3R(99)};
+ memcpy(&l3regs[0x100/4],lut,sizeof(lut));l3regs[0]=1;l3regs[0x20/4]=0x20;l3regs[0x90/4]=2;
+ logCount=0;abiL3Report();
+ assert(l3MappedPa==0x17d90000 && !l3Writes && logCount==1);
+ assert(!strcmp(logs[0],"FUXI L3: read-only enable 1 vote 2 (614 MHz) state 0x20 (L 32 = 614 MHz?) top 1612 MHz, 5 LUT rows MHz: 300 384 614 998 1612\n"));
+ l3regs[0x90/4]=9;logCount=0;abiL3Report();assert(logCount==1 && strstr(logs[0]," vote 9 (no such row) "));
+ l3FaultOff=0x90;logCount=0;abiL3Report();
+ assert(logCount==1 && !strcmp(logs[0],"FUXI L3: read-only: unreadable at +0x90 (enable 0x1 state 0x20 vote 0, 0 rows read)\n"));
+ l3FaultOff=0x108;logCount=0;abiL3Report();assert(logCount==1 && strstr(logs[0],"unreadable at +0x108") && strstr(logs[0],"vote 9, 2 rows read"));
+ l3FaultOff=~0u;l3MapFail=1;logCount=0;abiL3Report();assert(logCount==1 && !strcmp(logs[0],"FUXI L3: read-only: map 0x17d90000 failed\n"));
+ assert(!l3Writes);
+ puts("PASS: ABI stat aggregation/window reset/log format, sleep slices and sleep accounting, submit_split report (cached-BO line), fence pending histogram, outside-lock_/contiguous line, read-only CPU L3 report");
 }
 '''
 

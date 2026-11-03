@@ -877,8 +877,43 @@ static void abiSplitReport(const uint64_t *sum, unsigned n, uint64_t lockMax, co
  for (unsigned i=1;i<=16;i++) if (bn[i]) { uint64_t mx; absolutetime_to_nanoseconds(bm[i],&mx); k+=snprintf(line+k,sizeof(line)-k," %s %u/%llu.%llu",abiStep(i),bn[i],mx/1000000,(mx%1000000)/100000); if (k>200) break; }
  IOLog("FUXI GPU ABI: submit_split lock_ max %llu.%llu ms; waits over 500 us blamed on the previous holder (n/max ms):%s\n",lm/1000000,(lm%1000000)/100000,k ? line : " none");
 }
+/* Read-only, once at boot: the CPU L3 clock level the boot loader left, to judge whether an L3 vote (UniXNU-sheng b0ccf61,
+ * CpuFreqProbe.cpp:61-64,128-134) is worth trying. SM8550 EPSS L3 at 0x17d90000 ("qcom,epss-l3", Linux osm-l3.c): enable +0x0 bit 0,
+ * HLOS vote +0x90 (a LUT row index), LUT +0x100 in 4-byte rows (bits 31:30 source, 7:0 L: L x 19.2 MHz, source 0 is 300 MHz; a
+ * repeated frequency ends the table). +0x20 is a CPU EPSS domain's current state (fuxi_perf.c samples it); what it holds on the L3
+ * block is not established, so it is shown raw beside its would-be MHz. 32-bit reads only, each through fuxi_gpu_access (an abort
+ * is contained and reported); nothing is written. The mapping and the read are the ones the governor uses for EPSS (fuxi_perf.c). */
+extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+extern "C" unsigned fuxi_gpu_access(uintptr_t, uint64_t *, unsigned, unsigned);
+static unsigned abiL3Khz(uint32_t row) { return row>>30 ? (row&255u)*19200u : 300000u; }
+static void abiL3Report()
+{
+ const uint64_t pa=0x17d90000;
+ const uintptr_t va=ml_io_map(pa,0x1000);
+ if (!va) { IOLog("FUXI L3: read-only: map %#llx failed\n",pa); return; }
+ static const unsigned offs[3]={0x0,0x20,0x90};
+ uint32_t reg[3]={}, rows[40]={};
+ unsigned n=0, bad=0, top=0;
+ for (unsigned i=0;i<3 && !bad;i++) { uint64_t v=0; if (fuxi_gpu_access(va+offs[i],&v,0,0)) bad=offs[i]+1; else reg[i]=(uint32_t)v; }
+ for (unsigned i=0;i<40 && !bad;i++) {
+  uint64_t v=0;
+  if (fuxi_gpu_access(va+0x100+4*i,&v,0,0)) { bad=0x100+4*i+1; break; }
+  rows[i]=(uint32_t)v;
+  if (i && abiL3Khz(rows[i])==abiL3Khz(rows[i-1])) break;
+  n=i+1;
+  if (abiL3Khz(rows[i])>top) top=abiL3Khz(rows[i]);
+ }
+ char list[200], vote[24];
+ size_t k=0; list[0]=0;
+ for (unsigned i=0;i<n && k<sizeof(list)-8;i++) k+=snprintf(list+k,sizeof(list)-k," %u",abiL3Khz(rows[i])/1000);
+ if (reg[2]<n) snprintf(vote,sizeof(vote),"%u MHz",abiL3Khz(rows[reg[2]])/1000); else snprintf(vote,sizeof(vote),"no such row");
+ if (bad) IOLog("FUXI L3: read-only: unreadable at +%#x (enable %#x state %#x vote %u, %u rows read)\n",bad-1,reg[0],reg[1],reg[2],n);
+ else IOLog("FUXI L3: read-only enable %u vote %u (%s) state %#x (L %u = %u MHz?) top %u MHz, %u LUT rows MHz:%s\n",
+     reg[0]&1u,reg[2],vote,reg[1],reg[1]&255u,(reg[1]&255u)*192u/10u,top/1000,n,list);
+}
 extern "C" void fuxi_gpu_abi_publish(void)
 {
+ abiL3Report();
  char swap[192]={};
  execswapTest=PE_parse_boot_argn("sweetexecswap",swap,sizeof(swap)) &&
      abiExecswapTest(swap);
