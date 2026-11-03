@@ -1,14 +1,17 @@
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
-@@ -34,6 +34,7 @@
+@@ -34,7 +34,10 @@
  #include <IOKit/IOLib.h>
  #include <IOKit/IOLocks.h>
  #include <IOKit/system.h>
 +#include <pexpert/pexpert.h>
  #include <libkern/c++/OSArray.h>
++#include <libkern/c++/OSCollectionIterator.h>
++#include <libkern/c++/OSSymbol.h>
  #include <libkern/c++/OSDictionary.h>
  #include <libkern/c++/OSNumber.h>
-@@ -63,7 +64,17 @@
+ #include <libkern/c++/OSUnserialize.h>
+@@ -63,7 +66,17 @@
  #define SWEET_SURFACE_MAX_ALLOC         (256u << 20)
  #define SWEET_SURFACE_MAX_PROPS         (64u << 10)
  #define SWEET_SURFACE_ROW_ALIGN         64
@@ -26,7 +29,7 @@
  #define SWEET_SURFACE_STATE_SEED        0xc     /* u32 in the state page */
  #define kIOSurfaceLockReadOnly          0x1
  
-@@ -72,8 +83,43 @@
+@@ -72,8 +85,43 @@
  static uint32_t      sweet_surface_users[SWEET_SURFACE_MAX_ID];
  static uint32_t      sweet_surface_next_id = 1;
  static uint32_t      sweet_surface_creates_logged;
@@ -70,7 +73,7 @@
  
  OSDefineMetaClassAndStructors(SweetSurface, OSObject);
  
-@@ -86,19 +132,40 @@
+@@ -86,19 +134,40 @@
   uint64_t length, pageGeneration, generation, age;
   bool quarantine;
  };
@@ -112,7 +115,7 @@
   }
   return true;
  }
-@@ -134,7 +201,31 @@
+@@ -134,7 +203,31 @@
   uint64_t cpu = thread_get_runtime_self(), start = mach_absolute_time();
   IOLockLock(sweet_gpu_lock);
   if (sweet_gpu_inflight) { IOLockUnlock(sweet_gpu_lock); return 2; }
@@ -145,7 +148,7 @@
   unsigned slot = FG_CACHE_SLOTS, victim = 0, replacement = FG_CACHE_SLOTS;
   uint64_t length = s->memory->getLength()-s->offset;
   uintptr_t source = src+s->offset;
-@@ -174,6 +265,12 @@
+@@ -174,6 +267,12 @@
   sweet_gpu_cache[slot].age = ++sweet_gpu_age;
   result = fuxi_gpu_copy(slot, sweet_gpu_cache[slot].generation, source, length,
       s->bytesPerRow, sx, sy, dx, dy, width, height, &sweet_gpu_times);
@@ -158,7 +161,7 @@
   if (result == 2) {
    s->retain();
    sweet_gpu_inflight = s;
-@@ -182,10 +279,14 @@
+@@ -182,10 +281,14 @@
   }
   if (result < 0) {
    sweet_gpu_cache[slot].quarantine = true;
@@ -174,7 +177,7 @@
   sweet_gpu_times.cpu += thread_get_runtime_self()-cpu;
   IOLockUnlock(sweet_gpu_lock);
   return result;
-@@ -203,14 +304,16 @@
+@@ -203,14 +306,16 @@
    result = fuxi_gpu_poll(&sweet_gpu_times);
    if (result) {
     *elapsed = mach_absolute_time()-sweet_gpu_begin;
@@ -193,7 +196,7 @@
    }
   }
   sweet_gpu_times.cpu += thread_get_runtime_self()-cpu;
-@@ -218,21 +321,221 @@
+@@ -218,21 +323,221 @@
   if (release) release->release(); /* free() takes the cache lock */
   return result;
  }
@@ -426,7 +429,7 @@
  }
  void sweet_surface_gpu_stats(struct fg_times *t)
  {
-@@ -241,7 +544,30 @@
+@@ -241,7 +546,30 @@
   IOLockLock(sweet_gpu_lock);
   *t = sweet_gpu_times;
   bzero(&sweet_gpu_times, sizeof(sweet_gpu_times));
@@ -457,7 +460,7 @@
  }
  #endif
  
-@@ -447,6 +773,50 @@
+@@ -447,6 +775,69 @@
  	return (uint32_t)((row + SWEET_SURFACE_ROW_ALIGN - 1) & ~(uint64_t)(SWEET_SURFACE_ROW_ALIGN - 1));
  }
  
@@ -490,25 +493,44 @@
 +	return sweet_surface_row_mode() != 2 || (row & 63) != 0;
 +}
 +
-+/* The first 64 rounded rows, with the creating process: who asks for which row. */
++/* The first 64 rounded or kept rows, with the creating process and the creation keys: which client asks
++ * for which row, and what tells a decoder's surface (written at the row it asked for) from MaterialKit's. */
 +static SInt32 sweet_surface_rows_logged;
 +
 +static void
-+sweet_surface_row_log(SweetSurface *s, uint32_t asked)
++sweet_surface_row_log(SweetSurface *s, uint32_t asked, OSDictionary *props)
 +{
 +	if (OSIncrementAtomic(&sweet_surface_rows_logged) >= 64) {
 +		return;
 +	}
-+	char name[32] = "?";
++	char name[32] = "?", keys[256] = "";
 +	proc_selfname(name, sizeof(name));
-+	IOLog("SWEET SURF: row %u -> %u for %ux%u fourcc 0x%08x by %s (sweetsurfrow=%u)\n",
-+	    asked, (uint32_t)s->bytesPerRow, s->width, s->height, s->pixelFormat, name, sweet_surface_row_mode());
++	OSCollectionIterator *it = OSCollectionIterator::withCollection(props);
++	if (it != NULL) {
++		size_t used = 0;
++		while (OSSymbol *key = OSDynamicCast(OSSymbol, it->getNextObject())) {
++			const char *k = key->getCStringNoCopy();
++			if (strncmp(k, "IOSurface", 9) == 0) {
++				k += 9;
++			}
++			int w = snprintf(keys + used, sizeof(keys) - used, "%s%s", used ? "," : "", k);
++			if (w < 0 || (size_t)w >= sizeof(keys) - used) {
++				break;
++			}
++			used += (size_t)w;
++		}
++		it->release();
++	}
++	IOLog("SWEET SURF: row %u -> %u for %ux%u fourcc 0x%08x cache %u explicit %d by %s keys %s (sweetsurfrow=%u)
++",
++	    asked, (uint32_t)s->bytesPerRow, s->width, s->height, s->pixelFormat, s->cacheMode,
++	    props->getObject("IOSurfaceBytesPerRow") != NULL, name, keys, sweet_surface_row_mode());
 +}
 +
  /* Geometry from the creation properties (IOSurface.h keys). */
  static IOReturn
  sweet_surface_layout(SweetSurface *s, OSDictionary *props)
-@@ -470,7 +840,23 @@
+@@ -470,7 +861,23 @@
  	if (s->bytesPerRow < (uint64_t)sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement) {
  		return kIOReturnBadArgument;
  	}
@@ -516,14 +538,14 @@
 +	uint32_t rows = sweet_div_up(s->height, s->elementHeight);
 +	bool gpu_rows = s->bytesPerElement == 4 && props->getObject("IOSurfacePlaneInfo") == NULL && sweet_surface_gpu_rows();
 +	if (gpu_rows && (s->bytesPerRow & (SWEET_SURFACE_GPU_ROW_ALIGN - 1)) != 0 && !sweet_surface_round_row((uint32_t)s->bytesPerRow)) {
-+		sweet_surface_row_log(s, (uint32_t)s->bytesPerRow);   /* kept as asked */
++		sweet_surface_row_log(s, (uint32_t)s->bytesPerRow, props);   /* kept as asked */
 +		gpu_rows = false;
 +	}
 +	if (gpu_rows) {
 +		if ((s->bytesPerRow & (SWEET_SURFACE_GPU_ROW_ALIGN - 1)) != 0) {
 +			uint32_t asked = (uint32_t)s->bytesPerRow;
 +			s->bytesPerRow = (s->bytesPerRow + SWEET_SURFACE_GPU_ROW_ALIGN - 1) & ~(uint32_t)(SWEET_SURFACE_GPU_ROW_ALIGN - 1);
-+			sweet_surface_row_log(s, asked);
++			sweet_surface_row_log(s, asked, props);
 +		}
 +		/* Turnip sizes a linear image's last level for a height padded to 4 rows
 +		 * (blit over-fetch), so a 1065x282 import needs 284 rows of memory. */
@@ -533,7 +555,7 @@
  
  	OSArray *planes = OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
  	s->planeCount = 0;
-@@ -528,6 +914,7 @@
+@@ -528,6 +935,7 @@
  	IOMemoryMap  *data;
  	IOMemoryMap  *state;
  	uint32_t      count;
@@ -541,7 +563,7 @@
  
  	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
  	void free() APPLE_KEXT_OVERRIDE;
-@@ -541,6 +928,10 @@
+@@ -541,6 +949,10 @@
  	OSSafeReleaseNULL(data);
  	OSSafeReleaseNULL(state);
  	if (surface != NULL) {
@@ -552,7 +574,7 @@
  		sweet_surface_put(surface);
  		surface->release();
  		surface = NULL;
-@@ -591,7 +982,9 @@
+@@ -591,7 +1003,9 @@
  	    void *reference) APPLE_KEXT_OVERRIDE;
  	IOExternalTrap *getTargetAndTrapForIndex(IOService **targetP, UInt32 index) APPLE_KEXT_OVERRIDE;
  
@@ -563,7 +585,7 @@
  	IOReturn trapLock(void *id, void *options, void *seedOut, void *, void *, void *);
  	IOReturn trapUnlock(void *id, void *options, void *seedOut, void *, void *, void *);
  	IOReturn trapRelease(void *id, void *, void *, void *, void *, void *);
-@@ -882,6 +1275,20 @@
+@@ -882,6 +1296,20 @@
  		    name, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
  		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), ret);
  	}
@@ -584,7 +606,7 @@
  	props->release();
  	if (ret != kIOReturnSuccess) {
  		s->release();
-@@ -956,11 +1363,34 @@
+@@ -956,11 +1384,34 @@
  	}
  }
  
@@ -624,7 +646,7 @@
  }
  
  static IOReturn
-@@ -1001,7 +1431,7 @@
+@@ -1001,7 +1452,7 @@
  		return kIOReturnNotFound;
  	}
  #if defined(FUXI)
@@ -633,7 +655,7 @@
    s->release(); return kIOReturnNotReady;
   }
  #endif
-@@ -1041,8 +1471,8 @@
+@@ -1041,8 +1492,8 @@
  }
  
  static IOExternalTrap sweet_surface_traps[] = {

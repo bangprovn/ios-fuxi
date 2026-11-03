@@ -36,6 +36,8 @@
 #include <IOKit/system.h>
 #include <pexpert/pexpert.h>
 #include <libkern/c++/OSArray.h>
+#include <libkern/c++/OSCollectionIterator.h>
+#include <libkern/c++/OSSymbol.h>
 #include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSNumber.h>
 #include <libkern/c++/OSUnserialize.h>
@@ -802,19 +804,38 @@ sweet_surface_round_row(uint32_t row)
 	return sweet_surface_row_mode() != 2 || (row & 63) != 0;
 }
 
-/* The first 64 rounded rows, with the creating process: who asks for which row. */
+/* The first 64 rounded or kept rows, with the creating process and the creation keys: which client asks
+ * for which row, and what tells a decoder's surface (written at the row it asked for) from MaterialKit's. */
 static SInt32 sweet_surface_rows_logged;
 
 static void
-sweet_surface_row_log(SweetSurface *s, uint32_t asked)
+sweet_surface_row_log(SweetSurface *s, uint32_t asked, OSDictionary *props)
 {
 	if (OSIncrementAtomic(&sweet_surface_rows_logged) >= 64) {
 		return;
 	}
-	char name[32] = "?";
+	char name[32] = "?", keys[256] = "";
 	proc_selfname(name, sizeof(name));
-	IOLog("SWEET SURF: row %u -> %u for %ux%u fourcc 0x%08x by %s (sweetsurfrow=%u)\n",
-	    asked, (uint32_t)s->bytesPerRow, s->width, s->height, s->pixelFormat, name, sweet_surface_row_mode());
+	OSCollectionIterator *it = OSCollectionIterator::withCollection(props);
+	if (it != NULL) {
+		size_t used = 0;
+		while (OSSymbol *key = OSDynamicCast(OSSymbol, it->getNextObject())) {
+			const char *k = key->getCStringNoCopy();
+			if (strncmp(k, "IOSurface", 9) == 0) {
+				k += 9;
+			}
+			int w = snprintf(keys + used, sizeof(keys) - used, "%s%s", used ? "," : "", k);
+			if (w < 0 || (size_t)w >= sizeof(keys) - used) {
+				break;
+			}
+			used += (size_t)w;
+		}
+		it->release();
+	}
+	IOLog("SWEET SURF: row %u -> %u for %ux%u fourcc 0x%08x cache %u explicit %d by %s keys %s (sweetsurfrow=%u)
+",
+	    asked, (uint32_t)s->bytesPerRow, s->width, s->height, s->pixelFormat, s->cacheMode,
+	    props->getObject("IOSurfaceBytesPerRow") != NULL, name, keys, sweet_surface_row_mode());
 }
 
 /* Geometry from the creation properties (IOSurface.h keys). */
@@ -843,14 +864,14 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
 	uint32_t rows = sweet_div_up(s->height, s->elementHeight);
 	bool gpu_rows = s->bytesPerElement == 4 && props->getObject("IOSurfacePlaneInfo") == NULL && sweet_surface_gpu_rows();
 	if (gpu_rows && (s->bytesPerRow & (SWEET_SURFACE_GPU_ROW_ALIGN - 1)) != 0 && !sweet_surface_round_row((uint32_t)s->bytesPerRow)) {
-		sweet_surface_row_log(s, (uint32_t)s->bytesPerRow);   /* kept as asked */
+		sweet_surface_row_log(s, (uint32_t)s->bytesPerRow, props);   /* kept as asked */
 		gpu_rows = false;
 	}
 	if (gpu_rows) {
 		if ((s->bytesPerRow & (SWEET_SURFACE_GPU_ROW_ALIGN - 1)) != 0) {
 			uint32_t asked = (uint32_t)s->bytesPerRow;
 			s->bytesPerRow = (s->bytesPerRow + SWEET_SURFACE_GPU_ROW_ALIGN - 1) & ~(uint32_t)(SWEET_SURFACE_GPU_ROW_ALIGN - 1);
-			sweet_surface_row_log(s, asked);
+			sweet_surface_row_log(s, asked, props);
 		}
 		/* Turnip sizes a linear image's last level for a height padded to 4 rows
 		 * (blit over-fetch), so a 1065x282 import needs 284 rows of memory. */
