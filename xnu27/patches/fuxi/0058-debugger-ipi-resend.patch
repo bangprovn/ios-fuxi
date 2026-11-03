@@ -1,0 +1,44 @@
+diff --git a/osfmk/arm/model_dep.c b/osfmk/arm/model_dep.c
+index be2252c..a802cc1 100644
+--- a/osfmk/arm/model_dep.c
++++ b/osfmk/arm/model_dep.c
+@@ -1172,10 +1172,39 @@ DebuggerXCallEnter(
+ 		 * all other CPUs have either responded or are spinning in a context that is
+ 		 * debugger safe.
+ 		 */
++#if defined(FUXI)
++		/*
++		 * Fuxi: an IPI to a core is now and then lost on this board (its GIC path, see
++		 * sheng_sigp_recover), and a stackshot then panicked with "Debugger synch pending".
++		 * Every millisecond, a core that still has SIGPdebug pending is signalled again.
++		 */
++		uint64_t kick_period, kick_at;
++		static uint32_t fuxi_debug_rekicks;
++
++		nanoseconds_to_absolutetime(NSEC_PER_MSEC, &kick_period);
++		kick_at = current_mabs_time + kick_period;
++#endif
+ 		do {
+ 			current_mabs_time = mach_absolute_time();
+ 			sync_pending = os_atomic_load(&debugger_sync, acquire) -
+ 			    os_atomic_load(&panic_stop_count, acquire);
++#if defined(FUXI)
++			if (sync_pending != 0 && current_mabs_time >= kick_at) {
++				kick_at = current_mabs_time + kick_period;
++				for (cpu = 0; cpu <= max_cpu; cpu++) {
++					target_cpu_datap = (cpu_data_t *)CpuDataEntries[cpu].cpu_data_vaddr;
++					if (target_cpu_datap == NULL || target_cpu_datap == cpu_data_ptr ||
++					    !(os_atomic_load(&target_cpu_datap->cpu_signal, acquire) & SIGPdebug) ||
++					    (target_cpu_datap->cpu_signal & SIGPdisabled)) {
++						continue;
++					}
++					PE_cpu_signal(cpu_data_ptr->cpu_id, target_cpu_datap->cpu_id);
++					if (fuxi_debug_rekicks++ < 20) {
++						kprintf("fuxi: debugger IPI to cpu %d sent again\n", cpu);
++					}
++				}
++			}
++#endif
+ 		} while ((sync_pending != 0) && (current_mabs_time < max_mabs_time));
+ 	}
+ 
