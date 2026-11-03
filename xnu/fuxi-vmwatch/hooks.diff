@@ -1,0 +1,41 @@
+--- a/osfmk/vm/vm_map.c
++++ b/osfmk/vm/vm_map.c
+@@ -163,6 +163,9 @@
+ extern int proc_selfpid(void);
+ extern char *proc_name_address(void *p);
+ extern char *proc_best_name(struct proc *p);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include "fuxi_vm_watch.h"   /* boot-arg fuxivmwatch: who removes CoreAnimation memory */
++#endif
+ 
+ #if VM_MAP_DEBUG_APPLE_PROTECT
+ int vm_map_debug_apple_protect = 0;
+@@ -5805,6 +5808,13 @@
+ 		return KERN_INVALID_ARGUMENT;
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (os_atomic_load(&fuxi_vmw_state, relaxed) != 0 && vm_map_pmap(map) != kernel_pmap &&
++	    (new_prot & VM_PROT_WRITE) == 0) {
++		fuxi_vmw_scan(map, start, end, set_max ? "protmax" : "prot", false);
++	}
++#endif
++
+ 	if (new_prot & VM_PROT_COPY) {
+ 		vm_map_offset_t         new_start;
+ 		vm_prot_t               cur_prot, max_prot;
+@@ -8005,6 +8015,14 @@
+ 		state |= VMDS_GAPS_OK;
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* User maps that are not being torn down; the caller holds the map lock. */
++	if ((state & (VMDS_KERNEL_PMAP | VMDS_GAPS_OK)) == 0 &&
++	    os_atomic_load(&fuxi_vmw_state, relaxed) != 0) {
++		fuxi_vmw_scan(map, start, end, "del", true);
++	}
++#endif
++
+ 	interruptible = (flags & VM_MAP_REMOVE_INTERRUPTIBLE) ?
+ 	    THREAD_ABORTSAFE : THREAD_UNINT;
+ 
