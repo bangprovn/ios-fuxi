@@ -87,7 +87,6 @@ static void
 show_store(void)
 {
 	copy_url_for_user_t copy_url = (copy_url_for_user_t)dlsym(RTLD_DEFAULT, "_LSDatabaseCopyURLForUser");
-	display_data_t display = (display_data_t)dlsym(RTLD_DEFAULT, "_LSDisplayData");
 	Class workspace = NSClassFromString(@"LSApplicationWorkspace");
 	Class uttype = NSClassFromString(@"UTType");
 	NSUUID *uuid = nil;
@@ -122,7 +121,41 @@ show_store(void)
 	    [uttype typeWithIdentifier:@"public.data"] != nil ? "present" : "nil",
 	    [uttype typeWithIdentifier:@"com.microsoft.windows-executable"] != nil ? "present" : "nil",
 	    [[NSClassFromString(@"LSBundleRecord") coreTypesBundleRecord] description].UTF8String);
-	/* the dump of this process's store and of the file lsd keeps for the user: counts and the head only */
+}
+
+static void
+show(NSString *what, id obj, NSArray<NSString *> *keys)
+{
+	fprintf(stderr, "lsprobe: %s: %s\n", what.UTF8String, obj == nil ? "nil" : [[obj description] UTF8String]);
+	for (NSString *key in keys) {
+		id v = nil;
+
+		@try {
+			v = [obj valueForKeyPath:key];
+		} @catch (NSException *e) {
+			v = [NSString stringWithFormat:@"<exception %@>", e.reason];
+		}
+		fprintf(stderr, "lsprobe:   %s = %s\n", key.UTF8String, v == nil ? "nil" : [[v description] UTF8String]);
+	}
+}
+
+/* _LSDisplayData (lsregister -dump), last as it may take long (K8o: 3 minutes and more): its counts and head */
+static void
+show_dump(void)
+{
+	display_data_t display = (display_data_t)dlsym(RTLD_DEFAULT, "_LSDisplayData");
+	copy_url_for_user_t copy_url = (copy_url_for_user_t)dlsym(RTLD_DEFAULT, "_LSDatabaseCopyURLForUser");
+	char path[1024] = "";
+
+	if (copy_url != NULL) {
+		CFURLRef u = copy_url(getuid());
+
+		if (u != NULL) {
+			(void)CFURLGetFileSystemRepresentation(u, true, (UInt8 *)path, sizeof(path));
+			CFRelease(u);
+		}
+	}
+	fprintf(stderr, "lsprobe: dump starts\n");
 	for (int k = 0; k < 2 && display != NULL; k++) {
 		char *buf = NULL, *line, *save;
 		size_t len = 0;
@@ -148,22 +181,6 @@ show_store(void)
 		fprintf(stderr, "lsprobe: dump%d (%s): ok %d, %zu bytes, %u lines, %u 'bundle id:', %u 'type id:', error %s\n",
 		    k, k == 0 ? "this process's store" : path, ok, len, lines, bundles, types, e.description.UTF8String);
 		free(buf);
-	}
-}
-
-static void
-show(NSString *what, id obj, NSArray<NSString *> *keys)
-{
-	fprintf(stderr, "lsprobe: %s: %s\n", what.UTF8String, obj == nil ? "nil" : [[obj description] UTF8String]);
-	for (NSString *key in keys) {
-		id v = nil;
-
-		@try {
-			v = [obj valueForKeyPath:key];
-		} @catch (NSException *e) {
-			v = [NSString stringWithFormat:@"<exception %@>", e.reason];
-		}
-		fprintf(stderr, "lsprobe:   %s = %s\n", key.UTF8String, v == nil ? "nil" : [[v description] UTF8String]);
 	}
 }
 
@@ -283,6 +300,7 @@ main(int argc, char **argv)
 				d++;
 			}
 		}
+		show_dump();
 		fprintf(stderr, "lsprobe: DONE\n");
 	}
 	return 0;
