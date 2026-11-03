@@ -1,0 +1,151 @@
+diff --git a/iokit/Kernel/arm/FuxiFramebuffer.cpp b/iokit/Kernel/arm/FuxiFramebuffer.cpp
+index 0d4a511..48c2815 100644
+--- a/iokit/Kernel/arm/FuxiFramebuffer.cpp
++++ b/iokit/Kernel/arm/FuxiFramebuffer.cpp
+@@ -55,6 +55,7 @@
+ #include "FuxiIOSurface.h"
+ 
+ extern "C" void fuxi_fb_start(void);
++extern "C" void fuxi_debug_sync_report(void);       /* osfmk/arm/model_dep.c */
+ 
+ /* IOConnectCallMethod selectors of the framebuffer user client (iOS 16.5; hakios found them unchanged in iOS 26) */
+ enum {
+@@ -1239,6 +1240,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			}
+ 			gFBSummaryAt = now;
+ 			IOLog("FuxiFramebuffer: calls in %llu ms (selector:count)%s\n", nanos / NSEC_PER_MSEC, line);
++			fuxi_debug_sync_report();
+ 		}
+ 	}
+ 
+diff --git a/osfmk/arm/model_dep.c b/osfmk/arm/model_dep.c
+index a802cc1..0e4dfd2 100644
+--- a/osfmk/arm/model_dep.c
++++ b/osfmk/arm/model_dep.c
+@@ -1092,6 +1092,46 @@ DebuggerPatchupThreadState(
+  * @result returns KERN_OPERATION_TIMED_OUT if synchronization times out and
+  * proceed_on_sync_failure is false.
+  */
++
++#if defined(FUXI)
++/*
++ * Fuxi: a core that does not answer a stackshot's SIGPdebug within the timeout is left out of
++ * that stackshot instead of panicking ("Debugger synch pending on cpu N", spindump at boot with
++ * several cores). Its bit in fuxi_debug_excused makes it return at once when the IPI is finally
++ * taken; the next DebuggerXCallEnter() clears the bits, as it signals every core again.
++ * fuxi_debug_sync_report() logs, from an ordinary context, what was seen of such cores.
++ */
++static _Atomic uint32_t fuxi_debug_excused;
++static uint32_t fuxi_debug_excuse_count, fuxi_debug_late_count, fuxi_debug_reported;
++static struct {
++	int cpu;
++	uint32_t signal;
++	int state;
++	uint64_t irq[2], ipi[2], timer[2];
++	uint64_t tid;
++	uint64_t waited_ns;
++} fuxi_debug_excuse_last;
++
++void fuxi_debug_sync_report(void);
++void
++fuxi_debug_sync_report(void)
++{
++	uint32_t count = fuxi_debug_excuse_count;
++
++	if (count == fuxi_debug_reported) {
++		return;
++	}
++	fuxi_debug_reported = count;
++	printf("fuxi: stackshot went on without a core %u times (late answers %u); last cpu %d signal 0x%x "
++	    "state %d thread %llu waited %llu us, while signalled irq %llu->%llu ipi %llu->%llu timer %llu->%llu\n",
++	    count, fuxi_debug_late_count, fuxi_debug_excuse_last.cpu, fuxi_debug_excuse_last.signal,
++	    fuxi_debug_excuse_last.state, fuxi_debug_excuse_last.tid, fuxi_debug_excuse_last.waited_ns / 1000,
++	    fuxi_debug_excuse_last.irq[0], fuxi_debug_excuse_last.irq[1],
++	    fuxi_debug_excuse_last.ipi[0], fuxi_debug_excuse_last.ipi[1],
++	    fuxi_debug_excuse_last.timer[0], fuxi_debug_excuse_last.timer[1]);
++}
++#endif
++
+ kern_return_t
+ DebuggerXCallEnter(
+ 	boolean_t proceed_on_sync_failure, bool is_stackshot)
+@@ -1122,6 +1162,11 @@ DebuggerXCallEnter(
+ 	os_atomic_store(&mp_kdp_trap, 1, relaxed);
+ 	os_atomic_store(&debug_cpus_spinning, 0, relaxed);
+ 	trap_is_stackshot = is_stackshot;
++#if defined(FUXI)
++	os_atomic_store(&fuxi_debug_excused, 0, release);
++	uint64_t fuxi_sync_start = mach_absolute_time();
++	uint64_t fuxi_irq0[MAX_CPUS] = { 0 }, fuxi_ipi0[MAX_CPUS] = { 0 }, fuxi_timer0[MAX_CPUS] = { 0 };
++#endif
+ 
+ 
+ 	/*
+@@ -1144,6 +1189,13 @@ DebuggerXCallEnter(
+ 				continue;
+ 			}
+ 
++#if defined(FUXI)
++			if (cpu < MAX_CPUS) {
++				fuxi_irq0[cpu] = target_cpu_datap->cpu_stat.irq_ex_cnt;
++				fuxi_ipi0[cpu] = target_cpu_datap->cpu_stat.ipi_cnt;
++				fuxi_timer0[cpu] = target_cpu_datap->cpu_stat.timer_cnt;
++			}
++#endif
+ 			kern_return_t ret = cpu_signal(target_cpu_datap, SIGPdebug, (void *)NULL, NULL);
+ 			if (ret == KERN_SUCCESS) {
+ 				os_atomic_inc(&debugger_sync, relaxed);
+@@ -1269,6 +1321,34 @@ DebuggerXCallEnter(
+ #endif
+ 		}
+ 
++#if defined(FUXI)
++		if (is_stackshot) {
++			for (cpu = 0; cpu <= max_cpu && cpu < MAX_CPUS; cpu++) {
++				target_cpu_datap = (cpu_data_t *)CpuDataEntries[cpu].cpu_data_vaddr;
++				if ((target_cpu_datap == NULL) || (target_cpu_datap == cpu_data_ptr) ||
++				    !(os_atomic_load(&target_cpu_datap->cpu_signal, acquire) & SIGPdebug) ||
++				    processor_array[cpu]->state <= PROCESSOR_PENDING_OFFLINE) {
++					continue;
++				}
++				os_atomic_or(&fuxi_debug_excused, 1u << cpu, acq_rel);
++				os_atomic_dec(&debugger_sync, relaxed);
++				os_atomic_dec(&debug_cpus_spinning, relaxed);
++				fuxi_debug_excuse_last.cpu = cpu;
++				fuxi_debug_excuse_last.signal = (uint32_t)target_cpu_datap->cpu_signal;
++				fuxi_debug_excuse_last.state = processor_array[cpu]->state;
++				fuxi_debug_excuse_last.tid = target_cpu_datap->cpu_active_thread ?
++				    thread_tid(target_cpu_datap->cpu_active_thread) : 0;
++				absolutetime_to_nanoseconds(current_mabs_time - fuxi_sync_start, &fuxi_debug_excuse_last.waited_ns);
++				fuxi_debug_excuse_last.irq[0] = fuxi_irq0[cpu];
++				fuxi_debug_excuse_last.irq[1] = target_cpu_datap->cpu_stat.irq_ex_cnt;
++				fuxi_debug_excuse_last.ipi[0] = fuxi_ipi0[cpu];
++				fuxi_debug_excuse_last.ipi[1] = target_cpu_datap->cpu_stat.ipi_cnt;
++				fuxi_debug_excuse_last.timer[0] = fuxi_timer0[cpu];
++				fuxi_debug_excuse_last.timer[1] = target_cpu_datap->cpu_stat.timer_cnt;
++				fuxi_debug_excuse_count++;
++			}
++		}
++#endif
+ 		sync_pending = os_atomic_load(&debugger_sync, acquire) - os_atomic_load(&panic_stop_count, acquire);
+ 		if (sync_pending == 0) {
+ 			return KERN_SUCCESS;
+@@ -1423,6 +1503,18 @@ DebuggerXCall(
+ #endif
+ 	}
+ 
++#if defined(FUXI)
++	{
++		uint32_t bit = 1u << cpu_number();
++
++		if (os_atomic_and_orig(&fuxi_debug_excused, ~bit, acq_rel) & bit) {
++			/* the stackshot that signalled this core went on without it (DebuggerXCallEnter) */
++			fuxi_debug_late_count++;
++			return;
++		}
++	}
++#endif
++
+ 	kstackptr = (vm_offset_t)current_thread()->machine.kstackptr;
+ 
+ #if defined(__arm64__)
