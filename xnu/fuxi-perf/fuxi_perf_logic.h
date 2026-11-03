@@ -83,6 +83,62 @@ static int fp_idle_level(const uint32_t *rows, unsigned count,
  *khz = freq;
  return best;
 }
+/* fl3=1: EPSS L3 ("qcom,epss-l3", Linux osm-l3.c epss_l3_l3_vote). The HLOS
+ * vote +0x90 is a LUT row index. Before any write, the boot vote must name a
+ * row and the block's state +0x20 must run that row's L value (0097 boots:
+ * vote 12, state 0x2dc00c52, L 82 = row 12 = 1574.4 MHz). Returns the fastest
+ * non-turbo row to vote while boosted, or -1 to stay read-only. */
+static int fp_l3_check(const uint32_t *rows, unsigned count, uint32_t enable,
+    uint32_t vote, uint32_t state, unsigned *khz)
+{
+ *khz = 0;
+ if (!(enable & 1) || vote >= count || (state & 255u) != (rows[vote] & 255u)) return -1;
+ return fp_level(rows,count,UINT32_MAX,khz);
+}
+/* fla=MS: launch boost. The latest exec of an application's main executable
+ * holds gold/prime high for MS (Xiaomi perfboostsconfig.xml launch hint
+ * 0x1081: every cluster at max for 2 s). Entry obeys fp_start and a running
+ * launch fp_boost_max, as touch; the hot/limit/slope latch (safe) vetoes both.
+ * The touch duty budget does not apply: the thermal guards are its budget. */
+static int fp_want_launch(int high, int valid, int temp, int safe,
+    uint64_t now, uint64_t launch, uint64_t hold)
+{
+ if (!hold || !launch || !valid || !safe || temp > (int)fp_boost_max ||
+     (!high && temp > (int)fp_start)) return 0;
+ return now >= launch && now-launch <= hold;
+}
+/* fsf=PCT: scroll floor. While the last input is at most hold old, a cool
+ * gold/prime vote rises to the floor (sheng 36ec562 holds 60 % of the top
+ * level; stock scrolling holds DDR/L3 floors and sched_boost 2). The thermal
+ * latch and the ceiling veto it, as for a running boost; no duty budget. */
+static int fp_want_floor(int valid, int temp, int safe,
+    uint64_t now, uint64_t input, uint64_t hold)
+{
+ if (!valid || !safe || temp > (int)fp_boost_max) return 0;
+ return input && now >= input && now-input <= hold;
+}
+/* Floor row: the slowest eligible row at/above pct % of the fastest
+ * non-turbo row, else the fastest at/below high; -1 unless faster than cool. */
+static int fp_floor_level(const uint32_t *rows, unsigned count, unsigned pct,
+    unsigned cool, unsigned high, unsigned *khz)
+{
+ unsigned top, freq = 0, prev = 0;
+ int best = -1;
+ *khz = 0;
+ if (fp_level(rows,count,UINT32_MAX,&top) < 0) return -1;
+ uint64_t want = (uint64_t)top*pct/100;
+ for (unsigned i = 0; i < count; i++) {
+  unsigned f = fp_khz(rows[i]);
+  if (i && f == prev) break;
+  prev = f;
+  if (((rows[i] >> 16) & 7u) == 1 || !f || f < want || f > high) continue;
+  if (best < 0 || f < freq) { best = (int)i; freq = f; }
+ }
+ if (best < 0) best = fp_level(rows,count,high,&freq);
+ if (best < 0 || freq <= cool) return -1;
+ *khz = freq;
+ return best;
+}
 enum { FP_COOL, FP_HIGH, FP_IDLE };
 static int fp_state(int boosted, int valid, int temp, int safe, int duty_ok,
     uint64_t now, uint64_t input, uint64_t swap, uint64_t hold,

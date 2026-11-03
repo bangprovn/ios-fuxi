@@ -77,9 +77,55 @@
  /*
   * thread_vm_bind_group_add:
   *
+--- a/bsd/kern/sys_work_interval.c
++++ b/bsd/kern/sys_work_interval.c
+@@ -34,6 +34,12 @@
+ #include <kern/sched_prim.h>
+ #include <kern/thread.h>
+ #include <kern/task.h>
++#if defined(FUXI)
++/* fwi=1: a diagnostic census in bsd/dev/fuxi_perf.c; the call itself is unchanged. */
++extern void fuxi_wi_census(uint32_t operation);
++extern void fuxi_wi_census_flags(uint32_t create_flags);
++extern void fuxi_wi_census_notify(uint32_t create_flags, uint64_t start, uint64_t finish, uint64_t deadline);
++#endif
+ #include <kern/work_interval.h>
+ 
+ #include <libkern/libkern.h>
+@@ -53,6 +59,9 @@
+ 	struct kern_work_interval_workload_id_args workload_id_args;
+ 	mach_port_name_t port_name;
+ 
++#if defined(FUXI)
++	fuxi_wi_census(operation);
++#endif
+ 	switch (operation) {
+ 	case WORK_INTERVAL_OPERATION_CREATE:
+ 		return ENOTSUP;
+@@ -67,6 +76,9 @@
+ 		if ((error = copyin(uap->arg, &create_params, sizeof(create_params)))) {
+ 			return error;
+ 		}
++#if defined(FUXI)
++		fuxi_wi_census_flags(create_params.wicp_create_flags);
++#endif
+ 
+ 		if ((error = priv_check_cred(kauth_cred_get(), PRIV_WORK_INTERVAL, 0)) != 0) {
+ 			return error;
+@@ -230,6 +242,10 @@
+ 		if ((error = copyin(uap->arg, &notification, sizeof(notification)))) {
+ 			return error;
+ 		}
++#if defined(FUXI)
++		fuxi_wi_census_notify(notification.create_flags, notification.start,
++		    notification.finish, notification.deadline);
++#endif
+ 
+ 
+ 		struct kern_work_interval_args kwi_args = {
 --- a/bsd/dev/fuxi_perf.c
 +++ b/bsd/dev/fuxi_perf.c
-@@ -0,0 +1,714 @@
+@@ -0,0 +1,1099 @@
 +/* Opt-in touch/compile boost for SM8550. One serialized worker owns MMIO.
 + * Input/swap hooks only publish timestamps and queue work; no MMIO or sleeps.
 + * No voltage, PLL, thermal-trip or power-collapse registers are programmed.
@@ -156,6 +202,43 @@
 + * worker tick. [0] while boosted, [1] otherwise; gold and prime only. */
 +static uint64_t fp_cur_sum[2][2], fp_cur_n[2];
 +static unsigned fp_cur_max[2][2];
++/* fpk=MHz (1401 up to the boost cap, default off): a raised gold/prime base.
++ * The cool vote becomes the fastest eligible row at/below MHz while the
++ * thermal guards allow it (a valid sample and no hot/limit/slope latch);
++ * otherwise it falls back to the compiled fp_cool_cap rows. Silver, idle and
++ * the boost rows are unchanged. */
++static unsigned fp_base_mhz, fp_base[3], fp_base_khz[3];
++static int fp_base_on;
++static uint64_t fp_base_time, fp_base_fallback_time;
++/* fl3=1 (default off): EPSS L3 at 0x17d90000 ("qcom,epss-l3", Linux osm-l3.c
++ * epss_l3_l3_vote, sheng b0ccf61): enable +0x0 bit 0, HLOS vote +0x90 (a LUT
++ * row index), LUT +0x100. While any high vote runs, the vote is the fastest
++ * non-turbo row (the stock launch hint's L3 1804.8 MHz); unboost restores the
++ * boot vote read at ready. Only +0x90 is written, never before fp_l3_check
++ * matched the boot vote to the running state; firmware owns L3 voltage. */
++static uintptr_t fp_l3;
++static const uint64_t fp_l3_pa = 0x17d90000;
++static unsigned fp_l3_enabled, fp_l3_ready, fp_l3_boot, fp_l3_high, fp_l3_voted;
++static unsigned fp_l3_boot_khz, fp_l3_high_khz, fp_l3_said, fp_l3_state_max;
++static uint64_t fp_l3_samples, fp_l3_votes;
++/* fla=MS (500..3000, default off): stock launch policy, gold/prime (and L3
++ * with fl3) high for MS after the exec of an application's main executable
++ * (kern_exec.c, patch 0121). Silver keeps cool: fuxicores=0x7c leaves the
++ * A510s to interrupts and bound threads, and a silver boost also raises the
++ * loader's monitor core (cpu@100, docs-lanes/thermal.md).
++ * fsf=PCT (30..90, default off): stock-like scrolling, gold/prime at least
++ * PCT % of their fastest non-turbo row while input is under 1.5 s old.
++ * fsw=MS (100..1000, default off): the same floor while frames flow, i.e.
++ * the last two AppleCLCD swaps are both at most MS old (scripted HID never
++ * reaches the input hook; sheng 36ec562 floors on GPU submits). The level
++ * is fsf's PCT, or 60 with fsw alone. All obey the thermal guards (start,
++ * hot, limit, slope), not the touch duty. */
++static unsigned fp_launch_ms, fp_floor_pct, fp_fsf, fp_frame_ms, fp_floor_touch;
++static uint64_t fp_launch_hold, fp_launch, fp_launch_last, fp_launch_start;
++static uint64_t fp_launch_time, fp_launches, fp_launch_refused, fp_floor_time;
++static uint64_t fp_frame_hold, fp_swap_prev, fp_frame_time;
++static unsigned fp_launch_seen, fp_launch_said, fp_floor[3], fp_floor_khz[3];
++static int fp_launch_high, fp_floor_on, fp_floor_frames;
 +static unsigned fp_enabled, fp_started, fp_ready;
 +static thread_call_data_t fp_call;
 +/* Refusals are EBUSY, never EAGAIN: userland_sysctl() retries a handler's
@@ -420,7 +503,7 @@
 +static int fp_initialize(void)
 +{
 + unsigned percore[3], cool_level[3], high_level[3], cool_freq[3], high_freq[3];
-+ unsigned idle_level[3], idle_freq[3];
++ unsigned idle_level[3], idle_freq[3], base_level[3], base_freq[3], floor_level[3], floor_freq[3];
 + for (unsigned d = 0; d < 3; d++) {
 +  if (!fp_epss[d]) fp_epss[d] = ml_io_map(fp_epss_pa[d], 0x1000);
 +  if (!fp_epss[d]) return fp_init_fail("map",d,fp_epss_pa[d],0,0,0,-1);
@@ -459,6 +542,15 @@
 +  high_level[d] = d ? (unsigned)high : (unsigned)cool;
 +  cool_freq[d] = cool_khz;
 +  high_freq[d] = d ? high_khz : cool_khz;
++  /* fpk: never below cool, never above high (fpk is bounded by the cap). */
++  int base = d && fp_base_mhz ? fp_level(rows,count,fp_base_mhz*1000,&base_freq[d]) : -1;
++  if (base < 0 || base_freq[d] <= cool_khz) { base = cool; base_freq[d] = cool_khz; }
++  base_level[d] = (unsigned)base;
++  /* fsf: never above high, never on silver; no faster row means no floor. */
++  int flr = d && fp_floor_pct ?
++      fp_floor_level(rows,count,fp_floor_pct,cool_khz,high_khz,&floor_freq[d]) : -1;
++  floor_level[d] = flr < 0 ? (unsigned)cool : (unsigned)flr;
++  if (flr < 0) floor_freq[d] = cool_khz;
 + }
 + for (unsigned d = 0; d < 2; d++) {
 +  if (!fp_tsens[d]) fp_tsens[d] = ml_io_map(fp_tsens_pa[d],0x1000);
@@ -471,8 +563,72 @@
 +  fp_percore[d] = percore[d];
 +  fp_cool[d] = cool_level[d]; fp_high[d] = high_level[d];
 +  fp_cool_khz[d] = cool_freq[d]; fp_high_khz[d] = high_freq[d];
++  fp_base[d] = base_level[d]; fp_base_khz[d] = base_freq[d];
++  fp_floor[d] = floor_level[d]; fp_floor_khz[d] = floor_freq[d];
 + }
 + return 1;
++}
++/* fl3: once at ready, read-only. Any unreadable register, a clear enable or
++ * a boot vote that does not name the running row leaves L3 untouched. */
++static void fp_l3_init(void)
++{
++ uint32_t enable = UINT32_MAX, state = UINT32_MAX, vote = UINT32_MAX, rows[40];
++ unsigned count, khz;
++ if (!fp_l3) fp_l3 = ml_io_map(fp_l3_pa,0x1000);
++ if (!fp_l3) { printf("FUXI PERF: L3 off: map %#llx failed\n",fp_l3_pa); return; }
++ if (!fp_read(fp_l3,0,&enable) || !fp_read(fp_l3,0x20,&state) || !fp_read(fp_l3,0x90,&vote)) {
++  printf("FUXI PERF: L3 off: unreadable (enable %#x state %#x vote %#x), no write\n",enable,state,vote);
++  return;
++ }
++ for (count = 0; count < 40; count++) {
++  rows[count] = UINT32_MAX;
++  if (!fp_read(fp_l3,0x100+4*count,&rows[count])) {
++   printf("FUXI PERF: L3 off: LUT row %u unreadable, no write\n",count);
++   return;
++  }
++  if (count && fp_khz(rows[count]) == fp_khz(rows[count-1])) break;
++ }
++ int high = fp_l3_check(rows,count,enable,vote,state,&khz);
++ if (high < 0) {
++  printf("FUXI PERF: L3 off: enable %#x vote %u state %#x do not match the %u-row LUT, no write\n",
++      enable,vote,state,count);
++  return;
++ }
++ fp_l3_boot = fp_l3_voted = vote;
++ fp_l3_boot_khz = fp_khz(rows[vote]);
++ fp_l3_high = (unsigned)high;
++ fp_l3_high_khz = khz;
++ fp_l3_ready = 1;
++ printf("FUXI PERF: L3 vote ready: boot row %u (%u kHz) state %#x, boost row %u (%u kHz, word %#x) of %u; writes +0x90 only\n",
++     vote,fp_l3_boot_khz,state,fp_l3_high,khz,rows[high],count);
++}
++/* Called by the worker after the CPU votes. A lost enable, a write fault or a
++ * readback mismatch restores the boot vote once and ends L3 voting. */
++static void fp_l3_update(int high)
++{
++ if (!fp_l3_ready) return;
++ unsigned want = high ? fp_l3_high : fp_l3_boot;
++ if (want == fp_l3_voted) return;
++ uint32_t enable, got = UINT32_MAX;
++ if (!fp_read(fp_l3,0,&enable) || !(enable & 1)) {
++  fp_l3_ready = 0;
++  printf("FUXI PERF: L3 off: enable %#x lost before voting row %u, no write\n",enable,want);
++  return;
++ }
++ uint64_t v = want;
++ if (fuxi_gpu_access(fp_l3+0x90,&v,1,0) || !fp_read(fp_l3,0x90,&got) || got != want) {
++  uint64_t boot = fp_l3_boot;
++  (void)fuxi_gpu_access(fp_l3+0x90,&boot,1,0);
++  fp_l3_ready = 0;
++  printf("FUXI PERF: L3 off: row %u read back %#x, boot row %u rewritten\n",want,got,fp_l3_boot);
++  return;
++ }
++ fp_l3_voted = want;
++ if (high) { fp_l3_votes++; return; }
++ /* Once: the state +0x20 sampled while the boost row was voted proves it ran. */
++ if (!fp_l3_said++)
++  printf("FUXI PERF: L3 first boost: row %u voted and read back, state L max %u (%u kHz) over %llu samples; boot row %u restored\n",
++      fp_l3_high,fp_l3_state_max,fp_l3_state_max*19200,fp_l3_samples,fp_l3_boot);
 +}
 +/* Timestamp gate also applies to input-triggered calls, so input cannot
 + * accelerate retries or extend the fixed 60-second initialization window. */
@@ -491,6 +647,14 @@
 +  if (fp_idle_after)
 +   printf("FUXI PERF: ready idle LUT %u/%u/%u kHz after %u ms floor %u kHz (clamped to cool)\n",
 +       fp_idle_khz[0],fp_idle_khz[1],fp_idle_khz[2],fp_idle_ms,fp_idle_floor);
++  if (fp_base_mhz)
++   printf("FUXI PERF: ready base fpk=%u: gold/prime %u/%u kHz while thermally safe, else compiled cool %u/%u kHz\n",
++       fp_base_mhz,fp_base_khz[1],fp_base_khz[2],fp_cool_khz[1],fp_cool_khz[2]);
++  if (fp_launch_hold || fp_floor_pct)
++   printf("FUXI PERF: ready policy launch %u ms high %u/%u kHz (silver cool), floor %u%% %u/%u kHz on touch %u frames %u ms (0 = off, cool %u/%u)\n",
++       fp_launch_ms,fp_high_khz[1],fp_high_khz[2],fp_floor_pct,fp_floor_khz[1],fp_floor_khz[2],
++       fp_floor_touch,fp_frame_ms,fp_cool_khz[1],fp_cool_khz[2]);
++  if (fp_l3_enabled) fp_l3_init();
 +  return 1;
 + }
 + if (!fp_attempted) fp_init_report("init retry");
@@ -516,8 +680,12 @@
 +   fp_applied_valid[d] = 0;
 +  } else {
 +   int compile = fp_compile_high && fp_compile_domain(d);
-+   unsigned level = (state == FP_HIGH || compile) && !failed ? fp_high[d] :
-+       state == FP_IDLE ? fp_idle[d] : fp_cool[d];
++   /* Cool is the fpk base when allowed; a floor applies only above it. */
++   int raised = fp_base_on && !failed;
++   unsigned base = raised ? fp_base[d] : fp_cool[d], base_khz = raised ? fp_base_khz[d] : fp_cool_khz[d];
++   unsigned level = (state == FP_HIGH || compile || fp_launch_high) && !failed ? fp_high[d] :
++       state == FP_IDLE ? fp_idle[d] :
++       fp_floor_on && !failed && fp_floor_khz[d] > base_khz ? fp_floor[d] : base;
 +   if (!fp_applied_valid[d] || fp_applied[d] != level) {
 +    if (fp_vote(d,level)) {
 +     fp_applied[d] = fp_domain_failed[d] && state != FP_IDLE ? fp_cool[d] : level;
@@ -628,11 +796,46 @@
 +  * The thermal hot, limit and slope guards are unchanged. */
 + fp_arg("fpb",&fp_budget_ms,20,1000);
 + fp_arg("fpc",&fp_cap_mhz,1402,3200);
++ /* fpk=MHz raised gold/prime base, 1401 up to the boost cap (fpc or 2400). */
++ fp_arg("fpk",&fp_base_mhz,1401,fp_cap_mhz ? fp_cap_mhz : fp_high_cap[1]/1000);
++ /* fla=MS launch boost (stock 2000), fsf=PCT touch floor (sheng 60),
++  * fsw=MS frame floor at fsf's PCT or 60. */
++ fp_arg("fla",&fp_launch_ms,500,3000);
++ fp_arg("fsf",&fp_fsf,30,90);
++ fp_arg("fsw",&fp_frame_ms,100,1000);
++ fp_floor_touch = fp_fsf != 0;
++ fp_floor_pct = fp_fsf ? fp_fsf : fp_frame_ms ? 60 : 0;
++ nanoseconds_to_absolutetime((uint64_t)fp_launch_ms*NSEC_PER_MSEC,&fp_launch_hold);
++ nanoseconds_to_absolutetime((uint64_t)fp_frame_ms*NSEC_PER_MSEC,&fp_frame_hold);
 + nanoseconds_to_absolutetime((uint64_t)fp_budget_ms*NSEC_PER_MSEC,&fp_budget);
 + nanoseconds_to_absolutetime(NSEC_PER_SEC,&fp_duty_window);
 + nanoseconds_to_absolutetime(500ULL*NSEC_PER_MSEC,&fp_recovery);
 + printf("FUXI PERF: thermal hot %u limit %u resume %u start %u dC rise %u dC/s fast %u ms slope %u ms duty %u/1000 ms recovery 500 ms predict 100 ms\n",
 +     fp_hot,fp_limit,fp_resume,fp_start,fp_rise,fp_fast_ms,fp_rate_ms,fp_budget_ms);
++}
++/* fla: one worker sample of the launch window. A new exec that cannot start
++ * (start, hot, limit or slope guard) counts as refused. The first 8 ends and
++ * refusals are logged with the reason and the hottest CPU sensor. */
++static void fp_launch_update(int valid, int temp, int safe, uint64_t now)
++{
++ uint64_t launch = __atomic_load_n(&fp_launch,__ATOMIC_ACQUIRE);
++ int fresh = launch != fp_launch_last;
++ int high = fp_want_launch(fp_launch_high,valid,temp,safe,now,launch,fp_launch_hold);
++ fp_launch_last = launch;
++ if (high && !fp_launch_high) { fp_launches++; fp_launch_start = now; }
++ if (fresh && !high) fp_launch_refused++;
++ if (fp_launch_high && !high && fp_launch_said < 8) {
++  uint64_t ns;
++  absolutetime_to_nanoseconds(now-fp_launch_start,&ns);
++  fp_launch_said++;
++  printf("FUXI PERF: launch boost %llu ms, ended by %s at %d dC\n",ns/1000000,
++      valid && safe && temp <= (int)fp_boost_max ? "hold" : "thermal",temp);
++ } else if (fresh && !high && !fp_launch_high && fp_launch_said < 8) {
++  fp_launch_said++;
++  printf("FUXI PERF: launch boost refused at %d dC (valid %d blocked %d start %u)\n",
++      temp,valid,fp_blocked,fp_start);
++ }
++ fp_launch_high = high;
 +}
 +static void fp_worker_locked(thread_call_param_t arg, thread_call_param_t result)
 +{
@@ -649,6 +852,11 @@
 + uint64_t elapsed = fp_last ? now-fp_last : 0, elapsed_ns;
 + absolutetime_to_nanoseconds(elapsed,&elapsed_ns);
 + if (fp_boosted) fp_boost_time += elapsed;
++ if (fp_base_on) fp_base_time += elapsed;
++ else if (fp_base_mhz) fp_base_fallback_time += elapsed;
++ if (fp_launch_high) fp_launch_time += elapsed;
++ if (fp_floor_on && fp_floor_frames) fp_frame_time += elapsed;
++ else if (fp_floor_on) fp_floor_time += elapsed;
 + unsigned was_idle = __atomic_load_n(&fp_idling,__ATOMIC_RELAXED);
 + if (was_idle) fp_idle_time += elapsed;
 + int temp = -400;
@@ -659,6 +867,9 @@
 + if ((valid && temp >= (int)fp_hot) ||
 +     (fp_prev_valid && fp_prev_temp >= (int)fp_hot)) fp_above_time += elapsed;
 + int safe = fp_thermal_guard(valid,temp,now,elapsed_ns);
++ /* fpk: the raised base needs a valid sample and no thermal latch (hot,
++  * limit, predicted limit, slope; 500 ms at/below resume to clear). */
++ fp_base_on = fp_base_mhz && valid && safe;
 + if (fp_pressure_enabled)
 +  fp_pressure = fp_pressure_hold(fp_pressure,
 +      fp_pressure_level(fp_pressure,valid,temp,fp_blocked,fp_hot,fp_limit,fp_resume),
@@ -671,7 +882,17 @@
 +     __atomic_load_n(&fp_swap,__ATOMIC_ACQUIRE),fp_hold,
 +     fp_idle_after,fp_idle_start,fp_idle_entry);
 + fp_touch_high = state == FP_HIGH;
-+ if (fp_compile_high && state == FP_IDLE) state = FP_COOL;
++ fp_launch_update(valid,temp,safe,now);
++ if ((fp_compile_high || fp_launch_high) && state == FP_IDLE) state = FP_COOL;
++ /* fsf/fsw raise only a cool vote: high is higher, idle (fuxiperfidle) lower.
++  * The time counts as touch whenever an input also asks for the floor. */
++ int touch_floor = fp_floor_touch &&
++     fp_want_floor(valid,temp,safe,now,__atomic_load_n(&fp_input,__ATOMIC_ACQUIRE),fp_hold);
++ int frame_floor = fp_frame_hold &&
++     fp_want_floor(valid,temp,safe,now,__atomic_load_n(&fp_swap_prev,__ATOMIC_ACQUIRE),fp_frame_hold);
++ fp_floor_on = fp_floor_pct && state == FP_COOL && !fp_launch_high && (touch_floor || frame_floor);
++ fp_floor_frames = fp_floor_on && !touch_floor;
++ /* boost is the touch-duty-accounted vote; a launch is outside the duty. */
 + int boost = fp_touch_high || fp_compile_high;
 + /* First sample also establishes cool votes. No boost without fresh TSENS. */
 + fp_update_votes(state);
@@ -681,6 +902,7 @@
 +  fp_update_votes(state);
 + }
 + if (fp_compile_high) fp_compile_voted = 1;
++ fp_l3_update(boost || fp_launch_high);
 + unsigned idle = state == FP_IDLE;
 + if (idle != was_idle) {
 +  if (idle) { fp_idle_entries++; fp_idle_entry = now; }
@@ -704,10 +926,17 @@
 + for (unsigned d = 1; d < 3; d++) {
 +  uint32_t cur;
 +  if (!fp_epss[d] || fp_domain_failed[d] || !fp_read(fp_epss[d],0x20,&cur)) continue;
-+  unsigned mhz = (cur & 0xff)*192/10, b = boost ? 0 : 1;
++  unsigned mhz = (cur & 0xff)*192/10, b = boost || fp_launch_high ? 0 : 1;
 +  fp_cur_sum[b][d-1] += mhz;
 +  if (d == 1) fp_cur_n[b]++;
 +  if (mhz > fp_cur_max[b][d-1]) fp_cur_max[b][d-1] = mhz;
++ }
++ if (fp_l3_ready && fp_l3_voted == fp_l3_high && fp_l3_high != fp_l3_boot) {
++  uint32_t cur;
++  if (fp_read(fp_l3,0x20,&cur)) {
++   fp_l3_samples++;
++   if ((cur & 255) > fp_l3_state_max) fp_l3_state_max = cur & 255;
++  }
 + }
 + fp_last = now;
 + if (!fp_window_start) fp_window_start = now;
@@ -729,6 +958,27 @@
 +       fp_boosts,ns/1000000,fp_max_temp,fp_hot,above_ns/1000000,fp_cuts,
 +       valid,idle ? "idle" : fp_boosted ? "high" : "cool",idle_ns/1000000,fp_idle_entries);
 +  }
++  if (fp_base_mhz) {
++   uint64_t base_ns, fallback_ns;
++   absolutetime_to_nanoseconds(fp_base_time,&base_ns);
++   absolutetime_to_nanoseconds(fp_base_fallback_time,&fallback_ns);
++   printf("FUXI PERF: base fpk=%u raised %llu ms compiled %llu ms (hot, latched or no valid sample)\n",
++       fp_base_mhz,base_ns/1000000,fallback_ns/1000000);
++  }
++  fp_base_time = fp_base_fallback_time = 0;
++  if (fp_launch_hold || fp_floor_pct) {
++   /* By source: touch boosts (and compile leases) are the stats line's;
++    * launch and the floor run outside the touch duty. */
++   uint64_t launch_ns, floor_ns, frame_ns;
++   absolutetime_to_nanoseconds(fp_launch_time,&launch_ns);
++   absolutetime_to_nanoseconds(fp_floor_time,&floor_ns);
++   absolutetime_to_nanoseconds(fp_frame_time,&frame_ns);
++   printf("FUXI PERF: policy touch boosts %llu %llu ms, launches %llu %llu ms refused %llu, floor touch %llu ms frames %llu ms, L3 votes %llu\n",
++       fp_boosts,ns/1000000,fp_launches,launch_ns/1000000,fp_launch_refused,
++       floor_ns/1000000,frame_ns/1000000,fp_l3_votes);
++  }
++  fp_frame_time = 0;
++  fp_launches = fp_launch_time = fp_launch_refused = fp_floor_time = fp_l3_votes = 0;
 +  for (unsigned b = 0; b < 2; b++) {
 +   fp_cur_n[b] = 0;
 +   fp_cur_sum[b][0] = fp_cur_sum[b][1] = 0;
@@ -739,9 +989,14 @@
 +  fp_max_temp = -400;
 +  fp_window_start = now;
 + }
++ /* A raised base under load samples as fast as a boost; idle stays at 100 ms. */
++ uint64_t activity = __atomic_load_n(&fp_input,__ATOMIC_ACQUIRE);
++ uint64_t swapped = __atomic_load_n(&fp_swap,__ATOMIC_ACQUIRE);
++ if (swapped > activity) activity = swapped;
++ int active = activity && now >= activity && now-activity <= fp_hold;
 + uint64_t deadline;
-+ clock_interval_to_deadline(fp_boosted || fp_blocked ? fp_fast_ms : 100,
-+     NSEC_PER_MSEC,&deadline);
++ clock_interval_to_deadline(fp_boosted || fp_launch_high || fp_floor_on || fp_blocked ||
++     (fp_base_on && active) ? fp_fast_ms : 100,NSEC_PER_MSEC,&deadline);
 + /* Do not overrun a fractional remaining duty budget by a full sample. */
 + if (fp_boosted && fp_budget-used < deadline-now) deadline = now+fp_budget-used;
 + if (fp_compile_thread != THREAD_NULL && fp_compile_deadline < deadline)
@@ -754,8 +1009,163 @@
 + fp_worker_locked(arg,result);
 + lck_mtx_unlock(&fp_lock);
 +}
++/* fwi=1 (default off, independent of fuxiperf): a census of work_interval_ctl
++ * (bsd/kern/sys_work_interval.c hooks in 0097), diagnostic only. Each call is
++ * counted by caller process and operation; CREATE2 and NOTIFY also record the
++ * interval type, NOTIFY whether it carries a deadline (deadline > start), the
++ * mean deadline-start and finish-start and how many finished late. A 60 s
++ * thread call prints and clears it; backboardd keeps row 0. Arguments,
++ * results and scheduling are unchanged. Ops 6/7/8 are the os_workgroup
++ * instance start/update/finish (UniXNU 8b6a0f5); xnu-8796 refuses them with
++ * ENOTSUP before reading their argument, so only their count is known.
++ * types: bit N for WORK_INTERVAL_TYPE N<<28 (0x1 default, 0x2 CoreAudio,
++ * 0x4 CA render server, 0x8 CA client, 0x10 HID delivery, 0x20 CoreMedia,
++ * 0x40 ARKit, 0x80 frame compositor). */
++#define FWI_PROCS 24
++#define FWI_OPS 12
++static const char * const fwi_op[FWI_OPS] = {"other","create","destroy","notify","create2",
++    "join","start","update","finish","flags","name","wlid"};
++struct fwi_proc {
++ char name[MAXCOMLEN+1];
++ uint32_t ops[FWI_OPS], types, deadlines, missed;
++ uint64_t budget, used;
++};
++static struct fwi_proc fwi_table[FWI_PROCS], fwi_copy[FWI_PROCS];
++static uint32_t fwi_dropped;
++static unsigned fwi_on, fwi_started;
++static uint64_t fwi_window_start;
++static thread_call_data_t fwi_call;
++static LCK_MTX_DECLARE(fwi_lock, &fp_group);
++static void fwi_clear_locked(void)
++{
++ memset(fwi_table,0,sizeof(fwi_table));
++ snprintf(fwi_table[0].name,sizeof(fwi_table[0].name),"%s","backboardd");
++ fwi_dropped = 0;
++}
++/* The caller's row, or -1 with the table full (counted as dropped). */
++static int fwi_row_locked(const char *name)
++{
++ for (unsigned i = 0; i < FWI_PROCS; i++) {
++  if (!fwi_table[i].name[0]) {
++   snprintf(fwi_table[i].name,sizeof(fwi_table[i].name),"%s",name);
++   return (int)i;
++  }
++  if (!strcmp(fwi_table[i].name,name)) return (int)i;
++ }
++ fwi_dropped++;
++ return -1;
++}
++static void fwi_self(char *name, int size)
++{
++ proc_selfname(name,size);
++ if (!name[0]) snprintf(name,(size_t)size,"%s","?");
++}
++void fuxi_wi_census(uint32_t operation)
++{
++ if (!__atomic_load_n(&fwi_on,__ATOMIC_ACQUIRE)) return;
++ char name[MAXCOMLEN+1] = {};
++ fwi_self(name,sizeof(name));
++ lck_mtx_lock(&fwi_lock);
++ int row = fwi_row_locked(name);
++ if (row >= 0) fwi_table[row].ops[operation < FWI_OPS ? operation : 0]++;
++ lck_mtx_unlock(&fwi_lock);
++}
++void fuxi_wi_census_flags(uint32_t create_flags)
++{
++ if (!__atomic_load_n(&fwi_on,__ATOMIC_ACQUIRE)) return;
++ char name[MAXCOMLEN+1] = {};
++ fwi_self(name,sizeof(name));
++ lck_mtx_lock(&fwi_lock);
++ int row = fwi_row_locked(name);
++ if (row >= 0) fwi_table[row].types |= 1u << (create_flags >> 28);
++ lck_mtx_unlock(&fwi_lock);
++}
++void fuxi_wi_census_notify(uint32_t create_flags, uint64_t start, uint64_t finish, uint64_t deadline)
++{
++ if (!__atomic_load_n(&fwi_on,__ATOMIC_ACQUIRE)) return;
++ char name[MAXCOMLEN+1] = {};
++ fwi_self(name,sizeof(name));
++ lck_mtx_lock(&fwi_lock);
++ int row = fwi_row_locked(name);
++ if (row >= 0) {
++  struct fwi_proc *p = &fwi_table[row];
++  p->types |= 1u << (create_flags >> 28);
++  if (deadline > start) {
++   p->deadlines++;
++   p->budget += deadline-start;
++   if (finish > start) p->used += finish-start;
++   if (finish > deadline) p->missed++;
++  }
++ }
++ lck_mtx_unlock(&fwi_lock);
++}
++static unsigned long long fwi_us(uint64_t sum, uint32_t n)
++{
++ uint64_t ns;
++ absolutetime_to_nanoseconds(sum,&ns);
++ return n ? ns/n/1000 : 0;
++}
++static void fwi_report(thread_call_param_t arg, thread_call_param_t result)
++{
++ (void)arg; (void)result;
++ lck_mtx_lock(&fwi_lock);
++ memcpy(fwi_copy,fwi_table,sizeof(fwi_copy));
++ uint32_t dropped = fwi_dropped;
++ fwi_clear_locked();
++ lck_mtx_unlock(&fwi_lock);
++ uint64_t now = mach_absolute_time(), span_ns, calls = 0;
++ unsigned procs = 0;
++ absolutetime_to_nanoseconds(now-fwi_window_start,&span_ns);
++ fwi_window_start = now;
++ for (unsigned i = 0; i < FWI_PROCS; i++) {
++  uint64_t n = 0;
++  for (unsigned o = 0; o < FWI_OPS; o++) n += fwi_copy[i].ops[o];
++  procs += n != 0;
++  calls += n;
++ }
++ printf("FUXI WI: census %llu ms: %llu calls from %u processes, %u dropped (table %u)\n",
++     span_ns/1000000,calls,procs,dropped,FWI_PROCS);
++ for (unsigned i = 0; i < FWI_PROCS; i++) {
++  struct fwi_proc *p = &fwi_copy[i];
++  char line[320];
++  size_t k = (size_t)snprintf(line,sizeof(line),"FUXI WI: %s",p->name);
++  int any = 0;
++  for (unsigned o = 0; o < FWI_OPS; o++) if (p->ops[o] && k < sizeof(line)) {
++   k += (size_t)snprintf(line+k,sizeof(line)-k," %s %u",fwi_op[o],p->ops[o]);
++   any = 1;
++  }
++  if (!any && i) continue; /* backboardd prints every window, even idle */
++  if (!any && k < sizeof(line)) k += (size_t)snprintf(line+k,sizeof(line)-k," none");
++  if (p->types && k < sizeof(line)) k += (size_t)snprintf(line+k,sizeof(line)-k," types %#x",p->types);
++  if (p->deadlines && k < sizeof(line))
++   k += (size_t)snprintf(line+k,sizeof(line)-k," deadline %u budget_us %llu used_us %llu missed %u",
++       p->deadlines,fwi_us(p->budget,p->deadlines),fwi_us(p->used,p->deadlines),p->missed);
++  printf("%s\n",line);
++ }
++ uint64_t deadline;
++ clock_interval_to_deadline(60,NSEC_PER_SEC,&deadline);
++ (void)thread_call_enter_delayed(&fwi_call,deadline);
++}
++static void fp_wi_start(void)
++{
++ unsigned on = 0;
++ if (fwi_started || !PE_parse_boot_argn("fwi",&on,sizeof(on)) || on != 1) return;
++ fwi_started = 1;
++ lck_mtx_lock(&fwi_lock);
++ fwi_clear_locked();
++ lck_mtx_unlock(&fwi_lock);
++ thread_call_setup_with_options(&fwi_call,fwi_report,NULL,
++     THREAD_CALL_PRIORITY_LOW,THREAD_CALL_OPTIONS_ONCE);
++ fwi_window_start = mach_absolute_time();
++ uint64_t deadline;
++ clock_interval_to_deadline(60,NSEC_PER_SEC,&deadline);
++ (void)thread_call_enter_delayed(&fwi_call,deadline);
++ __atomic_store_n(&fwi_on,1,__ATOMIC_RELEASE);
++ printf("FUXI WI: census on (fwi=1): work_interval_ctl by process and op every 60 s; calls and scheduling unchanged\n");
++}
 +void fuxi_perf_start(void)
 +{
++ fp_wi_start();
 + unsigned enable = 0;
 + (void)PE_parse_boot_argn("fuxiperf",&enable,sizeof(enable));
 + if (enable != 1 || fp_started) return;
@@ -765,6 +1175,8 @@
 + nanoseconds_to_absolutetime(10*NSEC_PER_SEC,&fp_pressure_dwell);
 + (void)PE_parse_boot_argn("fuxicompileboost",&fp_compile_enabled,sizeof(fp_compile_enabled));
 + fp_compile_enabled = fp_compile_enabled == 1;
++ (void)PE_parse_boot_argn("fl3",&fp_l3_enabled,sizeof(fp_l3_enabled));
++ fp_l3_enabled = fp_l3_enabled == 1;
 + /* Keep at least two of logical 2-6 (gold/prime); otherwise ignore. */
 + if (!PE_parse_boot_argn("fuxicores",&fp_recommend,sizeof(fp_recommend)) ||
 +     (fp_recommend & ~0x7fu) || __builtin_popcount(fp_recommend & 0x7cu) < 2) fp_recommend = 0;
@@ -788,15 +1200,34 @@
 +void fuxi_perf_swap(void)
 +{
 + if (__atomic_load_n(&fp_enabled,__ATOMIC_ACQUIRE)) {
-+  __atomic_store_n(&fp_swap,mach_absolute_time(),__ATOMIC_RELEASE);
-+  if (__atomic_load_n(&fp_idling,__ATOMIC_ACQUIRE))
++  uint64_t now = mach_absolute_time();
++  uint64_t prev = __atomic_exchange_n(&fp_swap,now,__ATOMIC_ACQ_REL);
++  __atomic_store_n(&fp_swap_prev,prev,__ATOMIC_RELEASE);
++  /* fsw: the second swap of a burst starts the frame floor at once. Once it
++   * is on, while a higher vote runs or the thermal latch holds, swaps wake
++   * nothing (the worker samples at its own period). */
++  int frame_wake = fp_frame_hold && prev && now >= prev && now-prev <= fp_frame_hold &&
++      !__atomic_load_n(&fp_floor_on,__ATOMIC_RELAXED) && !__atomic_load_n(&fp_blocked,__ATOMIC_RELAXED) &&
++      !__atomic_load_n(&fp_boosted,__ATOMIC_RELAXED) && !__atomic_load_n(&fp_launch_high,__ATOMIC_RELAXED);
++  if (__atomic_load_n(&fp_idling,__ATOMIC_ACQUIRE) || frame_wake)
 +   (void)thread_call_enter(&fp_call);
 + }
++}
++/* Exec hook (bsd/kern/kern_exec.c, patch 0121): the main executable of an
++ * application (".../X.app/X") is starting. Publishes a timestamp and wakes
++ * the worker, like input; no MMIO, no sleep. name is the last path part. */
++void fuxi_perf_launch(const char *name)
++{
++ if (!__atomic_load_n(&fp_enabled,__ATOMIC_ACQUIRE) || !fp_launch_hold) return;
++ unsigned n = __atomic_add_fetch(&fp_launch_seen,1,__ATOMIC_RELAXED);
++ __atomic_store_n(&fp_launch,mach_absolute_time(),__ATOMIC_RELEASE);
++ (void)thread_call_enter(&fp_call);
++ if (n <= 8 || !(n & 63)) printf("FUXI PERF: launch exec %u %s\n",n,name ? name : "?");
 +}
 +#endif
 --- a/bsd/dev/fuxi_perf_logic.h
 +++ b/bsd/dev/fuxi_perf_logic.h
-@@ -0,0 +1,106 @@
+@@ -0,0 +1,162 @@
 +/* Pure policy shared with offline tests. Frequencies always come from EPSS LUT. */
 +#ifndef FUXI_PERF_LOGIC_H
 +#define FUXI_PERF_LOGIC_H
@@ -879,6 +1310,62 @@
 +  if (((rows[i] >> 16) & 7u) == 1 || !f || f < floor || f > cool) continue;
 +  if (best < 0 || f < freq) { best = i; freq = f; }
 + }
++ *khz = freq;
++ return best;
++}
++/* fl3=1: EPSS L3 ("qcom,epss-l3", Linux osm-l3.c epss_l3_l3_vote). The HLOS
++ * vote +0x90 is a LUT row index. Before any write, the boot vote must name a
++ * row and the block's state +0x20 must run that row's L value (0097 boots:
++ * vote 12, state 0x2dc00c52, L 82 = row 12 = 1574.4 MHz). Returns the fastest
++ * non-turbo row to vote while boosted, or -1 to stay read-only. */
++static int fp_l3_check(const uint32_t *rows, unsigned count, uint32_t enable,
++    uint32_t vote, uint32_t state, unsigned *khz)
++{
++ *khz = 0;
++ if (!(enable & 1) || vote >= count || (state & 255u) != (rows[vote] & 255u)) return -1;
++ return fp_level(rows,count,UINT32_MAX,khz);
++}
++/* fla=MS: launch boost. The latest exec of an application's main executable
++ * holds gold/prime high for MS (Xiaomi perfboostsconfig.xml launch hint
++ * 0x1081: every cluster at max for 2 s). Entry obeys fp_start and a running
++ * launch fp_boost_max, as touch; the hot/limit/slope latch (safe) vetoes both.
++ * The touch duty budget does not apply: the thermal guards are its budget. */
++static int fp_want_launch(int high, int valid, int temp, int safe,
++    uint64_t now, uint64_t launch, uint64_t hold)
++{
++ if (!hold || !launch || !valid || !safe || temp > (int)fp_boost_max ||
++     (!high && temp > (int)fp_start)) return 0;
++ return now >= launch && now-launch <= hold;
++}
++/* fsf=PCT: scroll floor. While the last input is at most hold old, a cool
++ * gold/prime vote rises to the floor (sheng 36ec562 holds 60 % of the top
++ * level; stock scrolling holds DDR/L3 floors and sched_boost 2). The thermal
++ * latch and the ceiling veto it, as for a running boost; no duty budget. */
++static int fp_want_floor(int valid, int temp, int safe,
++    uint64_t now, uint64_t input, uint64_t hold)
++{
++ if (!valid || !safe || temp > (int)fp_boost_max) return 0;
++ return input && now >= input && now-input <= hold;
++}
++/* Floor row: the slowest eligible row at/above pct % of the fastest
++ * non-turbo row, else the fastest at/below high; -1 unless faster than cool. */
++static int fp_floor_level(const uint32_t *rows, unsigned count, unsigned pct,
++    unsigned cool, unsigned high, unsigned *khz)
++{
++ unsigned top, freq = 0, prev = 0;
++ int best = -1;
++ *khz = 0;
++ if (fp_level(rows,count,UINT32_MAX,&top) < 0) return -1;
++ uint64_t want = (uint64_t)top*pct/100;
++ for (unsigned i = 0; i < count; i++) {
++  unsigned f = fp_khz(rows[i]);
++  if (i && f == prev) break;
++  prev = f;
++  if (((rows[i] >> 16) & 7u) == 1 || !f || f < want || f > high) continue;
++  if (best < 0 || f < freq) { best = (int)i; freq = f; }
++ }
++ if (best < 0) best = fp_level(rows,count,high,&freq);
++ if (best < 0 || freq <= cool) return -1;
 + *khz = freq;
 + return best;
 +}

@@ -24,7 +24,8 @@
 #define FUXI_INJECT_ENV_MAX     128
 #define FUXI_INJECT_SAID        24      /* the first programs given a library are logged */
 
-/* path is ".../X.app/EXECUTABLE": an application's main executable, not an .appex or a helper deeper inside */
+/* path is ".../X.app/EXECUTABLE": an application's main executable, not an .appex or a helper deeper inside.
+ * With fla=MS the same test, whatever fxinj is, starts the governor's launch boost (fuxi_perf_launch). */
 static inline bool
 fuxi_inject_is_app(const char *path)
 {

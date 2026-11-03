@@ -75,6 +75,14 @@ def main():
     assert 'exec_add_user_string(imgp, CAST_USER_ADDR_T(inject_env), UIO_SYSSPACE, TRUE)' in patch
     assert patch.index('+\t\t\timgp->ip_envc++;') < patch.index(' \t/* Save space for envv[] NULL terminator */')
     assert '+#include "fuxi_exec_inject.h"' in patch and '+++ b/bsd/kern/fuxi_exec_inject.h' in patch
+    # fla: the same application test starts the governor's launch boost (FUXI only, whatever fxinj is),
+    # after the library string, with the signature 0097 defines.
+    assert patch.count('fuxi_perf_launch(') == 2 and '+extern void fuxi_perf_launch(const char *name);' in patch
+    call = '+\t\tif (imgp->ip_ndp->ni_cnd.cn_pnbuf != NULL && fuxi_inject_is_app(imgp->ip_ndp->ni_cnd.cn_pnbuf)) {\n' \
+           '+\t\t\tfuxi_perf_launch(imgp->ip_ndp->ni_cnd.cn_nameptr);\n'
+    assert call in patch and patch.index(call) > patch.index('+\t\t\tfuxi_inject_said(mode')
+    assert patch.index(call) < patch.index(' \t/* Save space for envv[] NULL terminator */')
+    assert '\nvoid fuxi_perf_launch(const char *name)\n{' in (ROOT / 'xnu/fuxi-perf/fuxi_perf.c').read_text()
     # One path for each library everywhere.
     app = define(header, 'FUXI_INJECT_APP_LIB')
     sb = define(header, 'FUXI_INJECT_SB_LIB')

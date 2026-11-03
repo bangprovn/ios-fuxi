@@ -1,11 +1,15 @@
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -5667,6 +5667,37 @@
+@@ -5667,6 +5667,41 @@
   * Note:	The argument and environment vectors are user space pointers
   *		to arrays of user space pointers.
   */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include "fuxi_exec_inject.h"
++#if defined(FUXI)
++/* fla: the governor's launch boost (bsd/dev/fuxi_perf.c); it returns at once when off */
++extern void fuxi_perf_launch(const char *name);
++#endif
 +/* Boot-arg fxinj (fuxi_exec_inject.h), read on every exec: nothing cached, nothing to race on. */
 +static unsigned
 +fuxi_inject_mode(void)
@@ -38,7 +42,7 @@
  __attribute__((noinline))
  static int
  exec_extract_strings(struct image_params *imgp)
-@@ -5840,6 +5871,30 @@
+@@ -5840,6 +5875,36 @@
  		imgp->ip_envc++;
  	}
  
@@ -63,6 +67,12 @@
 +			imgp->ip_envc++;
 +			fuxi_inject_said(mode, imgp->ip_ndp->ni_cnd.cn_nameptr, library);
 +		}
++#if defined(FUXI)
++		/* fla: an application's main executable is starting (the stock launch hint) */
++		if (imgp->ip_ndp->ni_cnd.cn_pnbuf != NULL && fuxi_inject_is_app(imgp->ip_ndp->ni_cnd.cn_pnbuf)) {
++			fuxi_perf_launch(imgp->ip_ndp->ni_cnd.cn_nameptr);
++		}
++#endif
 +	}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 +
@@ -71,7 +81,7 @@
  		error = E2BIG;
 --- a/bsd/kern/fuxi_exec_inject.h
 +++ b/bsd/kern/fuxi_exec_inject.h
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,62 @@
 +/*
 + * fxinj=N (FUXI): DYLD_INSERT_LIBRARIES added by the kernel at exec, for some programs.
 + *
@@ -98,7 +108,8 @@
 +#define FUXI_INJECT_ENV_MAX     128
 +#define FUXI_INJECT_SAID        24      /* the first programs given a library are logged */
 +
-+/* path is ".../X.app/EXECUTABLE": an application's main executable, not an .appex or a helper deeper inside */
++/* path is ".../X.app/EXECUTABLE": an application's main executable, not an .appex or a helper deeper inside.
++ * With fla=MS the same test, whatever fxinj is, starts the governor's launch boost (fuxi_perf_launch). */
 +static inline bool
 +fuxi_inject_is_app(const char *path)
 +{
