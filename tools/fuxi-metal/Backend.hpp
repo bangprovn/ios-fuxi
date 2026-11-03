@@ -105,7 +105,7 @@ struct Texture : TextureLevels {VkImage image{};VkDeviceMemory memory{};VkImageV
  // layout is level zero; levelLayouts[1..levels) track the remaining mips.
  bool rtTarget=false; // FUXI_MTL_RT_SHADOW: this is the persistent optimal-tiled render target of a large linear image (owned by Backend::rtShadows, keyed by the linear memory)
  VkImageTiling tiling=VK_IMAGE_TILING_OPTIMAL;VkImageLayout layout=VK_IMAGE_LAYOUT_UNDEFINED;std::array<VkImageLayout,32> levelLayouts{};void *mapped{};bool imported=false,borrowedMemory=false;
- MemoryKey recycleKey{};bool recyclable=false,slabbed=false;uint64_t memOffset{},memExtent{};SlabMemory<VkDeviceMemory>::Block slabBlock{};std::array<uint64_t,7> importKey{};bool importCached=false;
+ MemoryKey recycleKey{};bool recyclable=false,slabbed=false;uint64_t memOffset{},memExtent{};SlabMemory<VkDeviceMemory>::Block slabBlock{};std::array<uint64_t,8> importKey{};bool importCached=false;
  Buffer *backingBuffer{};size_t backingOffset{},backingRow{};bool shadow=false;uint64_t shadowHash{};bool shadowHashed=false; // hash of the backing rows the last recorded refresh copied
  std::vector<VkImageView> attachmentViews;bool canGenerate=false,filterable=true,blendable=false;uint64_t planStamp=0;};
 struct Sampler {size_t references=1;VkSampler sampler{};uint32_t filters=1;float lodMin=0,lodMax=0;};
@@ -393,7 +393,7 @@ public:
  // FUXI_MTL_SPLIT_SUBMIT window counters (noteSplitSubmit); splitDrained counts failed frames whose queued chunks were drained.
  static inline std::atomic<uint64_t> splitWindow{0},splitSubmits{0},splitChunks{0},splitFirstNs{0},splitLastNs{0},splitGapNs{0},splitGapSamples{0},splitFewPasses{0},splitUnsplit{0},splitDrained{0};
  static inline std::atomic<uint64_t> flushCalls{0},invalidateCalls{0},emptySubmits{0},submitObjectCreates{0},submitPoolCreates{0},submitFrameCreates{0},submitViewCreates{0};
- std::map<std::array<uint64_t,7>,Texture *> imports;
+ std::map<std::array<uint64_t,8>,Texture *> imports;
  struct ReuseCounts {uint64_t commandPools{},commandBuffers{},fences{},queries{},descriptors{},frames{},views{};} reuseCounts;
 #ifdef FUXI_MTL_HOST_TEST
  // Test-only reference mode and deterministic recording failure; no production environment switches.
@@ -780,29 +780,36 @@ public:
  // A nonzero identity (the IOSurface ID) shares one live import per surface mapping, size and plane layout: Core Animation re-wraps the
  // same surfaces every frame, and each wrap otherwise allocates and maps a fresh host-pointer memory object. The cache holds no reference;
  // an entry lives exactly as long as some wrapper or pending command holds the texture.
- Texture *importTexture(void *base,size_t bytes,size_t row,uint32_t width=256,uint32_t height=256,size_t offset=0,uint64_t identity=0) {
+ // format: the Metal pixel format CA asks for (BGRA8 for 'BGRA'; with 64-byte rows reported, also R8/RG8/RGBA8 surfaces such as
+ // Safari's 433x433 'LA08', whose refusal failed backboardd over to the CPU on 3 Nov). A format without linear colour-attachment
+ // support is imported for sampling and transfers only.
+ Texture *importTexture(void *base,size_t bytes,size_t row,uint32_t width=256,uint32_t height=256,size_t offset=0,uint64_t identity=0,uint32_t format=80) {
   std::unique_lock<std::mutex> guard(mutex);requireLive();
-  std::array<uint64_t,7> key{identity,uint64_t(uintptr_t(base)),bytes,row,offset,width,height};
+  std::array<uint64_t,8> key{identity,uint64_t(uintptr_t(base)),bytes,row,offset,width,height,format};
   if(identity){auto hit=imports.find(key);if(hit!=imports.end()){++hit->second->references;++surfaceImportHits;return hit->second;}++surfaceImportMisses;}
   if(!supportsHostImport())throw std::runtime_error("IOSurface same-memory import requires VK_EXT_external_memory_host / NativeAdreno HostImport");
-  constexpr VkFormatFeatureFlags required=VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT|VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT|
+  const VkFormat vkFormat=pixelFormat(format);const size_t texel=texelBytes(format);
+  VkFormatFeatureFlags have=linearFeatures;
+  if(vkFormat!=VK_FORMAT_B8G8R8A8_UNORM){VkFormatProperties fp{};GetPhysicalDeviceFormatProperties(physical,vkFormat,&fp);have=fp.linearTilingFeatures;}
+  constexpr VkFormatFeatureFlags required=VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT|
    VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT|VK_FORMAT_FEATURE_TRANSFER_SRC_BIT|VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
-  if((linearFeatures&required)!=required)throw std::runtime_error("IOSurface linear BGRA8 format features unavailable");
-  if(!base || !bytes || bytes>maxBufferLength || (uintptr_t(base)%hostAlignment) || bytes%hostAlignment || !limits.rows(width,height,4,row,offset,bytes))
+  const bool attachment=have&VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
+  if((have&required)!=required || (vkFormat==VK_FORMAT_B8G8R8A8_UNORM && !attachment))throw std::runtime_error("IOSurface linear format features unavailable");
+  if(!base || !bytes || bytes>maxBufferLength || (uintptr_t(base)%hostAlignment) || bytes%hostAlignment || !limits.rows(width,height,texel,row,offset,bytes))
    throw std::runtime_error("IOSurface host alignment/length/stride");
   VkPhysicalDeviceExternalImageFormatInfo external{};external.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO;
   external.handleType=VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
   VkPhysicalDeviceImageFormatInfo2 info{};info.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2;info.pNext=&external;
-  info.format=VK_FORMAT_B8G8R8A8_UNORM;info.type=VK_IMAGE_TYPE_2D;info.tiling=VK_IMAGE_TILING_LINEAR;
-  info.usage=(orderedColorAccess?VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT:0)|VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  info.format=vkFormat;info.type=VK_IMAGE_TYPE_2D;info.tiling=VK_IMAGE_TILING_LINEAR;
+  info.usage=(attachment?((orderedColorAccess?VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT:0)|VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT):0)|VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT;
   VkExternalImageFormatProperties ep{};ep.sType=VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES;
   VkImageFormatProperties2 props{};props.sType=VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2;props.pNext=&ep;
   check(GetPhysicalDeviceImageFormatProperties2(physical,&info,&props));
   auto features=ep.externalMemoryProperties.externalMemoryFeatures;
   if(!(features&VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) || (features&VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT) ||
      !(ep.externalMemoryProperties.compatibleHandleTypes&external.handleType) || props.imageFormatProperties.maxExtent.width<width || props.imageFormatProperties.maxExtent.height<height)
-   throw std::runtime_error("IOSurface linear BGRA8 sampled/render/transfer import unsupported");
-  auto *t=new Texture{};t->blendable=linearFeatures&VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT;t->width=width;t->height=height;t->usage=info.usage;t->tiling=VK_IMAGE_TILING_LINEAR;t->imported=true;t->defined=true;t->layout=VK_IMAGE_LAYOUT_PREINITIALIZED;
+   throw std::runtime_error("IOSurface linear sampled/transfer import unsupported");
+  auto *t=new Texture{};t->blendable=have&VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT;t->format=format;t->vkFormat=vkFormat;t->width=width;t->height=height;t->usage=info.usage;t->tiling=VK_IMAGE_TILING_LINEAR;t->imported=true;t->defined=true;t->layout=VK_IMAGE_LAYOUT_PREINITIALIZED;
   try {
    VkExternalMemoryImageCreateInfo ei{};ei.sType=VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;ei.handleTypes=external.handleType;
    VkImageCreateInfo ii{};ii.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;ii.pNext=&ei;ii.imageType=info.type;ii.format=info.format;
@@ -812,7 +819,7 @@ public:
    // Turnip picks a 256-byte pitch for a plain linear BGRA8 image; Apple's IOSurface rows are 64-byte aligned and the
    // clients that fill them keep the row they asked for (the switcher's decoded snapshot cards, 3 Nov). Then the image is
    // made again as an explicit DRM_FORMAT_MOD_LINEAR layout at the surface's own row, which Turnip allows for 64-byte rows.
-   if(layout.rowPitch!=row && explicitPitch && row%64==0 && row>=size_t(width)*4) {
+   if(layout.rowPitch!=row && explicitPitch && row%64==0 && row>=size_t(width)*texel) {
     DestroyImage(device,t->image,nullptr);t->image=VK_NULL_HANDLE;
     VkSubresourceLayout plane{};plane.rowPitch=row;
     VkImageDrmFormatModifierExplicitCreateInfoEXT ex{};ex.sType=VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT;

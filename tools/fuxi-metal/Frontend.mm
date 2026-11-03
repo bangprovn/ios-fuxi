@@ -1907,14 +1907,18 @@ static NSString *surfaceDescriptorText(IOSurfaceRef surface,NSUInteger plane){
  // reinterpret _RB4 as BGRA or silently discard its red/blue plane.
  CHECK("IOSurface.planeCount",planes,actual<=1);
  CHECK("IOSurface.plane",plane,actual==0);
- CHECK("IOSurface.fourcc",IOSurfaceGetPixelFormat(surface),actual==0x42475241);
+ // 'BGRA' as BGRA8, and (64-byte rows reported) any single-plane surface CA reads as R8, RG8 or RGBA8 with the matching
+ // element size, e.g. Safari's 'LA08' as RG8 (3 Nov; its refusal failed backboardd over to the CPU).
+ const MTLPixelFormat wanted=d.pixelFormat;
+ const bool otherFormat=wanted==MTLPixelFormatR8Unorm || wanted==MTLPixelFormatRG8Unorm || wanted==MTLPixelFormatRGBA8Unorm;
+ CHECK("IOSurface.fourcc",IOSurfaceGetPixelFormat(surface),actual==0x42475241 || otherFormat);
  if(!textureDescriptorAccepted(d,owner(self)->backend->maxTextureDimension()))return nil;
  size_t width=planes?IOSurfaceGetWidthOfPlane(surface,plane):IOSurfaceGetWidth(surface);
  size_t height=planes?IOSurfaceGetHeightOfPlane(surface,plane):IOSurfaceGetHeight(surface);
  size_t row=planes?IOSurfaceGetBytesPerRowOfPlane(surface,plane):IOSurfaceGetBytesPerRow(surface);
  CHECK("IOSurface.width",width,actual==d.width);CHECK("IOSurface.height",height,actual==d.height);
- CHECK("IOSurface.bytesPerElement",planes?IOSurfaceGetBytesPerElementOfPlane(surface,plane):IOSurfaceGetBytesPerElement(surface),actual==4);
- CHECK("IOSurface.pixelFormat",d.pixelFormat,actual==MTLPixelFormatBGRA8Unorm);
+ CHECK("IOSurface.pixelFormat",d.pixelFormat,actual==MTLPixelFormatBGRA8Unorm || otherFormat);
+ CHECK("IOSurface.bytesPerElement",planes?IOSurfaceGetBytesPerElementOfPlane(surface,plane):IOSurfaceGetBytesPerElement(surface),actual==fuxi::metalTexelBytes((uint32_t)wanted));
  CHECK("IOSurface.textureType",d.textureType,actual==MTLTextureType2D);CHECK("IOSurface.mipmapLevelCount",d.mipmapLevelCount,actual==1);CHECK("IOSurface.storageMode",d.storageMode,actual==MTLStorageModeShared);
  CHECK("IOSurface.hostImport",owner(self)->backend->supportsHostImport(),actual);
  CHECK("IOSurface.lock",IOSurfaceLock(surface,kIOSurfaceLockAvoidSync,nullptr),actual==0);
@@ -1925,10 +1929,10 @@ static NSString *surfaceDescriptorText(IOSurfaceRef surface,NSUInteger plane){
   void *base=IOSurfaceGetBaseAddress(surface);void *start=planes?IOSurfaceGetBaseAddressOfPlane(surface,plane):base;
   if(!base || !start || uintptr_t(start)<uintptr_t(base))throw std::runtime_error("IOSurface plane base address");
   size_t offset=uintptr_t(start)-uintptr_t(base);
-  t->_texture=owner(self)->backend->importTexture(base,IOSurfaceGetAllocSize(surface),row,(uint32_t)width,(uint32_t)height,offset,IOSurfaceGetID(surface));
+  t->_texture=owner(self)->backend->importTexture(base,IOSurfaceGetAllocSize(surface),row,(uint32_t)width,(uint32_t)height,offset,IOSurfaceGetID(surface),(uint32_t)wanted);
  }catch(const std::exception &e) {failureLog("FUXI MTL: texture reject IOSurfaceImport 0 desc=%s %s reason=%s\n",textureDescriptorText(d).UTF8String,layout.UTF8String,e.what());[t release];return nil;}
  if(gpuScanout){IOSurfaceUnlock(surface,0,nullptr);t->_surfaceLockHeld=NO;}
- fprintf(stderr,"FUXI MTL: IOSurface import PASS BGRA8 %lux%lu same-memory %s\n",(unsigned long)d.width,(unsigned long)d.height,layout.UTF8String);return t;
+ fprintf(stderr,"FUXI MTL: IOSurface import PASS %s %lux%lu same-memory %s\n",wanted==MTLPixelFormatBGRA8Unorm?"BGRA8":wanted==MTLPixelFormatR8Unorm?"R8":wanted==MTLPixelFormatRG8Unorm?"RG8":"RGBA8",(unsigned long)d.width,(unsigned long)d.height,layout.UTF8String);return t;
 }
 // Repeat, mirror repeat, clamp-to-zero and clamp-to-border map to core Vulkan; mirror clamp-to-edge stays refused.
 static bool fuxiAddressMode(MTLSamplerAddressMode m) {return m==MTLSamplerAddressModeClampToEdge || m==MTLSamplerAddressModeRepeat ||
