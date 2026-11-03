@@ -640,7 +640,7 @@ def ci():
                        check=True, capture_output=True)
         assert sorted(p.name for p in out.iterdir()) == ['cmdline-cpus7.txt', 'cmdline.txt', 'fuxi27-cpus7.adt', 'fuxi27.adt']
         one, seven = (out / 'cmdline.txt').read_text(), (out / 'cmdline-cpus7.txt').read_text()
-        assert ' cpus=1 ' in one and ' cpus=7 ' in seven and 'sheng-smp=1' in seven and 'sheng-smp' not in one
+        assert ' cpus=1 ' in one and ' cpus=7 ' in seven and 'sheng-smp=1' in seven and 'sheng-smp' not in one and 'armcpu-spi-ipi=1' in seven
         assert len(seven.encode()) < 1024 and 'rd=' not in one   # K1: no root device yet
         assert len(adt.parse((out / 'fuxi27-cpus7.adt').read_bytes())[0].children[1].children) == 7
     sh = ['bash', str(ROOT / 'tools/ci/build.sh')]

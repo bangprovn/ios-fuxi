@@ -50,7 +50,9 @@ def ios27(out):
             raise SystemExit(f"{name} exceeds the loader's 16 KiB ADT limit")
         (out / name).write_bytes(blob)
     return {"cmdline.txt": IOS27,
-            "cmdline-cpus7.txt": IOS27.replace(" cpus=1 ", " cpus=7 ") + " sheng-smp=1"}
+            # armcpu-spi-ipi=1: ICC_SGI1R_EL1 delivers no SGI on this board, so IPIs are software-pended
+            # SPIs (K9n: 0 SGIs taken on every core; K9o: every core takes them, stackshots sync).
+            "cmdline-cpus7.txt": IOS27.replace(" cpus=1 ", " cpus=7 ") + " sheng-smp=1 armcpu-spi-ipi=1"}
 
 
 def main():
