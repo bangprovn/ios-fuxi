@@ -265,10 +265,12 @@ show_registration_data(const char *path)
 	NSError *e = nil;
 	id node;
 
-	if (defaults != nil) {
+	if (defaults != nil && [defaults respondsToSelector:@selector(sharedInstance)]) {
 		id d = [defaults sharedInstance];
 
 		fprintf(stderr, "lsprobe: data %s: hasServer %d isServer %d, lsd pid %d\n", path, [d hasServer], [d isServer], lsd);
+	} else {
+		fprintf(stderr, "lsprobe: data %s: lsd pid %d\n", path, lsd);
 	}
 	if (realpath(path, real) == NULL) {
 		strlcpy(real, path, sizeof(real));
