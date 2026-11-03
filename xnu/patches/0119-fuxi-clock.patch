@@ -1,0 +1,115 @@
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -9,6 +9,8 @@
+ #include <IOKit/IOPlatformExpert.h>
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
+ 
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+@@ -18,9 +20,95 @@
+ 	void processTopLevel(IORegistryEntry *root) APPLE_KEXT_OVERRIDE;
+ 	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
+ 	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
++	long getGMTTimeOfDay(void) APPLE_KEXT_OVERRIDE;
++	void setGMTTimeOfDay(long secs) APPLE_KEXT_OVERRIDE;
+ };
+ 
+ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
++
++/*
++ * The time of day. The phone's real-time clock (in the PMK8550) is not driven,
++ * so whoever starts the kernel says what time it is: the boot-arg
++ * epoch=<seconds since 1970, UTC> or, failing that, /chosen boot-epoch (8 bytes,
++ * little-endian), which a host script can put into the ADT without spending
++ * boot-line bytes. It is taken as the time at which this platform expert starts
++ * (about a second into the kernel), so a host that stamps it just before
++ * `fastboot boot` leaves the calendar behind by the upload. The system timer
++ * counts on from there; settimeofday (timed, date) moves the base until the
++ * next boot. Without either the calendar starts in 1970, as before.
++ * After HakiOS's findBootEpoch (oosexgang/hakios-xnu-kernel, GenericARMPE.cpp).
++ */
++static long fuxi_boot_epoch;            /* calendar seconds at which the system timer read zero */
++static bool fuxi_boot_epoch_known;
++
++static void
++fuxi_find_boot_epoch(void)
++{
++	uint64_t epoch = 0;
++	const char *from = "epoch=";
++	clock_sec_t secs;
++	clock_usec_t usecs;
++
++	if (fuxi_boot_epoch_known) {
++		return;
++	}
++	fuxi_boot_epoch_known = true;
++	if (!PE_parse_boot_argn("epoch", &epoch, sizeof(epoch)) || epoch == 0) {
++		IORegistryEntry *chosen = IORegistryEntry::fromPath("/chosen", gIODTPlane);
++		OSData *data = chosen ? OSDynamicCast(OSData, chosen->getProperty("boot-epoch")) : NULL;
++
++		epoch = 0;
++		if (data != NULL && data->getLength() == sizeof(epoch)) {
++			memcpy(&epoch, data->getBytesNoCopy(), sizeof(epoch));
++		}
++		OSSafeReleaseNULL(chosen);
++		from = "/chosen boot-epoch";
++	}
++	clock_get_system_microtime(&secs, &usecs);
++	if (epoch <= (uint64_t)secs) {
++		IOLog("FUXI CLOCK: no epoch (boot-arg epoch= or /chosen boot-epoch): the calendar starts at 1970\n");
++		return;
++	}
++	fuxi_boot_epoch = (long)epoch - (long)secs;
++	IOLog("FUXI CLOCK: %s %llu at uptime %lu.%06u s, so the timer's zero is %ld\n",
++	    from, epoch, (unsigned long)secs, (unsigned)usecs, fuxi_boot_epoch);
++}
++
++long
++SweetPlatformExpert::getGMTTimeOfDay(void)
++{
++	static bool logged;
++	clock_sec_t secs;
++	clock_usec_t usecs;
++
++	fuxi_find_boot_epoch();
++	if (fuxi_boot_epoch == 0) {
++		return 0;
++	}
++	clock_get_system_microtime(&secs, &usecs);
++	if (!logged) {
++		logged = true;
++		IOLog("FUXI CLOCK: the calendar reads %ld at uptime %lu s\n", fuxi_boot_epoch + (long)secs, (unsigned long)secs);
++	}
++	return fuxi_boot_epoch + (long)secs;
++}
++
++void
++SweetPlatformExpert::setGMTTimeOfDay(long secs)
++{
++	static SInt32 logged;
++	clock_sec_t uptime;
++	clock_usec_t usecs;
++	long before = fuxi_boot_epoch;
++
++	clock_get_system_microtime(&uptime, &usecs);
++	fuxi_boot_epoch = secs - (long)uptime;
++	fuxi_boot_epoch_known = true;
++	if (OSIncrementAtomic(&logged) < 8) {
++		IOLog("FUXI CLOCK: set to %ld at uptime %lu s, %ld s from the base before\n",
++		    secs, (unsigned long)uptime, before != 0 ? fuxi_boot_epoch - before : 0);
++	}
++}
+ 
+ bool
+ SweetPlatformExpert::start(IOService *provider)
+@@ -29,6 +117,7 @@
+ 	if (!IODTPlatformExpert::start(provider)) {
+ 		return false;
+ 	}
++	fuxi_find_boot_epoch();
+ 	registerService();
+ 	IOLog("SWEET: platform expert registered\n");
+ 	return true;
