@@ -1703,12 +1703,25 @@ static int IOLockSleepDeadline(IOLock *,void *,uint64_t,int) {if(sleepHook){slee
 #define kIOSurfaceLockReadOnly 1
 #define kIOReturnNotFound 3
 #define kIOReturnNotReady 4
-using IOReturn=int;
+using IOReturn=int;using SInt32=int32_t;
 struct IOSurfaceRootUserClient {
- IOLock *fLock=nullptr;void *fRefs=nullptr;
+ IOLock *fLock=nullptr;void *fRefs=nullptr;bool fGpuLeases=false;
  IOReturn trapLock(void *,void *,void *,void *,void *,void *);
  IOReturn trapUnlock(void *,void *,void *,void *,void *,void *);
 };
+// Read lock wait: the client's ref (fRefs points at it here) counts its own writes; boot line, process name and time are stubbed.
+struct SweetSurfaceRef {uint32_t writes=0;unsigned refs=1;void retain(){refs++;}void release(){assert(refs>1);refs--;}};
+static SweetSurfaceRef *sweet_surface_own_ref(IOLock *,void *refs,uint32_t,int delta) {
+ auto *r=(SweetSurfaceRef *)refs;if(!r)return nullptr;
+ if(delta>0)r->writes++;else if(delta<0 && r->writes)r->writes--;
+ r->retain();return r;}
+static void sweet_surface_own_writes(IOLock *lock,void *refs,uint32_t id,int delta) {SweetSurfaceRef *r=sweet_surface_own_ref(lock,refs,id,delta);if(r)r->release();}
+static SInt32 sweet_gpu_clients_logged;static int32_t OSIncrementAtomic(volatile int32_t *p) {return (*p)++;}
+static uint32_t bootScanout=1;static unsigned bootParses;
+static int PE_parse_boot_argn(const char *name,void *value,int size) {assert(!strcmp(name,"fuxigpuscanout") && size==4);bootParses++;memcpy(value,&bootScanout,4);return 1;}
+static const char *procName="SpringBoard";static void proc_selfname(char *buf,int size) {snprintf(buf,size,"%s",procName);}
+static void absolutetime_to_nanoseconds(uint64_t t,uint64_t *ns) {*ns=t*1000;}
+static SweetSurface *readHeld;
 static SweetSurface *trapSurface;
 static SweetSurface *sweet_surface_held(IOLock *,void *,uint32_t) {if(trapSurface)trapSurface->retain();return trapSurface;}
 static IOReturn sweet_surface_seed_out(SweetSurface *,void *,bool) {return 0;}
@@ -1908,9 +1921,61 @@ static int IOLog(const char *format,...) {va_list args;va_start(args,format);vsn
  puts("PASS: writer lease display wait (fuxiearly bit 2): off/no wait, wait until the display drop, none with a writer outstanding, 25 ms bound, quarantine, wake only with waiters");
  }
 '''
+        extra += r'''
+ // fuxigpuscanout=1: a read lock without AvoidSync waits while another client holds a writer lock (FuxiMetal's leases until the fence):
+ // never for its own writers, never for a client that takes AvoidSync writer locks, never with AvoidSync; 1 s bound, then that writer
+ // epoch is not waited for again; a quarantine ends the wait; an unlock wakes only with a reader waiting; logged.
+ {
+ IOMemoryDescriptor rm;SweetSurface rs;rs.memory=&rm;rs.id=19;rs.width=1125;rs.height=2436;readHeld=&rs;trapSurface=&rs;owned=true;
+ SweetSurfaceRef springRef,backRef;IOSurfaceRootUserClient spring,back;spring.fRefs=&springRef;back.fRefs=&backRef;
+ #define TL(c,o) (c).trapLock((void *)19,(void *)(uintptr_t)(o),nullptr,nullptr,nullptr,nullptr)
+ #define TU(c,o) (c).trapUnlock((void *)19,(void *)(uintptr_t)(o),nullptr,nullptr,nullptr,nullptr)
+ // backboardd: the pending AvoidSync lease at commit (marks it a GPU client, logged once), then the active lease from the worker.
+ unsigned logs=zcLogs;procName="backboardd";
+ assert(TL(back,2)==0 && back.fGpuLeases && rs.gpuWriters==1 && !backRef.writes && zcLogs==logs+1 && strstr(zcLog,"backboardd takes AvoidSync writer locks"));
+ assert(TL(back,0)==0 && rs.gpuWriters==2 && !backRef.writes && zcLogs==logs+1);
+ // Its own read lease (a sampled surface) never sleeps, nor does an AvoidSync read.
+ sleepHook=[](){assert(!"no read wait");};uint32_t waits=sweet_read_waits;
+ assert(TL(back,1)==0 && TU(back,1)==0 && TL(spring,3)==0 && TU(spring,3)==0 && sweet_read_waits==waits && !spring.fGpuLeases);
+ // SpringBoard's read waits until both leases retire (the sleep stands in for the GPU fence), then logs once.
+ procName="SpringBoard";sleepHook=[](){readHeld->gpuWriters--;};
+ assert(TL(spring,1)==0 && !rs.gpuWriters && sweet_read_waits==waits+1 && zcLogs==logs+2);
+ assert(strstr(zcLog,"SWEET SURF: read lock by SpringBoard id 19 1125x2436 waited ") && strstr(zcLog," us for 2 writer(s) (waits=") && !strstr(zcLog,"timed out"));
+ assert(TU(spring,1)==0);
+ // Its own write lock (counted on its ref) never makes its read wait; the unlock drops the count.
+ sleepHook=[](){assert(!"no wait for own writer");};
+ assert(TL(spring,0)==0 && springRef.writes==1 && rs.gpuWriters==1 && TL(spring,1)==0 && TU(spring,1)==0 && sweet_read_waits==waits+1);
+ assert(zcLogs==logs+3 && strstr(zcLog,"read lock by SpringBoard id 19 1125x2436, no wait (writers 1, own 1)\n"));
+ assert(TU(spring,0)==0 && !springRef.writes && !rs.gpuWriters && springRef.refs==1);
+ // A failed writer lock (quarantine) takes its count back.
+ rs.gpuQuarantined=true;assert(TL(spring,0)==kIOReturnNotReady && !springRef.writes);rs.gpuQuarantined=false;
+ // Unlocks wake waiters only while a reader waits.
+ unsigned wakes=lockWakes;assert(sweet_gpu_writer(&rs,true) && sweet_gpu_writer(&rs,false) && lockWakes==wakes);
+ sweet_read_waiters=1;assert(sweet_gpu_writer(&rs,true) && sweet_gpu_writer(&rs,false) && lockWakes==wakes+1);sweet_read_waiters=0;
+ // A lease that never ends: 1 s, logged as timed out, and that writer epoch is not waited for again; a new epoch is.
+ sleepHook=nullptr;assert(TL(back,0)==0 && rs.gpuWriters==1);uint64_t before=ticks;
+ assert(TL(spring,1)==0 && ticks-before>=1000000 && sweet_read_waits==waits+2 && sweet_read_timeouts==1 && rs.gpuReadSkipEpoch==rs.gpuWriterEpoch+1);
+ assert(strstr(zcLog,"for 1 writer(s), timed out: read anyway (waits=") && strstr(zcLog,"timeouts=1 "));
+ before=ticks;assert(TL(spring,1)==0 && ticks-before<1000 && sweet_read_waits==waits+2 && strstr(zcLog,"no wait (writers 1, own 0, epoch timed out before)"));
+ // Small surfaces that need no wait are not logged; the 1M-pixel ones only 8 times.
+ rs.width=100;logs=zcLogs;assert(TL(spring,1)==0 && zcLogs==logs);rs.width=1125;
+ assert(TU(back,0)==0 && !rs.gpuWriters && TL(back,0)==0);sleepHook=[](){readHeld->gpuWriters--;};
+ assert(TL(spring,1)==0 && sweet_read_waits==waits+3 && sweet_read_timeouts==1);
+ // A quarantine during the wait ends it.
+ assert(TL(back,0)==0);sleepHook=[](){readHeld->gpuQuarantined=true;};
+ assert(TL(spring,1)==0 && sweet_read_waits==waits+4 && rs.gpuWriters==1);rs.gpuQuarantined=false;rs.gpuWriters=0;
+ // Off without fuxigpuscanout=1 (FuxiMetal then holds its import lock for the texture's life): parsed once, no wait.
+ sweet_read_sync=-1;bootScanout=0;unsigned parses=bootParses;sleepHook=[](){assert(!"no wait when off");};
+ assert(TL(back,0)==0 && TL(spring,1)==0 && TL(spring,1)==0 && bootParses==parses+1 && sweet_read_waits==waits+4);
+ assert(TU(back,0)==0);sweet_read_sync=-1;bootScanout=1;sleepHook=nullptr;trapSurface=nullptr;readHeld=nullptr;owned=false;
+ #undef TL
+ #undef TU
+ puts("PASS: read lock waits for other clients' writer leases (fuxigpuscanout=1): until retired, not for its own writers, not for GPU-lease clients or AvoidSync, 1 s bound and epoch skip, quarantine, wake only with readers, off, log");
+ }
+'''
         model = cache.MODEL.replace(' IOLockFree(sweet_gpu_lock);', extra + ' IOLockFree(sweet_gpu_lock);')
         model = model.replace('assert(sweet_surface_gpu_poll(&elapsed)==1);IOLockLock(p);', 'if(sweet_present_count)sweet_surface_present_end();else assert(sweet_surface_gpu_poll(&elapsed)==1);IOLockLock(p);')
-        compile_run(tmp, 'cache', cache.PREFIX.replace('static void IOLockWakeup(IOLock *p,void *,bool) { assert(p->held); }', 'static unsigned lockWakes;static void IOLockWakeup(IOLock *p,void *,bool) { assert(p->held);lockWakes++; }').replace(' uint64_t getLength()', ' uint64_t phys=0;uint64_t getPhysicalSegment(uint64_t off,uint64_t *len,int){*len=4096;return phys+off/4096*8192;}\n uint64_t getLength()').replace('uint64_t gpuReadyTime=0;', 'uint32_t id=0,gpuLockSeq=0,gpuWriterFence=0,width=0,height=0;uint64_t gpuReadyTime=0,gpuWriterSerial=0,gpuWriterEpoch=0,gpuCleanSerial=0,gpuCleanEpoch=0;bool gpuCleanValid=false;uint32_t displayUses=0;') + stubs + declarations + funcs + model, cpp=True)
+        compile_run(tmp, 'cache', cache.PREFIX.replace('static void IOLockWakeup(IOLock *p,void *,bool) { assert(p->held); }', 'static unsigned lockWakes;static void IOLockWakeup(IOLock *p,void *,bool) { assert(p->held);lockWakes++; }').replace(' uint64_t getLength()', ' uint64_t phys=0;uint64_t getPhysicalSegment(uint64_t off,uint64_t *len,int){*len=4096;return phys+off/4096*8192;}\n uint64_t getLength()').replace('uint64_t gpuReadyTime=0;', 'uint32_t id=0,gpuLockSeq=0,gpuWriterFence=0,width=0,height=0;uint64_t gpuReadyTime=0,gpuWriterSerial=0,gpuWriterEpoch=0,gpuCleanSerial=0,gpuCleanEpoch=0,gpuReadSkipEpoch=0;bool gpuCleanValid=false;uint32_t displayUses=0;') + stubs + declarations + funcs + model, cpp=True)
         source = (ROOT / 'xnu/fuxi-unixnu/SweetFramebuffer.cpp').read_text()
         declaration = source[source.index('class AppleCLCD :'):source.index('OSDefineMetaClassAndStructors(AppleCLCD')]
         declaration = declaration.replace(': public IOMobileFramebuffer', '').replace('OSDeclareDefaultStructors(AppleCLCD);', 'public:')

@@ -420,6 +420,64 @@ static void sweet_display_wait(SweetSurface *s)
  uint64_t d = mach_absolute_time() - start;
  sweet_display_waits++; sweet_display_wait_sum += d; if (d > sweet_display_wait_max) sweet_display_wait_max = d; if (timedOut) sweet_display_wait_timeouts++;
 }
+/* fuxigpuscanout=1: FuxiMetal holds a writer lease on every IOSurface a command buffer renders into, from commit (the pending AvoidSync
+ * lease) until its fence has retired (SurfaceLease). On iOS a lock without kIOSurfaceLockAvoidSync waits for the GPU's pending writes,
+ * and CoreAnimation answers a snapshot (SplashBoard's launch images) once it is committed, not drawn. A read lock returned at once here,
+ * so SplashBoard copied a launch image the GPU had not drawn yet: black (the new surface's zeros) from the top down to wherever its
+ * row-by-row copy met the GPU's write, ending mid-row (r-v23 Phone 14 %, r-v23-fmtl1 Phone 34 %). A read lock without AvoidSync now
+ * waits while another client holds a writer lock on the surface, SWEET_READ_WAIT_MS at most; after a timeout that writer epoch is not
+ * waited for again (a lease that never ends: its client died). A client that takes AvoidSync writer locks (FuxiMetal: its imports and
+ * pending leases) never waits, as its own read leases must not sleep, nor does a client for its own writers. The first 16 waits, every
+ * 256th and the first 16 timeouts are logged, and the first 8 read locks of a 1M-pixel surface that did not wait (who reads, writers). */
+#define SWEET_READ_WAIT_MS 1000
+static int sweet_read_sync = -1;
+static uint32_t sweet_read_waiters, sweet_read_waits, sweet_read_timeouts;
+static uint64_t sweet_read_wait_max;
+static SInt32 sweet_read_quiet_logged;
+static void sweet_surface_read_wait(SweetSurface *s, const uint32_t *own)
+{
+ if (sweet_read_sync < 0) {
+  uint32_t scanout = 0;
+  (void)PE_parse_boot_argn("fuxigpuscanout", &scanout, sizeof(scanout));
+  sweet_read_sync = scanout == 1;
+ }
+ if (!sweet_read_sync || !sweet_gpu_init()) return;
+ IOLockLock(sweet_writer_lock);
+ unsigned writers = s->gpuWriters, mine = own ? __atomic_load_n(own, __ATOMIC_SEQ_CST) : 0;
+ if (s->gpuQuarantined || writers <= mine || s->gpuReadSkipEpoch == s->gpuWriterEpoch + 1) {
+  bool skipped = writers > mine && !s->gpuQuarantined;
+  IOLockUnlock(sweet_writer_lock);
+  if ((uint64_t)s->width * s->height >= (1u << 20) && OSIncrementAtomic(&sweet_read_quiet_logged) < 8) {
+   char name[32] = "?";
+   proc_selfname(name, sizeof(name));
+   IOLog("SWEET SURF: read lock by %s id %u %ux%u, no wait (writers %u, own %u%s)\n", name, s->id, s->width, s->height, writers, mine,
+       skipped ? ", epoch timed out before" : "");
+  }
+  return;
+ }
+ uint64_t start = mach_absolute_time(), bound = 0; bool timedOut = false;
+ nanoseconds_to_absolutetime(SWEET_READ_WAIT_MS * 1000000ull, &bound);
+ sweet_read_waiters++;
+ while (!s->gpuQuarantined && s->gpuWriters > (own ? __atomic_load_n(own, __ATOMIC_SEQ_CST) : 0)) {
+  if (mach_absolute_time() - start >= bound) { timedOut = true; s->gpuReadSkipEpoch = s->gpuWriterEpoch + 1; break; }
+  (void)IOLockSleepDeadline(sweet_writer_lock, &sweet_gpu_inflight, start + bound, THREAD_UNINT);
+ }
+ sweet_read_waiters--;
+ uint64_t waited = mach_absolute_time() - start;
+ uint32_t n = ++sweet_read_waits, t = sweet_read_timeouts += timedOut;
+ if (waited > sweet_read_wait_max) sweet_read_wait_max = waited;
+ uint64_t max = sweet_read_wait_max;
+ IOLockUnlock(sweet_writer_lock);
+ if (n <= 16 || !(n % 256) || (timedOut && t <= 16)) {
+  char name[32] = "?";
+  uint64_t ns = 0, maxNs = 0;
+  proc_selfname(name, sizeof(name));
+  absolutetime_to_nanoseconds(waited, &ns); absolutetime_to_nanoseconds(max, &maxNs);
+  IOLog("SWEET SURF: read lock by %s id %u %ux%u waited %llu us for %u writer(s)%s (waits=%u timeouts=%u max_us=%llu)\n", name, s->id,
+      s->width, s->height, (unsigned long long)(ns / 1000), writers - mine, timedOut ? ", timed out: read anyway" : "", n, t,
+      (unsigned long long)(maxNs / 1000));
+ }
+}
 /* AvoidSync reserves a pending producer without waiting; it must take a
  * normal writer lease before touching pixels. Display reads never sleep. */
 static bool sweet_gpu_writer(SweetSurface *s, bool lock, bool pending = false)
@@ -447,6 +505,7 @@ static bool sweet_gpu_writer(SweetSurface *s, bool lock, bool pending = false)
   s->gpuWriterFence = fuxi_gpu_abi_seq() != s->gpuLockSeq ? s->gpuLockSeq + 1 : 0; /* bit 24: the writer job's fence, as copy priority */
   if (sweet_present_wake) sweet_present_wake(sweet_present_context);
  }
+ if (!lock && sweet_read_waiters) IOLockWakeup(sweet_writer_lock, &sweet_gpu_inflight, false); /* read locks wait for other writers */
  bool ok = !s->gpuQuarantined;
  IOLockUnlock(sweet_writer_lock);
  return ok;
@@ -939,6 +998,7 @@ public:
 	IOMemoryMap  *state;
 	uint32_t      count;
  uint32_t uses[2];
+ uint32_t writes; /* this client's write locks: a read lock never waits for its own writers (sweet_surface_read_wait) */
 
 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
 	void free() APPLE_KEXT_OVERRIDE;
@@ -991,6 +1051,7 @@ class IOSurfaceRootUserClient : public IOUserClient {
 	task_t   fTask;
 	IOLock  *fLock;
 	OSArray *fRefs;
+ bool     fGpuLeases; /* took an AvoidSync writer lock (FuxiMetal's imports and pending leases): its read locks never wait */
 
 	SweetSurfaceRef *findRef(uint32_t id, unsigned int *index);
 	IOReturn addRef(SweetSurface *s, SweetSurfaceRef **refOut, bool *existing);
@@ -1040,6 +1101,7 @@ IOSurfaceRootUserClient::initWithTask(task_t owningTask, void *securityID, UInt3
 	fTask = owningTask;
 	fLock = IOLockAlloc();
 	fRefs = OSArray::withCapacity(16);
+ fGpuLeases = false;
 	return fLock != NULL && fRefs != NULL;
 }
 
@@ -1446,6 +1508,37 @@ sweet_surface_held(IOLock *lock, OSArray *refs, uint32_t id)
 	return s;
 }
 
+#if defined(FUXI)
+/* This client's ref to id, retained, after adding delta to its write locks (counted before the writer lock is taken and after it is
+ * dropped, so the count never trails the client's share of gpuWriters). NULL when the client no longer holds id. */
+static SweetSurfaceRef *
+sweet_surface_own_ref(IOLock *lock, OSArray *refs, uint32_t id, int delta)
+{
+ SweetSurfaceRef *found = NULL;
+ IOLockLock(lock);
+ for (unsigned int i = 0; i < refs->getCount() && found == NULL; i++) {
+  SweetSurfaceRef *ref = (SweetSurfaceRef *)refs->getObject(i);
+  if (ref->surface->id != id) continue;
+  if (delta > 0) __atomic_fetch_add(&ref->writes, 1, __ATOMIC_SEQ_CST);
+  else if (delta < 0 && ref->writes) __atomic_fetch_sub(&ref->writes, 1, __ATOMIC_SEQ_CST);
+  found = ref;
+  found->retain();
+ }
+ IOLockUnlock(lock);
+ return found;
+}
+
+/* Writes of a client that is not a GPU lease holder (fGpuLeases) are counted per ref; the GPU client's are not needed and cost a scan. */
+static void
+sweet_surface_own_writes(IOLock *lock, OSArray *refs, uint32_t id, int delta)
+{
+ SweetSurfaceRef *ref = sweet_surface_own_ref(lock, refs, id, delta);
+ if (ref != NULL) ref->release();
+}
+
+static SInt32 sweet_gpu_clients_logged;
+#endif
+
 IOReturn
 IOSurfaceRootUserClient::trapLock(void *id, void *options, void *seedOut,
     void *, void *, void *)
@@ -1455,8 +1548,24 @@ IOSurfaceRootUserClient::trapLock(void *id, void *options, void *seedOut,
 		return kIOReturnNotFound;
 	}
 #if defined(FUXI)
- if (!((uintptr_t)options & kIOSurfaceLockReadOnly) && !sweet_gpu_writer(s, true, ((uintptr_t)options & kIOSurfaceLockAvoidSync) != 0)) {
-  s->release(); return kIOReturnNotReady;
+ uintptr_t o = (uintptr_t)options;
+ if (!(o & kIOSurfaceLockReadOnly)) {
+  if ((o & kIOSurfaceLockAvoidSync) && !__atomic_exchange_n(&fGpuLeases, true, __ATOMIC_SEQ_CST) &&
+      OSIncrementAtomic(&sweet_gpu_clients_logged) < 8) {
+   char name[32] = "?";
+   proc_selfname(name, sizeof(name));
+   IOLog("SWEET SURF: %s takes AvoidSync writer locks (GPU leases): its read locks never wait\n", name);
+  }
+  bool counted = !__atomic_load_n(&fGpuLeases, __ATOMIC_SEQ_CST);
+  if (counted) sweet_surface_own_writes(fLock, fRefs, s->id, 1);
+  if (!sweet_gpu_writer(s, true, (o & kIOSurfaceLockAvoidSync) != 0)) {
+   if (counted) sweet_surface_own_writes(fLock, fRefs, s->id, -1);
+   s->release(); return kIOReturnNotReady;
+  }
+ } else if (!(o & kIOSurfaceLockAvoidSync) && !__atomic_load_n(&fGpuLeases, __ATOMIC_SEQ_CST)) {
+  SweetSurfaceRef *ref = sweet_surface_own_ref(fLock, fRefs, s->id, 0);
+  sweet_surface_read_wait(s, ref != NULL ? &ref->writes : NULL);
+  if (ref != NULL) ref->release();
  }
 #endif
 	IOReturn ret = sweet_surface_seed_out(s, seedOut, false);
@@ -1473,7 +1582,10 @@ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
 		return kIOReturnNotFound;
 	}
 #if defined(FUXI)
- if (!((uintptr_t)options & kIOSurfaceLockReadOnly)) (void)sweet_gpu_writer(s, false);
+ if (!((uintptr_t)options & kIOSurfaceLockReadOnly)) {
+  (void)sweet_gpu_writer(s, false);
+  if (!__atomic_load_n(&fGpuLeases, __ATOMIC_SEQ_CST)) sweet_surface_own_writes(fLock, fRefs, s->id, -1);
+ }
 #endif
 	IOReturn ret = sweet_surface_seed_out(s, seedOut,
 	    !((uintptr_t)options & kIOSurfaceLockReadOnly));

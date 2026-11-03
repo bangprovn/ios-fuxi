@@ -42,6 +42,8 @@ public:
  /* fuxigpuncimport bit 24: ABI sequence when the writer epoch opened, and the writer fence when it closed (lock sequence + 1 when a
   * submit followed the lock, else 0). */
  uint32_t gpuLockSeq, gpuWriterFence;
+ /* A read lock that timed out waiting for writer leases: their writer epoch + 1 (0 none); that epoch is not waited for again. */
+ uint64_t gpuReadSkipEpoch;
 #endif
 	uint32_t width, height, bytesPerRow, offset, pixelFormat, allocSize;
 	uint16_t bytesPerElement;
