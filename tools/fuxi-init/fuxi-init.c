@@ -595,6 +595,25 @@ open_ttys(void)
 	}
 }
 
+/*
+ * Copy n bytes to the console as lines of at most RELAY_LINE bytes, each headed "fuxi-log NAME: ":
+ * the console loses the start of a long line (SpringBoard's exception backtrace is one).
+ */
+#define RELAY_LINE      160
+
+static void
+relay(const char *name, const char *suffix, const char *buf, ssize_t n)
+{
+	while (n > 0) {
+		const char *nl = memchr(buf, '\n', (size_t)MIN(n, RELAY_LINE));
+		ssize_t len = nl != NULL ? nl - buf + 1 : MIN(n, RELAY_LINE);
+
+		dprintf(2, "fuxi-log %s%s: %.*s%s", name, suffix, (int)len, buf, nl != NULL ? "" : "\n");
+		buf += len;
+		n -= len;
+	}
+}
+
 /* Copy what the TTYS jobs wrote, waiting up to timeout microseconds for it. */
 static void
 relay_ttys(long timeout)
@@ -616,11 +635,7 @@ relay_ttys(long timeout)
 		ssize_t n;
 
 		while (FD_ISSET(ttys[i].master, &fds) && (n = read(ttys[i].master, buf, sizeof(buf))) > 0) {
-			dprintf(2, "fuxi-log %s.tty: ", ttys[i].label);
-			(void)write(2, buf, (size_t)n);
-			if (buf[n - 1] != '\n') {
-				(void)write(2, "\n", 1);
-			}
+			relay(ttys[i].label, ".tty", buf, n);
 		}
 	}
 }
@@ -692,14 +707,10 @@ log_relay(void)
 					continue;
 				}
 				while ((n = pread(fd, buf, sizeof(buf), seen[i].done)) > 0) {
-					dprintf(2, "fuxi-log %s: ", e->d_name);
-					(void)write(2, buf, (size_t)n);
+					relay(e->d_name, "", buf, n);
 					if (um_task == 0 && strcmp(e->d_name, UM_TASK_LOG) == 0 &&
 					    memmem(buf, (size_t)n, UM_TASK_DONE, strlen(UM_TASK_DONE)) != NULL) {
 						um_task = 1;
-					}
-					if (buf[n - 1] != '\n') {
-						(void)write(2, "\n", 1);
 					}
 					seen[i].done += n;
 				}
