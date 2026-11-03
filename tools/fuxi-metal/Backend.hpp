@@ -254,14 +254,27 @@ private:
  uint64_t submitSheds=0;
  void shedBeforeSubmit() {
   if(poisoned || ResourceLimits::budget-limits.used>=submitHeadroom)return;
-  if(sampleShadows.empty() && renamePool.empty() && rtShadows.empty())return;
   const size_t before=limits.used;
-  releaseSampleShadows();releaseRenamePool();releaseRtShadows();++submitSheds;
-  // Released textures may sit in the recycling pools still charged; hand back what the headroom needs.
   auto shortBy=[&]()->size_t{size_t left=ResourceLimits::budget-limits.used;return left<submitHeadroom?submitHeadroom-left:0;};
-  if(shortBy())textureMemory.reclaim(shortBy(),[&](VkDeviceMemory h,size_t n){freePooledUnlocked(h,n);});
-  if(shortBy())slabMemory.reclaim(shortBy(),[&](VkDeviceMemory h,size_t n){freePooledUnlocked(h,n);});
-  fprintf(stderr,"FUXI MTL: budget pressure shed optional memory before submit (sheds=%llu used=%zu->%zu)\n",(unsigned long long)submitSheds,before,limits.used);
+  // Released textures may sit in the recycling pools still charged; hand back what the headroom needs.
+  auto reclaim=[&](){
+   if(shortBy())textureMemory.reclaim(shortBy(),[&](VkDeviceMemory h,size_t n){freePooledUnlocked(h,n);});
+   if(shortBy())slabMemory.reclaim(shortBy(),[&](VkDeviceMemory h,size_t n){freePooledUnlocked(h,n);});};
+  reclaim();
+  // Only what nothing else holds (references 1: the cache's own), least recently used first. Releasing them all, held or not,
+  // freed a shadow this submit's ops still named (d-v13-rt3: "destination mip level" right after a shed, then the CPU).
+  unsigned evicted=0;
+  for(auto i=renamePool.begin();shortBy() && i!=renamePool.end();){if(i->t->references==1){destroyTextureUnlocked(i->t);i=renamePool.erase(i);++evicted;reclaim();}else ++i;}
+  while(shortBy() && evictIdleSampleShadow(0)){++evicted;reclaim();}
+  while(shortBy()) {
+   auto victim=rtShadows.end();
+   for(auto v=rtShadows.begin();v!=rtShadows.end();++v)if(v->second.s->references==1 && (victim==rtShadows.end() || v->second.used<victim->second.used))victim=v;
+   if(victim==rtShadows.end())break;
+   destroyTextureUnlocked(victim->second.s);rtShadows.erase(victim);++evicted;reclaim();
+  }
+  if(before==limits.used)return;
+  ++submitSheds;
+  fprintf(stderr,"FUXI MTL: budget pressure shed optional memory before submit (sheds=%llu evicted=%u used=%zu->%zu)\n",(unsigned long long)submitSheds,evicted,before,limits.used);
  }
  struct OptionalScope {Backend &b;bool old;explicit OptionalScope(Backend &x):b(x),old(x.optionalAlloc){b.optionalAlloc=true;}~OptionalScope(){b.optionalAlloc=old;}};
  // Two independently resettable lanes. A busy lane belongs to its retirement.
