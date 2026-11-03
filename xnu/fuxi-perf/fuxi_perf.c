@@ -74,6 +74,14 @@ static uint64_t fp_pressure_since, fp_pressure_dwell; /* fall hold, 10 s */
  * worker tick. [0] while boosted, [1] otherwise; gold and prime only. */
 static uint64_t fp_cur_sum[2][2], fp_cur_n[2];
 static unsigned fp_cur_max[2][2];
+/* fpk=MHz (1401 up to the boost cap, default off): a raised gold/prime base.
+ * The cool vote becomes the fastest eligible row at/below MHz while the
+ * thermal guards allow it (a valid sample and no hot/limit/slope latch);
+ * otherwise it falls back to the compiled fp_cool_cap rows. Silver, idle and
+ * the boost rows are unchanged. */
+static unsigned fp_base_mhz, fp_base[3], fp_base_khz[3];
+static int fp_base_on;
+static uint64_t fp_base_time, fp_base_fallback_time;
 static unsigned fp_enabled, fp_started, fp_ready;
 static thread_call_data_t fp_call;
 /* Refusals are EBUSY, never EAGAIN: userland_sysctl() retries a handler's
@@ -338,7 +346,7 @@ static void fp_init_report(const char *outcome)
 static int fp_initialize(void)
 {
  unsigned percore[3], cool_level[3], high_level[3], cool_freq[3], high_freq[3];
- unsigned idle_level[3], idle_freq[3];
+ unsigned idle_level[3], idle_freq[3], base_level[3], base_freq[3];
  for (unsigned d = 0; d < 3; d++) {
   if (!fp_epss[d]) fp_epss[d] = ml_io_map(fp_epss_pa[d], 0x1000);
   if (!fp_epss[d]) return fp_init_fail("map",d,fp_epss_pa[d],0,0,0,-1);
@@ -377,6 +385,10 @@ static int fp_initialize(void)
   high_level[d] = d ? (unsigned)high : (unsigned)cool;
   cool_freq[d] = cool_khz;
   high_freq[d] = d ? high_khz : cool_khz;
+  /* fpk: never below cool, never above high (fpk is bounded by the cap). */
+  int base = d && fp_base_mhz ? fp_level(rows,count,fp_base_mhz*1000,&base_freq[d]) : -1;
+  if (base < 0 || base_freq[d] <= cool_khz) { base = cool; base_freq[d] = cool_khz; }
+  base_level[d] = (unsigned)base;
  }
  for (unsigned d = 0; d < 2; d++) {
   if (!fp_tsens[d]) fp_tsens[d] = ml_io_map(fp_tsens_pa[d],0x1000);
@@ -389,6 +401,7 @@ static int fp_initialize(void)
   fp_percore[d] = percore[d];
   fp_cool[d] = cool_level[d]; fp_high[d] = high_level[d];
   fp_cool_khz[d] = cool_freq[d]; fp_high_khz[d] = high_freq[d];
+  fp_base[d] = base_level[d]; fp_base_khz[d] = base_freq[d];
  }
  return 1;
 }
@@ -409,6 +422,9 @@ static int fp_try_initialize(uint64_t now)
   if (fp_idle_after)
    printf("FUXI PERF: ready idle LUT %u/%u/%u kHz after %u ms floor %u kHz (clamped to cool)\n",
        fp_idle_khz[0],fp_idle_khz[1],fp_idle_khz[2],fp_idle_ms,fp_idle_floor);
+  if (fp_base_mhz)
+   printf("FUXI PERF: ready base fpk=%u: gold/prime %u/%u kHz while thermally safe, else compiled cool %u/%u kHz\n",
+       fp_base_mhz,fp_base_khz[1],fp_base_khz[2],fp_cool_khz[1],fp_cool_khz[2]);
   return 1;
  }
  if (!fp_attempted) fp_init_report("init retry");
@@ -435,7 +451,7 @@ static void fp_update_votes(int state)
   } else {
    int compile = fp_compile_high && fp_compile_domain(d);
    unsigned level = (state == FP_HIGH || compile) && !failed ? fp_high[d] :
-       state == FP_IDLE ? fp_idle[d] : fp_cool[d];
+       state == FP_IDLE ? fp_idle[d] : fp_base_on && !failed ? fp_base[d] : fp_cool[d];
    if (!fp_applied_valid[d] || fp_applied[d] != level) {
     if (fp_vote(d,level)) {
      fp_applied[d] = fp_domain_failed[d] && state != FP_IDLE ? fp_cool[d] : level;
@@ -546,6 +562,8 @@ static void fp_configure(void)
   * The thermal hot, limit and slope guards are unchanged. */
  fp_arg("fpb",&fp_budget_ms,20,1000);
  fp_arg("fpc",&fp_cap_mhz,1402,3200);
+ /* fpk=MHz raised gold/prime base, 1401 up to the boost cap (fpc or 2400). */
+ fp_arg("fpk",&fp_base_mhz,1401,fp_cap_mhz ? fp_cap_mhz : fp_high_cap[1]/1000);
  nanoseconds_to_absolutetime((uint64_t)fp_budget_ms*NSEC_PER_MSEC,&fp_budget);
  nanoseconds_to_absolutetime(NSEC_PER_SEC,&fp_duty_window);
  nanoseconds_to_absolutetime(500ULL*NSEC_PER_MSEC,&fp_recovery);
@@ -567,6 +585,8 @@ static void fp_worker_locked(thread_call_param_t arg, thread_call_param_t result
  uint64_t elapsed = fp_last ? now-fp_last : 0, elapsed_ns;
  absolutetime_to_nanoseconds(elapsed,&elapsed_ns);
  if (fp_boosted) fp_boost_time += elapsed;
+ if (fp_base_on) fp_base_time += elapsed;
+ else if (fp_base_mhz) fp_base_fallback_time += elapsed;
  unsigned was_idle = __atomic_load_n(&fp_idling,__ATOMIC_RELAXED);
  if (was_idle) fp_idle_time += elapsed;
  int temp = -400;
@@ -577,6 +597,9 @@ static void fp_worker_locked(thread_call_param_t arg, thread_call_param_t result
  if ((valid && temp >= (int)fp_hot) ||
      (fp_prev_valid && fp_prev_temp >= (int)fp_hot)) fp_above_time += elapsed;
  int safe = fp_thermal_guard(valid,temp,now,elapsed_ns);
+ /* fpk: the raised base needs a valid sample and no thermal latch (hot,
+  * limit, predicted limit, slope; 500 ms at/below resume to clear). */
+ fp_base_on = fp_base_mhz && valid && safe;
  if (fp_pressure_enabled)
   fp_pressure = fp_pressure_hold(fp_pressure,
       fp_pressure_level(fp_pressure,valid,temp,fp_blocked,fp_hot,fp_limit,fp_resume),
@@ -647,6 +670,14 @@ static void fp_worker_locked(thread_call_param_t arg, thread_call_param_t result
        fp_boosts,ns/1000000,fp_max_temp,fp_hot,above_ns/1000000,fp_cuts,
        valid,idle ? "idle" : fp_boosted ? "high" : "cool",idle_ns/1000000,fp_idle_entries);
   }
+  if (fp_base_mhz) {
+   uint64_t base_ns, fallback_ns;
+   absolutetime_to_nanoseconds(fp_base_time,&base_ns);
+   absolutetime_to_nanoseconds(fp_base_fallback_time,&fallback_ns);
+   printf("FUXI PERF: base fpk=%u raised %llu ms compiled %llu ms (hot, latched or no valid sample)\n",
+       fp_base_mhz,base_ns/1000000,fallback_ns/1000000);
+  }
+  fp_base_time = fp_base_fallback_time = 0;
   for (unsigned b = 0; b < 2; b++) {
    fp_cur_n[b] = 0;
    fp_cur_sum[b][0] = fp_cur_sum[b][1] = 0;
@@ -657,8 +688,13 @@ static void fp_worker_locked(thread_call_param_t arg, thread_call_param_t result
   fp_max_temp = -400;
   fp_window_start = now;
  }
+ /* A raised base under load samples as fast as a boost; idle stays at 100 ms. */
+ uint64_t activity = __atomic_load_n(&fp_input,__ATOMIC_ACQUIRE);
+ uint64_t swapped = __atomic_load_n(&fp_swap,__ATOMIC_ACQUIRE);
+ if (swapped > activity) activity = swapped;
+ int active = activity && now >= activity && now-activity <= fp_hold;
  uint64_t deadline;
- clock_interval_to_deadline(fp_boosted || fp_blocked ? fp_fast_ms : 100,
+ clock_interval_to_deadline(fp_boosted || fp_blocked || (fp_base_on && active) ? fp_fast_ms : 100,
      NSEC_PER_MSEC,&deadline);
  /* Do not overrun a fractional remaining duty budget by a full sample. */
  if (fp_boosted && fp_budget-used < deadline-now) deadline = now+fp_budget-used;

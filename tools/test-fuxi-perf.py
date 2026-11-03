@@ -684,8 +684,42 @@ int main(void) {
   assert(fp_pressure==-1); /* start never fabricates a sample */
   fp_worker(0,0);assert(fp_pressure==(tp_args[i]==1?0:-1));
  }
+ /* fpk: bounds 1401 up to the cap (fpc, else 2400); rows on the observed
+  * LUTs; the raised base only with a valid sample and no thermal latch,
+  * compiled cool when hot or without quorum and again after the 500 ms
+  * recovery; touch boost, silver and the window line. */
+ const unsigned fpk_args[6][3]={{1400,0,0},{1401,1401,0},{2400,2400,0},{2401,0,0},{1900,0,1800},{1800,1800,1800}};
+ for(unsigned i=0;i<6;i++) {
+  reset();arg_name="fpk";arg_value=fpk_args[i][0];
+  arg_name2=fpk_args[i][2]?"fpc":0;arg_value2=fpk_args[i][2];fp_configure();
+  assert(fp_base_mhz==fpk_args[i][1]);
+ }
+ arg_name=arg_name2=0;
+ const unsigned fpk_rows[3][5]={{1401,8,1401600,6,1363200},{1800,11,1785600,9,1708800},{2400,15,2323200,14,2342400}};
+ for(unsigned i=0;i<3;i++) {
+  reset_init();arg_name="fpk";arg_value=fpk_rows[i][0];fp_configure();arg_name=0;fp_worker(0,0);
+  assert(fp_base[1]==fpk_rows[i][1] && fp_base_khz[1]==fpk_rows[i][2]);
+  assert(fp_base[2]==fpk_rows[i][3] && fp_base_khz[2]==fpk_rows[i][4] && fp_base[0]==fp_cool[0]);
+  assert(fp_base[1]<=fp_high[1] && fp_base[2]<=fp_high[2]);
+ }
+ reset_init();arg_name="fpk";arg_value=1800;fp_configure();arg_name=0;log_count=0;fp_worker(0,0);
+ assert(log_count==2 && strstr(last_log,"ready base fpk=1800: gold/prime 1785600/1708800 kHz while thermally safe, else compiled cool 1401600/1363200 kHz"));
+ assert(fp_base_on && regs[1][0x320/4]==11 && regs[2][0x320/4]==9 && regs[0][0x320/4]==fp_cool[0] && scheduled==200);
+ ticks=101;fuxi_perf_input();fp_worker(0,0);assert(fp_boosted && regs[1][0x320/4]==fp_high[1]);
+ ticks=301;fp_worker(0,0);assert(!fp_boosted && fp_base_on && regs[1][0x320/4]==11 && scheduled==321);
+ ticks=1700;fp_worker(0,0);assert(!fp_boosted && regs[1][0x320/4]==11 && regs[2][0x320/4]==9 && scheduled==1800);
+ all_temp(620);ticks=1720;fp_worker(0,0);
+ assert(fp_blocked && !fp_base_on && regs[1][0x320/4]==fp_cool[1] && regs[2][0x320/4]==fp_cool[2] && scheduled==1740);
+ all_temp(570);ticks=1740;fp_worker(0,0);assert(fp_blocked && regs[1][0x320/4]==fp_cool[1]);
+ ticks=2239;fp_worker(0,0);assert(fp_blocked && !fp_base_on);
+ ticks=2240;fp_worker(0,0);assert(!fp_blocked && fp_base_on && regs[1][0x320/4]==11 && regs[2][0x320/4]==9);
+ for(unsigned n=1;n<=5;n++)regs[3][(0xa0+4*n)/4]=570; /* 13 of 18 valid: no quorum */
+ ticks=2340;fp_worker(0,0);assert(!fp_base_on && regs[1][0x320/4]==fp_cool[1] && regs[2][0x320/4]==fp_cool[2]);
+ ticks=10100;fp_worker(0,0);
+ assert(strstr(last_log,"base fpk=1800 raised 1720 ms compiled 8280 ms (hot, latched or no valid sample)"));
  arg_name=arg_name2=0;
 #undef printf
+ puts("PASS: fpk default off, 1401..cap bounds (fpc), base rows 1401/1800/2400 on real LUTs, raised only with valid sample and no thermal latch, compiled cool when hot/no quorum, 500 ms recovery, boost/silver unchanged, fast samples only while active, window line");
  puts("PASS: thermal pressure opt-in, read-only sysctl/readiness/no-MMIO, guard/quorum integration, Apple wire values, rising trips/falling hysteresis and no sleeping");
  puts("PASS: compile gate/default off, prime/gold votes, idle/touch precedence, thermal/quorum/duty cuts, cap, nested limit/no renewal, leave without enter, cross-thread isolation, dead-thread cleanup and balanced references");
  puts("PASS: opt-in idle boundaries, LUT floor/clamp, legacy equivalence, hook wakeups, thermal/duty precedence, stats and transition rate limit");
@@ -821,6 +855,8 @@ static void reset(void) {
  fp_hot=620;fp_limit=680;fp_boost_max=680;fp_resume=580;fp_rise=100;fp_fast_ms=20;fp_rate_ms=20;fp_budget_ms=200;
  fp_idle_ms=fp_idle_floor=fp_idling=0;
  fp_idle_start=fp_idle_entry=fp_idle_time=fp_idle_entries=fp_idle_transitions=0;
+ fp_cap_mhz=fp_base_mhz=0;fp_base_on=0;fp_base_time=fp_base_fallback_time=0;
+ memset(fp_base,0,sizeof(fp_base));memset(fp_base_khz,0,sizeof(fp_base_khz));
  arg_name=arg_name2=0;fp_configure();
  fp_recover_since=fp_above_time=fp_cuts=fp_active_start=0;
  fp_duty_count=0;fp_prev_temp=fp_prev_valid=fp_blocked=0;
@@ -848,6 +884,9 @@ static void reset(void) {
 }
 static void reset_init(void) {
  reset();memset(fp_epss,0,sizeof(fp_epss));memset(fp_tsens,0,sizeof(fp_tsens));
+}
+static void all_temp(unsigned t) {
+ for(unsigned d=0;d<2;d++)for(unsigned n=1;n<=(d?3:15);n++)regs[d+3][(0xa0+4*n)/4]=(1u<<21)|t;
 }
 '''
 idle_globals = actual[actual.index('static unsigned fp_idle[3]'):actual.index('static unsigned fp_percore[3]')]
