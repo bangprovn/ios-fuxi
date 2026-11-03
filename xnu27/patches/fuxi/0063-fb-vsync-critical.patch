@@ -1,0 +1,50 @@
+diff --git a/iokit/Kernel/arm/FuxiFramebuffer.cpp b/iokit/Kernel/arm/FuxiFramebuffer.cpp
+index 2849884..d4fe2a6 100644
+--- a/iokit/Kernel/arm/FuxiFramebuffer.cpp
++++ b/iokit/Kernel/arm/FuxiFramebuffer.cpp
+@@ -111,6 +111,8 @@ enum {
+ static uint64_t gFBLogged[2];           /* selectors already reported */
+ static uint32_t gFBTotal[128];          /* calls of each selector since the last summary */
+ static uint64_t gFBSummaryAt;           /* when the last summary was logged */
++static uint64_t gVSyncLateMost;         /* the latest a vsync tick fired after its time, ns, since the last summary */
++static uint32_t gVSyncLate1ms, gVSyncTicks;     /* ticks a millisecond or more late, and all ticks, since then */
+ static uint8_t  gFBCalls[128];          /* how many calls of each selector were traced */
+ static uint32_t gFBSwapSizeSaid;        /* a swap request size that is neither iOS 16.5's nor iOS 26's, said once */
+ 
+@@ -1165,7 +1167,9 @@ IOMobileFramebufferUserClient::armVSync(void)
+ 	if (fVSyncTime <= now || fVSyncTime > now + 2 * period) {
+ 		fVSyncTime = now + period;
+ 	}
+-	thread_call_enter_delayed(fVSyncCall, fVSyncTime);
++	/* user critical, no leeway: a coalesced timer let CA's tick come late (K9q: ~3% of 120 Hz frames a refresh late) */
++	thread_call_enter_delayed_with_leeway(fVSyncCall, NULL, fVSyncTime, 0,
++	    THREAD_CALL_DELAY_USER_CRITICAL | THREAD_CALL_DELAY_LEEWAY);
+ }
+ 
+ /*
+@@ -1182,6 +1186,14 @@ IOMobileFramebufferUserClient::vsync(void)
+ 
+ 	IOLockLock(fLock);
+ 	now = fVSyncTime;
++	{
++		uint64_t late = mach_absolute_time() - now, nanos;
++
++		absolutetime_to_nanoseconds(late, &nanos);
++		gVSyncLateMost = nanos > gVSyncLateMost ? nanos : gVSyncLateMost;
++		gVSyncLate1ms += nanos >= NSEC_PER_MSEC;
++		gVSyncTicks++;
++	}
+ 	if (fClosed || fCallbacks[kFBNotifyVSync] == 0 || fPorts[kFBNotifyVSync] == NULL) {
+ 		fVSyncRunning = false;
+ 	} else {
+@@ -1243,6 +1255,10 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			gFBSummaryAt = now;
+ 			IOLog("FuxiFramebuffer: calls in %llu ms (selector:count)%s\n", nanos / NSEC_PER_MSEC, line);
+ 			fuxi_debug_sync_report();
++			IOLog("FuxiFramebuffer: vsync ticks %u, %u of them 1 ms or more late, the latest %llu us\n",
++			    gVSyncTicks, gVSyncLate1ms, gVSyncLateMost / 1000);
++			gVSyncTicks = gVSyncLate1ms = 0;
++			gVSyncLateMost = 0;
+ 			IOLog("FuxiFramebuffer: IPIs sent %llu; per core SGI/timer interrupts %u/%u %u/%u %u/%u %u/%u %u/%u %u/%u %u/%u %u/%u\n",
+ 			    armcpu_ipi_sent, armcpu_core_sgi[0], armcpu_core_timer[0], armcpu_core_sgi[1], armcpu_core_timer[1],
+ 			    armcpu_core_sgi[2], armcpu_core_timer[2], armcpu_core_sgi[3], armcpu_core_timer[3],

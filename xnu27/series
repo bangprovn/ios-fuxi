@@ -127,3 +127,4 @@ fuxi/0059-stackshot-skip-silent-core.patch
 fuxi/0060-reinit-signal-assert.patch
 fuxi/0061-stackshot-abort-on-silent-core.patch
 fuxi/0062-fb-ipi-counts.patch
+fuxi/0063-fb-vsync-critical.patch
