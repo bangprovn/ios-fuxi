@@ -20,7 +20,7 @@ register_functions = actual[actual.index('static uint64_t fp_duty_used(uint64_t 
                             actual.index('static int fp_thermal_guard(')]
 register_functions += ''.join(submit.function(actual, n) for n in (
     'fp_read','fp_vote','fp_temperature','fp_init_fail','fp_init_report',
-    'fp_apply_cores','fp_initialize','fp_try_initialize','fp_update_votes','fp_thermal_guard',
+    'fp_apply_cores','fp_initialize','fp_l3_init','fp_l3_update','fp_try_initialize','fp_update_votes','fp_thermal_guard',
     'fp_arg','fp_configure','fp_worker_locked','fp_worker','fuxi_perf_input','fuxi_perf_swap'))
 register_functions = "static uint64_t fp_duty_used(uint64_t);\nstatic void fp_worker_locked(thread_call_param_t,thread_call_param_t);\n" + ''.join(
     submit.function(actual, n) for n in ('fp_compile_domain','fp_compile_failed','fp_compile_cut','fp_compile_forget','fp_compile_poll','fp_compile_admitted','fp_compile_command')) + register_functions
@@ -717,9 +717,74 @@ int main(void) {
  ticks=2340;fp_worker(0,0);assert(!fp_base_on && regs[1][0x320/4]==fp_cool[1] && regs[2][0x320/4]==fp_cool[2]);
  ticks=10100;fp_worker(0,0);
  assert(strstr(last_log,"base fpk=1800 raised 1720 ms compiled 8280 ms (hot, latched or no valid sample)"));
+ /* fl3: only exact 1 enables. Off maps, reads and writes nothing of L3. */
+ for(unsigned i=0;i<4;i++) {
+  reset();fp_enabled=0;arg_name="fuxiperf";arg_value=1;
+  arg_name2="fl3";arg_value2=tp_args[i];fuxi_perf_start();
+  assert(fp_enabled && fp_l3_enabled==(tp_args[i]==1));
+ }
+ arg_name=arg_name2=0;
+ reset_init();fp_worker(0,0);ticks=101;fuxi_perf_input();fp_worker(0,0);
+ ticks=1700;fp_worker(0,0);
+ assert(fp_ready && fp_boosts==1 && maps==5 && !l3_reads && !l3_writes && !fp_l3);
+ /* On: read once at ready, no write; the boost row only while high, the boot
+  * row back on unboost; one line at ready and one after the first boost. */
+ reset_init();fp_l3_enabled=1;fp_worker(0,0);
+ assert(fp_ready && fp_l3_ready && maps==6 && !l3_writes && log_count==2);
+ assert(fp_l3_boot==12 && fp_l3_high==14 && fp_l3_boot_khz==1574400 && fp_l3_high_khz==1804800);
+ assert(strstr(last_log,"L3 vote ready: boot row 12 (1574400 kHz) state 0x2dc00c52, boost row 14 (1804800 kHz, word 0x4000005e) of 15; writes +0x90 only"));
+ ticks=101;fuxi_perf_input();fp_worker(0,0);
+ assert(fp_boosted && regs[5][0x90/4]==14 && l3_writes==1 && fp_l3_votes==1 && log_count==2);
+ regs[5][0x20/4]=0x2dc00e5e; /* the block now runs row 14, L 94 */
+ ticks=121;fp_worker(0,0);ticks=141;fp_worker(0,0);
+ assert(fp_boosted && l3_writes==1 && fp_l3_samples==3 && fp_l3_state_max==94);
+ ticks=1700;fp_worker(0,0);
+ assert(!fp_boosted && regs[5][0x90/4]==12 && l3_writes==2 && log_count==3);
+ assert(strstr(last_log,"L3 first boost: row 14 voted and read back, state L max 94 (1804800 kHz) over 3 samples; boot row 12 restored"));
+ ticks=1800;fp_worker(0,0);assert(l3_writes==2); /* no rewrite of an unchanged vote */
+ /* A thermal cut restores the boot row in the same sample, without a line. */
+ ticks=3000;fuxi_perf_input();fp_worker(0,0);
+ assert(fp_boosted && regs[5][0x90/4]==14 && l3_writes==3 && fp_l3_votes==2);
+ regs[3][0xa4/4]=(1u<<21)|700;ticks=3020;fp_worker(0,0);
+ assert(!fp_boosted && fp_blocked && regs[5][0x90/4]==12 && l3_writes==4 && log_count==3);
+ for(unsigned d=1;d<3;d++)assert(regs[d][0x320/4]==fp_cool[d]);
+ /* A compile lease is a high vote too. */
+ reset();fp_l3_enabled=1;fp_compile_enabled=1;fp_worker(0,0);assert(fp_l3_ready);
+ assert(!fp_compile_command(1,&reply) && regs[5][0x90/4]==14);
+ ticks+=50;assert(!fp_compile_command(0,&reply) && regs[5][0x90/4]==12 && l3_writes==2);
+ /* Read-only refusals: clear enable, a vote past the LUT, a state that does
+  * not run the voted row, any unreadable register or row, a failed map. */
+ const struct { unsigned off; uint32_t value; } bad[]={{0,0},{0,2},{0x90,15},{0x90,99},{0x20,0x2dc00c53},{0x20,0x2dc00e5e}};
+ for(unsigned i=0;i<6;i++) {
+  reset_init();fp_l3_enabled=1;regs[5][bad[i].off/4]=bad[i].value;fp_worker(0,0);
+  assert(fp_ready && !fp_l3_ready && log_count==2 && strstr(last_log,"L3 off: enable") && strstr(last_log,"no write"));
+  ticks=101;fuxi_perf_input();fp_worker(0,0);assert(fp_boosted && !l3_writes);
+ }
+ const unsigned l3_faults[]={0,0x20,0x90,0x100,0x10c,0x13c};
+ for(unsigned i=0;i<6;i++) {
+  reset_init();fp_l3_enabled=1;fault_block=5;fault_off=l3_faults[i];fp_worker(0,0);
+  assert(fp_ready && !fp_l3_ready && log_count==2 && strstr(last_log,"L3 off:") && strstr(last_log,"no write"));
+  fault_block=-1;ticks=101;fuxi_perf_input();fp_worker(0,0);assert(fp_boosted && !l3_writes);
+ }
+ reset_init();fp_l3_enabled=1;fail_map=6;fp_worker(0,0);
+ assert(fp_ready && !fp_l3_ready && !fp_l3 && strstr(last_log,"L3 off: map 0x17d90000 failed"));
+ /* Runtime: a lost enable writes nothing; a write fault or a readback that
+  * does not match rewrites the boot row once and ends L3 voting. */
+ reset_init();fp_l3_enabled=1;fp_worker(0,0);regs[5][0]=0;
+ ticks=101;fuxi_perf_input();fp_worker(0,0);
+ assert(fp_boosted && !fp_l3_ready && !l3_writes && strstr(last_log,"L3 off: enable 0 lost before voting row 14, no write"));
+ reset_init();fp_l3_enabled=1;fp_worker(0,0);fault_block=5;fault_off=0x90;fault_write_only=1;
+ ticks=101;fuxi_perf_input();fp_worker(0,0);
+ assert(fp_boosted && !fp_l3_ready && !l3_writes && regs[5][0x90/4]==12);
+ assert(strstr(last_log,"L3 off: row 14 read back 0xffffffff, boot row 12 rewritten"));
+ fault_block=-1;fault_write_only=0;ticks=1700;fp_worker(0,0);assert(!fp_boosted && !l3_writes);
+ reset_init();fp_l3_enabled=1;fp_worker(0,0);l3_stuck=1;
+ ticks=101;fuxi_perf_input();fp_worker(0,0);
+ assert(fp_boosted && !fp_l3_ready && l3_writes==2 && strstr(last_log,"L3 off: row 14 read back 0xc, boot row 12 rewritten"));
  arg_name=arg_name2=0;
 #undef printf
  puts("PASS: fpk default off, 1401..cap bounds (fpc), base rows 1401/1800/2400 on real LUTs, raised only with valid sample and no thermal latch, compiled cool when hot/no quorum, 500 ms recovery, boost/silver unchanged, fast samples only while active, window line");
+ puts("PASS: fl3 default off/exact 1; L3 read once at ready, boot vote checked against state and LUT before any write; boost row while touch/compile high, boot row on unboost and thermal cut; one ready and one first-boost line; refusals, faults, lost enable and readback mismatch end voting with the boot row");
  puts("PASS: thermal pressure opt-in, read-only sysctl/readiness/no-MMIO, guard/quorum integration, Apple wire values, rising trips/falling hysteresis and no sleeping");
  puts("PASS: compile gate/default off, prime/gold votes, idle/touch precedence, thermal/quorum/duty cuts, cap, nested limit/no renewal, leave without enter, cross-thread isolation, dead-thread cleanup and balanced references");
  puts("PASS: opt-in idle boundaries, LUT floor/clamp, legacy equivalence, hook wakeups, thermal/duty precedence, stats and transition rate limit");
@@ -728,7 +793,13 @@ int main(void) {
 }
 '''
 REGISTERS = r'''
-static uint32_t regs[5][1024], writes[3], lut_reads[3], tsens_reads[2];
+static uint32_t regs[6][1024], writes[3], lut_reads[3], tsens_reads[2], l3_writes, l3_reads, l3_stuck;
+/* OBSERVED frequencies of the EPSS L3 LUT, boot vote and state (every 0097
+ * boot's "FUXI L3: read-only enable 1 vote 12 (1574 MHz) state 0x2dc00c52
+ * ... top 1804 MHz, 15 LUT rows"). Words model source 1, core count 0; the
+ * repeated last row is the terminator. Block 5 is L3 at 0x17d90000. */
+static const uint32_t l3_rows[16]={0x40000010,0x40000014,0x4000001a,0x40000020,0x40000026,0x4000002c,
+ 0x40000031,0x40000037,0x4000003c,0x40000042,0x40000047,0x4000004d,0x40000052,0x40000058,0x4000005e,0x4000005e};
 static uintptr_t fp_epss[3]={0x1000,0x2000,0x3000},fp_tsens[2]={0x4000,0x5000};
 static const uint64_t fp_epss_pa[3]={0x17d91000,0x17d92000,0x17d93000};
 static const uint64_t fp_tsens_pa[2]={0xc271000,0xc272000};
@@ -811,7 +882,8 @@ static char last_log[512];
 static uintptr_t ml_io_map(uint64_t pa,unsigned size) {
  assert(size==0x1000);unsigned d;
  for(d=0;d<5;d++) if(pa==(d<3?fp_epss_pa[d]:fp_tsens_pa[d-3])) break;
- assert(d<5);
+ if(pa==fp_l3_pa)d=5;
+ assert(d<6);
  unsigned offset=pa&0x3fff;
  assert(((size+offset+0x3fff)&~0x3fff)==0x4000);
  if(++maps==fail_map)return 0;
@@ -826,13 +898,19 @@ static unsigned fuxi_gpu_access(uintptr_t address,uint64_t *v,unsigned wr,unsign
  if(address<0x100000) {block=(address>>12)-1;off=address&0xfff;}
  else {
   block=(address-0x100000)/0x4000;
-  assert(block<5);
-  unsigned offset=(block<3?fp_epss_pa[block]:fp_tsens_pa[block-3])&0x3fff;
+  assert(block<6);
+  unsigned offset=(block==5?fp_l3_pa:block<3?fp_epss_pa[block]:fp_tsens_pa[block-3])&0x3fff;
   assert((address&0x3fff)>=offset);
   off=(address&0x3fff)-offset;
  }
- assert(block<5 && off<0x1000 && !(off&3));
- if(block>=3) {
+ assert(block<6 && off<0x1000 && !(off&3));
+ if(block==5) { /* L3: enable, state, vote and LUT reads; +0x90 the only write */
+  assert(off==0 || off==0x20 || off==0x90 || (off>=0x100 && off<0x1a0));
+  assert(!wr || (off==0x90 && (regs[5][0]&1)));
+  l3_reads+=!wr;
+  if(off>=0x100 && (off-0x100)/4>15)return 1; /* past the terminator */
+ }
+ if(block==3 || block==4) {
   assert(!wr && off>=0xa0 && off<0xe0); /* Never read TRDY, including on faults. */
   tsens_reads[block-3]|=1u<<((off-0xa0)/4);
  }
@@ -841,6 +919,7 @@ static unsigned fuxi_gpu_access(uintptr_t address,uint64_t *v,unsigned wr,unsign
   unsigned row=(off-0x100)/4;lut_reads[block]++;
   if(observed_tail_fault && row>observed_count[block])return 1;
  }
+ if(wr && block==5) { l3_writes++;if(!l3_stuck)regs[5][off/4]=(uint32_t)*v;return 0; }
  if(wr) { assert(block<3 && (regs[block][0]&1));writes[block]++;regs[block][off/4]=*v; if((int)block==drop_block && writes[block]==drop_after)regs[block][0]&=~1u; }
  else *v=regs[block][off/4];
  return 0;
@@ -881,6 +960,10 @@ static void reset(void) {
   regs[d+3][0xe4/4]=8;
   for(unsigned n=1;n<=(d?3:15);n++)regs[d+3][(0xa0+4*n)/4]=(1u<<21)|450;
  }
+ fp_l3=0;fp_l3_enabled=fp_l3_ready=fp_l3_boot=fp_l3_high=fp_l3_voted=fp_l3_said=fp_l3_state_max=0;
+ fp_l3_boot_khz=fp_l3_high_khz=0;fp_l3_samples=fp_l3_votes=0;l3_writes=l3_reads=l3_stuck=0;
+ regs[5][0]=1;regs[5][0x20/4]=0x2dc00c52;regs[5][0x90/4]=12;
+ memcpy(&regs[5][0x100/4],l3_rows,sizeof(l3_rows));
 }
 static void reset_init(void) {
  reset();memset(fp_epss,0,sizeof(fp_epss));memset(fp_tsens,0,sizeof(fp_tsens));

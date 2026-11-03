@@ -83,6 +83,18 @@ static int fp_idle_level(const uint32_t *rows, unsigned count,
  *khz = freq;
  return best;
 }
+/* fl3=1: EPSS L3 ("qcom,epss-l3", Linux osm-l3.c epss_l3_l3_vote). The HLOS
+ * vote +0x90 is a LUT row index. Before any write, the boot vote must name a
+ * row and the block's state +0x20 must run that row's L value (0097 boots:
+ * vote 12, state 0x2dc00c52, L 82 = row 12 = 1574.4 MHz). Returns the fastest
+ * non-turbo row to vote while boosted, or -1 to stay read-only. */
+static int fp_l3_check(const uint32_t *rows, unsigned count, uint32_t enable,
+    uint32_t vote, uint32_t state, unsigned *khz)
+{
+ *khz = 0;
+ if (!(enable & 1) || vote >= count || (state & 255u) != (rows[vote] & 255u)) return -1;
+ return fp_level(rows,count,UINT32_MAX,khz);
+}
 enum { FP_COOL, FP_HIGH, FP_IDLE };
 static int fp_state(int boosted, int valid, int temp, int safe, int duty_ok,
     uint64_t now, uint64_t input, uint64_t swap, uint64_t hold,

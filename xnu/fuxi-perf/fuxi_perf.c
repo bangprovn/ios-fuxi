@@ -82,6 +82,17 @@ static unsigned fp_cur_max[2][2];
 static unsigned fp_base_mhz, fp_base[3], fp_base_khz[3];
 static int fp_base_on;
 static uint64_t fp_base_time, fp_base_fallback_time;
+/* fl3=1 (default off): EPSS L3 at 0x17d90000 ("qcom,epss-l3", Linux osm-l3.c
+ * epss_l3_l3_vote, sheng b0ccf61): enable +0x0 bit 0, HLOS vote +0x90 (a LUT
+ * row index), LUT +0x100. While any high vote runs, the vote is the fastest
+ * non-turbo row (the stock launch hint's L3 1804.8 MHz); unboost restores the
+ * boot vote read at ready. Only +0x90 is written, never before fp_l3_check
+ * matched the boot vote to the running state; firmware owns L3 voltage. */
+static uintptr_t fp_l3;
+static const uint64_t fp_l3_pa = 0x17d90000;
+static unsigned fp_l3_enabled, fp_l3_ready, fp_l3_boot, fp_l3_high, fp_l3_voted;
+static unsigned fp_l3_boot_khz, fp_l3_high_khz, fp_l3_said, fp_l3_state_max;
+static uint64_t fp_l3_samples, fp_l3_votes;
 static unsigned fp_enabled, fp_started, fp_ready;
 static thread_call_data_t fp_call;
 /* Refusals are EBUSY, never EAGAIN: userland_sysctl() retries a handler's
@@ -405,6 +416,68 @@ static int fp_initialize(void)
  }
  return 1;
 }
+/* fl3: once at ready, read-only. Any unreadable register, a clear enable or
+ * a boot vote that does not name the running row leaves L3 untouched. */
+static void fp_l3_init(void)
+{
+ uint32_t enable = UINT32_MAX, state = UINT32_MAX, vote = UINT32_MAX, rows[40];
+ unsigned count, khz;
+ if (!fp_l3) fp_l3 = ml_io_map(fp_l3_pa,0x1000);
+ if (!fp_l3) { printf("FUXI PERF: L3 off: map %#llx failed\n",fp_l3_pa); return; }
+ if (!fp_read(fp_l3,0,&enable) || !fp_read(fp_l3,0x20,&state) || !fp_read(fp_l3,0x90,&vote)) {
+  printf("FUXI PERF: L3 off: unreadable (enable %#x state %#x vote %#x), no write\n",enable,state,vote);
+  return;
+ }
+ for (count = 0; count < 40; count++) {
+  rows[count] = UINT32_MAX;
+  if (!fp_read(fp_l3,0x100+4*count,&rows[count])) {
+   printf("FUXI PERF: L3 off: LUT row %u unreadable, no write\n",count);
+   return;
+  }
+  if (count && fp_khz(rows[count]) == fp_khz(rows[count-1])) break;
+ }
+ int high = fp_l3_check(rows,count,enable,vote,state,&khz);
+ if (high < 0) {
+  printf("FUXI PERF: L3 off: enable %#x vote %u state %#x do not match the %u-row LUT, no write\n",
+      enable,vote,state,count);
+  return;
+ }
+ fp_l3_boot = fp_l3_voted = vote;
+ fp_l3_boot_khz = fp_khz(rows[vote]);
+ fp_l3_high = (unsigned)high;
+ fp_l3_high_khz = khz;
+ fp_l3_ready = 1;
+ printf("FUXI PERF: L3 vote ready: boot row %u (%u kHz) state %#x, boost row %u (%u kHz, word %#x) of %u; writes +0x90 only\n",
+     vote,fp_l3_boot_khz,state,fp_l3_high,khz,rows[high],count);
+}
+/* Called by the worker after the CPU votes. A lost enable, a write fault or a
+ * readback mismatch restores the boot vote once and ends L3 voting. */
+static void fp_l3_update(int high)
+{
+ if (!fp_l3_ready) return;
+ unsigned want = high ? fp_l3_high : fp_l3_boot;
+ if (want == fp_l3_voted) return;
+ uint32_t enable, got = UINT32_MAX;
+ if (!fp_read(fp_l3,0,&enable) || !(enable & 1)) {
+  fp_l3_ready = 0;
+  printf("FUXI PERF: L3 off: enable %#x lost before voting row %u, no write\n",enable,want);
+  return;
+ }
+ uint64_t v = want;
+ if (fuxi_gpu_access(fp_l3+0x90,&v,1,0) || !fp_read(fp_l3,0x90,&got) || got != want) {
+  uint64_t boot = fp_l3_boot;
+  (void)fuxi_gpu_access(fp_l3+0x90,&boot,1,0);
+  fp_l3_ready = 0;
+  printf("FUXI PERF: L3 off: row %u read back %#x, boot row %u rewritten\n",want,got,fp_l3_boot);
+  return;
+ }
+ fp_l3_voted = want;
+ if (high) { fp_l3_votes++; return; }
+ /* Once: the state +0x20 sampled while the boost row was voted proves it ran. */
+ if (!fp_l3_said++)
+  printf("FUXI PERF: L3 first boost: row %u voted and read back, state L max %u (%u kHz) over %llu samples; boot row %u restored\n",
+      fp_l3_high,fp_l3_state_max,fp_l3_state_max*19200,fp_l3_samples,fp_l3_boot);
+}
 /* Timestamp gate also applies to input-triggered calls, so input cannot
  * accelerate retries or extend the fixed 60-second initialization window. */
 static int fp_try_initialize(uint64_t now)
@@ -425,6 +498,7 @@ static int fp_try_initialize(uint64_t now)
   if (fp_base_mhz)
    printf("FUXI PERF: ready base fpk=%u: gold/prime %u/%u kHz while thermally safe, else compiled cool %u/%u kHz\n",
        fp_base_mhz,fp_base_khz[1],fp_base_khz[2],fp_cool_khz[1],fp_cool_khz[2]);
+  if (fp_l3_enabled) fp_l3_init();
   return 1;
  }
  if (!fp_attempted) fp_init_report("init retry");
@@ -622,6 +696,7 @@ static void fp_worker_locked(thread_call_param_t arg, thread_call_param_t result
   fp_update_votes(state);
  }
  if (fp_compile_high) fp_compile_voted = 1;
+ fp_l3_update(boost);
  unsigned idle = state == FP_IDLE;
  if (idle != was_idle) {
   if (idle) { fp_idle_entries++; fp_idle_entry = now; }
@@ -649,6 +724,13 @@ static void fp_worker_locked(thread_call_param_t arg, thread_call_param_t result
   fp_cur_sum[b][d-1] += mhz;
   if (d == 1) fp_cur_n[b]++;
   if (mhz > fp_cur_max[b][d-1]) fp_cur_max[b][d-1] = mhz;
+ }
+ if (fp_l3_ready && fp_l3_voted == fp_l3_high && fp_l3_high != fp_l3_boot) {
+  uint32_t cur;
+  if (fp_read(fp_l3,0x20,&cur)) {
+   fp_l3_samples++;
+   if ((cur & 255) > fp_l3_state_max) fp_l3_state_max = cur & 255;
+  }
  }
  fp_last = now;
  if (!fp_window_start) fp_window_start = now;
@@ -719,6 +801,8 @@ void fuxi_perf_start(void)
  nanoseconds_to_absolutetime(10*NSEC_PER_SEC,&fp_pressure_dwell);
  (void)PE_parse_boot_argn("fuxicompileboost",&fp_compile_enabled,sizeof(fp_compile_enabled));
  fp_compile_enabled = fp_compile_enabled == 1;
+ (void)PE_parse_boot_argn("fl3",&fp_l3_enabled,sizeof(fp_l3_enabled));
+ fp_l3_enabled = fp_l3_enabled == 1;
  /* Keep at least two of logical 2-6 (gold/prime); otherwise ignore. */
  if (!PE_parse_boot_argn("fuxicores",&fp_recommend,sizeof(fp_recommend)) ||
      (fp_recommend & ~0x7fu) || __builtin_popcount(fp_recommend & 0x7cu) < 2) fp_recommend = 0;
