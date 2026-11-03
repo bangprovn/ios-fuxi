@@ -2,6 +2,7 @@
 # Build the P-SYS userland pieces on a Mac with Xcode (iPhoneOS SDK):
 #   OUT/FuxiAudio.driver   AudioServerPlugIn bundle for mediaserverd's HAL
 #   OUT/libfuxi-sb.dylib   SpringBoard snapshot-format library
+#   OUT/libfuxi-app.dylib  runningboardd and every application: CADisableMinimumFrameDurationOnPhone = YES
 # Install them with tools/fuxi-sys-root.py (see docs-lanes/sys-port.md).
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -17,9 +18,11 @@ cp tools/fuxi-audio/Info.plist "$bundle/Info.plist"
 "$cc" "${flags[@]}" -bundle tools/fuxi-audio/FuxiAudio.c -framework CoreFoundation -o "$bundle/FuxiAudio"
 "$cc" "${flags[@]}" -dynamiclib tools/fuxi-sb/FuxiSnapshots.c tools/fuxi-sb/FuxiRates.c -lobjc \
  -install_name /usr/local/lib/fuxi/libfuxi-sb.dylib -o "$out/libfuxi-sb.dylib"
-for binary in "$bundle" "$out/libfuxi-sb.dylib"; do
+"$cc" "${flags[@]}" -dynamiclib tools/fuxi-sb/FuxiAppRate.c -framework CoreFoundation -lobjc \
+ -install_name /usr/local/lib/fuxi/libfuxi-app.dylib -o "$out/libfuxi-app.dylib"
+for binary in "$bundle" "$out/libfuxi-sb.dylib" "$out/libfuxi-app.dylib"; do
  codesign -f -s - "$binary"
  codesign --verify --strict "$binary"
 done
-shasum -a 256 "$bundle/FuxiAudio" "$bundle/Info.plist" "$out/libfuxi-sb.dylib" > "$out/SYS-SHA256SUMS"
+shasum -a 256 "$bundle/FuxiAudio" "$bundle/Info.plist" "$out/libfuxi-sb.dylib" "$out/libfuxi-app.dylib" > "$out/SYS-SHA256SUMS"
 cat "$out/SYS-SHA256SUMS"

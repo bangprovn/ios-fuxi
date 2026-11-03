@@ -19,6 +19,12 @@ Every step is idempotent and has an undo option.
                           it to SpringBoard's DYLD_INSERT_LIBRARIES in the launchd
                           cache: application snapshots as JPEG/PNG instead of ATX
   --no-sb-snapshots       take it out of the job and remove the library
+  --app-rate DYLIB        install libfuxi-app.dylib as /usr/local/lib/fuxi/ and add
+                          it to runningboardd's DYLD_INSERT_LIBRARIES: runningboardd
+                          then inserts it into every application it starts, which
+                          sees CADisableMinimumFrameDurationOnPhone = YES (frames
+                          above 60 a second) with its signed Info.plist untouched
+  --no-app-rate           take it out of the job and remove the library
   --quiet-jobs PRESET,... set Disabled=true on the respawn-storm jobs of a preset
                           (marked _FuxiSysDisabled so the undo restores only them):
                             observed  nanotimekitcompaniond (55 execs per boot on
@@ -42,6 +48,8 @@ VIRTUAL_AUDIO = 'Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin'
 VIRTUAL_AUDIO_DISABLED = 'Library/Audio/Plug-Ins/HAL.disabled/VirtualAudio.plugin'
 SB_JOB = '/System/Library/LaunchDaemons/com.apple.SpringBoard.plist'
 SB_LIB = '/usr/local/lib/fuxi/libfuxi-sb.dylib'
+APP_JOB = 'com.apple.runningboardd'
+APP_LIB = '/usr/local/lib/fuxi/libfuxi-app.dylib'
 MARK = '_FuxiSysDisabled'
 PRESETS = {
     'observed': ('com.apple.nanotimekitcompaniond',),
@@ -147,33 +155,63 @@ def sb_job(plist):
     return job
 
 
-def sb_snapshots(root, dylib):
-    root.install_tree(dylib, SB_LIB)
-    plist = root.load_launchd()
-    env = sb_job(plist).setdefault('EnvironmentVariables', {})
+def labelled_job(plist, label):
+    for job in plist['LaunchDaemons'].values():
+        if job.get('Label') == label:
+            return job
+    sys.exit('launchd.plist: no job labelled ' + label)
+
+
+def insert_library(root, plist, job, name, lib):
+    env = job.setdefault('EnvironmentVariables', {})
     libs = [p for p in env.get('DYLD_INSERT_LIBRARIES', '').split(':') if p]
-    if SB_LIB in libs:
-        print('SpringBoard: DYLD_INSERT_LIBRARIES already has ' + SB_LIB)
+    if lib in libs:
+        print(name + ': DYLD_INSERT_LIBRARIES already has ' + lib)
         return
-    env['DYLD_INSERT_LIBRARIES'] = ':'.join(libs + [SB_LIB])
-    root.say('SpringBoard: DYLD_INSERT_LIBRARIES=' + env['DYLD_INSERT_LIBRARIES'])
+    env['DYLD_INSERT_LIBRARIES'] = ':'.join(libs + [lib])
+    root.say(name + ': DYLD_INSERT_LIBRARIES=' + env['DYLD_INSERT_LIBRARIES'])
     root.save_launchd(plist)
 
 
-def no_sb_snapshots(root):
-    plist = root.load_launchd()
-    job = sb_job(plist)
+def take_library(root, plist, job, name, lib):
+    """The other libraries stay; an environment emptied by this goes, as it was before insert_library."""
     env = job.get('EnvironmentVariables', {})
     libs = [p for p in env.get('DYLD_INSERT_LIBRARIES', '').split(':') if p]
-    if SB_LIB in libs:
-        libs.remove(SB_LIB)
+    if lib in libs:
+        libs.remove(lib)
         if libs:
             env['DYLD_INSERT_LIBRARIES'] = ':'.join(libs)
         else:
             env.pop('DYLD_INSERT_LIBRARIES')
-        root.say('SpringBoard: ' + SB_LIB + ' taken out of DYLD_INSERT_LIBRARIES')
+            if not env:
+                job.pop('EnvironmentVariables')
+        root.say(name + ': ' + lib + ' taken out of DYLD_INSERT_LIBRARIES')
         root.save_launchd(plist)
+
+
+def sb_snapshots(root, dylib):
+    root.install_tree(dylib, SB_LIB)
+    plist = root.load_launchd()
+    insert_library(root, plist, sb_job(plist), 'SpringBoard', SB_LIB)
+
+
+def no_sb_snapshots(root):
+    plist = root.load_launchd()
+    take_library(root, plist, sb_job(plist), 'SpringBoard', SB_LIB)
     root.remove(SB_LIB)
+
+
+def app_rate(root, dylib):
+    plist = root.load_launchd()
+    job = labelled_job(plist, APP_JOB)
+    root.install_tree(dylib, APP_LIB)
+    insert_library(root, plist, job, 'runningboardd', APP_LIB)
+
+
+def no_app_rate(root):
+    plist = root.load_launchd()
+    take_library(root, plist, labelled_job(plist, APP_JOB), 'runningboardd', APP_LIB)
+    root.remove(APP_LIB)
 
 
 def quiet_jobs(root, presets):
@@ -229,6 +267,9 @@ def main():
     sb = ap.add_mutually_exclusive_group()
     sb.add_argument('--sb-snapshots', metavar='DYLIB')
     sb.add_argument('--no-sb-snapshots', action='store_true')
+    app = ap.add_mutually_exclusive_group()
+    app.add_argument('--app-rate', metavar='DYLIB')
+    app.add_argument('--no-app-rate', action='store_true')
     jobs = ap.add_mutually_exclusive_group()
     jobs.add_argument('--quiet-jobs', metavar='PRESET,...')
     jobs.add_argument('--unquiet-jobs', action='store_true')
@@ -251,6 +292,12 @@ def main():
         sb_snapshots(root, args.sb_snapshots)
     if args.no_sb_snapshots:
         no_sb_snapshots(root)
+    if args.app_rate:
+        if not os.path.isfile(args.app_rate):
+            ap.error('no such library: ' + args.app_rate)
+        app_rate(root, args.app_rate)
+    if args.no_app_rate:
+        no_app_rate(root)
     if args.quiet_jobs:
         quiet_jobs(root, [p for p in args.quiet_jobs.split(',') if p])
     if args.unquiet_jobs:

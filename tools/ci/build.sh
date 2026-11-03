@@ -239,6 +239,7 @@ kernel() {
     python3 tools/test-fuxi-audio-mic.py
     python3 tools/test-fuxi-audio-dsp.py
     python3 tools/test-fuxi-rates.py
+    python3 tools/test-fuxi-apprate.py
     python3 tools/test-fuxi-audio-amp-on.py
     python3 tools/sync-fuxi-audio.py --check
     python3 tools/test-fuxi-pac.py
