@@ -124,3 +124,4 @@ fuxi/0056-apfs-vol-attributes.patch
 fuxi/0057-fb-call-summary.patch
 fuxi/0058-debugger-ipi-resend.patch
 fuxi/0059-stackshot-skip-silent-core.patch
+fuxi/0060-reinit-signal-assert.patch

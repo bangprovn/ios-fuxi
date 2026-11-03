@@ -1,0 +1,21 @@
+diff --git a/osfmk/arm/cpu_common.c b/osfmk/arm/cpu_common.c
+index 8776f16..60fb7da 100644
+--- a/osfmk/arm/cpu_common.c
++++ b/osfmk/arm/cpu_common.c
+@@ -943,7 +943,16 @@ assert_ml_cpu_signal_is_enabled(bool enabled)
+ 	if (enabled) {
+ 		assert((getCpuDatap()->cpu_signal & SIGPdisabled) == 0);
+ 	} else {
++#if defined(FUXI)
++		/*
++		 * Fuxi: sheng_sigp_recover() clears SIGPdisabled on a core that is in InitState|StartedState
++		 * but has not reached here yet, so a signal sent meanwhile (seen: SIGPast, 0x8) is already
++		 * pending; it is handled once interrupts are enabled below.
++		 */
++		assert(getCpuDatap()->cpu_signal == SIGPdisabled || sheng_sigp_recovered != 0);
++#else
+ 		assert3u(getCpuDatap()->cpu_signal, ==, SIGPdisabled);
++#endif
+ 	}
+ }
+ 
