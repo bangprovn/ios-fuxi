@@ -49,7 +49,7 @@ extern "C" void _objc_msgForward(void);
 #endif
 static fuxi::ClientMode clientMode=fuxi::ClientMode::deny;
 static char clientProcess[64]="unknown";
-static bool gpuScanout=false,gpuScanoutQuiet=false;
+static bool gpuScanout=false,gpuScanoutQuiet=false,renderPriorityOff=false;
 // One worker avoids a compile stampede. Blocks own device, descriptor snapshot
 // and handler until completion; the backend still serializes Vulkan/cache use.
 static dispatch_queue_t pipelineCompilationQueue() {
@@ -120,6 +120,7 @@ static void checkClient() {
    char args[4096]={};
    (void)FUXI_MTL_BOOTARGS(args,sizeof(args));
    gpuScanout=fuxi::gpuScanoutEnabled(args);gpuScanoutQuiet=fuxi::translationOption(args,"sweetfb_noconsole=");
+   {bool key=false;renderPriorityOff=!fuxi::translationOption(args,"fuxigpuprio=",&key) && key;}
    if(gpuScanout)fprintf(stderr,"FUXI MTL: GPU scanout surface locks per submission\n");
    if(fuxi::earlyScheduledWait(fuxi::systemTranslationPolicy(),gpuScanout,gpuScanoutQuiet,clientProcess))fprintf(stderr,"FUXI MTL: CA scheduled wait early=1 commit-reserved surfaces\n");
    selectedBackend=fuxi::selectMetalBackend(args);if(selectedBackend==fuxi::MetalBackend::invalid)clientMode=fuxi::ClientMode::deny;
@@ -210,6 +211,32 @@ struct DescriptorContext {
  ~DescriptorContext(){descriptorContext=previous;}
 };
 static qos_class_t compositorQoS(){return strcmp(clientProcess,"backboardd")?QOS_CLASS_DEFAULT:QOS_CLASS_USER_INTERACTIVE;}
+// CoreAnimation's render thread has a fixed priority: iOS 16.7 QuartzCore's CA::Render::Server::start() calls set_thread_priority(thread,0),
+// which is pthread_setschedparam(SCHED_FIFO,55+0), so XNU runs it fixed at 55 with no QoS and no decay. The compositor's submit and retire
+// queues do that thread's frame work, so they run at its priority, as UniXNU AdrenoMetal 241f355 does for its encoding thread: at
+// user-interactive QoS they are timeshare threads whose priority decays under their own load. GCD's threads refuse a fixed policy
+// (ENOTSUP), so each queue targets a workloop that the kernel serves fixed at 55. fuxigpuprio=0 on the boot line keeps the plain queues.
+static dispatch_queue_t compositorQueue(const char *label,dispatch_queue_attr_t attr) {
+ if(strcmp(clientProcess,"backboardd"))return dispatch_queue_create(label,attr);
+ using SetPriority=void (*)(dispatch_workloop_t,int,uint64_t); // libdispatch SPI; flag 1 is DISPATCH_WORKLOOP_FIXED_PRIORITY (POLICY_RR)
+ static const SetPriority setPriority=(SetPriority)dlsym(RTLD_DEFAULT,"dispatch_workloop_set_scheduler_priority");
+ static std::once_flag logged;
+ std::call_once(logged,[]{fprintf(stderr,"FUXI MTL: submit/retire priority %s\n",renderPriorityOff?"timeshare reason=fuxigpuprio":setPriority?"fixed=55":"timeshare reason=no-workloop-priority");});
+ if(renderPriorityOff || !setPriority)return dispatch_queue_create(label,attr);
+ dispatch_workloop_t loop=dispatch_workloop_create_inactive(label);if(!loop)return dispatch_queue_create(label,attr);
+ setPriority(loop,55,1);dispatch_activate(loop);
+ dispatch_queue_t queue=dispatch_queue_create_with_target(label,attr,loop);dispatch_release(loop);return queue;
+}
+// Once per role in backboardd: the kernel's view of the calling thread (policy 1 timeshare, 2 fixed; base and current priority).
+static std::atomic<bool> renderThreadLogged{false},submitThreadLogged{false},retireThreadLogged{false};
+static void logThreadPriority(std::atomic<bool> &done,const char *role,bool coreAnimationOnly=false) {
+ if(done.load(std::memory_order_relaxed) || strcmp(clientProcess,"backboardd"))return;
+ if(coreAnimationOnly){char name[64]={};pthread_getname_np(pthread_self(),name,sizeof name);if(strncmp(name,"com.apple.coreanimation",23))return;}
+ if(done.exchange(true))return;
+ thread_extended_info_data_t info{};mach_msg_type_number_t count=THREAD_EXTENDED_INFO_COUNT;
+ if(thread_info(pthread_mach_thread_np(pthread_self()),THREAD_EXTENDED_INFO,(thread_info_t)&info,&count)!=KERN_SUCCESS)return;
+ fprintf(stderr,"FUXI MTL: thread priority %s name=%.64s policy=%d base=%d cur=%d\n",role,info.pth_name,info.pth_policy,info.pth_priority,info.pth_curpri);
+}
 static void failureLog(const char *format,...) {
  fuxi::backboardGate.fault();uint64_t n=failureCount.fetch_add(1);
  char message[fuxi::Survey::messageBytes];va_list args;va_start(args,format);vsnprintf(message,sizeof(message),format,args);va_end(args);
@@ -1486,7 +1513,7 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
   // Start the fence wait before user scheduled handlers. Retirement can free a
   // flight slot even if a handler enqueues another command on this queue.
   auto queued=_frameTrace?fuxi::FrameClock::now():fuxi::FrameClock::time_point{};
-  dispatch_async(_queue->_retireQueue,^{@autoreleasepool{if(_frameTrace)_flightTrace.retireQueue=fuxi::frameNanos(queued);[self retireCommitted];}});
+  dispatch_async(_queue->_retireQueue,^{@autoreleasepool{if(_frameTrace)_flightTrace.retireQueue=fuxi::frameNanos(queued);logThreadPriority(retireThreadLogged,"retire");[self retireCommitted];}});
   auto start=_frameTrace?fuxi::FrameClock::now():fuxi::FrameClock::time_point{};[self publishScheduled];if(_frameTrace)_flightTrace.scheduledHandlers=fuxi::frameNanos(start);dispatch_group_leave(_scheduledGroup);
  }
  else [self retireCommitted];
@@ -1544,10 +1571,12 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
  [self encodeCacheHintTag:tag resourceGroups:groups count:count];
 }
 - (void)reserveOverlap {
+ logThreadPriority(renderThreadLogged,"render",true);
  auto start=_frameTrace?fuxi::FrameClock::now():fuxi::FrameClock::time_point{};
  if(!_earlySubmit){dispatch_semaphore_wait(_queue->_inflight,DISPATCH_TIME_FOREVER);if(_frameTrace)_flightTrace.admissionWait+=fuxi::frameNanos(start);_flightTrace.inflight=++_queue->_depth;}
  _enqueued=YES;dispatch_group_enter(_commitReady);++_queue->_pending;
  dispatch_async(_queue->_submitQueue,^{@autoreleasepool{
+  logThreadPriority(submitThreadLogged,"submit");
   dispatch_group_wait(_commitReady,DISPATCH_TIME_FOREVER);
   if(_earlySubmit){auto start=_frameTrace?fuxi::FrameClock::now():fuxi::FrameClock::time_point{};dispatch_semaphore_wait(_queue->_inflight,DISPATCH_TIME_FOREVER);if(_frameTrace)_flightTrace.admissionWait+=fuxi::frameNanos(start);_flightTrace.inflight=++_queue->_depth;}
   [self executeCommitted];
@@ -1788,8 +1817,9 @@ static NSString *surfaceDescriptorText(IOSurfaceRef surface,NSUInteger plane){
 - (id)newCommandQueue {CENSUS();if(clientMode==fuxi::ClientMode::census)return nil;FuxiQueue *q=[FuxiQueue new];q->_device=[self retain];q->_depth=0;q->_pending=0;q->_traceReturn=0;q->_traceDelivery=0;q->_traceHandlers=0;q->_traceWaitCompleted=0;q->_traceWaitScheduled=0;if(fuxi::systemTranslationPolicy().overlap){
  // The compositor's submit/retire/handler work is on the frame path; at default
  // QoS it competes with background daemons (UniXNU AdrenoMetal c6d29ca does the same).
+ // Submit and retire also run fixed at the render thread's priority (compositorQueue).
  dispatch_queue_attr_t attr=dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,compositorQoS(),0);
- q->_submitQueue=dispatch_queue_create("fuxi.metal.submit",attr);q->_retireQueue=dispatch_queue_create("fuxi.metal.retire",attr);q->_finishQueue=dispatch_queue_create("fuxi.metal.finish",attr);q->_deliveryQueue=dispatch_queue_create("fuxi.metal.handlers",attr);q->_inflight=dispatch_semaphore_create(2);
+ q->_submitQueue=compositorQueue("fuxi.metal.submit",attr);q->_retireQueue=compositorQueue("fuxi.metal.retire",attr);q->_finishQueue=dispatch_queue_create("fuxi.metal.finish",attr);q->_deliveryQueue=dispatch_queue_create("fuxi.metal.handlers",attr);q->_inflight=dispatch_semaphore_create(2);
  if(!q->_submitQueue || !q->_retireQueue || !q->_finishQueue || !q->_deliveryQueue || !q->_inflight){[q release];return nil;}
  }return q;}
 - (id)newHeapWithDescriptor:(MTLHeapDescriptor *)d {CENSUS();
