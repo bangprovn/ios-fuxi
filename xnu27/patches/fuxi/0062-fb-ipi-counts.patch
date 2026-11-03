@@ -1,0 +1,25 @@
+diff --git a/iokit/Kernel/arm/FuxiFramebuffer.cpp b/iokit/Kernel/arm/FuxiFramebuffer.cpp
+index 48c2815..2849884 100644
+--- a/iokit/Kernel/arm/FuxiFramebuffer.cpp
++++ b/iokit/Kernel/arm/FuxiFramebuffer.cpp
+@@ -56,6 +56,8 @@
+ 
+ extern "C" void fuxi_fb_start(void);
+ extern "C" void fuxi_debug_sync_report(void);       /* osfmk/arm/model_dep.c */
++extern volatile uint32_t armcpu_core_timer[8], armcpu_core_sgi[8];   /* ArmCpu.cpp: per logical core */
++extern volatile uint64_t armcpu_ipi_sent;
+ 
+ /* IOConnectCallMethod selectors of the framebuffer user client (iOS 16.5; hakios found them unchanged in iOS 26) */
+ enum {
+@@ -1241,6 +1243,11 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			gFBSummaryAt = now;
+ 			IOLog("FuxiFramebuffer: calls in %llu ms (selector:count)%s\n", nanos / NSEC_PER_MSEC, line);
+ 			fuxi_debug_sync_report();
++			IOLog("FuxiFramebuffer: IPIs sent %llu; per core SGI/timer interrupts %u/%u %u/%u %u/%u %u/%u %u/%u %u/%u %u/%u %u/%u\n",
++			    armcpu_ipi_sent, armcpu_core_sgi[0], armcpu_core_timer[0], armcpu_core_sgi[1], armcpu_core_timer[1],
++			    armcpu_core_sgi[2], armcpu_core_timer[2], armcpu_core_sgi[3], armcpu_core_timer[3],
++			    armcpu_core_sgi[4], armcpu_core_timer[4], armcpu_core_sgi[5], armcpu_core_timer[5],
++			    armcpu_core_sgi[6], armcpu_core_timer[6], armcpu_core_sgi[7], armcpu_core_timer[7]);
+ 		}
+ 	}
+ 

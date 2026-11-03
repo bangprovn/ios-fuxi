@@ -126,3 +126,4 @@ fuxi/0058-debugger-ipi-resend.patch
 fuxi/0059-stackshot-skip-silent-core.patch
 fuxi/0060-reinit-signal-assert.patch
 fuxi/0061-stackshot-abort-on-silent-core.patch
+fuxi/0062-fb-ipi-counts.patch
