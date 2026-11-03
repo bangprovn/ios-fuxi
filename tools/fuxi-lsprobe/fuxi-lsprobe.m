@@ -187,8 +187,29 @@ show_registration(const char *path, bool reg)
 			a.forkattr |= 0x110;
 		}
 		r = getattrlist(path, &a, big, sizeof(big), 0x25);
-		fprintf(stderr, "lsprobe:   getattrlist CoreServices group %d (common 0x%x): %s\n", k == 0 ? 0 : k == 1 ? 5 : k == 2 ? 7 : 2,
-		    a.commonattr, r == 0 ? "ok" : strerror(errno));
+		const uint32_t *ret = (const uint32_t *)(big + 4);     /* size, then the returned attribute_set_t */
+
+		fprintf(stderr, "lsprobe:   getattrlist CoreServices group %d (common 0x%x): %s, size %u, returned common 0x%x dir 0x%x "
+		    "file 0x%x ext 0x%x\n", k == 0 ? 0 : k == 1 ? 5 : k == 2 ? 7 : 2, a.commonattr, r == 0 ? "ok" : strerror(errno),
+		    *(uint32_t *)big, ret[0], ret[2], ret[3], ret[4]);
+	}
+	/* CoreServicesInternal's canonical path is ATTR_CMN_FULLPATH; ask for it alone */
+	for (int k = 0; k < 2; k++) {
+		struct attrlist a = { .bitmapcount = ATTR_BIT_MAP_COUNT, .commonattr = ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_FULLPATH };
+		struct {
+			uint32_t size;
+			attribute_set_t ret;
+			attrreference_t full;
+			char buf[MAXPATHLEN];
+		} __attribute__((packed)) fb;
+		int r;
+
+		memset(&fb, 0, sizeof(fb));
+		r = getattrlist(path, &a, &fb, sizeof(fb), k == 0 ? 0 : 0x25);
+		fprintf(stderr, "lsprobe:   getattrlist FULLPATH (options 0x%x): %s, size %u, returned common 0x%x, path '%.*s'\n",
+		    k == 0 ? 0 : 0x25, r == 0 ? "ok" : strerror(errno), fb.size, fb.ret.commonattr,
+		    (fb.ret.commonattr & ATTR_CMN_FULLPATH) ? (int)fb.full.attr_length : 0,
+		    (fb.ret.commonattr & ATTR_CMN_FULLPATH) ? (char *)&fb.full + fb.full.attr_dataoffset : "");
 	}
 	node = fsnode == nil ? nil : [[fsnode alloc] initWithURL:url flags:0 error:&e];
 	if (node == nil) {
@@ -285,6 +306,33 @@ show_registration_data(const char *path)
 		d = sandbox_check(getpid(), "file-read-data", FUXI_SANDBOX_FILTER_PATH | FUXI_SANDBOX_CHECK_NO_REPORT | FUXI_SANDBOX_CHECK_CANONICAL, real);
 		fprintf(stderr, "lsprobe:   sandbox_check lsd sandboxed %d (errno %d), lsd file-read-data canonical %d (%d), plain %d (%d); "
 		    "self %d (%d), path %s\n", a, ea, b, eb, c, ec, d, errno, real);
+	}
+	/* the canonical path through CoreFoundation and Foundation, on a few paths, with whatever error they give */
+	{
+		const char *paths[] = { "/", "/System", "/System/Library/CoreServices", path };
+
+		for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+			CFURLRef cf = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)paths[i], strlen(paths[i]), true);
+			CFTypeRef value = NULL;
+			CFErrorRef cferr = NULL;
+			Boolean ok = CFURLCopyResourcePropertyForKey(cf, kCFURLCanonicalPathKey, &value, &cferr);
+			NSError *ne = nil;
+			NSDictionary *d = [[NSURL fileURLWithPath:@(paths[i])] resourceValuesForKeys:@[NSURLCanonicalPathKey, NSURLPathKey,
+			    NSURLIsDirectoryKey] error:&ne];
+
+			fprintf(stderr, "lsprobe:   %s: CF canonical (key %s) %d '%s' %s; NS %s %s\n", paths[i],
+			    [(__bridge NSString *)kCFURLCanonicalPathKey UTF8String], ok,
+			    value != NULL ? [[(__bridge id)value description] UTF8String] : "nil",
+			    cferr != NULL ? [[(__bridge NSError *)cferr description] UTF8String] : "",
+			    d.description.UTF8String ?: "nil", ne.description.UTF8String ?: "");
+			if (value != NULL) {
+				CFRelease(value);
+			}
+			if (cferr != NULL) {
+				CFRelease(cferr);
+			}
+			CFRelease(cf);
+		}
 	}
 	/* FSNode's own check, step by step: its audit token (task_info 15), the canonical path, realpath, the verdict */
 	{
