@@ -20,6 +20,13 @@ emit iig-pregen/), replay (any Xcode; replay FUXI_IIG_CACHE or xnu/iig-pregen/).
 HELP
 }
 die() { echo "fuxi-ci: $*" >&2; exit 2; }
+# FUXI_CI_TESTS=quick (workflow input tests): skip the host test suites, about 8 of a kernel job's 15 minutes,
+# while a change is being tried on the phone. The patch sync checks and every other python3 call still run; the
+# lines stay `python3 tools/test-fuxi-*.py` (several tests look for them here). A finished change gets a full build.
+python3() {
+    if [[ ${FUXI_CI_TESTS:-full} == quick && ${1:-} == tools/test-fuxi-* ]]; then echo "fuxi-ci: quick build, skipped $1"; return 0; fi
+    command python3 "$@"
+}
 [[ $# -gt 0 ]] || { usage >&2; exit 2; }
 case "$1" in
     -h|--help) [[ $# == 1 ]] || die 'unexpected help arguments'; usage; exit 0 ;;

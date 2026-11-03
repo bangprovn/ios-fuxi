@@ -42,6 +42,11 @@ on:
         description: replay - ID of a capture run with fuxi-iig-pregen-* artifacts (empty uses committed xnu/iig-pregen/)
         type: string
         default: ''
+      tests:
+        description: full - every host test before building; quick - only the patch sync checks (for trying a change on the phone; finish with full)
+        type: choice
+        options: [full, quick]
+        default: full
 
 permissions:
   contents: read
@@ -85,6 +90,7 @@ jobs:
       FUXI_IIG_MODE: ${{ inputs.iig_mode }}
       XCODE_VERSION: ${{ inputs.xcode }}
       IIG_RUN: ${{ inputs.iig_run }}
+      FUXI_CI_TESTS: ${{ inputs.tests }}
     steps:
       - uses: actions/checkout@v4
         with:
