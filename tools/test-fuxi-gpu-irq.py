@@ -2,8 +2,9 @@
 """GPU fence interrupt (fuxigpuncimport bit 26): the actual fuxi_gpu_irq.inc and the WaitFence spin loop on host models.
 
 1. fuxi_gpu_irq.inc with kernel-shaped declarations, compiled and assembled for arm64 under xnu's -Weverything list (-Werror).
-2. The same source against a modelled GICv3 distributor and RBBM: opt-in, attach sequence and readback, CPU binding order, source
-   clear of only bit 20, storm masks (empty run, burst, foreign SPI, no delivery, isolation), sleep race/timeout/written, mask repair.
+2. The same source against a modelled GICv3 distributor and RBBM: opt-in, attach sequence and readback, CPU binding order, the route
+   (SM8550 MPIDR layout: physical core 6, else the highest gold core, else CPU 0), source clear of only bit 20, away count, storm masks
+   (empty run, burst, foreign SPI, no delivery, isolation), sleep race/timeout/written, wake latency, mask repair.
 3. FuxiAdrenoUserClient::spin: interrupt sleeps only while the fence is unwritten, polls otherwise, retire stamp and first-poll flag.
 No hardware, SDK or GIC is touched; device interrupt delivery is not observed here.
 """
@@ -47,8 +48,13 @@ struct fg_window { uint64_t pa, size; uintptr_t va; };
 static unsigned fg_abi_live, fg_abi_poisoned, fg_access_failed, fg_irq_want, fg_ready = 1, guards, guardDepth;
 static uint32_t rbbm[0x400], fenceMem;
 static uint8_t gicd[0x10000] __attribute__((aligned(4096)));
-static uint64_t fakeMpidr = 0x281000000ULL, fakeNow, waitDeadline;
+/* SM8550 as booted: logical 0..6 = physical cores 0,2,3,4,5,6,7 (cpu@100 is the loader's). MPIDR_EL1 with Aff3 2, bit 31 and MT
+ * (bit 24) set, so the route must keep Aff3 and drop bits 24..31. A failed bind leaves the thread on bindMiss's CPU. */
+static uint64_t mpidrOf[16], fakeNow, waitDeadline;
 static unsigned cpuCount = 7, bound[16], binds, installs[16], installSource, wakes, waits, mapFail, rbbmPtrFail, blockResult, typerLines = 31;
+static unsigned curCpu, bindMiss = ~0u;
+static void (*blockHook)(void);
+static int ml_get_cpu_number_local(void) { return (int)curCpu; }
 static void (*installed)(void *, void *, void *, int);
 static int fg_guard(void) { guards++; guardDepth++; return 0; }
 static void fg_unguard(int *g) { (void)g; guardDepth--; }
@@ -59,14 +65,18 @@ uintptr_t fuxi_gpu_nc_pointer(uint64_t pa, uint64_t bytes) { (void)bytes; return
 static uint32_t g3_gr(unsigned reg) { return rbbm[reg]; }
 static int g3_gw(unsigned reg, uint32_t v) { if (fg_access_failed) return 0; if (reg == 0x37) rbbm[0x201] &= ~v; rbbm[reg] = v; return 1; }
 static uint32_t g3_read(uint64_t pa) { return pa == G3_FENCE_PA + FG_ABI_FENCE_OFF + 4 ? fenceMem : 0; }
-#define rsr(r) (fakeMpidr + 0*sizeof(r))
+#define rsr(r) (mpidrOf[curCpu] + 0*sizeof(r))
 static void delay(unsigned us) { fakeNow += us*1000; }
 static unsigned ml_get_cpu_count(void) { return cpuCount; }
 static unsigned processors[16];
 static processor_t cpu_to_processor(int i) { return (processor_t)(void *)&processors[i]; }
-static processor_t thread_bind(processor_t p) { if (p) bound[binds++ % 16] = (unsigned)((unsigned *)(void *)p - processors); return 0; }
+static processor_t thread_bind(processor_t p)
+{
+ if (p) { unsigned cpu = (unsigned)((unsigned *)(void *)p - processors); bound[binds++ % 16] = cpu; if (cpu != bindMiss) curCpu = cpu; }
+ return 0;
+}
 static unsigned blockPending;
-static wait_result_t thread_block(thread_continue_t c) { (void)c; if (!blockPending) return THREAD_AWAKENED; blockPending = 0; return (int)blockResult; }
+static wait_result_t thread_block(thread_continue_t c) { (void)c; if (blockHook) blockHook(); if (!blockPending) return THREAD_AWAKENED; blockPending = 0; return (int)blockResult; }
 static void ml_install_interrupt_handler(void *nub, int source, void *target, void (*h)(void *, void *, void *, int), void *ref)
 { (void)nub; (void)target; (void)ref; installs[bound[(binds - 1) % 16]]++; installSource = (unsigned)source; installed = h; }
 static wait_result_t assert_wait_deadline(event_t e, wait_interrupt_t i, uint64_t d) { (void)e; (void)i; waits++; waitDeadline = d; blockPending = 1; return 0; }
@@ -88,6 +98,8 @@ TEST = r'''
 #include <string.h>
 static uint32_t gd(unsigned off) { uint32_t v; memcpy(&v, gicd + off, 4); return v; }
 static void gdw(unsigned off, uint32_t v) { memcpy(gicd + off, &v, 4); }
+static void sm8550(void) { static const unsigned phys[7] = {0, 2, 3, 4, 5, 6, 7}; for (unsigned i = 0; i < 7; i++) mpidrOf[i] = 0x281000000ULL | (uint64_t)phys[i] << 8; }
+static uint64_t router(void) { uint64_t r; memcpy(&r, gicd + 0x6000 + 8*332, 8); return r; }
 static void reset(void)
 {
  memset(gicd, 0, sizeof(gicd)); memset(rbbm, 0, sizeof(rbbm)); memset(installs, 0, sizeof(installs));
@@ -95,7 +107,11 @@ static void reset(void)
  fg_irq_state = fg_irq_ok = fg_irq_inside = fg_irq_why = 0; fg_irq_gicd.va = 0; fg_irq_empty_run = fg_irq_burst = 0; fg_irq_window = 0;
  memset(fg_irq_stats, 0, sizeof(fg_irq_stats)); binds = 0; fg_abi_live = 1; fg_ready = 1; fg_access_failed = 0; fg_abi_poisoned = 0; fg_irq_want = 1;
  rbbm[0x38] = 0; mapFail = rbbmPtrFail = 0; installed = 0; fakeNow = 1000000000ull;
+ sm8550(); cpuCount = 7; curCpu = 0; bindMiss = ~0u; blockHook = 0; fg_irq_cpu = ~0u; fg_irq_at = 0;
 }
+/* The interrupt fires while the waiter is blocked: 1 us after the sleep starts, handled on curCpu, the waiter runs latTicks later. */
+static uint64_t latTicks;
+static void irqDuringBlock(void) { fakeNow += 1000; rbbm[0x201] = 1u<<20; installed(0, 0, 0, 332); fakeNow += latTicks; }
 int main(void)
 {
  unsigned w = (332/32)*4; uint32_t bit = 1u << (332%32); uint64_t s[FG_IRQ_STATS]; unsigned why;
@@ -111,20 +127,36 @@ int main(void)
  reset(); fg_access_failed = 1; assert(!fuxi_gpu_irq_setup() && !(gd(0x100 + w) & bit));
  /* Readback mismatch (RWP never clears): masked, not armed. */
  reset(); gdw(0, 0x10u|0x80000000u); assert(!fuxi_gpu_irq_setup() && (gd(0x180 + w) & bit) && !fg_irq_ok && rbbm[0x38] == 0); gdw(0, 0x10u);
- /* Attach: handler on every CPU, CPU 0 last; stale bit 20 cleared; only bit 20 unmasked; group 1, priority 0xa0, level, routed to CPU 0. */
+ /* Attach: handler on every CPU (bound in turn, CPU 0 last); stale bit 20 cleared; only bit 20 unmasked; group 1, priority 0xa0, level;
+  * routed to physical core 6 = logical 5 (MPIDR Aff1 6, Aff3 kept, bits 24..31 dropped), not CPU 0 and not the X3. */
  reset(); rbbm[0x201] = (1u<<20)|2u; rbbm[0x38] = 0;
  assert(fuxi_gpu_irq_setup() == 1 && fg_irq_state == 1 && fg_irq_ok && installSource == 332 && installed);
  for (unsigned i = 0; i < cpuCount; i++) assert(installs[i] == 1);
- assert(binds == cpuCount); for (unsigned i = 0; i < cpuCount; i++) assert(bound[i] == cpuCount - 1 - i); /* CPU 0 last: its MPIDR is the route */
+ assert(binds == cpuCount); for (unsigned i = 0; i < cpuCount; i++) assert(bound[i] == cpuCount - 1 - i);
  assert(rbbm[0x38] == (1u<<20) && rbbm[0x201] == 2u && fg_irq_mask_was == 0);
  assert((gd(0x80 + w) & bit) && gicd[0x400 + 332] == 0xa0 && !(gd(0xc00 + (332/16)*4) & (1u << ((332%16)*2+1))) && (gd(0x100 + w) & bit));
- { uint64_t r; memcpy(&r, gicd + 0x6000 + 8*332, 8); assert(r == (fakeMpidr & 0xff00ffffffULL) && r == 0x200000000ULL); }
+ assert(router() == (mpidrOf[5] & 0xff00ffffffULL) && router() == 0x200000600ULL && fg_irq_cpu == 5);
  assert(fuxi_gpu_irq_setup() == 1 && fuxi_gpu_irq_stats(s, &why) == 1 && !why);
  assert(gd(0x180 + w) & bit); gdw(0x180 + w, 0); /* attach disables before configuring; later masks are checked from here */
- /* Handler: clears only bit 20 (fault bits stay for g3_faulted), counts, wakes. */
- rbbm[0x201] = (1u<<20)|0x40u; rbbm[0x37] = 0; uint32_t seq = fuxi_gpu_irq_seq(); wakes = 0;
+ /* Handler: clears only bit 20 (fault bits stay for g3_faulted), counts, wakes; on the routed CPU it is not "away". */
+ rbbm[0x201] = (1u<<20)|0x40u; rbbm[0x37] = 0; uint32_t seq = fuxi_gpu_irq_seq(); wakes = 0; curCpu = 5;
  installed(0, 0, 0, 332);
  assert(rbbm[0x37] == (1u<<20) && fuxi_gpu_irq_seq() == seq + 1 && wakes == 1 && fg_irq_stats[FG_IRQ_N] == 1 && !fg_irq_stats[FG_IRQ_EMPTY]);
+ assert(!fg_irq_stats[FG_IRQ_AWAY] && fg_irq_at == fakeNow);
+ /* Handled anywhere else: still cleared and counted, plus "away". */
+ rbbm[0x201] = 1u<<20; rbbm[0x37] = 0; curCpu = 0; installed(0, 0, 0, 332);
+ assert(rbbm[0x37] == (1u<<20) && fg_irq_stats[FG_IRQ_N] == 2 && fg_irq_stats[FG_IRQ_AWAY] == 1); curCpu = 5;
+ /* Fewer cores (cpus=N): the highest gold core present; none: CPU 0 as before; the X3 or a silver core never. */
+ reset(); cpuCount = 3; assert(fuxi_gpu_irq_setup() == 1 && router() == 0x200000300ULL && fg_irq_cpu == 2);
+ reset(); cpuCount = 2; assert(fuxi_gpu_irq_setup() == 1 && router() == 0x200000000ULL && fg_irq_cpu == 0);
+ reset(); cpuCount = 1; assert(fuxi_gpu_irq_setup() == 1 && router() == 0x200000000ULL && fg_irq_cpu == 0 && binds == 1);
+ reset(); mpidrOf[1] = 0x281000700ULL; cpuCount = 2; assert(fuxi_gpu_irq_setup() == 1 && fg_irq_cpu == 0); /* X3 + CPU 0: CPU 0 */
+ /* A bind that does not take (the thread still runs elsewhere) never routes to the CPU it read: core 5 (logical 4) instead. */
+ reset(); bindMiss = 5; assert(fuxi_gpu_irq_setup() == 1 && router() == 0x200000500ULL && fg_irq_cpu == 4);
+ /* No CPU qualifies (no CPU 0 visited): masked, not armed, RBBM mask restored. */
+ reset(); cpuCount = 1; bindMiss = 0; curCpu = 3; rbbm[0x38] = 0x5u;
+ assert(!fuxi_gpu_irq_setup() && fg_irq_state == 2 && !fg_irq_ok && (gd(0x180 + w) & bit) && rbbm[0x38] == 0x5u && fg_irq_cpu == ~0u);
+ reset(); assert(fuxi_gpu_irq_setup() == 1 && fg_irq_cpu == 5); gdw(0x180 + w, 0); curCpu = 5;
  /* A foreign SPI is masked at the distributor; a PPI is ignored. */
  installed(0, 0, 0, 100); assert((gd(0x180 + (100/32)*4) & (1u << (100%32))) && fg_irq_stats[FG_IRQ_FOREIGN] == 1);
  installed(0, 0, 0, 27); assert(fg_irq_stats[FG_IRQ_FOREIGN] == 2 && fg_irq_state == 1);
@@ -147,6 +179,14 @@ int main(void)
  assert(waitDeadline == fakeNow + 1000000);
  blockResult = THREAD_TIMED_OUT; assert(fuxi_gpu_irq_sleep(fuxi_gpu_irq_seq(), 8, 1000) == 0 && fg_irq_stats[FG_IRQ_TIMEOUTS] == 1);
  blockResult = THREAD_AWAKENED; assert(fuxi_gpu_irq_sleep(fuxi_gpu_irq_seq(), 8, 1000) == 1 && fg_irq_stats[FG_IRQ_WAKES] == 1);
+ /* Wake latency: an interrupt during the sleep counts from its entry to the waiter running (n, sum, max); the wake above (its last
+  * interrupt no later than the sleep's start) counts none. */
+ assert(!fg_irq_stats[FG_IRQ_LAT_N] && !fg_irq_stats[FG_IRQ_LAT_SUM]);
+ latTicks = 25000; blockHook = irqDuringBlock; assert(fuxi_gpu_irq_sleep(fuxi_gpu_irq_seq(), 8, 1000) == 1);
+ assert(fg_irq_stats[FG_IRQ_LAT_N] == 1 && fg_irq_stats[FG_IRQ_LAT_SUM] == 25000 && fg_irq_stats[FG_IRQ_LAT_MAX] == 25000 && fg_irq_stats[FG_IRQ_WAKES] == 2);
+ latTicks = 5000; assert(fuxi_gpu_irq_sleep(fuxi_gpu_irq_seq(), 8, 1000) == 1);
+ assert(fg_irq_stats[FG_IRQ_LAT_N] == 2 && fg_irq_stats[FG_IRQ_LAT_SUM] == 30000 && fg_irq_stats[FG_IRQ_LAT_MAX] == 25000);
+ blockHook = 0;
  fenceMem = 5; assert(fuxi_gpu_irq_sleep(fuxi_gpu_irq_seq(), 0xfffffffeull, 1000) == -2); /* 32-bit wrap compare */
  fenceMem = 7; fg_abi_live = 0; assert(fuxi_gpu_irq_sleep(fuxi_gpu_irq_seq(), 8, 1000) == -2); fg_abi_live = 1;
  /* Many timeouts after an interrupt was seen keep it armed. */
@@ -165,7 +205,7 @@ int main(void)
  rbbm[0x201] = 1u<<20; rbbm[0x37] = 0; installed(0, 0, 0, 332); assert(rbbm[0x37] == 0 && rbbm[0x201] == (1u<<20));
  wakes = 0; fg_irq_quiesce(); assert(!wakes); /* idempotent */
  reset(); fg_irq_quiesce(); assert(fg_irq_state == 0); /* never armed: nothing to do */
- puts("PASS: actual fuxi_gpu_irq.inc: opt-in, refusals, GICD attach/readback/routing, per-CPU install order, bit-20-only clear, empty/burst/foreign/no-delivery/isolation masks, sleep race/timeout/written/wrap, mask repair");
+ puts("PASS: actual fuxi_gpu_irq.inc: opt-in, refusals, GICD attach/readback, route to physical core 6 (logical 5; fewer cores, failed bind, X3/silver never, CPU 0 fallback), per-CPU install order, bit-20-only clear, away count, empty/burst/foreign/no-delivery/isolation masks, sleep race/timeout/written/wrap, wake latency, mask repair");
  return 0;
 }
 '''

@@ -15,13 +15,15 @@ host = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(host)
 
 BUFFER = r'''
-static unsigned segMode,segCalls,lastBufOptions;
+static unsigned segMode,segCalls,lastBufOptions,contigCalls;
+static int allocDepth=-1,releaseDepth=-1; /* lockDepth: the client/stat lock nesting, declared with IOLockLock */
 constexpr unsigned kIOMemoryKernelUserShared=64,kIOMapWriteCombineCache=128,kIOMemoryPhysicallyContiguous=256;
 struct IOBufferMemoryDescriptor: IOMemoryDescriptor {
  void *data=nullptr;
  ~IOBufferMemoryDescriptor() override {free(data);}
  static IOBufferMemoryDescriptor *inTaskWithPhysicalMask(task_t task,unsigned options,uint64_t n,uint64_t mask) {
-  assert(task==kernel_task && mask);lastBufOptions=options;
+  assert(task==kernel_task && mask);lastBufOptions=options;allocDepth=lockDepth;
+  if(options&kIOMemoryPhysicallyContiguous)contigCalls++;
   if(fail==15 || (fail==16 && (options&kIOMemoryPhysicallyContiguous)))return nullptr;
   auto *m=new IOBufferMemoryDescriptor;m->length=n;m->data=calloc(1,n);assert(m->data);return m;
  }
@@ -40,7 +42,7 @@ struct IOBufferMemoryDescriptor: IOMemoryDescriptor {
 struct FuxiAdrenoBoView {
  IOBufferMemoryDescriptor *backing=nullptr;
  bool bind(IOBufferMemoryDescriptor *m) {backing=m;m->retain();return true;}
- void release() {if(backing){backing->complete();backing->release();}delete this;}
+ void release() {releaseDepth=lockDepth;if(backing){backing->complete();backing->release();}delete this;}
 };
 '''
 EXTRA = r'''
@@ -63,7 +65,10 @@ static uint64_t fuxi_gpu_abi_map_work() {return 0;}
 static bool queueOn;static int fuxi_gpu_abi_queue_enabled() {return queueOn;}
 static int submitRc=-1,submitBusy;static unsigned submitCount,submitCalls;static uint64_t submitLast;
 static int fuxi_gpu_abi_submit(const uint64_t *,const uint64_t *b,unsigned n,uint64_t *f) {submitCalls++;submitCount=n;submitLast=b[n-1];*f=submitCalls;if(submitBusy>0){submitBusy--;return 1;}return submitRc;}
-static uint64_t mach_absolute_time() {return 0;}
+static uint64_t nowTicks;
+static uint64_t mach_absolute_time() {return nowTicks;}
+static void nanoseconds_to_absolutetime(uint64_t ns,uint64_t *t) {*t=ns;}
+static int statLockStore,*statLock=&statLockStore;
 static constexpr unsigned NSEC_PER_MSEC=1000000;
 static void clock_interval_to_deadline(unsigned,unsigned,uint64_t *d) {*d=1;}
 static unsigned statCount[FG_ABI_STATS],spins,pauses;
@@ -273,7 +278,37 @@ int main() {
    ccState=0;}
   inputOverride=0;submitRc=-1;b->iova=0;assert(!d.clientClose());
  }
- puts("PASS: actual methods 7/8 dispatch/errors/lengths, 1024 BO allocation/refusal/reuse/close, handle index after churn, 128-IB and legacy 416-byte submit records, shared wired quota, metadata refusal and CPU leases, cached-coherent BOs (device-info flag, gated alloc, WB map attrs, default-cache CPU token)");
+ // BoAlloc's pages are made outside lock_ and BoFree's released after it (4c75ccb, 14e4a7d); a BO that does not require one run asks
+ // for a contiguous one only up to 128 KiB, and a failed search of S bytes stops asks of S or more for 5 s (01ed692).
+ {
+  Client e;e.live_=true;contigState={};memset(contigN,0,sizeof(contigN));memset(outsideN,0,sizeof(outsideN));nowTicks=1000;contigCalls=0;fail=0;segMode=0;
+  NativeAdrenoAbiBoAlloc k128{131072,12,0},k144{147456,12,0},k64{65536,12,0},req{262144,12,NativeAdrenoAllocContiguous};
+  NativeAdrenoAbiBoAllocReply o{};
+  allocDepth=-1;assert(!call(e,2,&k128,&o) && contigCalls==1 && allocDepth==0 && lockDepth==0); // asked, before lock_
+  NativeAdrenoAbiBoFree fr{o.handle};releaseDepth=-1;unsigned d0=descriptors;
+  assert(!call(e,4,&fr,nullptr) && releaseDepth==0 && descriptors==d0-1 && !e.find(fr.handle)); // released after lock_
+  assert(!call(e,2,&k144,&o) && contigCalls==1);                           // over 128 KiB: never asks
+  fail=16;assert(!call(e,2,&k128,&o) && contigCalls==2);                   // asks, fails, falls back to pages
+  assert(!call(e,2,&k128,&o) && contigCalls==2 && contigN[3]==1);          // same size within 5 s: skipped
+  assert(!call(e,2,&k64,&o) && contigCalls==3);                            // smaller: still asks (fails: back-off now from 64 KiB)
+  assert(!call(e,2,&k128,&o) && contigCalls==3 && contigN[3]==2);
+  assert(call(e,2,&req,&o)==kIOReturnNoMemory && contigCalls==4);         // required: always asks
+  fail=0;nowTicks+=FG_ABI_CONTIG_BACKOFF_NS-1;assert(!call(e,2,&k128,&o) && contigCalls==4);
+  nowTicks+=1;assert(!call(e,2,&k128,&o) && contigCalls==5);              // 5 s after the last failure
+  assert(contigN[0]==5 && contigN[1]==2 && contigN[2]==3 && contigN[3]==3);
+  assert(outsideN[0][0]==9 && outsideN[1][0]==1);                          // every live alloc call prepared outside lock_
+  // Pages made outside but refused under lock_ (the unlocked pre-check does not see tokens) are released after it.
+  d0=descriptors;e.nextToken_=UINT32_MAX;assert(call(e,2,&k64,&o)==kIOReturnNoResources && descriptors==d0);e.nextToken_=1;
+  // A closed client prepares nothing; a full table or quota is refused before any allocation.
+  e.live_=false;unsigned a0=outsideN[0][0];assert(call(e,2,&k64,&o)==kIOReturnNotOpen && outsideN[0][0]==a0 && descriptors==d0);e.live_=true;
+  uint64_t w0=e.wired_;e.wired_=FG_ABI_MAX_WIRED_BYTES;assert(call(e,2,&k64,&o)==kIOReturnNoResources && outsideN[0][0]==a0 && descriptors==d0);e.wired_=w0;
+  // Imported BOs: GPU unmap and alias unwire under lock_, map and pin released after it.
+  NativeAdrenoAbiBoImport im{0x100000,32768};NativeAdrenoAbiBoAllocReply ih{};unsigned m0=maps,c0=completes;
+  assert(!call(e,16,&im,&ih) && maps==m0+1);
+  NativeAdrenoAbiBoFree ifr{ih.handle};assert(!call(e,4,&ifr,nullptr) && maps==m0 && completes==c0+1 && descriptors==d0 && outsideN[1][0]==2);
+  assert(!e.clientClose() && !e.wired_);
+ }
+ puts("PASS: actual methods 7/8 dispatch/errors/lengths, 1024 BO allocation/refusal/reuse/close, handle index after churn, 128-IB and legacy 416-byte submit records, shared wired quota, metadata refusal and CPU leases, cached-coherent BOs (device-info flag, gated alloc, WB map attrs, default-cache CPU token), BoAlloc pages before lock_ / BoFree pages after it (alloc and import), contiguous asks up to 128 KiB with a 5 s back-off");
 }
 '''
 
@@ -309,7 +344,10 @@ def main():
     # The real waitUnlocked must release the client lock around the sleep loop.
     wait += ' IOReturn spin(uint64_t,uint64_t,uint64_t *,bool *) {spins++;waits++;lastSpinDepth=lockDepth;if(spinKill)*spinKill=false;return 0;}\n'
     prefix = prefix.replace('static void IOLockLock(int *){}','static int lockDepth;static void IOLockLock(int *){lockDepth++;}').replace('static void IOLockUnlock(int *){}','static void IOLockUnlock(int *){lockDepth--;}')
-    model = prefix+EXTRA+HANDLE_STUBS+helper+'struct Client {\n'+bo+r'''
+    # The actual outside-lock_ counters and contiguous back-off (statLock is modelled), and BoAlloc's page maker.
+    contig = source[source.index('static uint64_t outsideN[2][3]'):source.index('static void abiSplit(unsigned slot')]
+    pages = source[source.index(' static Pages makePages('):source.index(' IOReturn allocate(')]
+    model = prefix+EXTRA+contig+HANDLE_STUBS+helper+'struct Client {\n'+bo+pages+r'''
  /* The kernel allocates the table in initWithTask; the model owns it inline. */
  Bo storage_[MaxBos]={};
  Client(){bos_={storage_,storage_+MaxBos};assert(index_.allocate());}

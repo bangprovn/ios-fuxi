@@ -12,8 +12,23 @@
 /* Internal quotas, independent of the unchanged per-object wire limit. */
 #define FG_ABI_MAX_BOS 1024u
 #define FG_ABI_MAX_WIRED_BYTES (UINT64_C(768) << 20)
-#define FG_ABI_CONTIG_TRY_BYTES (UINT64_C(1) << 20)
 #define FG_ABI_MAX_IMPORTS 512u
+/* A BO that does not require one physical run asks for one only up to 128 KiB, and not for 5 s after a failed search of its size or
+ * less (UniXNU Adreno740 01ed692, MIT). A search the kernel cannot serve scans every free page first: theirs took 21.7 s over 124
+ * failures of 0.1-64 MiB while every success was 64-128 KiB; ours measured 50-58 ms per failed large attempt. A BO that requires one
+ * run (NativeAdrenoAllocContiguous) still always asks; its failure also starts the back-off. */
+#define FG_ABI_CONTIG_TRY_BYTES (UINT64_C(128) << 10)
+#define FG_ABI_CONTIG_BACKOFF_NS UINT64_C(5000000000)
+struct fg_abi_contig { uint64_t failed_bytes, failed_at; };
+static inline int fg_abi_contig_try(const struct fg_abi_contig *c, uint64_t bytes, uint64_t now, uint64_t backoff)
+{
+ return bytes <= FG_ABI_CONTIG_TRY_BYTES && (!c->failed_bytes || now - c->failed_at >= backoff || bytes < c->failed_bytes);
+}
+static inline void fg_abi_contig_failed(struct fg_abi_contig *c, uint64_t bytes, uint64_t now, uint64_t backoff)
+{
+ if (!c->failed_bytes || now - c->failed_at >= backoff || bytes < c->failed_bytes) c->failed_bytes = bytes;
+ c->failed_at = now;
+}
 /* Internal: bit 8 of the permissions handed to fuxi_gpu_abi_map_import means NativeAdrenoMapGpuOnly was passed in BoMap.reserved. */
 #define FG_ABI_IMPORT_GPU_ONLY 0x100u
 /* fuxi_gpu_abi_clean_split: what the per-submit import clean cost, by class [GPU-writable, read-only] and size bucket, the KiB GPU_ONLY

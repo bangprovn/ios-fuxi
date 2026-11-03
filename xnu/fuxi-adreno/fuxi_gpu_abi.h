@@ -52,7 +52,9 @@ void fuxi_gpu_abi_publish(void);
 int fuxi_gpu_irq_setup(void);
 uint32_t fuxi_gpu_irq_seq(void);
 int fuxi_gpu_irq_sleep(uint32_t seq0, uint64_t fence, unsigned us);
-enum { FG_IRQ_N, FG_IRQ_EMPTY, FG_IRQ_FOREIGN, FG_IRQ_WAKES, FG_IRQ_TIMEOUTS, FG_IRQ_RACES, FG_IRQ_MASKFIX, FG_IRQ_WRITTEN, FG_IRQ_STATS };
+/* AWAY: interrupts handled on a CPU other than the routed one. LAT_*: interrupt entry to a woken waiter running again, mach ticks. */
+enum { FG_IRQ_N, FG_IRQ_EMPTY, FG_IRQ_FOREIGN, FG_IRQ_WAKES, FG_IRQ_TIMEOUTS, FG_IRQ_RACES, FG_IRQ_MASKFIX, FG_IRQ_WRITTEN, FG_IRQ_AWAY,
+ FG_IRQ_LAT_N, FG_IRQ_LAT_SUM, FG_IRQ_LAT_MAX, FG_IRQ_STATS };
 /* Counters and why it was masked (1 empty run, 2 burst, 3 isolation, 4 no delivery); returns 0 off, 1 armed, 2 attach failed, 3 masked, 4 attaching. */
 unsigned fuxi_gpu_irq_stats(uint64_t s[FG_IRQ_STATS], unsigned *why);
 #ifdef __cplusplus
