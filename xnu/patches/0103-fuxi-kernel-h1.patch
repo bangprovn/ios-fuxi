@@ -1181,7 +1181,20 @@
  #endif /* ARM64_BOARD_CONFIG_SWEET */
 --- a/bsd/dev/fuxi_touch.c
 +++ b/bsd/dev/fuxi_touch.c
-@@ -19,6 +19,19 @@
+@@ -12,6 +12,12 @@
+  * polls the event FIFO while GPIO25 (IRQ, active low) is asserted.
+  * No firmware upload: the FTS keeps its firmware in its own flash.
+  *
++ * Interrupt (default): GPIO25 through the TLMM summary interrupt (GIC SPI
++ * 208) wakes the thread, which reads the FIFO only then; see "Touch
++ * interrupt" below. If that cannot be set up, or the interrupt does not come
++ * while the line says there is data, the driver polls as follows, for the
++ * rest of the boot (boot-arg fuxitouch_irq=0 polls from the start).
++ *
+  * Polling (0093): every 4 ms while a finger is down or the IRQ line was
+  * seen recently, every 8 ms when idle and every 32 ms while the display is
+  * off (AppleCLCD RequestPowerChange(0)); deadlines are absolute and use the
+@@ -19,12 +25,26 @@
   * reported while the display is off (boot-arg fuxitouch_offsuppress=0 keeps
   * reporting). Boot-arg fuxitouch_poll_us sets the active period (default
   * 4000), fuxitouch_idle_us the idle one (default 8000).
@@ -1201,7 +1214,14 @@
   */
  #if defined(FUXI)
  #include <sys/param.h>
-@@ -32,14 +45,17 @@
+ #include <sys/systm.h>
+ #include <sys/errno.h>
+ #include <kern/clock.h>
++#include <kern/kern_types.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+@@ -32,14 +52,19 @@
  #include <vm/vm_kern.h>
  #include <vm/pmap.h>
  #include <arm/caches_internal.h>
@@ -1216,10 +1236,12 @@
      void *parameter, integer_t priority, thread_t *new_thread);
  extern int sweet_fb_display_off;       /* iokit/Kernel/arm/SweetFramebuffer.cpp */
 +extern bool fuxi_keys_touch_wake(void); /* bsd/dev/fuxi_keys.c */
++extern processor_t cpu_to_processor(int);
++extern processor_t thread_bind(processor_t);
  void fuxi_touch_init(void);
  
  #define FT_SE_PA     0x00a90000u
-@@ -64,12 +80,16 @@
+@@ -64,12 +89,17 @@
  	uint64_t dma_pa;
  	unsigned depth, level, wp[2], evrp;
  	bool started;
@@ -1228,6 +1250,7 @@
  	uint32_t active;
  	int x[FT_MAX], y[FT_MAX];
  	bool ic_reset;                 /* controller-ready event while sensing */
++	unsigned fifo_hits;            /* FIFO reads that found an event (interrupt checks) */
  	/* Per-contact statistics (first finger down -> last finger up). */
  	uint64_t c_start, c_last, c_poll_sum, c_poll_max;
  	unsigned c_reports, c_polls, contacts;
@@ -1236,7 +1259,7 @@
  } ft;
  static int ft_chan;
  
-@@ -460,9 +480,11 @@
+@@ -460,9 +490,11 @@
  	uint64_t dur = ft_us(ft.c_last - ft.c_start);
  	ft.contacts++;
  	printf("FUXI TOUCH: contact %u: %u reports in %llu ms (%llu us apart), %u polls, "
@@ -1250,7 +1273,7 @@
  }
  
  extern void fuxi_perf_input(void);
-@@ -475,15 +497,28 @@
+@@ -475,15 +507,28 @@
  		ft.c_start = now;
  		ft.c_reports = ft.c_polls = 0;
  		ft.c_poll_sum = ft.c_poll_max = 0;
@@ -1284,7 +1307,7 @@
  	if (mask || ft.active) {
  		ft.c_reports++;
  		ft.c_last = now;
-@@ -492,6 +527,15 @@
+@@ -492,6 +537,15 @@
  	ft.active = mask;
  	if (ended) {
  		ft_contact_end();
@@ -1300,7 +1323,15 @@
  	}
  }
  
-@@ -535,6 +579,15 @@
+@@ -515,6 +569,7 @@
+ 	if (e[0] == 0) {
+ 		return 0;
+ 	}
++	ft.fifo_hits++;
+ 	unsigned n = 1 + (e[7] & 0x1f);
+ 	if (n > 32) {
+ 		n = 32;
+@@ -535,6 +590,15 @@
  		if ((ev[0] != FT_EV_ENTER && ev[0] != FT_EV_MOTION && ev[0] != FT_EV_LEAVE) ||
  		    id >= FT_MAX || (type == 0 && ev[0] != FT_EV_LEAVE)) {
  			continue;
@@ -1316,7 +1347,323 @@
  		}
  		/* Super-resolution coordinates, 10x the 1080x2400 panel. */
  		int x = ((ev[3] << 8) | ev[2]) / 10, y = ((ev[5] << 8) | ev[4]) / 10;
-@@ -568,10 +621,14 @@
+@@ -553,6 +617,305 @@
+ 	return 0;
+ }
+ 
++/*
++ * Touch interrupt. Adapted from UniXNU-sheng package/TouchProbe.cpp armTouchIrq/touchIrq (5872a4f, GPIO 25 through
++ * the TLMM summary SPI 208 on SM8550; BSD-2-Clause-Patent, bsd/dev/LICENSE.UniXNU-sheng) and, for the distributor,
++ * ArmCpu armcpu_spi_attach as fuxi_gpu_irq.inc fg_spi_on has it (BSD-2-Clause-Patent, bsd/dev/LICENSE.ArmCpu).
++ *
++ * Facts. Stock DT (dtbo_a fuxi overlay fragment@34 fts@0; merged: /soc/qcom,qupv3_1_geni_se@ac0000/spi@a90000/fts@0):
++ * interrupts = <25 0x2008> on the TLMM, fts,irq-gpio = <&tlmm 25 0x2008>, fts,irq-flags = <0x2008>: IRQ_TYPE_LEVEL_LOW
++ * (8) with IRQF_ONESHOT (0x2000). The TLMM (/soc/pinctrl@f000000, pins from 0xf100000) has one summary interrupt,
++ * <0 208 4> = SPI 208 level high = INTID 240; GICD at 0x17100000 (/soc/interrupt-controller@17100000 reg[0]). Pin
++ * registers at TLMM + 0x1000 * pin (Linux pinctrl-sm8550.c PINGROUP, as UniXNU): +0x8 INTR_CFG, bit 0 enable, bit 1
++ * polarity, bits 3:2 detection (0 level), bit 4 raw status enable, bits 7:5 target (3 = apps); +0xc INTR_STATUS bit 0,
++ * acknowledged by writing 0. Only GPIO25's two interrupt registers are written; no other pin is touched.
++ *
++ * Level handling as pinctrl-msm.c (handle_level_irq): the handler masks the pin (enable and raw status off, so the
++ * held level cannot latch again), acknowledges it and wakes the thread, which drains the FIFO and unmasks; a line
++ * still low then latches at once. A FIFO found empty with the line still low, or a read error, unmasks only after
++ * one poll period. The thread wakes every FT_WATCH_MS to see the display state and that the path still works, and
++ * reads the FIFO every FT_SWEEP_MS regardless.
++ *
++ * Routing. sleh_irq (patch 0004) calls one handler per CPU (cpu_data interrupt_handler). The GPU fence interrupt
++ * (fuxi_gpu_irq.inc) installs its handler on every CPU and routes INTID 332 to CPU 0, so this routes INTID 240 to
++ * FT_IRQ_CPU and installs its handler there only (it masks any other INTID that reaches it, as the GPU's does; never
++ * route another SPI to that CPU). If the GPU attaches after this, its handler takes FT_IRQ_CPU's slot and masks INTID
++ * 240 at the first touch: the watchdog sees the line low with INTID 240 disabled and installs this handler again
++ * (FT_REPAIRS times at most).
++ *
++ * Fallback to polling, logged once, for the rest of the boot: setup failed; FT_SPUR_MAX interrupts in a row with
++ * GPIO25's status clear or FT_BURST_MAX within 100 ms (the handler masks the SPI); the line low and the pin armed
++ * FT_MISS_MS with no interrupt, twice in a row; FIFO data at FT_SWEEP_STRIKES sweeps in a row with no interrupt
++ * between them; more than FT_REPAIRS re-installs.
++ */
++#define FT_INTID         240u          /* TLMM summary interrupt, GIC SPI 208 */
++#define FT_GICD_PA       0x17100000u
++#define FT_IRQ_CPU       1             /* logical CPU 1 (setup logs its MPIDR): not CPU 0, the GPU fence SPI's */
++#define FT_IC_EN         (1u << 0)
++#define FT_IC_POL        (1u << 1)
++#define FT_IC_DET        (3u << 2)
++#define FT_IC_RAW        (1u << 4)
++#define FT_IC_TGT        (7u << 5)
++#define FT_IC_APPS       (3u << 5)
++#define FT_WATCH_MS      100u
++#define FT_MISS_MS       5u
++#define FT_SWEEP_MS      1000u
++#define FT_SWEEP_STRIKES 3u
++#define FT_STATS_S       60u
++#define FT_SPUR_MAX      100u
++#define FT_BURST_MAX     500u
++#define FT_REPAIRS       3u
++
++static struct {
++	vm_offset_t gicd, pin;           /* GICD; GPIO25's TLMM registers */
++	unsigned state;                  /* 0 off, 1 armed, 2 masked by the handler, 3 polling */
++	unsigned why;                    /* state 2: 1 status clear in a row, 2 burst */
++	uint32_t seq;                    /* interrupts taken, handler to thread */
++	uint32_t spur_run, burst;        /* handler only (one CPU) */
++	uint64_t burst_t0, burst_abs;
++	uint64_t irqs, spurious, foreign; /* handler counters */
++	unsigned rd_irq, rd_timer, rd_timer_data, missed, repairs;  /* thread counters */
++	uint64_t mpidr;
++	int event;
++} fi;
++
++static volatile uint32_t *
++ft_gicd(unsigned off)
++{
++	return (volatile uint32_t *)(fi.gicd + off);
++}
++
++static bool
++ft_spi_bit(unsigned base, unsigned id)
++{
++	return (*ft_gicd(base + (id / 32) * 4) >> (id % 32)) & 1u;
++}
++
++static void
++ft_spi_mask(unsigned id)
++{
++	if (!fi.gicd || id < 32 || id >= 1020) {
++		return;
++	}
++	*ft_gicd(0x180 + (id / 32) * 4) = 1u << (id % 32);
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static void
++ft_irq_wake(void)
++{
++	(void)thread_wakeup((event_t)&fi.event);
++}
++
++static void
++ft_irq_dead(unsigned why)
++{
++	if (!fi.why) {
++		fi.why = why;
++	}
++	__atomic_store_n(&fi.state, 2u, __ATOMIC_RELEASE);   /* before the mask, so a thread that sees it masked falls back */
++	ft_spi_mask(FT_INTID);
++	ft_irq_wake();
++}
++
++/* Interrupt context on FT_IRQ_CPU, interrupts masked, before sleh's EOI. */
++static void
++ft_irq_handler(void *target, void *refcon, void *nub, int source)
++{
++	(void)target;
++	(void)refcon;
++	(void)nub;
++	unsigned id = (unsigned)source;
++	if (id != FT_INTID || __atomic_load_n(&fi.state, __ATOMIC_ACQUIRE) != 1) {
++		ft_spi_mask(id);        /* nobody here to clear it */
++		if (id != FT_INTID) {
++			__atomic_fetch_add(&fi.foreign, 1, __ATOMIC_RELAXED);
++		}
++		return;
++	}
++	uint64_t now = mach_absolute_time();
++	if (now - fi.burst_t0 > fi.burst_abs) {
++		fi.burst_t0 = now;
++		fi.burst = 0;
++	}
++	if (ft_rd(fi.pin, 0xc) & 1u) {
++		ft_wr(fi.pin, 0x8, ft_rd(fi.pin, 0x8) & ~(FT_IC_EN | FT_IC_RAW));
++		ft_wr(fi.pin, 0xc, 0);
++		fi.spur_run = 0;
++		__atomic_fetch_add(&fi.irqs, 1, __ATOMIC_RELAXED);
++		__atomic_fetch_add(&fi.seq, 1, __ATOMIC_RELEASE);
++		ft_irq_wake();
++	} else {
++		__atomic_fetch_add(&fi.spurious, 1, __ATOMIC_RELAXED);
++		if (++fi.spur_run >= FT_SPUR_MAX) {
++			ft_irq_dead(1);
++		}
++	}
++	if (++fi.burst >= FT_BURST_MAX) {
++		ft_irq_dead(2);
++	}
++}
++
++/* The handler into FT_IRQ_CPU's slot (bound there in turn, as fuxi_gpu_irq.inc does); that CPU's affinity. */
++static const char *
++ft_irq_install(uint64_t *mpidr)
++{
++	if (ml_get_cpu_count() <= FT_IRQ_CPU) {
++		return "no second CPU";
++	}
++	processor_t p = cpu_to_processor(FT_IRQ_CPU);
++	if (!p) {
++		return "no processor for the CPU";
++	}
++	processor_t previous = thread_bind(p);
++	(void)thread_block(THREAD_CONTINUE_NULL);
++	ml_install_interrupt_handler(NULL, (int)FT_INTID, NULL, ft_irq_handler, NULL);
++	*mpidr = __builtin_arm_rsr64("MPIDR_EL1") & 0xff00ffffffULL;
++	(void)thread_bind(previous);
++	return NULL;
++}
++
++/* fg_spi_on's sequence: level, group 1 NS, priority 0xa0, routed to one affinity; readback grp|en<<1|edge<<2|prio<<8. */
++static const char *
++ft_spi_on(unsigned id, uint64_t affinity, uint32_t *readback, uint64_t *router)
++{
++	unsigned word = (id / 32) * 4, cfg = 0xc00 + (id / 16) * 4, shift = (id % 16) * 2 + 1, n = 0;
++	uint32_t bit = 1u << (id % 32);
++	*ft_gicd(0x180 + word) = bit;
++	while ((*ft_gicd(0) & 0x80000000u) && n < 100000) {
++		n++;
++		delay(1);
++	}
++	if (n == 100000) {
++		return "GICD_CTLR.RWP stuck";
++	}
++	*ft_gicd(0x80 + word) |= bit;
++	*(volatile uint8_t *)(fi.gicd + 0x400 + id) = 0xa0;
++	*ft_gicd(cfg) &= ~(1u << shift);
++	*(volatile uint64_t *)(fi.gicd + 0x6000 + 8 * id) = affinity;
++	__asm__ volatile("dsb sy" ::: "memory");
++	*ft_gicd(0x100 + word) = bit;
++	__asm__ volatile("dsb sy" ::: "memory");
++	*readback = (ft_spi_bit(0x80, id) ? 1u : 0) | (ft_spi_bit(0x100, id) ? 2u : 0) |
++	    (((*ft_gicd(cfg) >> shift) & 1u) << 2) | ((uint32_t)*(volatile uint8_t *)(fi.gicd + 0x400 + id) << 8);
++	*router = *(volatile uint64_t *)(fi.gicd + 0x6000 + 8 * id);
++	return (*readback & 7u) != 3u || *router != affinity ? "GICD readback" : NULL;
++}
++
++/* One line either way; returns whether interrupts are armed. */
++static bool
++ft_irq_setup(void)
++{
++	uint32_t was = 0, cfg = 0, readback = 0;
++	uint64_t router = 0;
++	unsigned pending = 0;
++	const char *fail = NULL;
++	fi.pin = ft.tlmm + FT_GPIO(FT_IRQ);
++	nanoseconds_to_absolutetime(100 * NSEC_PER_MSEC, &fi.burst_abs);
++	fi.gicd = ml_io_map(FT_GICD_PA, 0x10000);
++	if (!fi.gicd) {
++		fail = "GICD map";
++	} else if (!(*ft_gicd(0) & 0x10u)) {
++		fail = "GICD_CTLR.ARE_NS clear";
++	} else if (((*ft_gicd(4) & 31u) + 1) * 32 <= FT_INTID) {
++		fail = "GICD_TYPER lines";
++	} else {
++		/* msm_gpio_irq_set_type(IRQ_TYPE_LEVEL_LOW) with the pin masked: apps target, level, active low, raw
++		 * status on; then acknowledge whatever latched before. */
++		was = ft_rd(fi.pin, 0x8);
++		cfg = was & ~(FT_IC_EN | FT_IC_POL | FT_IC_DET | FT_IC_TGT | FT_IC_RAW);
++		ft_wr(fi.pin, 0x8, cfg);
++		cfg |= FT_IC_APPS | FT_IC_RAW;
++		ft_wr(fi.pin, 0x8, cfg);
++		ft_wr(fi.pin, 0xc, 0);
++		pending = ft_spi_bit(0x200, FT_INTID);   /* summary already high from another pin? */
++		fail = ft_irq_install(&fi.mpidr);
++		if (!fail) {
++			/* Armed before the SPI is enabled, so whatever arrives is counted (and a stuck summary masked). */
++			__atomic_store_n(&fi.state, 1u, __ATOMIC_RELEASE);
++			fail = ft_spi_on(FT_INTID, fi.mpidr, &readback, &router);
++		}
++		if (fail) {
++			__atomic_store_n(&fi.state, 0u, __ATOMIC_RELEASE);
++			ft_spi_mask(FT_INTID);
++			ft_wr(fi.pin, 0x8, cfg & ~FT_IC_RAW);
++		} else {
++			cfg |= FT_IC_EN;
++			ft_wr(fi.pin, 0x8, cfg);   /* unmasked: a line already low latches now */
++		}
++	}
++	printf("FUXI TOUCH IRQ: GPIO%u level low -> TLMM summary SPI 208 (INTID %u) -> cpu %d mpidr %#llx router %#llx, "
++	    "gicd %#x (grp|en<<1|edge<<2|prio<<8), intr_cfg %#x->%#x, pending %u: %s%s\n", FT_IRQ, FT_INTID, FT_IRQ_CPU,
++	    fi.mpidr, router, readback, was, cfg, pending, fail ? "failed, polling: " : "interrupt-driven", fail ? fail : "");
++	return !fail;
++}
++
++/* Thread: unmask GPIO25 after the FIFO was drained (the handler masked it). */
++static void
++ft_irq_arm(void)
++{
++	ft_wr(fi.pin, 0x8, ft_rd(fi.pin, 0x8) | FT_IC_EN | FT_IC_RAW);
++}
++
++/* Another handler took FT_IRQ_CPU's slot and masked INTID 240: take the slot back and enable it again. */
++static const char *
++ft_irq_repair(void)
++{
++	uint64_t mpidr = 0;
++	const char *fail = ft_irq_install(&mpidr);
++	if (!fail && mpidr != fi.mpidr) {
++		fail = "CPU affinity changed";
++	}
++	if (!fail) {
++		*ft_gicd(0x100 + (FT_INTID / 32) * 4) = 1u << (FT_INTID % 32);
++		__asm__ volatile("dsb sy" ::: "memory");
++	}
++	return fail;
++}
++
++static void
++ft_irq_stats(const char *mode)
++{
++	static uint64_t last_irqs = ~0ULL;
++	static unsigned last_rd = ~0u, last_data = ~0u, last_missed = ~0u;
++	uint64_t irqs = __atomic_load_n(&fi.irqs, __ATOMIC_RELAXED);
++	if (irqs == last_irqs && fi.rd_irq == last_rd && fi.rd_timer_data == last_data && fi.missed == last_missed) {
++		return;
++	}
++	last_irqs = irqs;
++	last_rd = fi.rd_irq;
++	last_data = fi.rd_timer_data;
++	last_missed = fi.missed;
++	printf("FUXI TOUCH IRQ: %llu interrupts (%llu spurious, %llu foreign); reads %u on interrupt, %u on timer "
++	    "(%u with data); %u missed, %u repaired; %s\n", irqs, __atomic_load_n(&fi.spurious, __ATOMIC_RELAXED),
++	    __atomic_load_n(&fi.foreign, __ATOMIC_RELAXED), fi.rd_irq, fi.rd_timer, fi.rd_timer_data, fi.missed,
++	    fi.repairs, mode);
++}
++
++/* Polling from now on: mask the SPI and the pin. Logged once. */
++static void
++ft_irq_fallback(const char *why)
++{
++	__atomic_store_n(&fi.state, 3u, __ATOMIC_RELEASE);
++	ft_spi_mask(FT_INTID);
++	ft_wr(fi.pin, 0x8, ft_rd(fi.pin, 0x8) & ~(FT_IC_EN | FT_IC_RAW));
++	ft_wr(fi.pin, 0xc, 0);
++	printf("FUXI TOUCH IRQ: falling back to polling: %s\n", why);
++	ft_irq_stats("polling");
++}
++
++/* Sleep until the touch interrupt (or the handler giving up) or the deadline. */
++static void
++ft_irq_wait(uint32_t seen, uint64_t deadline, uint64_t leeway)
++{
++	(void)assert_wait_deadline_with_leeway((event_t)&fi.event, THREAD_UNINT,
++	    leeway ? TIMEOUT_URGENCY_SYS_NORMAL | TIMEOUT_URGENCY_LEEWAY : TIMEOUT_URGENCY_SYS_CRITICAL, deadline, leeway);
++	if (__atomic_load_n(&fi.seq, __ATOMIC_ACQUIRE) != seen || __atomic_load_n(&fi.state, __ATOMIC_ACQUIRE) != 1) {
++		ft_irq_wake();   /* it came between the caller's check and the assert: return at once */
++	}
++	(void)thread_block(THREAD_CONTINUE_NULL);
++}
++
+ static void
+ ft_thread(void *arg, wait_result_t result)
+ {
+@@ -560,18 +923,23 @@
+ 	static const uint8_t sense[] = {0xa0, 0x00, 0x01};
+ 	uint8_t ev[8] = {0}, chip[2] = {0};
+ 	unsigned delay_s = 30, errors = 0;
+-	unsigned poll_us = 4000, idle_us = 8000, offsup = 1;
++	unsigned poll_us = 4000, idle_us = 8000, offsup = 1, want_irq = 1;
+ 	bool irq_seen = false, was_off = false;
+ 	(void)arg;
+ 	(void)result;
++	(void)PE_parse_boot_argn("fuxitouch_irq", &want_irq, sizeof(want_irq));
+ 	(void)PE_parse_boot_argn("fuxitouchdelay", &delay_s, sizeof(delay_s));
  	(void)PE_parse_boot_argn("fuxitouch_poll_us", &poll_us, sizeof(poll_us));
  	(void)PE_parse_boot_argn("fuxitouch_idle_us", &idle_us, sizeof(idle_us));
  	(void)PE_parse_boot_argn("fuxitouch_offsuppress", &offsup, sizeof(offsup));
@@ -1331,15 +1678,143 @@
  	ft_sleep(delay_s * 1000u);
  	ft.gcc = ml_io_map(FT_GCC_PA, 0x1f0000);
  	ft.tlmm = ml_io_map(FT_TLMM_PA, 0x30000);
-@@ -641,6 +698,7 @@
+@@ -623,26 +991,56 @@
+ 		printf("FUXI TOUCH: sense on failed %d\n", err);
+ 		goto out;
+ 	}
+-	printf("FUXI TOUCH: sensing, polling GPIO%u\n", FT_IRQ);
++	bool irqmode = want_irq && ft_irq_setup();
++	if (!want_irq) {
++		printf("FUXI TOUCH IRQ: off (fuxitouch_irq=0)\n");
++	}
++	printf("FUXI TOUCH: sensing, %s GPIO%u\n", irqmode ? "interrupt from" : "polling", FT_IRQ);
+ 	/*
+-	 * IRQ is level low while the FIFO holds events. Check it every poll
+-	 * period (absolute deadlines, no timer leeway) and read the FIFO every
+-	 * 32 ms regardless in case the IC does not drive the line.
++	 * IRQ is level low while the FIFO holds events. Polling: check it every
++	 * poll period (absolute deadlines, no timer leeway) and read the FIFO
++	 * every 32 ms regardless in case the IC does not drive the line.
++	 * Interrupt: read after each interrupt; see "Touch interrupt".
+ 	 */
+ 	uint64_t poll_abs, idle_abs, off_abs, recent_abs, sweep_abs;
++	uint64_t watch_abs, miss_abs, isweep_abs, stats_abs, leeway_abs;
+ 	nanoseconds_to_absolutetime(poll_us * 1000ULL, &poll_abs);
+ 	nanoseconds_to_absolutetime(idle_us * 1000ULL, &idle_abs);
+ 	nanoseconds_to_absolutetime(32 * NSEC_PER_MSEC, &off_abs);
+ 	nanoseconds_to_absolutetime(32 * NSEC_PER_MSEC, &sweep_abs);
+ 	nanoseconds_to_absolutetime(150 * NSEC_PER_MSEC, &recent_abs);
++	nanoseconds_to_absolutetime(FT_WATCH_MS * NSEC_PER_MSEC, &watch_abs);
++	nanoseconds_to_absolutetime(FT_MISS_MS * NSEC_PER_MSEC, &miss_abs);
++	nanoseconds_to_absolutetime(FT_SWEEP_MS * NSEC_PER_MSEC, &isweep_abs);
++	nanoseconds_to_absolutetime(FT_STATS_S * NSEC_PER_SEC, &stats_abs);
++	nanoseconds_to_absolutetime(10 * NSEC_PER_MSEC, &leeway_abs);
+ 	uint64_t next = mach_absolute_time(), last_irq = 0, last_read = 0;
++	uint64_t suspect = 0, rearm_at = 0, last_stats = next;
++	uint32_t seen = 0, sweep_seq = 0;   /* 0: an interrupt taken right after setup armed the pin still counts */
++	unsigned missed_run = 0, sweep_run = 0;
++	bool armed = irqmode;
+ 	for (;;) {
+ 		uint64_t now = mach_absolute_time();
  		bool off = offsup && sweet_fb_display_off;
  		if (off != was_off) {
  			was_off = off;
 +			fuxi_wake_touch_display(&ft.wake, off);
  			if (off && ft.active) {
  				ft_report(0);   /* release fingers held when the display went off */
++			}
++		}
++		bool woke = false;
++		if (irqmode) {
++			uint32_t s = __atomic_load_n(&fi.seq, __ATOMIC_ACQUIRE);
++			if (s != seen) {
++				seen = s;
++				woke = true;
++				armed = false;   /* the handler masked GPIO25 */
++				missed_run = 0;
++			}
++			if (__atomic_load_n(&fi.state, __ATOMIC_ACQUIRE) != 1) {
++				ft_irq_fallback(fi.why == 1 ? "interrupts with GPIO25's status clear" : "interrupt storm");
++				irqmode = false;
  			}
-@@ -670,6 +728,9 @@
+ 		}
+ 		bool irq = !(ft_rd(ft.tlmm, FT_GPIO(FT_IRQ) + 4) & 1u);
+@@ -653,10 +1051,73 @@
+ 				printf("FUXI TOUCH: IRQ line asserted\n");
+ 			}
+ 		}
+-		if (irq || ft.active || now - last_read >= sweep_abs) {
++		bool late = false;
++		if (irqmode && armed && irq) {
++			/* Armed and the line low: the interrupt is due within microseconds. */
++			if (!ft_spi_bit(0x100, FT_INTID)) {
++				/* Not by this handler (it sets state 2 first; the next pass falls back then). */
++				if (__atomic_load_n(&fi.state, __ATOMIC_ACQUIRE) == 1) {
++					const char *rfail = ++fi.repairs > FT_REPAIRS ? "too many" : ft_irq_repair();
++					printf("FUXI TOUCH IRQ: INTID %u found disabled with the line low (another handler on cpu %d?), "
++					    "re-install %u: %s\n", FT_INTID, FT_IRQ_CPU, fi.repairs, rfail ? rfail : "done");
++					if (rfail) {
++						ft_irq_fallback("INTID 240 disabled by another handler");
++						irqmode = false;
++					}
++				}
++				suspect = 0;
++			} else if (!suspect) {
++				suspect = now;
++			} else if (now - suspect >= miss_abs && __atomic_load_n(&fi.seq, __ATOMIC_ACQUIRE) == seen) {
++				late = true;
++				suspect = 0;
++				fi.missed++;
++				if (fi.missed <= 3) {
++					printf("FUXI TOUCH IRQ: line low %u ms, no interrupt: intr_cfg %#x status %#x, INTID %u "
++					    "enabled %u pending %u active %u\n", FT_MISS_MS, ft_rd(fi.pin, 0x8), ft_rd(fi.pin, 0xc),
++					    FT_INTID, (unsigned)ft_spi_bit(0x100, FT_INTID), (unsigned)ft_spi_bit(0x200, FT_INTID),
++					    (unsigned)ft_spi_bit(0x300, FT_INTID));
++				}
++			}
++		} else {
++			suspect = 0;
++		}
++		bool sweep = now - last_read >= (irqmode ? isweep_abs : sweep_abs);
++		bool doread = irqmode ? woke || late || sweep : irq || ft.active || sweep;
++		if (doread) {
++			unsigned hits = ft.fifo_hits;
+ 			last_read = now;
+ 			int perr = ft_poll(!off);
+ 			uint64_t took = mach_absolute_time() - now;
++			bool data = ft.fifo_hits != hits;
++			if (woke) {
++				fi.rd_irq++;
++			} else {
++				fi.rd_timer++;
++				fi.rd_timer_data += data;
++			}
++			if (irqmode && late && ++missed_run >= 2) {
++				ft_irq_fallback("the line low with no interrupt, twice");
++				irqmode = false;
++			}
++			if (irqmode && sweep && !woke) {
++				/* Data at a sweep with no interrupt since the last one: the line may not tell. */
++				sweep_run = data && seen == sweep_seq ? sweep_run + 1 : 0;
++				sweep_seq = seen;
++				if (sweep_run >= FT_SWEEP_STRIKES) {
++					ft_irq_fallback("FIFO data at sweeps with no interrupt");
++					irqmode = false;
++				}
++			}
++			if (irqmode && !armed) {
++				bool low = !(ft_rd(ft.tlmm, FT_GPIO(FT_IRQ) + 4) & 1u);
++				if (!perr && (data || !low)) {
++					ft_irq_arm();
++					armed = true;
++				} else {
++					rearm_at = mach_absolute_time() + poll_abs;   /* empty or failed: not straight back */
++				}
++			}
+ 			if (ft.active) {
+ 				ft.c_polls++;
+ 				ft.c_poll_sum += took;
+@@ -670,6 +1131,9 @@
  				/* Do not leave a finger stuck down while reads fail. */
  				if (errors >= 2 && ft.active) {
  					ft_report(0);
@@ -1349,7 +1824,7 @@
  				}
  				/* A timed-out transfer leaves TREs queued: reset the GPII rings. */
  				if (errors == 3 || (errors % 50u) == 0) {
-@@ -688,10 +749,12 @@
+@@ -688,9 +1152,38 @@
  				if (ft.active) {
  					ft_report(0);
  				}
@@ -1357,11 +1832,37 @@
  				int serr = ft_tx(sense, 3, false);
  				printf("FUXI TOUCH: controller reset event, sense on again -> %d\n", serr);
  			}
- 		}
++		}
 +		ft_retry_report();
++		if (now - last_stats >= stats_abs) {
++			last_stats = now;
++			ft_irq_stats(irqmode ? "interrupt-driven" : "polling");
++		}
++		if (irqmode) {
++			now = mach_absolute_time();
++			if (!armed && now >= rearm_at) {
++				ft_irq_arm();
++				armed = true;
++			}
++			uint64_t deadline = now + watch_abs, leeway = leeway_abs;
++			if (suspect) {
++				deadline = suspect + miss_abs;
++				leeway = 0;
++			}
++			if (!armed && rearm_at < deadline) {
++				deadline = rearm_at;
++				leeway = 0;
++			}
++			if (ft.retry && now + poll_abs < deadline) {
++				deadline = now + poll_abs;
++				leeway = 0;
++			}
++			ft_irq_wait(seen, deadline, leeway);
++			next = mach_absolute_time();   /* polling restarts from here after a fallback */
++			continue;
+ 		}
  		uint64_t period = off ? off_abs :
  		    (ft.active || now - last_irq < recent_abs) ? poll_abs : idle_abs;
- 		next += period;
 --- a/iokit/Kernel/arm/hid/SweetHID.cpp
 +++ b/iokit/Kernel/arm/hid/SweetHID.cpp
 @@ -12,14 +12,26 @@
