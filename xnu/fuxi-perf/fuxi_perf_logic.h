@@ -139,6 +139,55 @@ static int fp_floor_level(const uint32_t *rows, unsigned count, unsigned pct,
  *khz = freq;
  return best;
 }
+/* fwd=MHz: frame-deadline boost. One finished CoreAnimation render-server
+ * frame gives start, finish and deadline (mach ticks); its budget is
+ * deadline-start. Constants:
+ * - near: the frame used at least 75 % of its budget. At 120 Hz that is about
+ *   6.2 of 8.3 ms, close enough that a little more work or a slower core
+ *   misses the vsync.
+ * - well inside: under 40 %. A frame that fast on the boosted clock (2.4 GHz)
+ *   would still be under 75 % at the 1.4 GHz cool vote (40 x 2.4/1.4 = 69),
+ *   so ending the boost there does not bounce straight back into "near".
+ * - trigger: one missed frame, or 2 near-or-missed among the last 8 (about
+ *   67 ms at 120 Hz), so one stray slow frame alone does not boost.
+ * - decay: 12 frames in a row well inside the budget (100 ms at 120 Hz).
+ * A budget of zero, a finish before the start, or a budget over max (a
+ * stalled or bogus interval) is skipped and changes nothing. */
+enum { FD_SKIP, FD_GOOD, FD_OK, FD_NEAR, FD_MISSED };
+#define FD_NEAR_PCT 75u
+#define FD_GOOD_PCT 40u
+#define FD_LATE_OF_8 2
+#define FD_GOOD_RUN 12u
+static int fp_frame_class(uint64_t start, uint64_t finish, uint64_t deadline, uint64_t max)
+{
+ if (deadline <= start || finish < start || deadline-start > max) return FD_SKIP;
+ if (finish > deadline) return FD_MISSED;
+ uint64_t budget = deadline-start, used = finish-start;
+ if (used*100 >= budget*FD_NEAR_PCT) return FD_NEAR;
+ return used*100 < budget*FD_GOOD_PCT ? FD_GOOD : FD_OK;
+}
+struct fp_frames {
+ uint32_t late;  /* bit i: the frame i finishes ago was near or missed */
+ unsigned good;  /* consecutive frames well inside the budget */
+};
+/* 1: (re)start the hold, -1: end it, 0: no change. */
+static int fp_frame_step(struct fp_frames *f, int cls)
+{
+ if (cls == FD_SKIP) return 0;
+ f->late = ((f->late << 1) | (cls >= FD_NEAR ? 1u : 0u)) & 0xffu;
+ f->good = cls == FD_GOOD ? f->good+1 : 0;
+ if (cls == FD_MISSED || __builtin_popcount(f->late) >= FD_LATE_OF_8) return 1;
+ return f->good >= FD_GOOD_RUN ? -1 : 0;
+}
+/* The hold runs under the touch boost's guards: a valid sample, no thermal
+ * latch (hot, limit, predicted limit, slope), the ceiling while running and
+ * fp_start to begin, and the duty budget (fpb). */
+static int fp_want_deadline(int high, int want, int valid, int temp, int safe, int duty_ok)
+{
+ if (!want || !valid || !safe || !duty_ok || temp > (int)fp_boost_max ||
+     (!high && temp > (int)fp_start)) return 0;
+ return 1;
+}
 enum { FP_COOL, FP_HIGH, FP_IDLE };
 static int fp_state(int boosted, int valid, int temp, int safe, int duty_ok,
     uint64_t now, uint64_t input, uint64_t swap, uint64_t hold,

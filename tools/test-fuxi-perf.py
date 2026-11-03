@@ -21,7 +21,7 @@ register_functions = actual[actual.index('static uint64_t fp_duty_used(uint64_t 
 register_functions += ''.join(submit.function(actual, n) for n in (
     'fp_read','fp_vote','fp_temperature','fp_init_fail','fp_init_report',
     'fp_apply_cores','fp_initialize','fp_l3_init','fp_l3_update','fp_try_initialize','fp_update_votes','fp_thermal_guard',
-    'fp_arg','fp_configure','fp_launch_update','fp_worker_locked','fp_worker','fuxi_perf_input','fuxi_perf_swap',
+    'fp_arg','fp_configure','fp_launch_update','fp_dl_frame','fp_dl_add','fp_dl_print','fp_dl_window','fp_worker_locked','fp_worker','fuxi_perf_input','fuxi_perf_swap',
     'fuxi_perf_launch'))
 register_functions = "static uint64_t fp_duty_used(uint64_t);\nstatic void fp_worker_locked(thread_call_param_t,thread_call_param_t);\n" + ''.join(
     submit.function(actual, n) for n in ('fp_compile_domain','fp_compile_failed','fp_compile_cut','fp_compile_forget','fp_compile_poll','fp_compile_admitted','fp_compile_command')) + register_functions
@@ -973,10 +973,173 @@ int main(void) {
  assert(strstr(all_log,"FUXI WI: p22 notify 1\n") && !strstr(all_log,"p23") && !fwi_dropped);
  process_name="backboardd";
  arg_name=arg_name2=0;
+
+ /* fwd: frame classes at the exact 40/75 % and deadline boundaries; a zero
+  * or over-100-tick budget and a finish before the start are skipped. */
+ assert(fp_frame_class(0,39,100,100)==FD_GOOD && fp_frame_class(0,40,100,100)==FD_OK);
+ assert(fp_frame_class(0,74,100,100)==FD_OK && fp_frame_class(0,75,100,100)==FD_NEAR);
+ assert(fp_frame_class(0,100,100,100)==FD_NEAR && fp_frame_class(0,101,100,100)==FD_MISSED);
+ assert(fp_frame_class(1000,1006,1008,100)==FD_NEAR && fp_frame_class(1000,1004,1008,100)==FD_OK);
+ assert(fp_frame_class(1000,1003,1008,100)==FD_GOOD && fp_frame_class(1000,1009,1008,100)==FD_MISSED);
+ assert(fp_frame_class(0,50,101,100)==FD_SKIP && fp_frame_class(10,20,10,100)==FD_SKIP);
+ assert(fp_frame_class(10,9,20,100)==FD_SKIP && fp_frame_class(10,20,5,100)==FD_SKIP);
+ { /* Sequences: on time never boosts; one near alone does not; two near
+    * within 8 frames do; one miss does at once; 12 well-inside frames in a
+    * row end it (an ordinary frame restarts the count); skips age nothing. */
+  struct fp_frames f={0,0};
+  for(unsigned i=0;i<64;i++)assert(fp_frame_step(&f,FD_OK)==0);
+  assert(fp_frame_step(&f,FD_NEAR)==0);
+  for(unsigned i=0;i<7;i++)assert(fp_frame_step(&f,FD_OK)==0);
+  assert(fp_frame_step(&f,FD_NEAR)==0); /* the first is 9 frames back */
+  for(unsigned i=0;i<6;i++)assert(fp_frame_step(&f,FD_OK)==0);
+  assert(fp_frame_step(&f,FD_NEAR)==1); /* 2 of the last 8 */
+  assert(fp_frame_step(&f,FD_OK)==0);
+  f=(struct fp_frames){0,0};assert(fp_frame_step(&f,FD_MISSED)==1);
+  for(unsigned i=0;i<11;i++)assert(fp_frame_step(&f,FD_GOOD)==0);
+  assert(fp_frame_step(&f,FD_OK)==0);
+  for(unsigned i=0;i<11;i++)assert(fp_frame_step(&f,FD_GOOD)==0);
+  assert(fp_frame_step(&f,FD_GOOD)==-1 && fp_frame_step(&f,FD_GOOD)==-1);
+  f=(struct fp_frames){0,0};assert(fp_frame_step(&f,FD_NEAR)==0);
+  for(unsigned i=0;i<20;i++)assert(fp_frame_step(&f,FD_SKIP)==0);
+  assert(fp_frame_step(&f,FD_NEAR)==1 && f.good==0);
+ }
+ /* fwd bounds as fpk: 1401 up to the cap (fpc, else 2400). */
+ { const unsigned fwd_args[6][3]={{1400,0,0},{1401,1401,0},{2400,2400,0},{2401,0,0},{1900,0,1800},{1800,1800,1800}};
+  for(unsigned i=0;i<6;i++) {
+   reset();arg_name="fwd";arg_value=fwd_args[i][0];
+   arg_name2=fwd_args[i][2]?"fpc":0;arg_value2=fwd_args[i][2];fp_configure();
+   assert(fp_dl_mhz==fwd_args[i][1]);
+  }
+  arg_name=arg_name2=0; }
+ /* Start: only with fuxiperf=1, one line with the parameters; off accepts nothing. */
+ reset();fp_enabled=0;arg_name="fuxiperf";arg_value=1;arg_name2="fwd";arg_value2=2400;log_count=0;fuxi_perf_start();
+ arg_name=arg_name2=0;
+ assert(fp_dl_on && log_count==2 && strstr(last_log,"FUXI PERF: deadline boost on (fwd=2400): work_interval ops 6/7/8 succeed for platform backboardd CA render-server intervals only; "
+     "trigger 1 missed or 2 of 8 >= 75% of budget, hold 300 ms, end after 12 frames < 40%; guards start 600 hot 620 limit 680 dC, duty 200/1000 ms; stats every 5 s and 60 s"));
+ reset();fp_enabled=0;arg_name="fwd";arg_value=2400;fuxi_perf_start();arg_name=0;assert(!fp_dl_on && !fp_started);
+ /* Instance ops: -1 (the caller keeps ENOTSUP) without fwd, for any other
+  * process, a non-platform backboardd, another interval type, a short or
+  * mismatched argument, other ops, or a fault reading it. Start returns a
+  * fresh nonzero instance id at +8, update succeeds, finish feeds a frame
+  * (and the fwi census when on). */
+ reset();
+ { struct fp_wi_instance wi={.id=77,.create_flags=2u<<28};
+  user_addr_t wa=(user_addr_t)(uintptr_t)&wi;
+  for(uint32_t op=6;op<=8;op++)assert(fuxi_wi_instance(op,77,wa,sizeof(wi))==-1);
+  arg_name="fwd";arg_value=2400;fp_configure();arg_name=0;fp_dl_on=1;
+  assert(fuxi_wi_instance(6,77,wa,sizeof(wi))==0 && wi.instance==1);
+  assert(fuxi_wi_instance(6,77,wa,sizeof(wi))==0 && wi.instance==2);
+  assert(fuxi_wi_instance(7,77,wa,sizeof(wi))==0 && wi.instance==2);
+  assert(fuxi_wi_instance(5,77,wa,sizeof(wi))==-1 && fuxi_wi_instance(9,77,wa,sizeof(wi))==-1);
+  assert(fuxi_wi_instance(6,0,wa,sizeof(wi))==-1 && fuxi_wi_instance(6,77,0,sizeof(wi))==-1);
+  assert(fuxi_wi_instance(6,78,wa,sizeof(wi))==-1 && fuxi_wi_instance(6,77,wa,sizeof(wi)-1)==-1);
+  process_name="Preferences";assert(fuxi_wi_instance(6,77,wa,sizeof(wi))==-1);process_name="backboardd";
+  platform=0;assert(fuxi_wi_instance(6,77,wa,sizeof(wi))==-1);platform=1;
+  for(uint32_t type=0;type<16;type++) if(type!=2) {
+   wi.create_flags=type<<28;assert(fuxi_wi_instance(6,77,wa,sizeof(wi))==-1 && fuxi_wi_instance(8,77,wa,sizeof(wi))==-1);
+  }
+  assert(wi.instance==2 && !fp_dl_hook.frames[FD_SKIP]);
+  wi.create_flags=(2u<<28)|0x5;
+  user_fault=1;assert(fuxi_wi_instance(6,77,wa,sizeof(wi))==-1 && wi.instance==2);user_fault=0;
+  user_out_fault=1;assert(fuxi_wi_instance(6,77,wa,sizeof(wi))==EFAULT && wi.instance==2);user_out_fault=0;
+  wi.start=1000;wi.finish=1010;wi.deadline=1008;
+  fp_enabled=0;assert(fuxi_wi_instance(8,77,wa,sizeof(wi))==0 && !fp_dl_hook.frames[FD_MISSED]);fp_enabled=1;
+  uint32_t census=fwi_table[0].missed;
+  assert(fuxi_wi_instance(8,77,wa,sizeof(wi))==0 && fp_dl_hook.frames[FD_MISSED]==1 && fp_dl_until==ticks+300);
+  assert(fwi_on && fwi_table[0].missed==census+1 && !wlocked && !locked);
+ }
+#define FRAME(s,f,dl) do{struct fp_wi_instance u_={.id=77,.instance=1,.start=(s),.finish=(f),.deadline=(dl),.create_flags=2u<<28}; \
+  assert(fuxi_wi_instance(8,77,(user_addr_t)(uintptr_t)&u_,sizeof(u_))==0);}while(0)
+ /* Worker at fwd=2400, fpb=1000: on-time 120 Hz frames (50 % of 8 ms) never
+  * boost or wake; a missed frame wakes it at once and gold/prime take fwd's
+  * rows (the boost rows at 2400), silver cool; the 300 ms hold then ends. */
+ reset_init();arg_name="fwd";arg_value=2400;arg_name2="fpb";arg_value2=1000;fp_configure();arg_name=arg_name2=0;
+ fp_dl_on=1;log_count=0;fp_worker(0,0);
+ assert(fp_ready && log_count==2 && strstr(last_log,"FUXI PERF: ready deadline fwd=2400: gold/prime 2323200/2342400 kHz while render-server frames run late, silver cool "));
+ assert(fp_dl[1]==15 && fp_dl[2]==14 && fp_dl[1]==fp_high[1] && fp_dl[2]==fp_high[2] && fp_dl[0]==fp_cool[0] && fp_dl_khz[0]==fp_cool_khz[0]);
+ assert(!fp_dl_high && regs[1][0x320/4]==fp_cool[1] && scheduled==200);
+ for(unsigned t=104;t<=196;t+=8){ticks=t;FRAME(t-4,t,t+4);assert(scheduled==200 && !fp_dl_until);}
+ ticks=200;fp_worker(0,0);assert(!fp_dl_high && !fp_boosted && scheduled==300);
+ ticks=204;FRAME(194,204,202);assert(scheduled==204 && fp_dl_until==504);
+ fp_worker(0,0);
+ assert(fp_dl_high && fp_boosted && regs[1][0x320/4]==15 && regs[2][0x320/4]==14 && regs[0][0x320/4]==fp_cool[0] && scheduled==224);
+ for(unsigned t=212;t<=504;t+=8){ticks=t;FRAME(t-4,t,t+4);if(ticks>=scheduled)fp_worker(0,0);assert(fp_dl_high);}
+ ticks=524;fp_worker(0,0);
+ assert(!fp_dl_high && !fp_boosted && regs[1][0x320/4]==fp_cool[1] && regs[2][0x320/4]==fp_cool[2] && scheduled==624);
+ /* Decay: after a miss, 12 frames in a row well inside the budget end it. */
+ ticks=1000;FRAME(990,1000,998);assert(scheduled==1000);fp_worker(0,0);assert(fp_dl_high);
+ for(unsigned i=1;i<=11;i++){ticks=1000+8*i;FRAME(ticks-2,ticks,ticks+6);if(ticks>=scheduled)fp_worker(0,0);assert(fp_dl_high && fp_dl_until==1300);}
+ ticks=1096;FRAME(1094,1096,1102);assert(!fp_dl_until && fp_dl_hook.decays==1);
+ fp_worker(0,0);assert(!fp_dl_high && regs[1][0x320/4]==fp_cool[1] && regs[2][0x320/4]==fp_cool[2]);
+ /* Near: one alone neither holds nor wakes; a second within 8 frames does. */
+ ticks=2000;fp_worker(0,0);
+ { uint64_t before=scheduled;
+  ticks=2004;FRAME(1998,2004,2006);assert(scheduled==before && !fp_dl_until);
+  for(unsigned i=1;i<=6;i++){ticks=2004+8*i;FRAME(ticks-4,ticks,ticks+4);assert(scheduled==before);}
+  ticks=2060;FRAME(2054,2060,2062);assert(scheduled==2060 && fp_dl_until==2360);
+  fp_worker(0,0);assert(fp_dl_high && regs[1][0x320/4]==15); }
+ /* fpk with fwd: the base row while frames are fine, fwd's row while late. */
+ reset_init();arg_name="fpk";arg_value=1800;arg_name2="fwd";arg_value2=2400;fp_configure();arg_name=arg_name2=0;
+ fp_dl_on=1;fp_worker(0,0);assert(regs[1][0x320/4]==11 && regs[2][0x320/4]==9);
+ ticks=150;FRAME(140,150,148);fp_worker(0,0);assert(fp_dl_high && regs[1][0x320/4]==15 && regs[2][0x320/4]==14);
+ ticks=460;fp_worker(0,0);assert(!fp_dl_high && regs[1][0x320/4]==11 && regs[2][0x320/4]==9);
+ /* A fwd row below the base never lowers the vote. */
+ reset_init();arg_name="fpk";arg_value=2400;arg_name2="fwd";arg_value2=1800;fp_configure();arg_name=arg_name2=0;
+ fp_dl_on=1;fp_worker(0,0);assert(regs[1][0x320/4]==15 && regs[2][0x320/4]==14);
+ ticks=150;FRAME(140,150,148);fp_worker(0,0);assert(fp_dl_high && regs[1][0x320/4]==15 && regs[2][0x320/4]==14);
+ /* Thermal, with the owner's 80 C ceiling (limit 800, hot 780): entry at
+  * fuxiperfstart (600); a running hold continues past it while the slope is
+  * gentle; a new trigger above it is refused (all cool, sampled fast, wakes
+  * at most once per fast period); the hot trip cuts a running boost, and
+  * late frames during the latch wake nothing. */
+ reset_init();arg_name="fuxiperflimit";arg_value=800;arg_name2="fuxiperfhot";arg_value2=780;fp_configure();
+ arg_name="fwd";arg_value=2400;arg_name2="fpb";arg_value2=1000;fp_configure();arg_name=arg_name2=0;fp_dl_on=1;
+ assert(fp_limit==800 && fp_hot==780 && fp_boost_max==800 && fp_start==600);
+ all_temp(600);fp_worker(0,0);assert(fp_ready);
+ ticks=200;FRAME(190,200,198);fp_worker(0,0);assert(fp_dl_high);
+ for(unsigned t=220,c=602;t<=300;t+=20,c+=2){all_temp(c);ticks=t;fp_worker(0,0);assert(fp_dl_high && !fp_blocked);}
+ for(unsigned t=320;t<=520;t+=20){ticks=t;fp_worker(0,0);}
+ assert(!fp_dl_high && !fp_blocked && fp_prev_temp==610);
+ ticks=600;FRAME(590,600,598);assert(scheduled==600);fp_worker(0,0);
+ assert(!fp_dl_high && fp_dl_state==2 && regs[1][0x320/4]==fp_cool[1] && regs[2][0x320/4]==fp_cool[2] && scheduled==620);
+ ticks=608;FRAME(598,608,606);assert(scheduled==620 && fp_dl_woke==600);
+ ticks=620;FRAME(610,620,618);assert(scheduled==620 && fp_dl_woke==620);
+ all_temp(560);ticks=700;FRAME(690,700,698);fp_worker(0,0);assert(fp_dl_high && regs[1][0x320/4]==15);
+ { uint64_t cuts=fp_cuts;
+  all_temp(780);ticks=720;fp_worker(0,0);
+  assert(!fp_dl_high && fp_blocked && fp_dl_state==2 && fp_cuts==cuts+1 && regs[1][0x320/4]==fp_cool[1] && regs[2][0x320/4]==fp_cool[2]);
+  uint64_t before=scheduled;ticks=730;FRAME(720,730,728);assert(scheduled==before && fp_dl_until==1030); }
+ /* Duty (default fpb 200 ms per 1 s): every frame missed for a second, the
+  * boost runs exactly 200 ms, then is refused as duty until the window frees. */
+ reset_init();arg_name="fwd";arg_value=2400;fp_configure();arg_name=0;fp_dl_on=1;fp_worker(0,0);
+ for(unsigned t=200;t<=1200;t+=8){ticks=t;FRAME(t-10,t,t-2);if(ticks>=scheduled)fp_worker(0,0);if(t>=400)assert(!fp_dl_high);}
+ assert(fp_dl_win.high==200 && fp_dl_win.duty>=780 && fp_dl_state==3 && fp_cuts==1 && !fp_dl_win.thermal);
+ ticks=1220;fp_worker(0,0);assert(fp_dl_high);
+ /* Stats at fwd=1800: one 5 s line while active, none while idle, and the
+  * 60 s line every 12 windows (zeros after an idle minute). */
+ reset_init();arg_name="fwd";arg_value=1800;arg_name2="fpb";arg_value2=1000;fp_configure();arg_name=arg_name2=0;
+ fp_dl_on=1;fp_worker(0,0);
+ assert(fp_dl[1]==11 && fp_dl[2]==9 && fp_dl_khz[1]==1785600 && fp_dl_khz[2]==1708800);
+ all_len=0;all_log[0]=0;
+ for(unsigned t=108;t<=180;t+=8){ticks=t;FRAME(t-4,t,t+4);}
+ ticks=188;FRAME(182,188,190);
+ ticks=192;FRAME(200,190,210);
+ ticks=196;FRAME(186,196,194);fp_worker(0,0);assert(fp_dl_high && regs[1][0x320/4]==11 && regs[2][0x320/4]==9);
+ while(scheduled<=5200){ticks=scheduled;fp_worker(0,0);}
+ assert(strstr(all_log,"FUXI PERF: deadline 5s frames 12 near 1 missed 1 skipped 1 triggers 1 decays 0 boosts 1 boosted_ms 320 refused_ms thermal 0 duty 0 floor_ms 0 budget_us 8000 used_us 4000 max temp 450 dC\n"));
+ while(scheduled<=60300){ticks=scheduled;fp_worker(0,0);}
+ { const char *a=strstr(all_log,"deadline 5s"); assert(a && !strstr(a+1,"deadline 5s")); }
+ assert(strstr(all_log,"FUXI PERF: deadline 60s frames 12 near 1 missed 1 skipped 1 triggers 1 decays 0 boosts 1 boosted_ms 320 refused_ms thermal 0 duty 0 floor_ms 0 budget_us 8000 used_us 4000 max temp 450 dC\n"));
+ all_len=0;all_log[0]=0;
+ while(scheduled<=121000){ticks=scheduled;fp_worker(0,0);}
+ assert(strstr(all_log,"FUXI PERF: deadline 60s frames 0 near 0 missed 0 skipped 0 triggers 0 decays 0 boosts 0 boosted_ms 0 refused_ms thermal 0 duty 0 floor_ms 0 budget_us 0 used_us 0 max temp 450 dC\n"));
+ assert(!strstr(all_log,"deadline 5s"));
+#undef FRAME
 #undef printf
  puts("PASS: fpk default off, 1401..cap bounds (fpc), base rows 1401/1800/2400 on real LUTs, raised only with valid sample and no thermal latch, compiled cool when hot/no quorum, 500 ms recovery, boost/silver unchanged, fast samples only while active, window line");
  puts("PASS: fwi census default off/exact 1/once, independent of fuxiperf; per process and op incl. 6/7/8/unknown, create2/notify types, deadline budget/used means and late count, 60 s report clears and re-arms, backboardd always reported, full-table drops, own lock only");
  puts("PASS: fsf floor rows on real LUTs (60/90/55/50/30 %), input-only 1.5 s window, cool-only, hot veto, duty-cut fallback, silver unchanged; fla 2 s launch high outside the touch duty, start refusal once per exec, thermal end, exec log limit, L3 with fl3, boot-arg bounds and off = no wake");
+ puts("PASS: fwd frame classes at 40/75 %/deadline/skip bounds, 2-of-8 and miss triggers, 12-frame decay, bounds as fpk, start line only with fuxiperf, instance ops -1 (ENOTSUP) unless fwd + platform backboardd + CA render server + full argument, start id at +8, finish feeds frames and census, fwd rows (silver cool), 300 ms hold, decay, fpk base underneath, start gate/running past start/hot cut/latch silence at 80 C ceiling, wake rate limit, fpb duty cut, 5 s and 60 s lines");
  puts("PASS: fsw frame floor (fsf PCT or 60), second-swap wake, lone swap/touch-without-fsf/hot latch do nothing, no wake while on/blocked/off, touch then frame time on one floor, policy line by source");
  puts("PASS: fl3 default off/exact 1; L3 read once at ready, boot vote checked against state and LUT before any write; boost row while touch/compile high, boot row on unboost and thermal cut; one ready and one first-boost line; refusals, faults, lost enable and readback mismatch end voting with the boot row");
  puts("PASS: thermal pressure opt-in, read-only sysctl/readiness/no-MMIO, guard/quorum integration, Apple wire values, rising trips/falling hysteresis and no sleeping");
@@ -1028,6 +1191,11 @@ static size_t all_len;
 struct sysctl_req {void *newptr,*oldptr;size_t newlen,oldlen;};
 #define SYSCTL_HANDLER_ARGS (struct sysctl_req *req)
 static int copyin_error,copyout_error;
+/* fwd: user memory is host memory; a fault flag per direction. */
+typedef uint64_t user_addr_t;
+static int user_fault,user_out_fault;
+static int copyin(user_addr_t u,void *k,size_t n){if(user_fault)return EFAULT;memcpy(k,(const void *)(uintptr_t)u,n);return 0;}
+static int copyout(const void *k,user_addr_t u,size_t n){if(user_out_fault)return EFAULT;memcpy((void *)(uintptr_t)u,k,n);return 0;}
 static int model_sysctl_in(struct sysctl_req *req,void *out,size_t n){if(copyin_error)return copyin_error;memcpy(out,req->newptr,n);return 0;}
 static int model_sysctl_out(struct sysctl_req *req,const void *in,size_t n){if(copyout_error)return copyout_error;memcpy(req->oldptr,in,n);return 0;}
 #define SYSCTL_IN model_sysctl_in
@@ -1047,7 +1215,7 @@ static unsigned fp_compile_enabled,fp_compile_high,fp_compile_voted,fp_touch_hig
 static thread_t fp_compile_thread;
 static uint64_t fp_compile_deadline,fp_compile_cap,fp_compile_start;
 static struct fuxi_compile_reply fp_compile_reply;
-static int fp_lock,locked,platform=1,proc_present=1,alive=1,online=1,bound=-1,refs,migrations,bind_temp,realtime;
+static int fp_lock,fp_dl_lock,locked,platform=1,proc_present=1,alive=1,online=1,bound=-1,refs,migrations,bind_temp,realtime;
 static thread_t caller=1;
 static const char *process_name="backboardd";
 typedef int proc_t;
@@ -1149,6 +1317,11 @@ static void reset(void) {
  fp_launch_seen=fp_launch_said=0;fp_launch_high=fp_floor_on=fp_floor_frames=0;fp_swap_prev=fp_frame_time=0;
  memset(fp_floor,0,sizeof(fp_floor));memset(fp_floor_khz,0,sizeof(fp_floor_khz));
  fp_recover_since=fp_above_time=fp_cuts=fp_active_start=0;
+ fp_dl_mhz=fp_dl_on=fp_dl_windows=0;fp_dl_high=fp_dl_state=0;
+ fp_dl_until=fp_dl_woke=fp_dl_instance=fp_dl_win_start=0;
+ memset(fp_dl,0,sizeof(fp_dl));memset(fp_dl_khz,0,sizeof(fp_dl_khz));memset(&fp_dl_frames,0,sizeof(fp_dl_frames));
+ memset(&fp_dl_hook,0,sizeof(fp_dl_hook));memset(&fp_dl_win,0,sizeof(fp_dl_win));memset(&fp_dl_min,0,sizeof(fp_dl_min));
+ user_fault=user_out_fault=0;
  fp_duty_count=0;fp_prev_temp=fp_prev_valid=fp_blocked=0;
  fp_pressure_enabled=fp_started=0;fp_pressure=-1;
  fp_rate_elapsed=0;fp_rate_temp=fp_rate_valid=fp_rate=0;
@@ -1206,8 +1379,15 @@ wi = re.search(r'^--- a/bsd/kern/sys_work_interval\.c\n.*?(?=^--- a/)', patch, r
 for hook in ('+\tfuxi_wi_census(operation);\n', '+\t\tfuxi_wi_census_flags(create_params.wicp_create_flags);\n',
              '+\t\tfuxi_wi_census_notify(notification.create_flags, notification.start,\n'):
     assert wi.count(hook) == 1, hook
-assert wi.count('+#if defined(FUXI)\n') == 4 and wi.count('+#endif\n') == 4
-assert not re.search(r'^\+.*\b(return|error|kret)\b', wi, re.M), 'census hooks must not touch the result'
+# fwd: ops 6/7/8 only, right before default; a negative answer keeps ENOTSUP.
+fwd = re.search(r'^\+#if defined\(FUXI\)\n\+\tcase 6:\n\+\tcase 7:\n\+\tcase 8:\n(?:\+\t\t[/ ]\*.*\n)+'
+                r'\+\t\terror = fuxi_wi_instance\(operation, uap->work_interval_id, uap->arg, uap->len\);\n'
+                r'\+\t\tif \(error < 0\) \{\n\+\t\t\treturn ENOTSUP;\n\+\t\t\}\n\+\t\tbreak;\n\+#endif\n \tdefault:\n \t\treturn ENOTSUP;\n', wi, re.M)
+assert fwd and wi.count('fuxi_wi_instance(') == 2, 'fwd case'
+assert '+extern int fuxi_wi_instance(uint32_t operation, uint64_t work_interval_id, user_addr_t arg, uint64_t len);\n' in wi
+census = wi.replace(fwd[0], '')
+assert census.count('+#if defined(FUXI)\n') == 4 and census.count('+#endif\n') == 4
+assert not re.search(r'^\+.*\b(return|error|kret)\b', census, re.M), 'census hooks must not touch the result'
 assert ' \tswitch (operation) {\n' in wi and wi.index('+\tfuxi_wi_census(operation);') < wi.index(' \tswitch (operation) {')
 with tempfile.TemporaryDirectory() as d:
     source, exe = Path(d)/'perf.c', Path(d)/'perf'
