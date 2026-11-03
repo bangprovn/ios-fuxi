@@ -457,34 +457,73 @@
  }
  #endif
  
-@@ -447,6 +773,18 @@
+@@ -447,6 +773,50 @@
  	return (uint32_t)((row + SWEET_SURFACE_ROW_ALIGN - 1) & ~(uint64_t)(SWEET_SURFACE_ROW_ALIGN - 1));
  }
  
++static uint32_t
++sweet_surface_row_mode(void)
++{
++	static int mode = -1;
++	if (mode < 0) {
++		uint32_t v = 1;
++		(void)PE_parse_boot_argn("sweetsurfrow", &v, sizeof(v));
++		mode = v <= 2 ? (int)v : 1;
++	}
++	return (uint32_t)mode;
++}
++
 +static bool
 +sweet_surface_gpu_rows(void)
 +{
-+	static int enabled = -1;
-+	if (enabled < 0) {
-+		uint32_t v = 1;
-+		(void)PE_parse_boot_argn("sweetsurfrow", &v, sizeof(v));
-+		enabled = v != 0;
++	return sweet_surface_row_mode() != 0;
++}
++
++/* sweetsurfrow=2 rounds only rows that are not 64-byte aligned. Rounding every row
++ * (=1) striped the app switcher's cards: whatever writes the decoded JPEG snapshot
++ * keeps the row it asked for, so the import read it at the wrong pitch (3 Nov,
++ * r-surfrow0: =0 fixed the cards and blacked App Library out again). MaterialKit's
++ * CGBitmapGetAlignedBytesPerRow rows are 32-byte aligned; decoders ask for 64. */
++static bool
++sweet_surface_round_row(uint32_t row)
++{
++	return sweet_surface_row_mode() != 2 || (row & 63) != 0;
++}
++
++/* The first 64 rounded rows, with the creating process: who asks for which row. */
++static SInt32 sweet_surface_rows_logged;
++
++static void
++sweet_surface_row_log(SweetSurface *s, uint32_t asked)
++{
++	if (OSIncrementAtomic(&sweet_surface_rows_logged) >= 64) {
++		return;
 +	}
-+	return enabled != 0;
++	char name[32] = "?";
++	proc_selfname(name, sizeof(name));
++	IOLog("SWEET SURF: row %u -> %u for %ux%u fourcc 0x%08x by %s (sweetsurfrow=%u)\n",
++	    asked, (uint32_t)s->bytesPerRow, s->width, s->height, s->pixelFormat, name, sweet_surface_row_mode());
 +}
 +
  /* Geometry from the creation properties (IOSurface.h keys). */
  static IOReturn
  sweet_surface_layout(SweetSurface *s, OSDictionary *props)
-@@ -470,7 +808,16 @@
+@@ -470,7 +840,23 @@
  	if (s->bytesPerRow < (uint64_t)sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement) {
  		return kIOReturnBadArgument;
  	}
 -	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
 +	uint32_t rows = sweet_div_up(s->height, s->elementHeight);
-+	if (s->bytesPerElement == 4 && props->getObject("IOSurfacePlaneInfo") == NULL && sweet_surface_gpu_rows()) {
++	bool gpu_rows = s->bytesPerElement == 4 && props->getObject("IOSurfacePlaneInfo") == NULL && sweet_surface_gpu_rows();
++	if (gpu_rows && (s->bytesPerRow & (SWEET_SURFACE_GPU_ROW_ALIGN - 1)) != 0 && !sweet_surface_round_row((uint32_t)s->bytesPerRow)) {
++		sweet_surface_row_log(s, (uint32_t)s->bytesPerRow);   /* kept as asked */
++		gpu_rows = false;
++	}
++	if (gpu_rows) {
 +		if ((s->bytesPerRow & (SWEET_SURFACE_GPU_ROW_ALIGN - 1)) != 0) {
++			uint32_t asked = (uint32_t)s->bytesPerRow;
 +			s->bytesPerRow = (s->bytesPerRow + SWEET_SURFACE_GPU_ROW_ALIGN - 1) & ~(uint32_t)(SWEET_SURFACE_GPU_ROW_ALIGN - 1);
++			sweet_surface_row_log(s, asked);
 +		}
 +		/* Turnip sizes a linear image's last level for a height padded to 4 rows
 +		 * (blit over-fetch), so a 1065x282 import needs 284 rows of memory. */
@@ -494,7 +533,7 @@
  
  	OSArray *planes = OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
  	s->planeCount = 0;
-@@ -528,6 +875,7 @@
+@@ -528,6 +914,7 @@
  	IOMemoryMap  *data;
  	IOMemoryMap  *state;
  	uint32_t      count;
@@ -502,7 +541,7 @@
  
  	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
  	void free() APPLE_KEXT_OVERRIDE;
-@@ -541,6 +889,10 @@
+@@ -541,6 +928,10 @@
  	OSSafeReleaseNULL(data);
  	OSSafeReleaseNULL(state);
  	if (surface != NULL) {
@@ -513,7 +552,7 @@
  		sweet_surface_put(surface);
  		surface->release();
  		surface = NULL;
-@@ -591,7 +943,9 @@
+@@ -591,7 +982,9 @@
  	    void *reference) APPLE_KEXT_OVERRIDE;
  	IOExternalTrap *getTargetAndTrapForIndex(IOService **targetP, UInt32 index) APPLE_KEXT_OVERRIDE;
  
@@ -524,7 +563,7 @@
  	IOReturn trapLock(void *id, void *options, void *seedOut, void *, void *, void *);
  	IOReturn trapUnlock(void *id, void *options, void *seedOut, void *, void *, void *);
  	IOReturn trapRelease(void *id, void *, void *, void *, void *, void *);
-@@ -882,6 +1236,20 @@
+@@ -882,6 +1275,20 @@
  		    name, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
  		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), ret);
  	}
@@ -545,7 +584,7 @@
  	props->release();
  	if (ret != kIOReturnSuccess) {
  		s->release();
-@@ -956,11 +1324,34 @@
+@@ -956,11 +1363,34 @@
  	}
  }
  
@@ -585,7 +624,7 @@
  }
  
  static IOReturn
-@@ -1001,7 +1392,7 @@
+@@ -1001,7 +1431,7 @@
  		return kIOReturnNotFound;
  	}
  #if defined(FUXI)
@@ -594,7 +633,7 @@
    s->release(); return kIOReturnNotReady;
   }
  #endif
-@@ -1041,8 +1432,8 @@
+@@ -1041,8 +1471,8 @@
  }
  
  static IOExternalTrap sweet_surface_traps[] = {
