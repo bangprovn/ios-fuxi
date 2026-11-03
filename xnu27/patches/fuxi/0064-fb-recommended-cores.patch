@@ -1,0 +1,44 @@
+diff --git a/iokit/Kernel/arm/FuxiFramebuffer.cpp b/iokit/Kernel/arm/FuxiFramebuffer.cpp
+index d4fe2a6..3ea67a6 100644
+--- a/iokit/Kernel/arm/FuxiFramebuffer.cpp
++++ b/iokit/Kernel/arm/FuxiFramebuffer.cpp
+@@ -58,6 +58,7 @@ extern "C" void fuxi_fb_start(void);
+ extern "C" void fuxi_debug_sync_report(void);       /* osfmk/arm/model_dep.c */
+ extern volatile uint32_t armcpu_core_timer[8], armcpu_core_sgi[8];   /* ArmCpu.cpp: per logical core */
+ extern volatile uint64_t armcpu_ipi_sent;
++extern "C" void sched_perfcontrol_update_recommended_cores(uint32_t recommended_cores);
+ 
+ /* IOConnectCallMethod selectors of the framebuffer user client (iOS 16.5; hakios found them unchanged in iOS 26) */
+ enum {
+@@ -143,6 +144,12 @@ static uint32_t gThreads = 3;
+ static uint32_t gQueue = 2;
+ static uint32_t gKeepConsole;
+ static uint32_t gAccelerator = 1;
++/*
++ * fuxi_cores=MASK (logical CPUs): from the first picture on, only these cores are recommended to the scheduler.
++ * The ADT gives one homogeneous cluster, so CA's threads land on the A510s (logical 0 and 1) as often as on the
++ * bigger cores; 0x7c keeps them on the A715/A710/X3. The others keep their interrupts and bound threads. 0: all.
++ */
++static uint32_t gCores;
+ 
+ static inline unsigned
+ swapQueue(void)
+@@ -952,6 +959,10 @@ IOMobileFramebuffer::show(const uint8_t * swap, FuxiIOSurface ** surfaces)
+ 				}
+ 				IOLog("FuxiFramebuffer: the first picture (swap %u, surface %u); the text console %s\n", swapWord(swap, SWAP_ID),
+ 				    sid, gKeepConsole ? "goes on drawing over it" : "stops");
++				if (gCores != 0) {
++					sched_perfcontrol_update_recommended_cores(gCores);
++					IOLog("FuxiFramebuffer: recommended cores 0x%x\n", gCores);
++				}
+ 			}
+ 			drawLayer(s, src, dst);
+ 			written = true;
+@@ -1545,6 +1556,7 @@ fuxi_fb_start(void)
+ 	PE_parse_boot_argn("fuxi_fb_threads", &gThreads, sizeof(gThreads));
+ 	PE_parse_boot_argn("fuxi_fb_queue", &gQueue, sizeof(gQueue));
+ 	PE_parse_boot_argn("fuxi_fb_beat", &gOnTheBeat, sizeof(gOnTheBeat));
++	PE_parse_boot_argn("fuxi_cores", &gCores, sizeof(gCores));
+ 	PE_parse_boot_argn("fuxi_fb_console", &gKeepConsole, sizeof(gKeepConsole));
+ 	PE_parse_boot_argn("fuxi_fb_accel", &gAccelerator, sizeof(gAccelerator));
+ 	if (resources == NULL) {

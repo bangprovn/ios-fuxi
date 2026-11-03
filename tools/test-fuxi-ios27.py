@@ -61,7 +61,7 @@ def layout():
     listed = series()
     files = sorted(p.relative_to(X27 / 'patches').as_posix() for p in (X27 / 'patches').rglob('*.patch'))
     assert sorted(listed) == files and len(set(listed)) == len(listed), 'series and patches/ differ'
-    assert listed[-63:] == ['fuxi/0001-machine-config.patch', 'fuxi/0002-builtin-crypto.patch',
+    assert listed[-64:] == ['fuxi/0001-machine-config.patch', 'fuxi/0002-builtin-crypto.patch',
                            'fuxi/0003-console.patch', 'fuxi/0004-components.patch', 'fuxi/0005-crypto-kext-handoff.patch',
                            'fuxi/0006-log-ring-fileset.patch', 'fuxi/0007-root27-storage.patch',
                            'fuxi/0008-dada-apfs.patch', 'fuxi/0009-cryptex-graft.patch', 'fuxi/0010-proc-log.patch',
@@ -88,7 +88,7 @@ def layout():
                            'fuxi/0043-spawn-join-label.patch', 'fuxi/0044-bank-persona-log.patch',
                            'fuxi/0045-nosugid.patch', 'fuxi/0046-msgdump.patch',
                            'fuxi/0047-spawn-persona.patch', 'fuxi/0048-fsgetpath-log.patch',
-                           'fuxi/0049-envlog.patch', 'fuxi/0050-taskallow.patch', 'fuxi/0051-lcskip.patch', 'fuxi/0052-iomfb-ios27.patch', 'fuxi/0053-trace-quiet.patch', 'fuxi/0054-apfs-names.patch', 'fuxi/0055-sandbox-check-allow.patch', 'fuxi/0056-apfs-vol-attributes.patch', 'fuxi/0057-fb-call-summary.patch', 'fuxi/0058-debugger-ipi-resend.patch', 'fuxi/0059-stackshot-skip-silent-core.patch', 'fuxi/0060-reinit-signal-assert.patch', 'fuxi/0061-stackshot-abort-on-silent-core.patch', 'fuxi/0062-fb-ipi-counts.patch', 'fuxi/0063-fb-vsync-critical.patch']
+                           'fuxi/0049-envlog.patch', 'fuxi/0050-taskallow.patch', 'fuxi/0051-lcskip.patch', 'fuxi/0052-iomfb-ios27.patch', 'fuxi/0053-trace-quiet.patch', 'fuxi/0054-apfs-names.patch', 'fuxi/0055-sandbox-check-allow.patch', 'fuxi/0056-apfs-vol-attributes.patch', 'fuxi/0057-fb-call-summary.patch', 'fuxi/0058-debugger-ipi-resend.patch', 'fuxi/0059-stackshot-skip-silent-core.patch', 'fuxi/0060-reinit-signal-assert.patch', 'fuxi/0061-stackshot-abort-on-silent-core.patch', 'fuxi/0062-fb-ipi-counts.patch', 'fuxi/0063-fb-vsync-critical.patch', 'fuxi/0064-fb-recommended-cores.patch']
     plog = (X27 / 'patches/fuxi/0010-proc-log.patch').read_text()
     assert plog.count('+#if defined(FUXI)') == 4 and 'PE_parse_boot_argn("fuxi_proc_log"' in plog
     watch = (X27 / 'patches/fuxi/0011-pid1-watch.patch').read_text()
@@ -167,6 +167,7 @@ def layout():
     assert 'fuxi_stackshot_abort(KERN_OPERATION_TIMED_OUT)' in (X27 / 'patches/fuxi/0061-stackshot-abort-on-silent-core.patch').read_text()
     assert 'per core SGI/timer interrupts' in (X27 / 'patches/fuxi/0062-fb-ipi-counts.patch').read_text()
     assert 'THREAD_CALL_DELAY_USER_CRITICAL' in (X27 / 'patches/fuxi/0063-fb-vsync-critical.patch').read_text()
+    assert 'fuxi_cores' in (X27 / 'patches/fuxi/0064-fb-recommended-cores.patch').read_text()
     assert 'fuxi_fsgetpath_log' in (X27 / 'patches/fuxi/0048-fsgetpath-log.patch').read_text()
     perm = (X27 / 'patches/fuxi/0034-sandbox-permissive.patch').read_text()
     assert 'fuxi_sandbox_permissive' in perm and 'FUXI_MAC_PERMIT(mpc, #check, __step_err)' in perm
