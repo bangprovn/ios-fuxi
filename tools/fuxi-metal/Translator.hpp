@@ -7,6 +7,7 @@
 #include "CAState.hpp"
 #include "TranslationPolicy.hpp"
 #include <cstdint>
+#include <atomic>
 #include <dlfcn.h>
 #include <stdexcept>
 #include <string>
@@ -106,6 +107,9 @@ public:
  int (*product_hash)(void *,uint8_t *){};
  int (*shadow_windows)(void *,ShadowWindow *){}; // Optional immutable access proof; absent means whole buffers.
  uint32_t (*texture_type)(void *,uint32_t){}; // Optional ABI-8 reflected Metal type; UINT32_MAX means unused.
+ // Optional: translator precision notes so far. The bridge prints the first eight, then powers of two; the cache period line the
+ // count. Set once the translator loads, null before that or with an older bridge.
+ static inline std::atomic<uint64_t (*)()> precisionNotes{nullptr};
  void (*free)(void *){};
  Translator() {
   dylib=dlopen(FUXI_MTL_TRANSLATOR,RTLD_NOW|RTLD_LOCAL);
@@ -119,13 +123,14 @@ public:
   shadow_windows=(decltype(shadow_windows))dlsym(dylib,"fuxi_m2v_shadow_windows_v1");
   texture_type=(decltype(texture_type))dlsym(dylib,"fuxi_m2v_texture_type");
   translationScope=(TranslationScope)dlsym(dylib,"fuxi_m2v_translation_scope_v1");
+  precisionNotes=(uint64_t (*)())dlsym(dylib,"fuxi_m2v_precision_notes_v1");
   auto policy=systemTranslationPolicy();if(policy.stages || policy.trace)fprintf(stderr,"FUXI MTL: translation settings stages=%u trace=%u bridge=%u\n",unsigned(policy.stages),unsigned(policy.trace),unsigned(translationScope!=nullptr));
   artifactScope=(CacheScope)dlsym(dylib,"fuxi_m2v_artifact_scope_v1");
   artifactScopeVerified=(CacheScopeVerified)dlsym(dylib,"fuxi_m2v_artifact_scope_v2");
   artifactVerify=(CacheVerify)dlsym(dylib,"fuxi_m2v_artifact_verify_v2");
   if(!artifactVerify)artifactScopeVerified=nullptr;
  }
- ~Translator() {if(dylib)dlclose(dylib);}
+ ~Translator() {precisionNotes=nullptr;if(dylib)dlclose(dylib);}
  Translator(const Translator&)=delete;Translator& operator=(const Translator&)=delete;
  static Translator &get() {static Translator translator;return translator;}
  static bool cacheIdentity(uint8_t *out) noexcept {

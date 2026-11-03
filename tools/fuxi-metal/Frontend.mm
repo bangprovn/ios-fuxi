@@ -1928,10 +1928,10 @@ static NSString *surfaceDescriptorText(IOSurfaceRef surface,NSUInteger plane){
 }
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane {CENSUS();FUXI_PHASE(iosurface);
  if(clientMode==fuxi::ClientMode::census)return nil;
- // Inspect the surface before the descriptor: even RGB8_444_2P (542) refusals
- // must include both planes' layout, rather than only an unknown Metal format.
- NSString *layout=surfaceDescriptorText(surface,plane);
-#define CHECK(field,value,accepted) do {__typeof__(value) actual=(value);if(!(accepted)){failureLog("FUXI MTL: texture reject %s %llu desc=%s %s\n",field,(unsigned long long)actual,textureDescriptorText(d).UTF8String,layout.UTF8String);return nil;}}while(0)
+ // Every refusal reports the surface, so even RGB8_444_2P (542) refusals include both planes' layout rather than only an
+ // unknown Metal format. The text is made only for a line that prints it: CA wraps its surfaces every frame.
+ auto layout=[&]()->NSString *{return surfaceDescriptorText(surface,plane);};
+#define CHECK(field,value,accepted) do {__typeof__(value) actual=(value);if(!(accepted)){failureLog("FUXI MTL: texture reject %s %llu desc=%s %s\n",field,(unsigned long long)actual,textureDescriptorText(d).UTF8String,layout().UTF8String);return nil;}}while(0)
  CHECK("IOSurface.present",surface,actual!=nullptr);
  size_t planes=IOSurfaceGetPlaneCount(surface);
  // The pinned bridge has no two-plane RGB rendering/sampling contract. Never
@@ -1961,9 +1961,12 @@ static NSString *surfaceDescriptorText(IOSurfaceRef surface,NSUInteger plane){
   if(!base || !start || uintptr_t(start)<uintptr_t(base))throw std::runtime_error("IOSurface plane base address");
   size_t offset=uintptr_t(start)-uintptr_t(base);
   t->_texture=owner(self)->backend->importTexture(base,IOSurfaceGetAllocSize(surface),row,(uint32_t)width,(uint32_t)height,offset,IOSurfaceGetID(surface),(uint32_t)wanted);
- }catch(const std::exception &e) {failureLog("FUXI MTL: texture reject IOSurfaceImport 0 desc=%s %s reason=%s\n",textureDescriptorText(d).UTF8String,layout.UTF8String,e.what());[t release];return nil;}
+ }catch(const std::exception &e) {failureLog("FUXI MTL: texture reject IOSurfaceImport 0 desc=%s %s reason=%s\n",textureDescriptorText(d).UTF8String,layout().UTF8String,e.what());[t release];return nil;}
  if(gpuScanout){IOSurfaceUnlock(surface,0,nullptr);t->_surfaceLockHeld=NO;}
- fprintf(stderr,"FUXI MTL: IOSurface import PASS %s %lux%lu same-memory %s\n",wanted==MTLPixelFormatBGRA8Unorm?"BGRA8":wanted==MTLPixelFormatR8Unorm?"R8":wanted==MTLPixelFormatRG8Unorm?"RG8":"RGBA8",(unsigned long)d.width,(unsigned long)d.height,layout.UTF8String);return t;
+ // Every pass is counted (cache hits included: d-ft-v27 printed 2614 lines in 200 s); the first eight and then powers of two
+ // are printed, and the cache period line has the count.
+ const uint64_t passes=++fuxi::surfacePassLogs;
+ if(fuxi::logSampled(passes))fprintf(stderr,"FUXI MTL: IOSurface import PASS %s %lux%lu same-memory %s count=%llu\n",wanted==MTLPixelFormatBGRA8Unorm?"BGRA8":wanted==MTLPixelFormatR8Unorm?"R8":wanted==MTLPixelFormatRG8Unorm?"RG8":"RGBA8",(unsigned long)d.width,(unsigned long)d.height,layout().UTF8String,(unsigned long long)passes);return t;
 }
 // Repeat, mirror repeat, clamp-to-zero and clamp-to-border map to core Vulkan; mirror clamp-to-edge stays refused.
 static bool fuxiAddressMode(MTLSamplerAddressMode m) {return m==MTLSamplerAddressModeClampToEdge || m==MTLSamplerAddressModeRepeat ||

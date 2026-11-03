@@ -9,14 +9,18 @@
 #include <string>
 #include <chrono>
 #include <atomic>
+#include <memory>
 #include <mutex>
+#include <utility>
 #include <sys/file.h>
 namespace fuxi {
 class BackboardGate {
  std::mutex mutex;
  int directory=-1,lease=-1;char boot[37]={};unsigned strikes=0;
  std::atomic<bool> active{false},failed{false};bool good=false;
- FrameTraceWindow frameTrace;
+ // completed() adds to frameTrace under the mutex. report() swaps in spareTrace there and formats the full window after
+ // unlocking, so a retiring frame never waits for the sorting and printing (reportMutex: one report at a time).
+ std::unique_ptr<FrameTraceWindow> frameTrace=std::make_unique<FrameTraceWindow>(),spareTrace;std::mutex reportMutex;
  uint64_t frames=0,late=0,failures=0,gpu=0,lastFrames=0,lastGPU=0;
  double began=0,lastReport=0;
  static double now(){return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();}
@@ -94,7 +98,7 @@ public:
  void completed(uint64_t gpuNanos,double wallMS,const FrameSample *sample=nullptr) {
   if(!active.load())return;
   std::lock_guard<std::mutex> guard(mutex);if(!active || failed)return;
-  if(sample)frameTrace.add(*sample);
+  if(sample)frameTrace->add(*sample);
   ++frames;gpu+=gpuNanos;if(wallMS>1000.0/60.0)++late;
   if(frames==1)fprintf(stderr,"FUXI MTL: backboardd first_frame_ms=%.3f gpu_ms=%.3f\n",(now()-began)*1000,gpuNanos/1e6);
   if(!good && frames>=goodFrames) {
@@ -108,18 +112,23 @@ public:
  static std::string causeCounts(){std::string r;char b[48];for(unsigned i=0;i<missCauses;++i)if(auto v=texturePoolMissCause[i].load()){snprintf(b,sizeof b,"%s%s:%llu",r.empty()?"":",",missCauseNames[i],(unsigned long long)v);r+=b;}return r.empty()?"-":r;}
  void report() {
   if(!active.load())return;
-  std::lock_guard<std::mutex> guard(mutex);double t=now();if(!active || t-lastReport<5)return;
-  uint64_t count=frames-lastFrames;
+  std::lock_guard<std::mutex> serial(reportMutex);
+  const bool trace=systemTranslationPolicy().frameTrace;
+  if(trace && !spareTrace)spareTrace=std::make_unique<FrameTraceWindow>(); // allocated before taking the gate lock
+  uint64_t count,gpuDelta,frameCount,lateCount,failureCount;double span;
+  {std::lock_guard<std::mutex> guard(mutex);double t=now();if(!active || t-lastReport<5)return;
+   count=frames-lastFrames;gpuDelta=gpu-lastGPU;span=t-lastReport;frameCount=frames;lateCount=late;failureCount=failures;
+   if(trace){std::swap(frameTrace,spareTrace);frameTrace->continueFrom(*spareTrace);}
+   lastReport=t;lastFrames=frames;lastGPU=gpu;}
   // Reuse completed-frame GPU timestamps. Completion-window attribution can
   // straddle report boundaries; overlapping work can exceed one wall interval.
   // This is compositor timestamp occupancy, not a whole-engine busy counter.
-  double busy=100.0*double(gpu-lastGPU)/1e9/(t-lastReport);if(busy>100.0)busy=100.0;
-  if(count && gpu==lastGPU)busy=-1.0; // completed frames without timestamp data
+  double busy=100.0*double(gpuDelta)/1e9/span;if(busy>100.0)busy=100.0;
+  if(count && !gpuDelta)busy=-1.0; // completed frames without timestamp data
   fprintf(stderr,"FUXI MTL: backboardd frames=%llu gpu_ms=%.3f late=%llu failures=%llu sampling_skipped=%llu hz=%.2f window_frames=%llu gpu_busy_est_pct=%.1f tex_pool_hits=%llu tex_pool_misses=%llu tex_pool_trims=%llu tex_pool_bytes=%llu tex_pool_wasted=%llu tex_pool_idle_trims=%llu tex_pool_pressure_trims=%llu tex_pool_reject_full=%llu tex_pool_reject_budget=%llu tex_pool_class_hits=%s tex_pool_class_misses=%s tex_pool_miss_causes=%s slab_hits=%llu slab_grows=%llu slab_grow_cold=%llu slab_grow_frag=%llu slab_grow_full=%llu slab_grow_refused=%llu slab_frees=%llu slab_trims=%llu slab_bytes=%llu slab_free_bytes=%llu buf_pool_hits=%llu buf_pool_misses=%llu buf_pool_trims=%llu buf_pool_bytes=%llu surface_import_hits=%llu surface_import_misses=%llu\n",
-   (unsigned long long)frames,count?(gpu-lastGPU)/1e6/double(count):0.0,(unsigned long long)late,
-   (unsigned long long)failures,(unsigned long long)skippedSamplingDraws.load(),double(count)/(t-lastReport),(unsigned long long)count,busy,(unsigned long long)texturePoolHits.load(),(unsigned long long)texturePoolMisses.load(),(unsigned long long)texturePoolTrims.load(),(unsigned long long)texturePoolBytes.load(),(unsigned long long)texturePoolWasted.load(),(unsigned long long)texturePoolIdleTrims.load(),(unsigned long long)texturePoolPressureTrims.load(),(unsigned long long)texturePoolRejectFull.load(),(unsigned long long)texturePoolRejectBudget.load(),classCounts(texturePoolClassHits).c_str(),classCounts(texturePoolClassMisses).c_str(),causeCounts().c_str(),(unsigned long long)slabHits.load(),(unsigned long long)slabGrows.load(),(unsigned long long)slabGrowCold.load(),(unsigned long long)slabGrowFrag.load(),(unsigned long long)slabGrowFull.load(),(unsigned long long)slabGrowRefused.load(),(unsigned long long)slabFrees.load(),(unsigned long long)slabTrims.load(),(unsigned long long)slabBytes.load(),(unsigned long long)slabFreeBytes.load(),(unsigned long long)bufferPoolHits.load(),(unsigned long long)bufferPoolMisses.load(),(unsigned long long)bufferPoolTrims.load(),(unsigned long long)bufferPoolBytes.load(),(unsigned long long)surfaceImportHits.load(),(unsigned long long)surfaceImportMisses.load());
-  if(systemTranslationPolicy().frameTrace)frameTrace.report();
-  lastReport=t;lastFrames=frames;lastGPU=gpu;
+   (unsigned long long)frameCount,count?gpuDelta/1e6/double(count):0.0,(unsigned long long)lateCount,
+   (unsigned long long)failureCount,(unsigned long long)skippedSamplingDraws.load(),double(count)/span,(unsigned long long)count,busy,(unsigned long long)texturePoolHits.load(),(unsigned long long)texturePoolMisses.load(),(unsigned long long)texturePoolTrims.load(),(unsigned long long)texturePoolBytes.load(),(unsigned long long)texturePoolWasted.load(),(unsigned long long)texturePoolIdleTrims.load(),(unsigned long long)texturePoolPressureTrims.load(),(unsigned long long)texturePoolRejectFull.load(),(unsigned long long)texturePoolRejectBudget.load(),classCounts(texturePoolClassHits).c_str(),classCounts(texturePoolClassMisses).c_str(),causeCounts().c_str(),(unsigned long long)slabHits.load(),(unsigned long long)slabGrows.load(),(unsigned long long)slabGrowCold.load(),(unsigned long long)slabGrowFrag.load(),(unsigned long long)slabGrowFull.load(),(unsigned long long)slabGrowRefused.load(),(unsigned long long)slabFrees.load(),(unsigned long long)slabTrims.load(),(unsigned long long)slabBytes.load(),(unsigned long long)slabFreeBytes.load(),(unsigned long long)bufferPoolHits.load(),(unsigned long long)bufferPoolMisses.load(),(unsigned long long)bufferPoolTrims.load(),(unsigned long long)bufferPoolBytes.load(),(unsigned long long)surfaceImportHits.load(),(unsigned long long)surfaceImportMisses.load());
+  if(trace)spareTrace->report();
  }
  BackboardGate()=default;
  BackboardGate(const BackboardGate&)=delete;BackboardGate& operator=(const BackboardGate&)=delete;

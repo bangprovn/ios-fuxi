@@ -153,6 +153,18 @@ unsafe fn read_artifact(io:ArtifactScope,key:*const u8,out:*mut *const u8)->(usi
 // inputs (including variant/fetch/attachment/varying facts), never just a name.
 thread_local! {static TRANSLATION_FLAGS:std::cell::Cell<u32>=const {std::cell::Cell::new(0)};}
 #[no_mangle] pub extern "C" fn fuxi_m2v_translation_scope_v1(flags:u32) {TRANSLATION_FLAGS.set(flags & 3);}
+// Translator precision notes so far: each is counted, the first eight and then powers of two are printed (d-ft-v27: 1806
+// lines a boot), and FuxiMetal's cache period line prints the count (optional ABI-8 extension).
+static PRECISION_NOTES:std::sync::atomic::AtomicU64=std::sync::atomic::AtomicU64::new(0);
+#[no_mangle] pub extern "C" fn fuxi_m2v_precision_notes_v1()->u64 {PRECISION_NOTES.load(std::sync::atomic::Ordering::Relaxed)}
+fn note_precision(note:&dyn std::fmt::Debug) {
+    let n=PRECISION_NOTES.fetch_add(1,std::sync::atomic::Ordering::Relaxed)+1;
+    if n<=8 || (n&(n-1))==0 {
+        // One write: eprintln! writes its pieces separately, which the device log kept as three lines.
+        let line=format!("FUXI MTL: translator precision count={} {:?}\n",n,note);
+        use std::io::Write;let _=std::io::stderr().write_all(line.as_bytes());
+    }
+}
 fn stage_reuse()->bool {TRANSLATION_FLAGS.get() & 1 != 0}
 struct TranslationTimer {phase:&'static str,start:std::time::Instant,enabled:bool}
 impl TranslationTimer {
@@ -999,7 +1011,7 @@ fn make_product(device:Device,descriptor:RenderPipelineDescriptor,options:&Compi
         reject_graphics!(!g.storage_attachments.is_empty());
         reject_graphics!(g.shadow_stencil.is_some());
         reject_graphics!(g.mesh_records.is_some());
-        for stage in &pipeline.stages {for note in &stage.precision_notes {eprintln!("FUXI MTL: translator precision {:?}",note);}}
+        for stage in &pipeline.stages {for note in &stage.precision_notes {note_precision(note);}}
         reflect_textures(&pipeline,&mut state,initial)?;
         let plan=pipeline.plan(&device,&state.shape()).map_err(|e|e.to_string())?;
         check_plan(&plan,&variant)?;

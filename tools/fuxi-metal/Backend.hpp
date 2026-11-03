@@ -194,10 +194,13 @@ class Backend {
   }
   artifactCache.report();
   // linear_textures: cumulative linearTexture outcomes (own_row: explicit row, tail: aliased past the buffer's bytes); tail_pad_kb: live.
-  fprintf(stderr,"FUXI MTL: cache period driver hits=%llu misses=%llu unknown=%llu objects hits=%llu misses=%llu live=%zu evictions=%zu bytes=%zu blobs=%zu blob_shared=%llu mesa_cache=%s linear_textures=own_row:%llu,tail:%llu,shadow:%llu,shadow_kinds:%zu tail_pad_kb=%zu\n",
+  // counted_logs: cumulative counts of lines printed only for the first eight and then powers of two (LogRate.hpp).
+  auto notes=Translator::precisionNotes.load();
+  fprintf(stderr,"FUXI MTL: cache period driver hits=%llu misses=%llu unknown=%llu objects hits=%llu misses=%llu live=%zu evictions=%zu bytes=%zu blobs=%zu blob_shared=%llu mesa_cache=%s linear_textures=own_row:%llu,tail:%llu,shadow:%llu,shadow_kinds:%zu tail_pad_kb=%zu counted_logs=surface_pass:%llu,render_target:%llu,precision:%llu\n",
    (unsigned long long)driverHits,(unsigned long long)driverMisses,(unsigned long long)driverUnknown,
    (unsigned long long)objectHits,(unsigned long long)objectMisses,objects.count(),objects.evictions,objects.totalBytes(),blobShare.size(),(unsigned long long)blobSharedHits,mesaStatus[0]?mesaStatus:"off",
-   (unsigned long long)linearOwnRows,(unsigned long long)linearTailUses,(unsigned long long)linearShadows,linearShadowKinds.size(),tailPadBytes>>10);
+   (unsigned long long)linearOwnRows,(unsigned long long)linearTailUses,(unsigned long long)linearShadows,linearShadowKinds.size(),tailPadBytes>>10,
+   (unsigned long long)surfacePassLogs.load(),(unsigned long long)renderTargetLogs.load(),(unsigned long long)(notes?notes():0));
   {size_t variants=0,largest=0,largestVariants=0;objects.each([&](Pipeline *p,size_t n){variants+=p->variants.size();if(n>largest){largest=n;largestVariants=p->variants.size();}});
    fprintf(stderr,"FUXI MTL: cache period object bytes live=%zu variants=%zu avg_kb=%zu largest_kb=%zu largest_variants=%zu (entry bytes include runtime variants: each variant is a full pipeline, up to 8 per entry)\n",objects.count(),variants,objects.count()?objects.totalBytes()/objects.count()/1024:0,largest/1024,largestVariants);}
   driverHits=driverMisses=driverUnknown=objectHits=objectMisses=0;return checkpoint;
@@ -690,9 +693,10 @@ public:
     if(t->image)DestroyImage(device,t->image,nullptr);delete t;t=nullptr;
     auto *shadow=allocateTextureUnlocked(format,1,width,height);
     shadow->shadow=true;b->shadowBacking=true;shadow->backingBuffer=b;++b->references;shadow->backingOffset=offset;shadow->backingRow=row;
-    // One line per kind of fallback (its reason without the numbers), not per texture; the cache period line counts them all.
+    // A line for each new kind of fallback (its reason without the numbers), otherwise the first eight and then powers of two;
+    // the cache period line counts them all.
     if(reason[0]!='s'){++linearShadows;const bool fresh=linearShadowKinds.size()<64 && linearShadowKinds.insert(linearShadowKind(reason)).second;
-     if(fresh)fprintf(stderr,"FUXI MTL: linear texture shadow format=%u %ux%u offset=%zu row=%zu count=%llu kinds=%zu reason=%s\n",format,width,height,offset,row,(unsigned long long)linearShadows,linearShadowKinds.size(),reason.c_str());}
+     if(fresh || logSampled(linearShadows))fprintf(stderr,"FUXI MTL: linear texture shadow format=%u %ux%u offset=%zu row=%zu count=%llu kinds=%zu reason=%s\n",format,width,height,offset,row,(unsigned long long)linearShadows,linearShadowKinds.size(),reason.c_str());}
     return shadow;
    };
    if((formatProperties.linearTilingFeatures&required)!=(uint32_t)required)return fallback("linear texture format features unavailable");
@@ -741,7 +745,7 @@ public:
      VkImageSubresource ownSub{VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT,0,0};VkSubresourceLayout ownLayout{};GetImageSubresourceLayout(device,image,&ownSub,&ownLayout);
      auto ownMismatch=linearAliasMismatch(ownReq,ownLayout,b->memoryType,span,offset,row,b->memoryOffset);
      if(ownMismatch.empty()){DestroyImage(device,t->image,nullptr);t->image=image;req=ownReq;mismatch.clear();++linearOwnRows;
-      if(linearOwnRows<=8)fprintf(stderr,"FUXI MTL: linear texture at its own row %zu format=%u %ux%u offset=%zu (Vulkan linear pitch=%llu size=%llu, own row size=%llu, memory=%zu) count=%llu\n",
+      if(logSampled(linearOwnRows))fprintf(stderr,"FUXI MTL: linear texture at its own row %zu format=%u %ux%u offset=%zu (Vulkan linear pitch=%llu size=%llu, own row size=%llu, memory=%zu) count=%llu\n",
        row,format,width,height,offset,(unsigned long long)plainPitch,(unsigned long long)plainSize,(unsigned long long)ownReq.size,span,(unsigned long long)linearOwnRows);}
      else {DestroyImage(device,image,nullptr);mismatch+="; at its own row: "+ownMismatch;}
     }else mismatch+="; own row refused";
@@ -2481,10 +2485,13 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
       if(occElide(ops,*occPlan,opIndex,passEnd,aw,ah)){if(!passOp)passOp=op;auto c=passOp->color(0);c.load=0;passOp->setColor(0,c);loadElided=true;++occElided;}}
      if(passQ || systemTranslationPolicy().rtShadow || systemTranslationPolicy().pipeStats){auto *t=op.texture;uint8_t tl=t->rtTarget?2:t->tiling==VK_IMAGE_TILING_LINEAR?1:0;
       uint64_t key=0xcbf29ce484222325ull;for(uint64_t x:{uint64_t(t->width),uint64_t(t->height),uint64_t(t->format),uint64_t(tl),uint64_t(t->backingBuffer && t->backingBuffer->imported),uint64_t(t->usage)})key=(key^x)*0x100000001b3ull;
-      if(targetLogged.insert(key).second){
+      // CA resizes its targets all the time (d-ft-v27: 1090 lines in 200 s): each new kind is counted, the first eight and then
+      // powers of two are printed, and the dedupe set starts over at 4096 kinds instead of growing for the process's life.
+      if(targetLogged.size()>=4096)targetLogged.clear();
+      if(targetLogged.insert(key).second && logSampled(++renderTargetLogs)){
        bool imported=t->backingBuffer && t->backingBuffer->imported;bool wide=t->vkFormat==VK_FORMAT_B8G8R8A8_UNORM || t->vkFormat==VK_FORMAT_R8G8B8A8_UNORM || t->vkFormat==VK_FORMAT_A2B10G10R10_UNORM_PACK32 || t->vkFormat==VK_FORMAT_R16G16B16A16_SFLOAT;
-       fprintf(stderr,"FUXI MTL: render target %ux%u format=%u vk=%d tiling=%s imported=%d borrowed=%d usage=0x%x storage=%d input_attachment=%d ubwc=%s (derived from tiling/format/usage; not queried)\n",t->width,t->height,t->format,int(t->vkFormat),tl==1?"linear":tl==2?"optimal(rt-shadow)":"optimal",int(imported),int(t->borrowedMemory),unsigned(t->usage),!!(t->usage&VK_IMAGE_USAGE_STORAGE_BIT),!!(t->usage&VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT),
-        tl==1?"no(linear)":(t->usage&VK_IMAGE_USAGE_STORAGE_BIT)?"no(storage)":wide?"possible":"unknown(format)");}}
+       fprintf(stderr,"FUXI MTL: render target %ux%u format=%u vk=%d tiling=%s imported=%d borrowed=%d usage=0x%x storage=%d input_attachment=%d ubwc=%s count=%llu (derived from tiling/format/usage; not queried)\n",t->width,t->height,t->format,int(t->vkFormat),tl==1?"linear":tl==2?"optimal(rt-shadow)":"optimal",int(imported),int(t->borrowedMemory),unsigned(t->usage),!!(t->usage&VK_IMAGE_USAGE_STORAGE_BIT),!!(t->usage&VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT),
+        tl==1?"no(linear)":(t->usage&VK_IMAGE_USAGE_STORAGE_BIT)?"no(storage)":wide?"possible":"unknown(format)",(unsigned long long)renderTargetLogs.load());}}
      if(passQ){cur={};cur.width=op.texture->levelWidth(op.dstLevel);cur.tiling=op.texture->rtTarget?2:op.texture->tiling==VK_IMAGE_TILING_LINEAR?1:0;cur.height=op.texture->levelHeight(op.dstLevel);cur.colors=used;
       for(unsigned i=0,u=0;i<op.colorCount && u<8;++i){auto c=op.color(i);if(!c.texture)continue;unsigned st=passEnd>opIndex?ops[passEnd].color(i).store:c.store;cur.load|=uint32_t(c.load&3u)<<(u*2);cur.store|=(st?1u:0u)<<u;++u;}}
      passFetchDraws=0;for(size_t i=opIndex;i<=passEnd;++i)if(ops[i].pipeline && ops[i].pipeline->fetchMask)++passFetchDraws;

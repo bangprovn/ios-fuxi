@@ -245,6 +245,8 @@ public:
   gpuUnavailable+=!s.gpuSamples;++cpus[s.cpu<8?s.cpu:8];encodeUnknown+=s.encodeCountsUnknown;
  }
  uint64_t size() const{return count;}
+ // A window taking over from `previous` (BackboardGate swaps two): the next frame's interval spans the swap.
+ void continueFrom(const FrameTraceWindow &previous){lastCreated=previous.lastCreated;}
  uint64_t percentile(uint64_t FrameSample::*field,unsigned percent) {
   size_t n=size_t(std::min<uint64_t>(count,capacity));if(!n)return 0;
   for(size_t i=0;i<n;++i)scratch[i]=samples[i].*field;
@@ -272,12 +274,16 @@ public:
   if(len>399)len=399;line[len]=0;fprintf(out,"%s\n",line);
  }
  void report(FILE *out=stderr) {
-  char *text=nullptr;size_t size=0;FILE *line=open_memstream(&text,&size); // the main line, wrapped at 200 chars
+  // The percentiles and lines are made in memory first: stderr's lock, which every other logging thread takes, is held only
+  // while the finished lines are written.
+  char *text=nullptr,*phases=nullptr;size_t size=0,phaseSize=0;
+  FILE *line=open_memstream(&text,&size),*rest=open_memstream(&phases,&phaseSize); // the main line, wrapped at 200 chars; the phase lines
+  if(line){reportMain(line);fclose(line);}
+  if(rest){reportPhases(rest);fclose(rest);}
   flockfile(out);
-  reportMain(line?line:out);
-  if(line){fclose(line);wrapLine(out,text?text:"","FUXI MTL: frame trace+");free(text);}
-  reportPhases(out);
-  funlockfile(out);
+  if(line)wrapLine(out,text?text:"","FUXI MTL: frame trace+");else reportMain(out);
+  if(rest)fputs(phases?phases:"",out);else reportPhases(out);
+  funlockfile(out);free(text);free(phases);
   count=wallMax=draws=passes=encodeUnknown=gpuUnavailable=mergedDraws=0;mergeSplits.fill(0);counts={};totals={};cpus.fill(0);cadence.fill(0);
  }
  void reportMain(FILE *out) {

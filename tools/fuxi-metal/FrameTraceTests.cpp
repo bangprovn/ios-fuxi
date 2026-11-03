@@ -1,9 +1,11 @@
 /* Original host controls for bounded frame statistics and thread attribution. */
 #define FUXI_MTL_HOST_TEST
 #include "FrameTrace.hpp"
+#include "LogRate.hpp"
 #include "PassTimes.hpp"
 #include <cassert>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <thread>
 // The main report line, rejoined from its <=200-char pieces ('FUXI MTL: frame trace+' continuations).
@@ -47,6 +49,13 @@ int main(){
  assert(strstr(line,"prior_wait_completed=0.000/0.000 backend_cpu=0.500/0.900 frontend_cpu=1.000/1.800 frontend_wall=1.500/2.700 frontend_draw_ns/frame=5000/9000 frontend_draw_samples/frame=10.00 pipe=2.000/3.600 desc=2.500/4.500 record=3.000/5.400 kernel_io=3.500/6.300"));
  assert(strstr(line,"pipe_cpu=0.400/0.720 desc_cpu=0.000/0.000 record_cpu=0.000/0.000 flush_cpu=0.000/0.000 kernel_io_cpu=0.000/0.000 queue_submit_cpu=0.000/0.000 cpu_sampled_submits/frame=0.00 cpu_omitted_submits/frame=0.00\n"));
  assert(!window.size());fclose(out);
+ // Counted log lines: 1..8, then 16, 32, ... 512 of the first thousand.
+ {unsigned printed=0;for(uint64_t n=1;n<=1000;++n)printed+=logSampled(n);assert(printed==14 && logSampled(1024) && !logSampled(1000));}
+ // BackboardGate swaps two windows and reports the full one after unlocking: the first frame after a swap keeps its interval.
+ {auto a=std::make_unique<FrameTraceWindow>(),b=std::make_unique<FrameTraceWindow>(),c=std::make_unique<FrameTraceWindow>();
+  FrameSample f;f.createdNs=1000000000;a->add(f);b->continueFrom(*a);f.createdNs+=8333333;b->add(f);c->add(f);
+  char text[8192];FILE *o=tmpfile();assert(o);b->report(o);joinedTrace(o,text,sizeof text);fclose(o);assert(strstr(text,"cadence_ticks=1:1,2:0,3:0,4+:0"));
+  o=tmpfile();assert(o);c->report(o);joinedTrace(o,text,sizeof text);fclose(o);assert(strstr(text,"cadence_ticks=1:0,2:0,3:0,4+:0"));}
  // Overflow retains the newest 1024 samples; window max includes evicted data.
  FrameSample s;s.wall=9999999999;window.add(s);
  for(unsigned i=0;i<2048;++i){s.wall=1000000;window.add(s);}
