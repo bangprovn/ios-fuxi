@@ -362,3 +362,106 @@ failure. Script runs only compare; a hand decides the limit.
   with about 950 copies replaced by a newer one per run. Copies finish in pairs
   within one period (CA swap interval p10 7.2, p90 9.3 ms), and the FIFO is what
   absorbs that. `fuxiearly=5` stays.
+
+## `fmtl` tokens OR together; late-frame lines (bit 22)
+
+Before 4 Nov `applyBootOptions` stopped at the first `fmtl=` token, so a test
+that appended its own token to the base one changed nothing (d-lean-b1/b2 logged
+`boot options fmtl=40001` and `submit_lean=0` with `fmtl=40811` on the line).
+All tokens now OR together, and the line says `fmtl=<mask> tokens=N` when there
+was more than one. A test can add `fmtl=400000` beside the base `fmtl=40001`.
+
+Bit 22 (`400000`) is `FUXI_MTL_LATE_FRAMES=1`. With the frame trace on
+(`fuxigpuframetrace=1` or `2`; without it there are no samples and the policy
+line says so), every backboardd surface frame whose interval (its command
+buffer's creation after the previous surface frame's) is over 12.5 ms gets one
+line of its own stages, at most 8 per 5 s (`FUXI_MTL_LATE_FRAMES_US`,
+`FUXI_MTL_LATE_FRAMES_MAX`):
+
+    FUXI MTL: late frame n=4 interval=16.67 wall=7.30 cpu_before_commit=1.50 ...
+    FUXI MTL: late frame+ ... gpu_exec=6.38 gpu_wait=6.23 retire_queue=... retire_lock=1.81 ...
+    FUXI MTL: late frame+ ... top=plan_bounds:0.81,record:0.40,descriptors:0.30 prev=wall:7.20,... late=1/4 dropped=0
+
+The fields carry the window line's names, in ms, for this one frame:
+`cpu_before_commit` (CoreAnimation's encode, creation to commit),
+`submit_queue`, `backend_lock`, `slot_wait`, `backend_submit` with `record`,
+`desc`, `pipe`, `queue_submit`, `gpu_exec`, `gpu_wait`, `retire_queue`,
+`retire_lock`, `surface_release`, and counts (`draws`, `passes`,
+`pipeline_barriers`, `image_barriers`, `plan_misses`, `pipelines`,
+`descriptors`, `allocations`, process-wide `sync_compiles` since the previous
+frame). `top=` names the frame's three longest submit phases (the fence wait
+left out; it is `gpu_wait`). A frame mostly starts late because the one before
+it ended late, so `prev=` gives that frame's wall, encode, submit, GPU, retire
+lock and surface release. `late=L/F` counts late and all frames since start,
+`dropped=` the late frames the rate limit left out since the line before. The
+line is cut at 200 characters like the window line: delete every
+`\nFUXI MTL: late frame+` to rejoin it. Printed after the gate lock.
+
+## Descriptor sets kept across submits (bit 23)
+
+Bit 23 (`800000`) is `FUXI_MTL_DESC_REUSE=1`, used with `fuxigpusubmit=1`
+(the per-submit set dedupe; without it the policy line says the knob does
+nothing). d-ft-v27 made 85.5 new sets a frame from a pool reset every submit.
+With the knob a set is kept after its submit and bound again by any later draw
+whose written values are the same (`DescriptorReuse.hpp`, `Backend::reuseSet`):
+
+- identity: same set layout handle, same binding count, and per binding the
+  same binding, type, sampler, image view, image layout, buffer, offset and
+  range, compared in full (the hash only picks candidates);
+- lifetime: every handle a kept set names is indexed, and each of the eleven
+  `Destroy{Buffer,ImageView,Sampler,DescriptorSetLayout}` calls in
+  `Backend.hpp` first drops the sets that name it, so an object that later gets
+  the same handle value (lavapipe and Turnip both reuse addresses) never
+  matches a set written for the old one. A pooled `VkBuffer` handed to a new
+  `Buffer` is not destroyed and describes the same memory, so its sets stay;
+- pending use: sets are made into two pools of 512 taken in turn and are never
+  updated after they are written. A pool is reset only when its last bind is
+  older than every busy flight and the submit being recorded (submit serials);
+  rotating drops every kept set first. A set the pools cannot take (full and
+  the other pool still pending, another type, a failed allocation) is made in
+  the submit pool as before.
+
+The backboardd line (every 5 s, only with the knob) ends with
+`desc_reuse=hits:H,new:N,fallbacks:F,forgotten:G,rotations:R,blocked:B`
+(cumulative: bound from the kept sets, made into them, left to the submit
+pool, dropped because a handle they name was destroyed, pool rotations, and
+rotation attempts refused while the other pool may be pending). The frame trace
+line adds `desc_reuse/frame=hits:..,new:..`, and its `descriptors/frame` counts
+sets made either way. Test: `tools/test-fuxi-metal-reuse.py` (lavapipe):
+pixels equal to the knob off over five boot-argument sets, with and without
+split submits; no set made in a steady frame; texture, sampler, uniform buffer
+and pipeline destroyed and remade under kept sets; two pending flights across
+rotations. Without ASan's quarantine the swapped objects get the old handles,
+and with the destroy-time rule disabled the test draws two scenes wrong.
+
+## Repeated push constants and vertex/index binds left out (bit 24)
+
+Bit 24 (`1000000`) is `FUXI_MTL_BIND_SKIP=1`, the analogue for our recording
+of hakios-metal b576ed1/8c54e65 (they drop register writes that repeat within
+a pass in their own command stream). Push constants and vertex/index buffer
+bindings are command buffer state: Vulkan keeps them across render passes and
+pipeline binds, and Turnip keeps `cmd->push_constants`, `state.vb` and the index
+state and re-emits them as draw state for each pass and pipeline (every pass end
+marks all draw state dirty; a pipeline bind marks the constants dirty). So
+`BindTracker.hpp` works per command buffer (reset with each one, split-submit
+chunks too), not per pass, which also helps with merging off (one draw a pass).
+A call is left out only when it would set exactly what was set last:
+
+- `vkCmdPushConstants`: same pipeline layout handle as every tracked push (a
+  push with another layout clears them all), same stages, offset and size, same
+  bytes; a push that is recorded first drops every tracked range it overlaps;
+- `vkCmdBindVertexBuffers`: same binding, buffer handle and offset;
+- `vkCmdBindIndexBuffer`: same buffer handle, offset and index type.
+
+Untracked cases (a fifth push range, a ninth binding, a push over 128 bytes)
+are always recorded. Draws, pipelines, descriptor sets and barriers are
+unchanged. In Turnip a skipped push saves the memcpy and the constant
+re-emission only while the pipeline stays bound (FuxiMetal rebinds the
+pipeline at every pass start); a skipped vertex bind saves a draw-state
+allocation and its register writes. The backboardd line (only with the knob)
+ends with `bind_skip=push:S/T,vertex:S/T,index:S/T` (skipped / asked,
+cumulative), the frame trace line with `binds_skipped/frame=push:,vertex:,index:`.
+Test: `tools/test-fuxi-metal-reuse.py`: same pixels, draws, indexed draws and
+set binds as the knob off, alone and with `DESC_REUSE`; the fixture's steady
+frame goes from 22/11/4 push/vertex/index calls to 8/4/3. A tracker that
+ignores the vertex offset or the push bytes fails it (checked by hand).

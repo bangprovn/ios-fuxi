@@ -24,26 +24,31 @@ inline unsigned translationLevel(const char *args,const char *key,unsigned maxim
 }
 inline unsigned translationPerf(const char *args){return translationLevel(args,"fuxigpuperf=",7);}
 inline unsigned translationFrameTrace(const char *args){return translationLevel(args,"fuxigpuframetrace=",2);}
-struct TranslationPolicy {bool stages=false,trace=false,async=false,compileBoost=false,frameTrace=false,pipelined=false,skipSampling=false,allowFeedback=false,overlap=false,submitFast=false,gmem=false,merge=false;unsigned perf=0;bool frameCPU=false,noSlab=false,shadowRename=false,shadowHash=true,passTimes=false,renderArea=true,reorder=true,drawTimes=false,linearShadow=false,pipeStats=false,f16=false,robust=false,rtShadow=false,rtReuse=false,rtRename=false,fragRelaxed=false,sampleShadow=false,occlude=false,orderFetchOnly=false,nofetchRp=false;unsigned sampleMinPx=65536,occludeMinPx=4096;bool drawArea=false;unsigned drawAreaMinPx=1u<<20,drawAreaMargin=16,drawAreaBudgetUs=1000;bool earlyRelease=false;unsigned spirvUnroll=0,halfRound=0,halfPipeCount=0;bool halfPipesSet=false;uint32_t halfPipes[16]{};bool submitLean=false,splitSubmit=false;unsigned submitLeanLevel=0,splitSubmitUs=400,splitSubmitMax=3;bool bufferCached=false,fetchSplit=false;unsigned rtShadowMb=48;};
+struct TranslationPolicy {bool stages=false,trace=false,async=false,compileBoost=false,frameTrace=false,pipelined=false,skipSampling=false,allowFeedback=false,overlap=false,submitFast=false,gmem=false,merge=false;unsigned perf=0;bool frameCPU=false,noSlab=false,shadowRename=false,shadowHash=true,passTimes=false,renderArea=true,reorder=true,drawTimes=false,linearShadow=false,pipeStats=false,f16=false,robust=false,rtShadow=false,rtReuse=false,rtRename=false,fragRelaxed=false,sampleShadow=false,occlude=false,orderFetchOnly=false,nofetchRp=false;unsigned sampleMinPx=65536,occludeMinPx=4096;bool drawArea=false;unsigned drawAreaMinPx=1u<<20,drawAreaMargin=16,drawAreaBudgetUs=1000;bool earlyRelease=false;unsigned spirvUnroll=0,halfRound=0,halfPipeCount=0;bool halfPipesSet=false;uint32_t halfPipes[16]{};bool submitLean=false,splitSubmit=false;unsigned submitLeanLevel=0,splitSubmitUs=400,splitSubmitMax=3;bool bufferCached=false,fetchSplit=false;unsigned rtShadowMb=48;bool lateFrames=false;unsigned lateFrameUs=12500,lateFrameMax=8;bool descReuse=false,bindSkip=false;};
 inline TranslationPolicy translationPolicy(const char *args) {
  return {translationOption(args,"fuxigpustages="),translationOption(args,"fuxigputrace="),translationOption(args,"fuxigpuasync="),translationOption(args,"fuxicompileboost="),translationFrameTrace(args)!=0,translationOption(args,"fuxigpupipelined="),translationOption(args,"fuxigpuskip="),translationOption(args,"fuxigpufeedback="),translationOption(args,"fuxigpuoverlap="),translationOption(args,"fuxigpusubmit="),translationOption(args,"fuxigpugmem="),translationOption(args,"fuxigpumerge="),translationPerf(args),translationFrameTrace(args)==2};
 }
 inline bool earlyScheduledWait(const TranslationPolicy &p,bool scanout,bool quiet,const char *process) {return p.overlap && p.submitFast && scanout && quiet && process && !strcmp(process,"backboardd");}
 // fmtl=<hex> on the boot line sets FUXI_MTL_* switches, so trying one needs no root write. A variable already set wins.
+// Bit i sets bits[i]: 0 ORDER_FETCH_ONLY, 1 NOFETCH_RP, 2 OCCLUDE, 3 DRAW_AREA, 4 EARLY_RELEASE, 5 SAMPLE_SHADOW, 6/7 SPIRV_UNROLL=1/2, 8/9/10 HALF_ROUND=1/2/3,
+// 11/12 SUBMIT_LEAN=1/2, 13 SPLIT_SUBMIT, 14 FETCH_SPLIT, 15 BUFFER_CACHED, 16 GPU_PASS_TIMES, 17 GPU_DRAW_TIMES, 18 RT_SHADOW, 19 RT_SHADOW_REUSE, 20 RT_RENAME,
+// 21 RT_SHADOW_MB=128, 22 LATE_FRAMES (400000), 23 DESC_REUSE (800000), 24 BIND_SKIP (1000000).
+// Several fmtl= tokens OR together (a test appends its bits to the base mask); before 4 Nov only the first counted, so a second token was ignored.
 inline void applyBootOptions(const char *args) {
  static const struct {const char *name,*value;} bits[]={{"FUXI_MTL_ORDER_FETCH_ONLY","1"},{"FUXI_MTL_NOFETCH_RP","1"},{"FUXI_MTL_OCCLUDE","1"},{"FUXI_MTL_DRAW_AREA","1"},
   {"FUXI_MTL_EARLY_RELEASE","1"},{"FUXI_MTL_SAMPLE_SHADOW","1"},{"FUXI_MTL_SPIRV_UNROLL","1"},{"FUXI_MTL_SPIRV_UNROLL","2"},{"FUXI_MTL_HALF_ROUND","1"},{"FUXI_MTL_HALF_ROUND","2"},
   {"FUXI_MTL_HALF_ROUND","3"},{"FUXI_MTL_SUBMIT_LEAN","1"},{"FUXI_MTL_SUBMIT_LEAN","2"},{"FUXI_MTL_SPLIT_SUBMIT","1"},{"FUXI_MTL_FETCH_SPLIT","1"},{"FUXI_MTL_BUFFER_CACHED","1"},
-  {"FUXI_MTL_GPU_PASS_TIMES","1"},{"FUXI_MTL_GPU_DRAW_TIMES","1"},{"FUXI_MTL_RT_SHADOW","1"},{"FUXI_MTL_RT_SHADOW_REUSE","1"},{"FUXI_MTL_RT_RENAME","1"},{"FUXI_MTL_RT_SHADOW_MB","128"}};
+  {"FUXI_MTL_GPU_PASS_TIMES","1"},{"FUXI_MTL_GPU_DRAW_TIMES","1"},{"FUXI_MTL_RT_SHADOW","1"},{"FUXI_MTL_RT_SHADOW_REUSE","1"},{"FUXI_MTL_RT_RENAME","1"},{"FUXI_MTL_RT_SHADOW_MB","128"},
+  {"FUXI_MTL_LATE_FRAMES","1"},{"FUXI_MTL_DESC_REUSE","1"},{"FUXI_MTL_BIND_SKIP","1"}};
+ unsigned long mask=0;unsigned tokens=0;
  for(const char *p=args;*p;){
   p+=strspn(p," \t\r\n");size_t n=strcspn(p," \t\r\n");
-  if(n>5 && !strncmp(p,"fmtl=",5)){
-   unsigned long mask=strtoul(p+5,nullptr,16);
-   for(size_t i=0;i<sizeof(bits)/sizeof(bits[0]);++i)if(mask>>i&1)setenv(bits[i].name,bits[i].value,0);
-   fprintf(stderr,"FUXI MTL: boot options fmtl=%lx\n",mask);return;
-  }
+  if(n>5 && !strncmp(p,"fmtl=",5)){mask|=strtoul(p+5,nullptr,16);++tokens;}
   p+=n;
  }
+ if(!tokens)return;
+ for(size_t i=0;i<sizeof(bits)/sizeof(bits[0]);++i)if(mask>>i&1)setenv(bits[i].name,bits[i].value,0);
+ if(tokens>1)fprintf(stderr,"FUXI MTL: boot options fmtl=%lx tokens=%u\n",mask,tokens);else fprintf(stderr,"FUXI MTL: boot options fmtl=%lx\n",mask);
 }
 inline TranslationPolicy systemTranslationPolicy() {
  static const auto policy=[] {
@@ -88,6 +93,16 @@ inline TranslationPolicy systemTranslationPolicy() {
   {const char *v=getenv("FUXI_MTL_FETCH_SPLIT");p.fetchSplit=v && !strcmp(v,"1");fprintf(stderr,"FUXI MTL: policy fetch_split=%d\n",int(p.fetchSplit));}
   // FUXI_MTL_BUFFER_CACHED=1: MTLBuffer memory prefers a HOST_VISIBLE|HOST_COHERENT|HOST_CACHED type (logged with the type list at the first buffer).
   {const char *v=getenv("FUXI_MTL_BUFFER_CACHED");p.bufferCached=v && !strcmp(v,"1");}
+  // FUXI_MTL_LATE_FRAMES=1: with the frame trace on (fuxigpuframetrace=1|2), a surface frame whose interval exceeds FUXI_MTL_LATE_FRAMES_US
+  // (1000..100000, default 12500) gets a 'late frame' line of its own stages, at most FUXI_MTL_LATE_FRAMES_MAX (1..1000, default 8) every 5 s.
+  {const char *v=getenv("FUXI_MTL_LATE_FRAMES");p.lateFrames=v && !strcmp(v,"1");
+   v=getenv("FUXI_MTL_LATE_FRAMES_US");if(v){char *e=nullptr;long m=strtol(v,&e,10);if(e!=v && !*e && m>=1000 && m<=100000)p.lateFrameUs=unsigned(m);}
+   v=getenv("FUXI_MTL_LATE_FRAMES_MAX");if(v){char *e=nullptr;long m=strtol(v,&e,10);if(e!=v && !*e && m>=1 && m<=1000)p.lateFrameMax=unsigned(m);}
+   if(p.lateFrames)fprintf(stderr,"FUXI MTL: policy late_frames=1 late_frames_us=%u late_frames_max=%u frame_trace=%d%s\n",p.lateFrameUs,p.lateFrameMax,int(p.frameTrace),p.frameTrace?"":" (no lines: needs fuxigpuframetrace=1|2)");}
+  // FUXI_MTL_DESC_REUSE=1: with fuxigpusubmit=1 (the per-submit set dedupe), descriptor sets are kept across submits (DescriptorReuse.hpp).
+  {const char *v=getenv("FUXI_MTL_DESC_REUSE");p.descReuse=v && !strcmp(v,"1");if(p.descReuse)fprintf(stderr,"FUXI MTL: policy desc_reuse=1 submit_fast=%d set_limit=512%s\n",int(p.submitFast),p.submitFast?"":" (no reuse: needs fuxigpusubmit=1)");}
+  // FUXI_MTL_BIND_SKIP=1: push constant, vertex and index buffer calls that would set what the command buffer already holds are left out (BindTracker.hpp).
+  {const char *v=getenv("FUXI_MTL_BIND_SKIP");p.bindSkip=v && !strcmp(v,"1");if(p.bindSkip)fprintf(stderr,"FUXI MTL: policy bind_skip=1\n");}
   {const char *v=getenv("FUXI_MTL_SPIRV_UNROLL");p.spirvUnroll=v && (!strcmp(v,"1") || !strcmp(v,"2"))?unsigned(v[0]-'0'):0;fprintf(stderr,"FUXI MTL: policy spirv_unroll=%u\n",p.spirvUnroll);}
   fprintf(stderr,"FUXI MTL: policy shadow_rename=%d source=%s\n",int(p.shadowRename),renameKey?"boot":renameEnv?"env":"none");
   return p;

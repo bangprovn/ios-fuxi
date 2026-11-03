@@ -156,5 +156,26 @@ int main(){
   auto m=drawOcclusion({},{});assert(!m.draws && !m.candidates);}
  std::vector<DrawInfo> none;std::vector<uint64_t> zero;char quiet[64]{};FILE *q=fmemopen(quiet,sizeof quiet,"w");reportDraws(q,none,zero);fclose(q);assert(!quiet[0]);
  }
+ { // FUXI_MTL_LATE_FRAMES: a line per frame whose interval exceeds 12.5 ms (default), 8 per 5 s, the previous frame's stages, wrapped at 200 chars
+  assert(systemTranslationPolicy().lateFrameUs==12500 && systemTranslationPolicy().lateFrameMax==8);
+  FrameTraceWindow w;LateFrameLog log;char text[1536];uint64_t t=5000000000ull,printed=0;
+  auto frame=[&](uint64_t gap,uint64_t wall,bool expect){FrameSample s;t+=gap;s.createdNs=t;s.wall=wall;s.cpuBeforeCommit=1500000;s.backendSubmit=2250000;s.record=900000;s.desc=190000;s.pipe=70000;s.gpuExec=6380000;s.gpuWait=6230000;s.retireLock=1810000;s.submitQueue=40000;s.queueSubmit=130000;s.draws=86;s.passes=85;s.pipelineBarriers=308;s.imageBarriers=219;s.planMisses=1;s.counts={2,85,1};s.cpu=3;
+   s.subNs[size_t(SubPhase::fence)]=6000000;s.subNs[size_t(SubPhase::planBounds)]=810000;s.subNs[size_t(SubPhase::record)]=400000;s.subNs[size_t(SubPhase::descriptors)]=300000;s.subNs[size_t(SubPhase::bind)]=200000;
+   bool p=log.note(s,w.add(s),text,sizeof text);assert(p==expect);printed+=p;return p;};
+  frame(0,7000000,false);frame(8333333,7100000,false);frame(12500000,7200000,false); // the first frame has no interval; 12.5 ms is not over
+  syncCompiles+=2;syncCompileNs+=1200000000;
+  assert(frame(16666667,7300000,true));
+  assert(strstr(text,"FUXI MTL: late frame n=4 interval=16.67 wall=7.30 cpu_before_commit=1.50 ") && strstr(text," submit_queue=0.04 ") && strstr(text," backend_submit=2.25 record=0.90 desc=0.19 pipe=0.07 queue_submit=0.13 gpu_exec=6.38 gpu_wait=6.23 "));
+  assert(strstr(text," retire_lock=1.81 ") && strstr(text," draws=86 passes=85 ") && strstr(text," pipeline_barriers=308 image_barriers=219 ") && strstr(text," plan_misses=1 pipelines=2 descriptors=85 allocations=1 sync_compiles=2 sync_compile_ms=1200.0 "));
+  assert(strstr(text," cpu=3 top=plan_bounds:0.81,record:0.40,descriptors:0.30 prev=wall:7.20,cpu_before_commit:1.50,") && strstr(text," late=1/4 dropped=0\n") && !strstr(text,"fence"));
+  {char b[4096]{};FILE *o=fmemopen(b,sizeof b,"w");wrapLine(o,text,"FUXI MTL: late frame+");fclose(o);std::string all(b),joined;size_t at=0,pieces=0;
+   while(at<all.size()){size_t e=all.find('\n',at);std::string l=all.substr(at,e-at);assert(l.size()<=200);if(pieces){assert(!l.compare(0,22,"FUXI MTL: late frame+ "));l=l.substr(21);}joined+=l;++pieces;at=e+1;}
+   assert(pieces>2 && joined+"\n"==text);}
+  frame(8333333,7000000,false);frame(150000000,7000000,false); // an idle pause (over 100 ms) is no interval
+  for(unsigned i=0;i<9;++i)frame(16666667,7000000,i<7); // 7 more fit the 5 s window, the next two are dropped
+  for(unsigned i=0;i<600;++i)frame(8333333,7000000,false); // 5 s of on-time frames: the window started at the first late frame ends
+  assert(frame(16666667,7000000,true) && strstr(text," late=11/616 dropped=2\n"));
+  assert(printed==9);
+ }
  puts("PASS: bounded frame percentiles/reset/overflow/max, log fields, CPU mask and thread-local attribution");
 }
