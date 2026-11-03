@@ -53,7 +53,6 @@
 #include <mach/mach.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
-#include <servers/bootstrap.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -61,6 +60,10 @@
 #include <string.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
+
+/* The iOS SDK the sys job builds with has no <servers/bootstrap.h> (CI 41693876752); libSystem exports both. */
+extern mach_port_t bootstrap_port;
+kern_return_t bootstrap_look_up(mach_port_t bp, const char *service_name, mach_port_t *sp);
 
 #define CT_CLASS                "SBTelephonyManager"
 #define CT_ERROR_SELECTOR       "_serverConnectionDidError:"
