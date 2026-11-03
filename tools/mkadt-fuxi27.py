@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build the Fuxi ADT for the iOS 27 kernel (xnu-12377, UniXNU machine layer).
 
-  mkadt-fuxi27.py OUT.adt [--cpus 1|7] [--psci-method smc|hvc] [--product iphone12,3|board] [--dump]
+  mkadt-fuxi27.py OUT.adt [--cpus 1-7] [--psci-method smc|hvc] [--product iphone12,3|board] [--dump]
                   [--root-extents EXTENTS.json --root-bytes N --root-uuid OS-VOLUME-UUID]
                   [--root-hash SYSTEMVOLUME.root_hash] [--fstab] [--display]
 
@@ -112,8 +112,8 @@ def root_matching(volume_uuid):
 
 def build(cpus=1, psci_method='smc', seed=None, mem_size=fuxi.MEM_SIZE, product='iphone12,3', root_props=(),
           root_uuid=None, root_hash=None, fstab=False, display=False):
-    if cpus not in (1, len(CPU_REGS)):
-        raise ValueError('cpus must be 1 or 7')
+    if not 1 <= cpus <= len(CPU_REGS):
+        raise ValueError('cpus must be 1 to 7')
     seed = os.urandom(256) if seed is None else seed
     if len(seed) != 256:
         raise ValueError('random-seed must be 256 bytes')
@@ -193,7 +193,7 @@ def build(cpus=1, psci_method='smc', seed=None, mem_size=fuxi.MEM_SIZE, product=
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('out', type=Path)
-    ap.add_argument('--cpus', type=int, choices=(1, len(CPU_REGS)), default=1)
+    ap.add_argument('--cpus', type=int, choices=range(1, len(CPU_REGS) + 1), default=1)
     ap.add_argument('--psci-method', choices=('smc', 'hvc'), default='smc')
     ap.add_argument('--product', choices=sorted(PRODUCTS), default='iphone12,3',
                     help='/product identity: the userland device (default) or the K1 board strings')
