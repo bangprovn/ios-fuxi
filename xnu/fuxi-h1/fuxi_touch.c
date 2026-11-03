@@ -63,8 +63,9 @@ extern kern_return_t kernel_thread_start_priority(thread_continue_t continuation
     void *parameter, integer_t priority, thread_t *new_thread);
 extern int sweet_fb_display_off;       /* iokit/Kernel/arm/SweetFramebuffer.cpp */
 extern bool fuxi_keys_touch_wake(void); /* bsd/dev/fuxi_keys.c */
-extern processor_t cpu_to_processor(int);
-extern processor_t thread_bind(processor_t);
+/* The shared SPI dispatcher (bsd/dev/fuxi_gpu_irq.inc, built into fuxi_adreno.c): one handler in every CPU's slot, by INTID. */
+extern uint64_t fuxi_spi_affinity(unsigned cpu);
+extern const char *fuxi_spi_register(unsigned intid, void (*fn)(unsigned intid), unsigned cpu);
 void fuxi_touch_init(void);
 
 #define FT_SE_PA     0x00a90000u
@@ -636,12 +637,11 @@ ft_poll(bool deliver)
  * one poll period. The thread wakes every FT_WATCH_MS to see the display state and that the path still works, and
  * reads the FIFO every FT_SWEEP_MS regardless.
  *
- * Routing. sleh_irq (patch 0004) calls one handler per CPU (cpu_data interrupt_handler). The GPU fence interrupt
- * (fuxi_gpu_irq.inc) installs its handler on every CPU and routes INTID 332 to CPU 0, so this routes INTID 240 to
- * FT_IRQ_CPU and installs its handler there only (it masks any other INTID that reaches it, as the GPU's does; never
- * route another SPI to that CPU). If the GPU attaches after this, its handler takes FT_IRQ_CPU's slot and masks INTID
- * 240 at the first touch: the watchdog sees the line low with INTID 240 disabled and installs this handler again
- * (FT_REPAIRS times at most).
+ * Routing. sleh_irq (patch 0004) calls one handler per CPU (cpu_data interrupt_handler), so this registers INTID 240
+ * with the shared SPI dispatcher (fuxi_gpu_irq.inc, which also serves the GPU fence's INTID 332): one handler in every
+ * CPU's slot that calls this one for INTID 240 and masks any INTID nobody registered. INTID 240 is routed to FT_IRQ_CPU
+ * (the GPU's goes to a gold core). Should the watchdog still find INTID 240 disabled with the line low, it registers
+ * and enables it again (FT_REPAIRS times at most).
  *
  * Fallback to polling, logged once, for the rest of the boot: setup failed; FT_SPUR_MAX interrupts in a row with
  * GPIO25's status clear or FT_BURST_MAX within 100 ms (the handler masks the SPI); the line low and the pin armed
@@ -650,7 +650,7 @@ ft_poll(bool deliver)
  */
 #define FT_INTID         240u          /* TLMM summary interrupt, GIC SPI 208 */
 #define FT_GICD_PA       0x17100000u
-#define FT_IRQ_CPU       1             /* logical CPU 1 (setup logs its MPIDR): not CPU 0, the GPU fence SPI's */
+#define FT_IRQ_CPU       1             /* logical CPU 1 (setup logs its MPIDR); the GPU fence SPI goes to a gold core */
 #define FT_IC_EN         (1u << 0)
 #define FT_IC_POL        (1u << 1)
 #define FT_IC_DET        (3u << 2)
@@ -718,14 +718,10 @@ ft_irq_dead(unsigned why)
 	ft_irq_wake();
 }
 
-/* Interrupt context on FT_IRQ_CPU, interrupts masked, before sleh's EOI. */
+/* Called by the SPI dispatcher for INTID 240: interrupt context on FT_IRQ_CPU, interrupts masked, before sleh's EOI. */
 static void
-ft_irq_handler(void *target, void *refcon, void *nub, int source)
+ft_irq_handler(unsigned id)
 {
-	(void)target;
-	(void)refcon;
-	(void)nub;
-	unsigned id = (unsigned)source;
 	if (id != FT_INTID || __atomic_load_n(&fi.state, __ATOMIC_ACQUIRE) != 1) {
 		ft_spi_mask(id);        /* nobody here to clear it */
 		if (id != FT_INTID) {
@@ -756,23 +752,20 @@ ft_irq_handler(void *target, void *refcon, void *nub, int source)
 	}
 }
 
-/* The handler into FT_IRQ_CPU's slot (bound there in turn, as fuxi_gpu_irq.inc does); that CPU's affinity. */
+/* INTID 240 -> this handler in the shared dispatcher (which goes into every CPU's slot the first time); FT_IRQ_CPU's
+ * affinity, read on that CPU by the dispatcher's install. */
 static const char *
 ft_irq_install(uint64_t *mpidr)
 {
 	if (ml_get_cpu_count() <= FT_IRQ_CPU) {
 		return "no second CPU";
 	}
-	processor_t p = cpu_to_processor(FT_IRQ_CPU);
-	if (!p) {
+	uint64_t affinity = fuxi_spi_affinity(FT_IRQ_CPU);
+	if (affinity == UINT64_MAX) {
 		return "no processor for the CPU";
 	}
-	processor_t previous = thread_bind(p);
-	(void)thread_block(THREAD_CONTINUE_NULL);
-	ml_install_interrupt_handler(NULL, (int)FT_INTID, NULL, ft_irq_handler, NULL);
-	*mpidr = __builtin_arm_rsr64("MPIDR_EL1") & 0xff00ffffffULL;
-	(void)thread_bind(previous);
-	return NULL;
+	*mpidr = affinity;
+	return fuxi_spi_register(FT_INTID, ft_irq_handler, FT_IRQ_CPU);
 }
 
 /* fg_spi_on's sequence: level, group 1 NS, priority 0xa0, routed to one affinity; readback grp|en<<1|edge<<2|prio<<8. */
@@ -858,7 +851,7 @@ ft_irq_arm(void)
 	ft_wr(fi.pin, 0x8, ft_rd(fi.pin, 0x8) | FT_IC_EN | FT_IC_RAW);
 }
 
-/* Another handler took FT_IRQ_CPU's slot and masked INTID 240: take the slot back and enable it again. */
+/* INTID 240 found masked with the line low (no handler should, with the dispatcher): register it again and enable it. */
 static const char *
 ft_irq_repair(void)
 {

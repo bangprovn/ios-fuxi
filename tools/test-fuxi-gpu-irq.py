@@ -6,6 +6,8 @@
    (SM8550 MPIDR layout: physical core 6, else the highest gold core, else CPU 0), source clear of only bit 20, away count, storm masks
    (empty run, burst, foreign SPI, no delivery, isolation), sleep race/timeout/written, wake latency, mask repair.
 3. FuxiAdrenoUserClient::spin: interrupt sleeps only while the fence is unwritten, polls otherwise, retire stamp and first-poll flag.
+4. The shared SPI dispatcher with the actual touch interrupt section of fuxi_touch.c and the actual GPU attach: one handler in every
+   CPU's slot, each INTID to its own handler, touch repair and fallback to polling.
 No hardware, SDK or GIC is touched; device interrupt delivery is not observed here.
 """
 from pathlib import Path
@@ -25,8 +27,11 @@ XNU_WARN = ('-Weverything -Wno-pedantic -Wno-bad-function-cast -Wno-bitwise-inst
 
 PREFIX = r'''
 #include <stdint.h>
+#include <stddef.h>
 #include "fuxi_gpu_abi.h"
 int printf(const char *, ...) __attribute__((format(printf, 1, 2)));
+int snprintf(char *, size_t, const char *, ...) __attribute__((format(printf, 3, 4)));
+typedef uintptr_t vm_offset_t;
 typedef int kern_return_t; typedef void *event_t; typedef int wait_result_t; typedef int wait_interrupt_t; typedef unsigned boolean_t;
 typedef struct processor *processor_t; typedef void (*thread_continue_t)(void *, wait_result_t);
 #define KERN_SUCCESS 0
@@ -44,7 +49,7 @@ typedef struct processor *processor_t; typedef void (*thread_continue_t)(void *,
 #define G3_FENCE_PA 0x80000000ULL
 #define FG_ABI_FENCE_OFF 0x100u
 #define FG_GUARD int fg_guard_ __attribute__((unused, cleanup(fg_unguard))) = fg_guard()
-struct fg_window { uint64_t pa, size; uintptr_t va; };
+struct fg_window { uint64_t pa, size; vm_offset_t va; };
 static unsigned fg_abi_live, fg_abi_poisoned, fg_access_failed, fg_irq_want, fg_ready = 1, guards, guardDepth;
 static uint32_t rbbm[0x400], fenceMem;
 static uint8_t gicd[0x10000] __attribute__((aligned(4096)));
@@ -108,10 +113,13 @@ static void reset(void)
  memset(fg_irq_stats, 0, sizeof(fg_irq_stats)); binds = 0; fg_abi_live = 1; fg_ready = 1; fg_access_failed = 0; fg_abi_poisoned = 0; fg_irq_want = 1;
  rbbm[0x38] = 0; mapFail = rbbmPtrFail = 0; installed = 0; fakeNow = 1000000000ull;
  sm8550(); cpuCount = 7; curCpu = 0; bindMiss = ~0u; blockHook = 0; fg_irq_cpu = ~0u; fg_irq_at = 0;
+ memset(fuxi_spi, 0, sizeof(fuxi_spi)); fuxi_spi_installed = fuxi_spi_busy = fuxi_spi_cpus = 0; fuxi_spi_foreign = 0;
 }
 /* The interrupt fires while the waiter is blocked: 1 us after the sleep starts, handled on curCpu, the waiter runs latTicks later. */
 static uint64_t latTicks;
 static void irqDuringBlock(void) { fakeNow += 1000; rbbm[0x201] = 1u<<20; installed(0, 0, 0, 332); fakeNow += latTicks; }
+static unsigned otherCalls, otherLast;
+static void otherHandler(unsigned id) { otherCalls++; otherLast = id; }
 int main(void)
 {
  unsigned w = (332/32)*4; uint32_t bit = 1u << (332%32); uint64_t s[FG_IRQ_STATS]; unsigned why;
@@ -130,7 +138,8 @@ int main(void)
  /* Attach: handler on every CPU (bound in turn, CPU 0 last); stale bit 20 cleared; only bit 20 unmasked; group 1, priority 0xa0, level;
   * routed to physical core 6 = logical 5 (MPIDR Aff1 6, Aff3 kept, bits 24..31 dropped), not CPU 0 and not the X3. */
  reset(); rbbm[0x201] = (1u<<20)|2u; rbbm[0x38] = 0;
- assert(fuxi_gpu_irq_setup() == 1 && fg_irq_state == 1 && fg_irq_ok && installSource == 332 && installed);
+ assert(fuxi_gpu_irq_setup() == 1 && fg_irq_state == 1 && fg_irq_ok && installed == fuxi_spi_dispatch && fuxi_spi_installed);
+ assert(fuxi_spi[0].intid == 332 && fuxi_spi[0].fn == fg_irq_handler && fuxi_spi[0].cpu == 5 && !fuxi_spi[1].intid);
  for (unsigned i = 0; i < cpuCount; i++) assert(installs[i] == 1);
  assert(binds == cpuCount); for (unsigned i = 0; i < cpuCount; i++) assert(bound[i] == cpuCount - 1 - i);
  assert(rbbm[0x38] == (1u<<20) && rbbm[0x201] == 2u && fg_irq_mask_was == 0);
@@ -156,10 +165,24 @@ int main(void)
  /* No CPU qualifies (no CPU 0 visited): masked, not armed, RBBM mask restored. */
  reset(); cpuCount = 1; bindMiss = 0; curCpu = 3; rbbm[0x38] = 0x5u;
  assert(!fuxi_gpu_irq_setup() && fg_irq_state == 2 && !fg_irq_ok && (gd(0x180 + w) & bit) && rbbm[0x38] == 0x5u && fg_irq_cpu == ~0u);
+ /* Shared dispatcher: in every CPU's slot once; another lane's INTID registers without binding again and reaches its own handler
+  * on any CPU, as INTID 332 reaches the GPU's; an INTID cannot be taken by another handler, the same handler again only updates
+  * its CPU; INTIDs outside the SPI range and a fifth entry are refused; affinities come from the one install. */
+ reset(); assert(fuxi_gpu_irq_setup() == 1 && binds == cpuCount);
+ assert(!fuxi_spi_register(240, otherHandler, 1) && binds == cpuCount && fuxi_spi[1].intid == 240 && fuxi_spi[1].cpu == 1);
+ curCpu = 1; installed(0, 0, 0, 240); assert(otherCalls == 1 && otherLast == 240 && !fg_irq_stats[FG_IRQ_N] && !fuxi_spi_foreign);
+ rbbm[0x201] = 1u<<20; curCpu = 3; installed(0, 0, 0, 332); assert(fg_irq_stats[FG_IRQ_N] == 1 && otherCalls == 1 && fg_irq_stats[FG_IRQ_AWAY] == 1);
+ curCpu = 6; installed(0, 0, 0, 240); assert(otherCalls == 2 && fg_irq_stats[FG_IRQ_N] == 1);
+ assert(fuxi_spi_register(240, fg_irq_handler, 2) && fuxi_spi[1].fn == otherHandler && fuxi_spi[1].cpu == 1);
+ assert(!fuxi_spi_register(240, otherHandler, 3) && fuxi_spi[1].cpu == 3 && !fuxi_spi[2].intid);
+ assert(fuxi_spi_register(20, otherHandler, 1) && fuxi_spi_register(1020, otherHandler, 1) && fuxi_spi_register(41, 0, 1) && !fuxi_spi[2].intid);
+ assert(!fuxi_spi_register(400, otherHandler, 1) && !fuxi_spi_register(401, otherHandler, 1) && fuxi_spi_register(402, otherHandler, 1));
+ assert(fuxi_spi_affinity(5) == 0x200000600ULL && fuxi_spi_affinity(0) == 0x200000000ULL && fuxi_spi_affinity(7) == UINT64_MAX);
+ assert(binds == cpuCount && !fuxi_spi_busy);
  reset(); assert(fuxi_gpu_irq_setup() == 1 && fg_irq_cpu == 5); gdw(0x180 + w, 0); curCpu = 5;
- /* A foreign SPI is masked at the distributor; a PPI is ignored. */
- installed(0, 0, 0, 100); assert((gd(0x180 + (100/32)*4) & (1u << (100%32))) && fg_irq_stats[FG_IRQ_FOREIGN] == 1);
- installed(0, 0, 0, 27); assert(fg_irq_stats[FG_IRQ_FOREIGN] == 2 && fg_irq_state == 1);
+ /* An SPI nobody registered is masked at the distributor by the dispatcher; a PPI is only counted. */
+ installed(0, 0, 0, 100); assert((gd(0x180 + (100/32)*4) & (1u << (100%32))) && fuxi_spi_foreign == 1 && !fg_irq_stats[FG_IRQ_FOREIGN]);
+ installed(0, 0, 0, 27); assert(fuxi_spi_foreign == 2 && fg_irq_state == 1);
  /* Empty run: 999 empty interrupts in a row keep it, one with the bit resets the run, 1000 in a row mask (why 1). */
  rbbm[0x201] = 0; for (unsigned i = 0; i < 999; i++) { fakeNow += 1000000; installed(0, 0, 0, 332); } assert(fg_irq_state == 1);
  rbbm[0x201] = 1u<<20; installed(0, 0, 0, 332); rbbm[0x201] = 0;
@@ -254,6 +277,71 @@ int main() {
 '''
 
 
+# 4. The actual touch interrupt section of fuxi_touch.c (INTID 240, logical CPU 1) and the actual GPU attach share one dispatcher.
+TOUCH_PREFIX = r'''
+#include <stdbool.h>
+#define FT_IRQ 25u
+#define FT_GPIO(n) ((uint32_t)(n) * 0x1000u)
+#define NSEC_PER_SEC 1000000000ull
+#define TIMEOUT_URGENCY_SYS_NORMAL 1
+#define TIMEOUT_URGENCY_SYS_CRITICAL 2
+#define TIMEOUT_URGENCY_LEEWAY 4
+#define thread_wakeup(e) thread_wakeup_prim((e), FALSE, THREAD_AWAKENED)
+static uint32_t tlmm[0x20000/4];
+static struct { vm_offset_t tlmm; } ft;
+static uint32_t ft_rd(vm_offset_t base, uint32_t off) { return *(volatile uint32_t *)(base + off); }
+static void ft_wr(vm_offset_t base, uint32_t off, uint32_t v) { *(volatile uint32_t *)(base + off) = v; }
+static vm_offset_t ml_io_map(vm_offset_t pa, unsigned long size) { return pa == 0x17100000u && size == 0x10000 ? (vm_offset_t)gicd : 0; }
+static wait_result_t assert_wait_deadline_with_leeway(event_t e, wait_interrupt_t i, int u, uint64_t d, uint64_t l)
+{ (void)e; (void)i; (void)u; (void)l; waits++; waitDeadline = d; blockPending = 1; return 0; }
+'''
+
+TOUCH_TEST = r'''
+#include <assert.h>
+#include <stdio.h>
+#include <string.h>
+static uint32_t gd(unsigned off) { uint32_t v; memcpy(&v, gicd + off, 4); return v; }
+static uint64_t routerOf(unsigned id) { uint64_t r; memcpy(&r, gicd + 0x6000 + 8*id, 8); return r; }
+#define PIN(off) tlmm[(FT_GPIO(FT_IRQ) + (off))/4]
+int main(void)
+{
+ static const unsigned phys[7] = {0, 2, 3, 4, 5, 6, 7};
+ for (unsigned i = 0; i < 7; i++) mpidrOf[i] = 0x281000000ULL | (uint64_t)phys[i] << 8;
+ uint32_t g0 = 0x10u|3u; memcpy(gicd, &g0, 4); memcpy(gicd + 4, &typerLines, 4);
+ fg_abi_live = 1; fg_irq_want = 1; fakeNow = 1000000000ull; ft.tlmm = (vm_offset_t)tlmm;
+ /* Touch first (its thread starts before backboardd's first fence wait): the dispatcher goes into all 7 slots, INTID 240 -> CPU 1. */
+ assert(ft_irq_setup() && fi.state == 1 && binds == 7 && installed == fuxi_spi_dispatch);
+ for (unsigned i = 0; i < 7; i++) assert(installs[i] == 1);
+ assert(fuxi_spi[0].intid == 240 && fuxi_spi[0].fn == ft_irq_handler && fuxi_spi[0].cpu == 1);
+ assert(fi.mpidr == 0x200000200ULL && routerOf(240) == 0x200000200ULL && (gd(0x100 + (240/32)*4) & (1u << (240%32))));
+ assert((PIN(0x8) & 0xffu) == (1u|(1u<<4)|(3u<<5)));                     /* GPIO25 armed: enable, raw status, apps target, level low */
+ /* The GPU attaches later: no second install (no bind, no slot written), INTID 332 -> CPU 5 alongside. */
+ assert(fuxi_gpu_irq_setup() == 1 && binds == 7 && installs[1] == 1 && fuxi_spi[1].intid == 332 && fuxi_spi[1].cpu == 5);
+ assert(routerOf(332) == 0x200000600ULL && routerOf(240) == 0x200000200ULL && fi.state == 1);
+ /* Each INTID reaches its own handler through the one dispatcher; neither masks the other. Both enables wrote ICENABLER first;
+  * masks are checked from here. */
+ memset(gicd + 0x180, 0, 0x80);
+ PIN(0xc) = 1; curCpu = 1; installed(0, 0, 0, 240);
+ assert(fi.irqs == 1 && fi.seq == 1 && !PIN(0xc) && !(PIN(0x8) & 1u) && !fg_irq_stats[FG_IRQ_N] && !fi.foreign);
+ rbbm[0x201] = 1u<<20; curCpu = 5; installed(0, 0, 0, 332);
+ assert(fg_irq_stats[FG_IRQ_N] == 1 && rbbm[0x37] == (1u<<20) && !fg_irq_stats[FG_IRQ_AWAY] && fi.irqs == 1);
+ assert(!(gd(0x180 + (240/32)*4) & (1u << (240%32))) && !(gd(0x180 + (332/32)*4) & (1u << (332%32))) && !fuxi_spi_foreign);
+ ft_irq_arm(); PIN(0xc) = 1; curCpu = 0; installed(0, 0, 0, 240); assert(fi.irqs == 2); /* landed elsewhere: still served */
+ /* The watchdog's repair registers the same handler again: no new entry, no new install. */
+ assert(!ft_irq_repair() && !fuxi_spi[2].intid && binds == 7);
+ /* An SPI nobody registered: masked by the dispatcher, no lane's handler runs. */
+ installed(0, 0, 0, 100); assert(fuxi_spi_foreign == 1 && (gd(0x180 + (100/32)*4) & (1u << (100%32))) && fi.irqs == 2 && fg_irq_stats[FG_IRQ_N] == 1);
+ /* Touch's fallback to polling still masks INTID 240 and the pin; the GPU's interrupt keeps working. */
+ ft_irq_fallback("test"); assert(fi.state == 3 && (gd(0x180 + (240/32)*4) & (1u << (240%32))) && !(PIN(0x8) & 1u));
+ PIN(0xc) = 1; installed(0, 0, 0, 240); assert(fi.irqs == 2);              /* stray after fallback: masked, not counted */
+ rbbm[0x201] = 1u<<20; curCpu = 5; installed(0, 0, 0, 332); assert(fg_irq_stats[FG_IRQ_N] == 2);
+ puts("PASS: actual touch interrupt section + actual GPU attach: one dispatcher in every CPU slot (installed once), INTID 240 -> CPU 1 "
+      "and 332 -> CPU 5 each served on any CPU, repair re-registers without a new entry, foreign SPI masked, touch fallback to polling");
+ return 0;
+}
+'''
+
+
 def main():
     irq = (ROOT/'xnu/fuxi-adreno/fuxi_gpu_irq.inc').read_text()
     # Enable bit: fuxigpuncimport bit 26 (67108864) only; 22 DPU SMMU survey, 23-24 DPU, 25 PAC self-test belong to other lanes.
@@ -275,6 +363,14 @@ def main():
         test.write_text(PREFIX + irq.replace('"dsb sy"', '""').replace('"yield"', '""') + TEST)  # barriers are arm64-only; assembled above
         exe = test.with_suffix('')
         subprocess.run(['clang', '-std=gnu11', '-O1', '-g', '-Wall', '-Wextra', '-Werror', '-Wno-unused-function', '-Wno-format', '-fsanitize=address,undefined', inc, str(test), '-o', str(exe)], check=True)
+        subprocess.run([str(exe)], check=True)
+        touch = (ROOT/'xnu/fuxi-h1/fuxi_touch.c').read_text()
+        section = touch[touch.index('#define FT_INTID'):touch.index('static void\nft_thread(')]
+        assert 'ml_install_interrupt_handler' not in touch and 'fuxi_spi_register(FT_INTID, ft_irq_handler, FT_IRQ_CPU)' in section
+        both = Path(tmp)/'both.c'
+        both.write_text(PREFIX + irq.replace('"dsb sy"', '""').replace('"yield"', '""') + TOUCH_PREFIX + section.replace('"dsb sy"', '""') + TOUCH_TEST)
+        exe = both.with_suffix('')
+        subprocess.run(['clang', '-std=gnu11', '-O1', '-g', '-Wall', '-Wextra', '-Werror', '-Wno-unused-function', '-Wno-format', '-fsanitize=address,undefined', inc, str(both), '-o', str(exe)], check=True)
         subprocess.run([str(exe)], check=True)
         model = Path(tmp)/'spin.cpp'
         model.write_text(SPIN % spin)
