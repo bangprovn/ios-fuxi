@@ -1,0 +1,32 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index f499c01..8f5cb9a 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -3146,6 +3146,27 @@ bad:
+ 			}
+ 		}
+ 	}
++	{
++		/*
++		 * boot-arg fuxi_taskallow=WORD: the programs whose path holds WORD run as if signed with
++		 * get-task-allow and debugged (CS_GET_TASK_ALLOW | CS_DEBUGGED), which is how Xcode starts
++		 * an application: to find out whether os_log's OS_ACTIVITY_DT_MODE asks for that.
++		 */
++		static char fuxi_taskallow[64];
++		static int fuxi_taskallow_read;
++
++		if (!fuxi_taskallow_read) {
++			if (!PE_parse_boot_argn("fuxi_taskallow", fuxi_taskallow, sizeof(fuxi_taskallow))) {
++				fuxi_taskallow[0] = '\0';
++			}
++			fuxi_taskallow_read = 1;
++		}
++		if (error == 0 && fuxi_taskallow[0] != '\0' && excpath != NULL &&
++		    strnstr(excpath, fuxi_taskallow, MAXPATHLEN) != NULL) {
++			proc_csflags_set(p, CS_GET_TASK_ALLOW | CS_DEBUGGED);
++			printf("fuxi: pid %d %s: csflags 0x%llx\n", proc_getpid(p), excpath, (unsigned long long)proc_getcsflags(p));
++		}
++	}
+ #endif
+ 	proc_transend(p, 0);
+ 

@@ -114,3 +114,4 @@ fuxi/0046-msgdump.patch
 fuxi/0047-spawn-persona.patch
 fuxi/0048-fsgetpath-log.patch
 fuxi/0049-envlog.patch
+fuxi/0050-taskallow.patch
