@@ -2,7 +2,7 @@
 """Lay out the tree of the Fuxi init disk (the boot payload's RAM disk, mounted at /fuxi by fuxi/0021).
 
   fuxi-initdisk.py OUT_DIR --os OS.dmg --system-os SYSTEMOS.dmg --app-os APPOS.dmg [--init FILE] [--log all|LABEL...]
-                   [--allow WORD...] [LABEL...]
+                   [--allow WORD...] [--skip-task TASK...] [LABEL...]
 
 OUT_DIR gets:
   init                      process 1 (tools/fuxi-init, built and signed on the Mac), when --init is given
@@ -118,6 +118,7 @@ def main():
     ap.add_argument('--init')
     ap.add_argument('--log', nargs='*', default=[])
     ap.add_argument('--allow', nargs='*', default=[])
+    ap.add_argument('--skip-task', nargs='*', default=[], help='BOOT_TASKS left out (HakiOS has no personas: usermanagerd)')
     a = ap.parse_intermixed_args()
     labels = a.labels or list(DEFAULT_LABELS)
     deny = tuple(w for w in DENY if w not in a.allow)
@@ -167,6 +168,8 @@ def main():
         plistlib.dump({'LastSystemVersion': build}, f)
     print(f'  migration record: build {build}')
     for task, argv in BOOT_TASKS.items():
+        if task in a.skip_task:
+            continue
         label = f'fuxi.boottask.{task}'
         job = {'Label': label, 'ProgramArguments': argv, 'RunAtLoad': True, 'LaunchOnlyOnce': True, 'UserName': 'root'}
         to_console(job, label, a.log, ttys)
