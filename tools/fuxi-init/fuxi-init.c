@@ -541,6 +541,37 @@ restart_usermanagerd(void)
 }
 
 /*
+ * A child of its own waits for the task's last line, so that the console relay, which falls behind
+ * when there is much to copy, does not hold it up (the daemon stayed 39 s, and lsd, appprotectiond
+ * and assetsd crashed meanwhile on the personas it lacked).
+ */
+static void
+watch_usermanagerd_task(void)
+{
+	static char buf[16384];
+
+	if (fork() != 0) {
+		return;
+	}
+	for (int round = 0; round < 10 * 60 * 5; round++) {     /* ten minutes at most */
+		int fd = open(JOB_LOGS "/" UM_TASK_LOG, O_RDONLY);
+		ssize_t n = fd >= 0 ? pread(fd, buf, sizeof(buf), 0) : -1;
+
+		if (fd >= 0) {
+			close(fd);
+		}
+		if (n > 0 && memmem(buf, (size_t)n, UM_TASK_DONE, strlen(UM_TASK_DONE)) != NULL) {
+			/* give the task a second to exit, so that only the daemon is left */
+			sleep(1);
+			restart_usermanagerd();
+			break;
+		}
+		usleep(200 * 1000);
+	}
+	_exit(0);
+}
+
+/*
  * Only root may open the console (xpcproxy gets EACCES for any other user), so fuxi-initdisk
  * points the other jobs' standard output and error at JOB_LOGS/<label>.log. A child of this
  * process, which stays when the parent becomes launchd, copies what they write to the console,
@@ -650,13 +681,13 @@ log_relay(void)
 	} seen[MAX_JOB_LOGS];
 	static char buf[4096];
 	unsigned nseen = 0;
-	int um_task = 0;        /* 1: its last line seen, 2..: waited that many rounds, -1: restarted */
 	struct timeval next = { 0, 0 };
 
 	if (mkdir(JOB_LOGS, 01777) != 0 || chmod(JOB_LOGS, 01777) != 0) {
 		say("mkdir %s: %s", JOB_LOGS, strerror(errno));
 		return;
 	}
+	watch_usermanagerd_task();
 	open_ttys();
 	if (fork() != 0) {
 		for (unsigned i = 0; i < nttys; i++) {
@@ -708,10 +739,6 @@ log_relay(void)
 				}
 				while ((n = pread(fd, buf, sizeof(buf), seen[i].done)) > 0) {
 					relay(e->d_name, "", buf, n);
-					if (um_task == 0 && strcmp(e->d_name, UM_TASK_LOG) == 0 &&
-					    memmem(buf, (size_t)n, UM_TASK_DONE, strlen(UM_TASK_DONE)) != NULL) {
-						um_task = 1;
-					}
 					seen[i].done += n;
 				}
 				close(fd);
@@ -719,11 +746,6 @@ log_relay(void)
 			if (d != NULL) {
 				closedir(d);
 			}
-		}
-		/* give the task a second to exit, so that only the daemon is left */
-		if (um_task > 0 && ++um_task > 3) {
-			restart_usermanagerd();
-			um_task = -1;
 		}
 	}
 }
