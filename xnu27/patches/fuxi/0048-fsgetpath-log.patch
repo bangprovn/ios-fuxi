@@ -1,0 +1,33 @@
+diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
+index efb3d69..d434e52 100644
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -14565,6 +14565,28 @@ fsgetpath_extended(user_addr_t buf, user_size_t bufsize, user_addr_t user_fsid,
+ 	    options, &length);
+ 
+ 	if (error) {
++#if defined(FUXI)
++		/*
++		 * fuxi_fsgetpath_log=1: log the failures with the volume asked for. LaunchServices keeps an
++		 * application as its volume and file number and finds its path with fsgetpath(); lsd's
++		 * calls fail (ENOTSUP, ENOENT) and SpringBoard gets no record of itself.
++		 */
++		static int fuxi_log = -1, fuxi_lines;
++
++		if (fuxi_log < 0) {
++			int on = 0;
++
++			fuxi_log = PE_parse_boot_argn("fuxi_fsgetpath_log", &on, sizeof(on)) && on == 1;
++		}
++		if (fuxi_log && fuxi_lines++ < 300) {
++			mount_t fuxi_mp = mount_lookupby_volfsid(fsid.val[0], 0);
++
++			printf("fuxi: fsgetpath %s[%d] fsid 0x%x objid %llu options 0x%x error %d: %s %s\n",
++			    proc_best_name(current_proc()), proc_getpid(current_proc()), fsid.val[0], objid, options, error,
++			    fuxi_mp != NULL ? fuxi_mp->mnt_vfsstat.f_fstypename : "(no volume)",
++			    fuxi_mp != NULL ? fuxi_mp->mnt_vfsstat.f_mntonname : "");
++		}
++#endif /* FUXI */
+ 		goto out;
+ 	}
+ 
