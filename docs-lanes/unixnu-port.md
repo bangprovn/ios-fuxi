@@ -696,3 +696,44 @@ the register offsets in it are unverified (GUESS).
   `fg_window` for MDSS, and route it to CPU 0 as well.
 - **Before enabling.** Check the MDSS offsets in the Linux SDE driver for
   kalama, and check that Gunyah forwards SPI 83.
+
+## UniXNU Turnip BO cache and GPU address trees
+
+Offline, 2026-11-03. Built on CI only; nothing has run on the device, so every
+effect below is **not yet observed**. Source (read only): UniXNU
+`patches/mesa/turnip-darwin-kmd.patch`, BSD-2-Clause-Patent, newer than our pin
+`fb6aad6`. Ported as `tools/patches/mesa-fuxi-bo-cache.patch`, applied last, after
+`mesa-fuxi-cached-coherent.patch`. It is the file as of `b624df5`, less the parts
+marked "not taken". The UniXNU pin itself stays `fb6aad6`.
+
+| UniXNU commit | Result |
+| --- | --- |
+| `c7353ea` red-black tree GPU address allocator, size-class BO cache | Taken. Two `rb_tree`s over the free holes (by address, by size and address) replace the `util_vma_heap` list. A freed BO whose fence completed stays whole (kernel handle, GPU mapping, CPU lease) and goes to the next allocation of its size class (the cached BO may be up to a quarter larger than the request). This saves BoAlloc, BoMap (the SMMU update, about 1 ms on UniXNU), BoFree and the unmap. Replayable BOs and host imports never enter the cache. Device-internal BOs are zeroed on reuse. |
+| `b252d39` owned-coherent BOs, 1024 entries / 384 MiB | Not taken. It needs `NativeAdrenoParamsOwnedCoherent`, which our ABI lacks. Our equivalent is `mesa-fuxi-cached-coherent.patch` (bit 29). |
+| `83cce1d` reap every completed BO | Taken. A BO behind a fence still in flight no longer holds back completed ones queued after it. The copy-back mapping hunk is not taken (owned-coherent). |
+| `bdcf746` pool-pressure poll, 2 s idle eviction | Not taken. `caffd5d` removed it again, and `NativeAdrenoParamsPoolPressure` is not in our ABI. |
+| `caffd5d` release on OS memory pressure | Taken: a `DISPATCH_SOURCE_TYPE_MEMORYPRESSURE` source (warning or critical) flushes the cache; the retire ring and the cache grow instead of stopping at 256 entries; `TU_DARWIN_BO_CACHE=0` turns the cache off. **Not taken:** its unbounded idle and ring-space waits. After our 100 ms watchdog poisons the GPU, `fuxi_gpu_abi_poll` returns -3/-4 for good and `WaitFence` answers `kIOReturnTimeout` at once. An unbounded Turnip wait would then spin. The 5 s bound and the 64 submit attempts stay, so a hang still ends in device loss. |
+| `2c40ae9` no CPU wait on syncs already on the ring | Not taken. It relies on UniXNU's ring prologue (flush, invalidate, wait for idle before each job). |
+| `b624df5` free cached BOs not reused within a second | Taken. This is freedreno's `fd_bo_cache_cleanup` rule; without it UniXNU saw backboardd hold 3099 MiB. |
+
+Fuxi-specific change: the cache key includes the cached-coherent attribute. A
+BO keeps the cache mode it was allocated and mapped with. A write-back
+(`NativeAdrenoAllocCachedCoherent`) BO must never come back to a write-combine
+request, or the reverse.
+
+Limits on our kernel. Cached BOs keep a kernel BO slot (1024 per client) and wired
+memory (`FG_ABI_MAX_WIRED_BYTES`, 768 MiB). When either runs out, BoAlloc fails;
+Turnip then flushes the cache and tries once more. Whether
+`DISPATCH_SOURCE_TYPE_MEMORYPRESSURE` ever fires on our kernel is unverified (it
+may lack `CONFIG_JETSAM`; see `c170d4c`). The 1 s rule does not depend on it.
+
+Log line every 4096 allocations, and at device close (stderr): `NativeAdreno BO
+cache: N allocations, N reused (P%), N cached now (N MiB), N evicted, N flushed,
+N free GPU ranges`. The reuse percentage measures the effect.
+
+Tests (Linux, external Mesa at the pin and the nine UniXNU patches):
+`test-fuxi-turnip-bocache.py` (new: 200000 random allocate/allocate-at/free
+operations on the real trees, size classes, cache key and quarter rule, flush),
+`test-fuxi-turnip-hostimport.py` (now models the growing ring and the cache
+functions; host imports never cached), `test-fuxi-patch-stack.py`, and
+`build-fuxi-turnip.py --verify-inputs-only`.

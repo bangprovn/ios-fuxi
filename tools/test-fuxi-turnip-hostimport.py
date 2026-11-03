@@ -28,13 +28,17 @@ PREFIX = r'''
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <pthread.h>
 #include <vulkan/vulkan_core.h>
 #include "NativeAdrenoABI.h"
+#include "util/rb_tree.h"
 #define VK_FROM_HANDLE(type,var,h) type *var=reinterpret_cast<type *>(h)
 #define BITMASK_ENUM(type) unsigned
 #define TU_RMV(...) ((void)0)
 #define mesa_loge(...) ((void)0)
+#define p_atomic_read(p) (*(p))
+static uint64_t os_time_get_nano() {return 0;}
 #define vk_error(p,r) (r)
 static VkResult vk_errorf(const void *,VkResult result,const char *,...) {return result;}
 using kern_return_t=int;using mach_vm_address_t=uint64_t;
@@ -45,6 +49,7 @@ struct tu_device {tu_physical_device *physical_device;int dma_bo_lock,vk;void *d
 struct tu_bo {
  uint32_t gem_handle;uint64_t size,iova;const char *name;int refcnt;
  uint64_t unique_id,darwin_handle;uint32_t darwin_token;void *map;bool never_unmap;
+ uint64_t darwin_alloc_size;bool darwin_read_only,darwin_cached;
 };
 static tu_bo storage;
 static struct {NativeAdrenoAbiParams params;int conn;pthread_mutex_t lock;uint32_t last_fence;} dw={{},0,PTHREAD_MUTEX_INITIALIZER,0};
@@ -90,7 +95,6 @@ static const char *tu_debug_bos_add(tu_device *,uint64_t,const char *s) {return 
 static void tu_debug_bos_del(tu_device *,tu_bo *){}
 static void tu_dump_bo_init(tu_device *,tu_bo *){}
 static void tu_dump_bo_del(tu_device *,tu_bo *){}
-static VkResult darwin_wait_idle(tu_device *) {waits++;return VK_TIMEOUT;}
 static void u_rwlock_rdlock(int *){}
 static void u_rwlock_rdunlock(int *){}
 static bool p_atomic_dec_zero(int *p) {assert(*p>0);return --*p==0;}
@@ -185,6 +189,9 @@ int main() {
  // A failed map followed by a failed native cleanup must retain the IOVA.
  fail=6;assert(darwin_bo_init_host(&dev,&out,(void *)0x100000,32768)==VK_ERROR_DEVICE_LOST && !out);
  assert(bo_live && iova_live && retire.failure==VK_ERROR_DEVICE_LOST);
+ // Host imports never enter the BO cache (mesa-fuxi-bo-cache.patch); the retire ring grew from empty.
+ assert(!retire.cache_count && !retire.cache_stats.inserts && retire.capacity==64);
+ free(retire.entries);free(retire.cache);
  pthread_mutex_destroy(&retire.lock);
  puts("PASS: actual Turnip host pointer/image/buffer queries, ABI2/16K validation, import/map unwind, same pointer, deferred BO refcount/free/retry, captured fences and failed-free/map IOVA retention");
 }
@@ -203,14 +210,16 @@ def main():
         folder = args.mesa/'src/freedreno/vulkan'
         model = PREFIX
         source = (folder/'tu_knl_darwin.cc').read_text()
-        start = source.index('enum { DARWIN_RETIRED_BOS')
+        start = source.index('struct darwin_retired_bo {')
         end = source.index('\nstatic kern_return_t', start)
         model += source[start:end]
         for file, names in [('tu_device.cc', ('tu_GetMemoryHostPointerPropertiesEXT',)),
                             ('tu_formats.cc', ('tu_get_external_image_format_properties',)),
                             ('tu_buffer.cc', ('tu_GetPhysicalDeviceExternalBufferProperties',)),
-                            ('tu_knl_darwin.cc', ('darwin_reap_locked', 'darwin_collect_retired',
-                                                 'darwin_map_failure', 'darwin_bo_init_host', 'darwin_bo_finish'))]:
+                            ('tu_knl_darwin.cc', ('darwin_release_native', 'darwin_cache_evict', 'darwin_cache_put',
+                                                 'darwin_cache_flush', 'darwin_cache_trim', 'darwin_reap_locked',
+                                                 'darwin_collect_retired', 'darwin_map_failure', 'darwin_bo_init_host',
+                                                 'darwin_bo_finish'))]:
             source = (folder/file).read_text()
             model += ''.join(function(source, name) for name in names)
         # Exercise the exact vkAllocateMemory host branch as well, with only
@@ -236,8 +245,9 @@ static VkResult allocate_host(tu_device *device,Memory *mem,const VkMemoryAlloca
         path = out/'import.cpp';path.write_text(model)
         exe = path.with_suffix('')
         subprocess.run(['clang++', '-std=c++17', '-O1', '-g', '-Wall', '-Wextra', '-Werror',
-                        '-Wno-missing-field-initializers', '-fsanitize=address,undefined', '-I'+str(ROOT/'xnu/fuxi-adreno'),
-                        '-I'+str(args.mesa/'include'), str(path), '-o', str(exe)], check=True)
+                        '-Wno-missing-field-initializers', '-Wno-unused-parameter', '-fsanitize=address,undefined',
+                        '-I'+str(ROOT/'xnu/fuxi-adreno'),
+                        '-I'+str(args.mesa/'include'), '-I'+str(args.mesa/'src'), str(path), '-o', str(exe)], check=True)
         subprocess.run([str(exe)], check=True)
 
 
