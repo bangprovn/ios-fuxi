@@ -79,7 +79,7 @@
   *
 --- a/bsd/dev/fuxi_perf.c
 +++ b/bsd/dev/fuxi_perf.c
-@@ -0,0 +1,710 @@
+@@ -0,0 +1,714 @@
 +/* Opt-in touch/compile boost for SM8550. One serialized worker owns MMIO.
 + * Input/swap hooks only publish timestamps and queue work; no MMIO or sleeps.
 + * No voltage, PLL, thermal-trip or power-collapse registers are programmed.
@@ -133,7 +133,10 @@
 +static uint64_t fp_boost_time, fp_boosts;
 +static int fp_max_temp, fp_boosted;
 +/* Temperatures are deci-Celsius, rise is dC/second. Only this worker owns
-+ * history and votes. The 68 C ceiling can be lowered, never raised. */
++ * history and votes. The 68 C ceiling is the default; fuxiperflimit raises it
++ * to at most 80 C, which the owner chose on 3 Nov 2026 for hand tests (stock
++ * Android lets the SM8550 cores run far hotter and throttles on skin
++ * temperature; LMh still limits in hardware). */
 +static unsigned fp_hot = 620, fp_limit = 680, fp_resume = 580;
 +static unsigned fp_rise = 100, fp_fast_ms = 20, fp_budget_ms = 200, fp_cap_mhz;
 +/* Slope window. TSENS reports 0.4 C steps: one step in 20 ms is 200 dC/s and
@@ -610,7 +613,8 @@
 + fp_arg("fuxiperfidle",&fp_idle_ms,1000,60000);
 + fp_arg("fuxiperfidlekhz",&fp_idle_floor,100000,3000000);
 + nanoseconds_to_absolutetime((uint64_t)fp_idle_ms*NSEC_PER_MSEC,&fp_idle_after);
-+ fp_arg("fuxiperflimit",&fp_limit,450,680);
++ fp_arg("fuxiperflimit",&fp_limit,450,800);
++ fp_boost_max = fp_limit;
 + fp_arg("fuxiperfhot",&fp_hot,400,fp_limit);
 + if (fp_hot > fp_limit) fp_hot = fp_limit;
 + fp_arg("fuxiperfresume",&fp_resume,350,fp_hot-10);
@@ -792,7 +796,7 @@
 +#endif
 --- a/bsd/dev/fuxi_perf_logic.h
 +++ b/bsd/dev/fuxi_perf_logic.h
-@@ -0,0 +1,105 @@
+@@ -0,0 +1,106 @@
 +/* Pure policy shared with offline tests. Frequencies always come from EPSS LUT. */
 +#ifndef FUXI_PERF_LOGIC_H
 +#define FUXI_PERF_LOGIC_H
@@ -848,12 +852,13 @@
 + return best;
 +}
 +/* A new boost may start at or below fp_start dC (fuxiperfstart, default 600);
-+ * a running one continues to 680. The hot/limit trip still vetoes both. */
-+static unsigned fp_start = 600;
++ * a running one continues to fp_boost_max (the limit, 680 unless fuxiperflimit
++ * raises it). The hot/limit trip still vetoes both. */
++static unsigned fp_start = 600, fp_boost_max = 680;
 +static int fp_want_boost(int boosted, int valid, int temp,
 +    uint64_t now, uint64_t input, uint64_t swap, uint64_t hold)
 +{
-+ if (!valid || temp > 680 || (!boosted && temp > (int)fp_start)) return 0;
++ if (!valid || temp > (int)fp_boost_max || (!boosted && temp > (int)fp_start)) return 0;
 + int recent_input = input && now >= input && now-input <= hold;
 + uint64_t activity = input > swap ? input : swap;
 + int recent_activity = activity && now >= activity && now-activity <= hold;

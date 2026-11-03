@@ -51,7 +51,10 @@ static uint64_t fp_input, fp_swap, fp_hold, fp_last, fp_window, fp_window_start;
 static uint64_t fp_boost_time, fp_boosts;
 static int fp_max_temp, fp_boosted;
 /* Temperatures are deci-Celsius, rise is dC/second. Only this worker owns
- * history and votes. The 68 C ceiling can be lowered, never raised. */
+ * history and votes. The 68 C ceiling is the default; fuxiperflimit raises it
+ * to at most 80 C, which the owner chose on 3 Nov 2026 for hand tests (stock
+ * Android lets the SM8550 cores run far hotter and throttles on skin
+ * temperature; LMh still limits in hardware). */
 static unsigned fp_hot = 620, fp_limit = 680, fp_resume = 580;
 static unsigned fp_rise = 100, fp_fast_ms = 20, fp_budget_ms = 200, fp_cap_mhz;
 /* Slope window. TSENS reports 0.4 C steps: one step in 20 ms is 200 dC/s and
@@ -528,7 +531,8 @@ static void fp_configure(void)
  fp_arg("fuxiperfidle",&fp_idle_ms,1000,60000);
  fp_arg("fuxiperfidlekhz",&fp_idle_floor,100000,3000000);
  nanoseconds_to_absolutetime((uint64_t)fp_idle_ms*NSEC_PER_MSEC,&fp_idle_after);
- fp_arg("fuxiperflimit",&fp_limit,450,680);
+ fp_arg("fuxiperflimit",&fp_limit,450,800);
+ fp_boost_max = fp_limit;
  fp_arg("fuxiperfhot",&fp_hot,400,fp_limit);
  if (fp_hot > fp_limit) fp_hot = fp_limit;
  fp_arg("fuxiperfresume",&fp_resume,350,fp_hot-10);
