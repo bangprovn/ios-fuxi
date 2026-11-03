@@ -116,6 +116,8 @@ show_volume(const char *path)
  * CoreServicesInternal asks for, FSNode's getters, _LSGetBundleClassForNode and, with register set, a
  * registration in this process (_LSRegisterBundleURL), whose error names the step that fails.
  */
+typedef int (*context_init_t)(void **);                         /* _LSContextInit 0x186dd6800 */
+typedef void (*context_destroy_t)(void **);                     /* _LSContextDestroy 0x186dd5aa0 */
 typedef uint32_t (*bundle_class_t)(void *, id);                                 /* _LSGetBundleClassForNode 0x186de6958 */
 typedef BOOL (*register_url_t)(void *, NSURL *, uint32_t, id, NSError **);      /* _LSRegisterBundleURL 0x186f368b0 */
 
@@ -149,6 +151,8 @@ show_registration(const char *path, bool reg)
 	Class fsnode = NSClassFromString(@"FSNode");
 	bundle_class_t bundle_class = (bundle_class_t)ls_function(0x186de6958);
 	register_url_t register_url = (register_url_t)ls_function(0x186f368b0);
+	context_init_t init = (context_init_t)ls_function(0x186dd6800);
+	context_destroy_t destroy = (context_destroy_t)ls_function(0x186dd5aa0);
 	NSError *e = nil;
 	id node;
 
@@ -187,13 +191,19 @@ show_registration(const char *path, bool reg)
 	if (bundle_class != NULL) {
 		fprintf(stderr, "lsprobe:   _LSGetBundleClassForNode = %u (2, 11, 13, 14, 16 may register)\n", bundle_class(NULL, node));
 	}
-	if (reg && register_url != NULL) {
+	/* with a context of its own: given NULL, _LSRegisterBundleNode's context has no database (-10817) */
+	if (reg && register_url != NULL && init != NULL && destroy != NULL) {
 		NSError *re = nil;
-		BOOL ok = register_url(NULL, url, 0x18000001, nil, &re);
+		void *ctx = NULL;
+		int r = init(&ctx);
+		BOOL ok = r == 0 && ctx != NULL ? register_url(&ctx, url, 0x18000001, nil, &re) : NO;
 
-		fprintf(stderr, "lsprobe:   _LSRegisterBundleURL = %d %s\n", ok, re == nil ? "" : re.description.UTF8String);
+		fprintf(stderr, "lsprobe:   _LSRegisterBundleURL (context %d) = %d %s\n", r, ok, re == nil ? "" : re.description.UTF8String);
 		if (re.userInfo != nil) {
 			fprintf(stderr, "lsprobe:   error userInfo %s\n", re.userInfo.description.UTF8String);
+		}
+		if (ctx != NULL) {
+			destroy(&ctx);
 		}
 	}
 }
@@ -259,8 +269,6 @@ show(NSString *what, id obj, NSArray<NSString *> *keys)
  * _LSContextInit gives the database, whose store is at +0x28; _CSStoreEnumerateTables names the
  * tables and CSStoreGetUnitCount counts them. A store without app bundles has a near empty Bundle table.
  */
-typedef int (*context_init_t)(void **);                         /* _LSContextInit 0x186dd6800 */
-typedef void (*context_destroy_t)(void **);                     /* _LSContextDestroy 0x186dd5aa0 */
 typedef void (*enumerate_tables_t)(void *, void (^)(uint32_t, CFStringRef, const void *, uint32_t, bool *));
 typedef uint32_t (*unit_count_t)(void *, uint32_t);
 
