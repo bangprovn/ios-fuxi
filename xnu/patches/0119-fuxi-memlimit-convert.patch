@@ -1,0 +1,56 @@
+--- a/bsd/kern/kern_memorystatus.c
++++ b/bsd/kern/kern_memorystatus.c
+@@ -232,9 +232,9 @@
+ unsigned long pressure_threshold_percentage = 15;
+ unsigned long policy_more_free_offset_percentage = 5;
+ unsigned long sysproc_aging_aggr_threshold_percentage = 7;
+-#if CONFIG_JETSAM
++#if CONFIG_JETSAM || defined(FUXI)
+ static int32_t memorystatus_get_default_task_active_limit(proc_t p);
+-#endif /* CONFIG_JETSAM */
++#endif /* CONFIG_JETSAM || FUXI */
+ 
+ /*
+  * default jetsam snapshot support
+@@ -7647,7 +7647,17 @@
+ 	proc_rele(p);
+ 	return error;
+ }
++#endif /* CONFIG_JETSAM */
+ 
++/*
++ * FUXI: the configuration is MacOSX's (no CONFIG_JETSAM), but iOS's RunningBoard
++ * asks for every process it manages what limit -1 and 0 stand for, and on EINVAL
++ * logs an error each time (some 370 per boot) and gives the process limits of 0.
++ * This command only reads: it sets no limit, kills nothing, and the default it
++ * returns is the same one SET_MEMLIMIT_PROPERTIES already applies for <= 0
++ * (max_task_pmem, or INT32_MAX, "no limit", when that is 0 as it is here).
++ */
++#if CONFIG_JETSAM || defined(FUXI)
+ static int
+ memorystatus_cmd_convert_memlimit_mb(pid_t pid, int32_t limit, int32_t *retval)
+ {
+@@ -7678,7 +7688,7 @@
+ 	proc_rele(p);
+ 	return error;
+ }
+-#endif /* CONFIG_JETSAM */
++#endif /* CONFIG_JETSAM || FUXI */
+ 
+ static int
+ memorystatus_set_memlimit_properties_internal(proc_t p, memorystatus_memlimit_properties_t *p_entry)
+@@ -8047,11 +8057,13 @@
+ 	case MEMORYSTATUS_CMD_GET_PROCESS_COALITION_IS_SWAPPABLE:
+ 		error = memorystatus_cmd_get_process_coalition_is_swappable(args->pid, ret);
+ 		break;
++#endif /* CONFIG_JETSAM */
+ 
++#if CONFIG_JETSAM || defined(FUXI)
+ 	case MEMORYSTATUS_CMD_CONVERT_MEMLIMIT_MB:
+ 		error = memorystatus_cmd_convert_memlimit_mb(args->pid, (int32_t) args->flags, ret);
+ 		break;
+-#endif /* CONFIG_JETSAM */
++#endif /* CONFIG_JETSAM || FUXI */
+ 		/* Test commands */
+ #if DEVELOPMENT || DEBUG
+ 	case MEMORYSTATUS_CMD_TEST_JETSAM:
