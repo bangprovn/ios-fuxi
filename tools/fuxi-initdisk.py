@@ -182,7 +182,7 @@ def main():
             g.write(f.read())
         os.chmod(os.path.join(a.out, 'lsprobe'), 0o755)
         job = {'Label': 'com.fuxi.lsprobe', 'ProgramArguments': ['/fuxi/lsprobe'], 'RunAtLoad': True,
-               'LaunchOnlyOnce': True, 'UserName': 'mobile', 'EnvironmentVariables': {'FUXI_LSPROBE_DELAY': '40'}}
+               'LaunchOnlyOnce': True, 'UserName': 'mobile', 'EnvironmentVariables': {'FUXI_LSPROBE_DELAY': '40,150,300'}}
         to_console(job, 'com.fuxi.lsprobe', a.log, ttys)
         with open(os.path.join(a.out, 'jobs/LaunchDaemons', 'com.fuxi.lsprobe.plist'), 'wb') as f:
             plistlib.dump(job, f, fmt=plistlib.FMT_BINARY)
