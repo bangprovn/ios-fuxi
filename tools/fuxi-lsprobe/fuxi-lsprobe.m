@@ -22,6 +22,7 @@
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
+#include <mach/mach.h>
 #include <bsm/audit.h>
 #include <dlfcn.h>
 #include <errno.h>
@@ -55,12 +56,14 @@
 - (NSString *)canonicalPathWithError:(NSError **)error;
 - (BOOL)canReadFromSandboxWithAuditToken:(const audit_token_t *)token;
 - (CFBundleRef)copyCFBundleWithError:(NSError **)error;
++ (BOOL)canReadURL:(NSURL *)url fromSandboxWithAuditToken:(const audit_token_t *)token;
 - (void)setVersion:(unsigned)version;
 - (void)setAction:(unsigned)action;
 @end
 
 /* libsystem_sandbox: whether a process's profile allows an operation (1 = denied) */
 extern int sandbox_check(pid_t pid, const char *operation, int type, ...);
+extern int sandbox_check_by_audit_token(audit_token_t token, const char *operation, int type, ...);
 #define FUXI_SANDBOX_FILTER_PATH        1
 #define FUXI_SANDBOX_CHECK_NO_REPORT    0x40000000
 #define FUXI_SANDBOX_CHECK_CANONICAL    0x20000000
@@ -282,6 +285,27 @@ show_registration_data(const char *path)
 		d = sandbox_check(getpid(), "file-read-data", FUXI_SANDBOX_FILTER_PATH | FUXI_SANDBOX_CHECK_NO_REPORT | FUXI_SANDBOX_CHECK_CANONICAL, real);
 		fprintf(stderr, "lsprobe:   sandbox_check lsd sandboxed %d (errno %d), lsd file-read-data canonical %d (%d), plain %d (%d); "
 		    "self %d (%d), path %s\n", a, ea, b, eb, c, ec, d, errno, real);
+	}
+	/* FSNode's own check, step by step: its audit token (task_info 15), the canonical path, realpath, the verdict */
+	{
+		audit_token_t tok;
+		mach_msg_type_number_t n = TASK_AUDIT_TOKEN_COUNT;
+		kern_return_t kr = task_info(mach_task_self(), TASK_AUDIT_TOKEN, (task_info_t)&tok, &n);
+		NSString *canon = nil;
+		BOOL got = [url getResourceValue:&canon forKey:NSURLCanonicalPathKey error:NULL];
+		char rp[MAXPATHLEN];
+		const char *r = canon != nil ? realpath(canon.fileSystemRepresentation, rp) : NULL;
+		int v = -2, ev = 0;
+
+		if (kr == KERN_SUCCESS && r != NULL) {
+			errno = 0;
+			v = sandbox_check_by_audit_token(tok, "file-read-data", FUXI_SANDBOX_FILTER_PATH | FUXI_SANDBOX_CHECK_NO_REPORT |
+			    FUXI_SANDBOX_CHECK_CANONICAL, r);
+			ev = errno;
+		}
+		fprintf(stderr, "lsprobe:   audit token kr %d (pid %u, version %u), canonical %d %s, realpath %s, by-token verdict %d errno %d, "
+		    "canReadURL %d\n", kr, tok.val[5], tok.val[7], got, canon.UTF8String ?: "-", r ?: strerror(errno), v, ev,
+		    fsnode != nil ? [fsnode canReadURL:url fromSandboxWithAuditToken:kr == KERN_SUCCESS ? &tok : NULL] : -1);
 	}
 	node = fsnode == nil ? nil : [[fsnode alloc] initWithURL:url flags:0x30 error:&e];
 	if (node != nil) {
