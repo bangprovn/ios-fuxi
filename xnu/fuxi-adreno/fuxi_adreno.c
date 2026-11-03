@@ -335,6 +335,11 @@ static void fg_cf_log(void); /* bit 16 copy priority counters, with the inline l
 enum { FG_PK_COPY, FG_PK_IDLE, FG_PK_CAP, FG_PK_SUBMIT, FG_PK_NOTDUE, FG_PK_OTHER, FG_PK_REASONS };
 static unsigned fg_pk_n; /* words of the parked job, 0 none */
 static int fg_pk_flush(unsigned why);
+/* fuxigpuncimport bit 30 (1073741824, classic path, needs 512 and no 2097152): a client submit a copy or a waiting present would refuse
+ * is deferred instead (built and fenced, not rung; see fg_cq_defer); the copy's retirement below rings it, or the other releases. */
+enum { FG_CQ_COPY, FG_CQ_SUBMIT, FG_CQ_OBSERVE, FG_CQ_REASONS };
+static unsigned fg_cq_n; /* words of the deferred job, 0 none */
+static int fg_cq_try(unsigned why);
 #define FG_INL_SRC_VA 0x90000000u
 #define FG_INL_FB_VA 0xa0000000u
 /* One transient PFN list, serialized by the surface cache lock. Keep lookup
@@ -868,6 +873,7 @@ int fuxi_gpu_poll(struct fg_times *t)
    return drained ? -1 : -2;
   }
   fg_busy = fg_inl_busy = 0;
+  if (fg_cq_n) (void)fg_cq_try(FG_CQ_COPY); /* bit 30: the client job deferred behind this copy takes the idle GPU (a fault there takes the client fault path; this copy still retired) */
   FG_ABI_WAKE(); /* the copy retired: a client submit refused for it may go */
   return 1;
  }
