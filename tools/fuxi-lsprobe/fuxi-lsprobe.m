@@ -21,6 +21,8 @@
 #include <sys/fsgetpath.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
+#include <bsm/audit.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <ptrauth.h>
@@ -51,7 +53,20 @@
 - (NSString *)nameWithError:(NSError **)error;
 - (NSString *)extensionWithError:(NSError **)error;
 - (NSString *)canonicalPathWithError:(NSError **)error;
+- (BOOL)canReadFromSandboxWithAuditToken:(const audit_token_t *)token;
+- (CFBundleRef)copyCFBundleWithError:(NSError **)error;
++ (id)sharedInstance;
+- (BOOL)hasServer;
+- (BOOL)isServer;
+- (void)setVersion:(unsigned)version;
+- (void)setAction:(unsigned)action;
 @end
+
+/* libsystem_sandbox: whether a process's profile allows an operation (1 = denied) */
+extern int sandbox_check(pid_t pid, const char *operation, int type, ...);
+#define FUXI_SANDBOX_FILTER_PATH        1
+#define FUXI_SANDBOX_CHECK_NO_REPORT    0x40000000
+#define FUXI_SANDBOX_CHECK_CANONICAL    0x20000000
 
 /* LaunchServices' C functions, found with dlsym (unslid addresses of 24A446's dyld cache) */
 typedef void (*set_log_file_t)(FILE *);                  /* _LSBindingSetLogFile 0x186e8d3e8 */
@@ -208,6 +223,109 @@ show_registration(const char *path, bool reg)
 	}
 }
 
+/*
+ * Why lsd builds no registration data (_LSCreateRegistrationData NULL, so -10817): its sandbox may refuse to read
+ * the bundle (-[FSNode copyCFBundleWithError:] asks sandbox_check "file-read-data" first, -10659), or CFBundle may
+ * fail (-10813).  Asked here of lsd's profile and of this process, then _LSCreateRegistrationData itself, as
+ * lsd's XPC handler calls it (no context).
+ */
+typedef CFDictionaryRef (*create_registration_data_t)(void *, id, CFURLRef, id, CFArrayRef *);
+
+static pid_t
+pid_named(const char *name)
+{
+	int mib[3] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL };
+	size_t len = 0;
+	struct kinfo_proc *kp;
+	pid_t pid = -1;
+
+	if (sysctl(mib, 3, NULL, &len, NULL, 0) != 0 || (kp = malloc(len)) == NULL) {
+		return -1;
+	}
+	if (sysctl(mib, 3, kp, &len, NULL, 0) == 0) {
+		for (size_t i = 0; i < len / sizeof(*kp); i++) {
+			if (strcmp(kp[i].kp_proc.p_comm, name) == 0) {
+				pid = kp[i].kp_proc.p_pid;
+			}
+		}
+	}
+	free(kp);
+	return pid;
+}
+
+static void
+show_registration_data(const char *path)
+{
+	NSURL *url = [NSURL fileURLWithPath:@(path)];
+	Class fsnode = NSClassFromString(@"FSNode"), defaults = NSClassFromString(@"_LSDefaults");
+	Class reginfo = NSClassFromString(@"LSRegistrationInfo");
+	create_registration_data_t create = (create_registration_data_t)dlsym(RTLD_DEFAULT, "_LSCreateRegistrationData");
+	pid_t lsd = pid_named("lsd");
+	char real[MAXPATHLEN];
+	NSError *e = nil;
+	id node;
+
+	if (defaults != nil) {
+		id d = [defaults sharedInstance];
+
+		fprintf(stderr, "lsprobe: data %s: hasServer %d isServer %d, lsd pid %d\n", path, [d hasServer], [d isServer], lsd);
+	}
+	if (realpath(path, real) == NULL) {
+		strlcpy(real, path, sizeof(real));
+	}
+	if (lsd > 0) {
+		int a, b, c, d;
+
+		errno = 0;
+		a = sandbox_check(lsd, NULL, 0);
+		int ea = errno;
+		errno = 0;
+		b = sandbox_check(lsd, "file-read-data", FUXI_SANDBOX_FILTER_PATH | FUXI_SANDBOX_CHECK_NO_REPORT | FUXI_SANDBOX_CHECK_CANONICAL, real);
+		int eb = errno;
+		errno = 0;
+		c = sandbox_check(lsd, "file-read-data", FUXI_SANDBOX_FILTER_PATH | FUXI_SANDBOX_CHECK_NO_REPORT, real);
+		int ec = errno;
+		errno = 0;
+		d = sandbox_check(getpid(), "file-read-data", FUXI_SANDBOX_FILTER_PATH | FUXI_SANDBOX_CHECK_NO_REPORT | FUXI_SANDBOX_CHECK_CANONICAL, real);
+		fprintf(stderr, "lsprobe:   sandbox_check lsd sandboxed %d (errno %d), lsd file-read-data canonical %d (%d), plain %d (%d); "
+		    "self %d (%d), path %s\n", a, ea, b, eb, c, ec, d, errno, real);
+	}
+	node = fsnode == nil ? nil : [[fsnode alloc] initWithURL:url flags:0x30 error:&e];
+	if (node != nil) {
+		NSError *be = nil;
+		CFBundleRef bundle = [node copyCFBundleWithError:&be];
+
+		fprintf(stderr, "lsprobe:   FSNode(0x30) directory %d, can read from sandbox %d, copyCFBundle %s %s\n", [node isDirectory],
+		    [node canReadFromSandboxWithAuditToken:NULL], bundle != NULL ? "ok" : "NULL", be == nil ? "" : be.description.UTF8String);
+		if (bundle != NULL) {
+			CFRelease(bundle);
+		}
+	} else {
+		fprintf(stderr, "lsprobe:   FSNode(0x30): %s\n", e.description.UTF8String);
+	}
+	if (create != NULL && reginfo != nil) {
+		id ri = [[reginfo alloc] init];
+		CFArrayRef extra = NULL;
+		CFDictionaryRef d;
+
+		[ri setVersion:7];
+		[ri setAction:0xcb];
+		*(uint32_t *)((char *)(__bridge void *)ri + 0x10) = 0x18000001;   /* options */
+		d = create(NULL, ri, (__bridge CFURLRef)url, nil, &extra);
+		if (d == NULL) {
+			fprintf(stderr, "lsprobe:   _LSCreateRegistrationData = NULL\n");
+		} else {
+			NSDictionary *nd = (__bridge NSDictionary *)d;
+
+			fprintf(stderr, "lsprobe:   _LSCreateRegistrationData = %lu keys, CFBundleIdentifier %s, missing Info.plist %s, no executable info %s, on cryptex %s\n",
+			    (unsigned long)nd.count, [[nd[@"CFBundleIdentifier"] description] UTF8String], [[nd[@"_LSInfoPlistIsMissing"] description] UTF8String],
+			    [[nd[@"_LSNoExecutableInfo"] description] UTF8String], [[nd[@"_LSIsOnCryptex"] description] UTF8String]);
+		}
+	} else {
+		fprintf(stderr, "lsprobe:   _LSCreateRegistrationData %s, LSRegistrationInfo %s\n", create ? "found" : "missing", reginfo ? "found" : "missing");
+	}
+}
+
 /* the store: its file, sequence number, core types and, from _LSDisplayData (lsregister -dump), its size */
 static void
 show_store(void)
@@ -335,6 +453,8 @@ probe(NSString *bid, NSString *path)
 	show_volume("/System/Library/CoreServices/MobileCoreTypes.bundle");
 	show_registration("/System/Library/CoreServices/MobileCoreTypes.bundle", getenv("FUXI_LSPROBE_REGISTER") != NULL);
 	show_registration("/System/Library/CoreServices/SpringBoard.app", getenv("FUXI_LSPROBE_REGISTER") != NULL);
+	show_registration_data("/System/Library/CoreServices/MobileCoreTypes.bundle");
+	show_registration_data("/System/Library/CoreServices/SpringBoard.app");
 
 	r = [[record alloc] initWithBundleIdentifier:bid allowPlaceholder:NO error:&error];
 	show(@"record (no placeholder)", r, recordKeys);
