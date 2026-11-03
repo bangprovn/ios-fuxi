@@ -1,0 +1,35 @@
+diff --git a/bsd/dev/arm/systemcalls.c b/bsd/dev/arm/systemcalls.c
+index 62d1920..fc1a88d 100644
+--- a/bsd/dev/arm/systemcalls.c
++++ b/bsd/dev/arm/systemcalls.c
+@@ -89,7 +89,8 @@ extern int mach_trap_count;
+ #if defined(FUXI)
+ /*
+  * fuxi_trace=NAME[,NAME...]: print the file system calls that fail in the processes with those names
+- * (p_comm), with the path and the error, at most 120 lines a process (fuxi_trace_max=N) and 3000 a boot;
++ * (p_comm), with the path and the error, at most 120 lines a process (fuxi_trace_max=N) and 3000 a boot
++ * (fuxi_trace_total=N); fuxi_trace_quiet=1 leaves out ENOENT and ENOATTR (most of a daemon's start);
+  * mkdir of what exists already (EEXIST) is not reported, nor a missing
+  * FeatureFlags or Logging preference file is not reported (every process looks for dozens). For
+  * daemons whose own logging goes to os_log only.
+@@ -99,7 +100,7 @@ fuxi_syscall_trace(struct proc *proc, unsigned short code, const u_int64_t *arg,
+ {
+ 	static char names[128];
+ 	static int state;       /* 0 not read, 1 on, 2 off */
+-	static int lines, pids[64], pid_lines[64], max_lines = 120;
++	static int lines, pids[64], pid_lines[64], max_lines = 120, total = 3000, quiet;
+ 	unsigned slot;
+ 	char path[2][160] = { "", "" };
+ 	int at[2] = { -1, -1 };
+@@ -108,8 +109,10 @@ fuxi_syscall_trace(struct proc *proc, unsigned short code, const u_int64_t *arg,
+ 	if (state == 0) {
+ 		state = PE_parse_boot_arg_str("fuxi_trace", names, sizeof(names)) && names[0] != '\0' ? 1 : 2;
+ 		(void)PE_parse_boot_argn("fuxi_trace_max", &max_lines, sizeof(max_lines));
++		(void)PE_parse_boot_argn("fuxi_trace_total", &total, sizeof(total));
++		(void)PE_parse_boot_argn("fuxi_trace_quiet", &quiet, sizeof(quiet));
+ 	}
+-	if (state != 1 || lines >= 3000) {
++	if (state != 1 || lines >= total || (quiet == 1 && (error == ENOENT || error == ENOATTR))) {
+ 		return;
+ 	}
+ 	for (const char *s = names;;) {

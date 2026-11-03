@@ -18,9 +18,11 @@
  */
 #import <Foundation/Foundation.h>
 #include <sys/attr.h>
+#include <sys/fsgetpath.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <ptrauth.h>
 #include <stdio.h>
 #include <string.h>
@@ -74,6 +76,25 @@ show_volume(const char *path)
 		    (unsigned long long)ab.fileid);
 	} else {
 		fprintf(stderr, "lsprobe:   getattrlist: %s\n", strerror(errno));
+	}
+	/* and back from the file id to the path, as LaunchServices' FSNode does (fsgetpath, file reference URLs) */
+	if (getattrlist(path, &al, &ab, sizeof(ab), 0) == 0) {
+		fsid_t ids[2] = { ab.fsid, { { ab.fsid.val[0], 0 } } };
+
+		for (int k = 0; k < 2; k++) {
+			char back[1024];
+			ssize_t n = fsgetpath(back, sizeof(back), &ids[k], ab.fileid);
+
+			fprintf(stderr, "lsprobe:   fsgetpath(0x%x:0x%x, %llu) = %s\n", ids[k].val[0], ids[k].val[1],
+			    (unsigned long long)ab.fileid, n >= 0 ? back : strerror(errno));
+		}
+	}
+	{
+		NSURL *ref = [url fileReferenceURL];
+		NSURL *back = [ref filePathURL];
+
+		fprintf(stderr, "lsprobe:   fileReferenceURL %s -> filePathURL %s\n", ref.absoluteString.UTF8String,
+		    back == nil ? "nil" : back.path.UTF8String);
 	}
 	v = [url resourceValuesForKeys:@[NSURLVolumeIdentifierKey, NSURLFileResourceIdentifierKey, NSURLVolumeUUIDStringKey,
 	    NSURLVolumeURLKey, NSURLVolumeNameKey, NSURLIsPackageKey] error:NULL];
