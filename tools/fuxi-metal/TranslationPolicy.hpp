@@ -30,20 +30,24 @@ inline TranslationPolicy translationPolicy(const char *args) {
 }
 inline bool earlyScheduledWait(const TranslationPolicy &p,bool scanout,bool quiet,const char *process) {return p.overlap && p.submitFast && scanout && quiet && process && !strcmp(process,"backboardd");}
 // fmtl=<hex> on the boot line sets FUXI_MTL_* switches, so trying one needs no root write. A variable already set wins.
+// Bit i sets bits[i]: 0 ORDER_FETCH_ONLY, 1 NOFETCH_RP, 2 OCCLUDE, 3 DRAW_AREA, 4 EARLY_RELEASE, 5 SAMPLE_SHADOW, 6/7 SPIRV_UNROLL=1/2, 8/9/10 HALF_ROUND=1/2/3,
+// 11/12 SUBMIT_LEAN=1/2, 13 SPLIT_SUBMIT, 14 FETCH_SPLIT, 15 BUFFER_CACHED, 16 GPU_PASS_TIMES, 17 GPU_DRAW_TIMES, 18 RT_SHADOW, 19 RT_SHADOW_REUSE, 20 RT_RENAME,
+// 21 RT_SHADOW_MB=128.
+// Several fmtl= tokens OR together (a test appends its bits to the base mask); before 4 Nov only the first counted, so a second token was ignored.
 inline void applyBootOptions(const char *args) {
  static const struct {const char *name,*value;} bits[]={{"FUXI_MTL_ORDER_FETCH_ONLY","1"},{"FUXI_MTL_NOFETCH_RP","1"},{"FUXI_MTL_OCCLUDE","1"},{"FUXI_MTL_DRAW_AREA","1"},
   {"FUXI_MTL_EARLY_RELEASE","1"},{"FUXI_MTL_SAMPLE_SHADOW","1"},{"FUXI_MTL_SPIRV_UNROLL","1"},{"FUXI_MTL_SPIRV_UNROLL","2"},{"FUXI_MTL_HALF_ROUND","1"},{"FUXI_MTL_HALF_ROUND","2"},
   {"FUXI_MTL_HALF_ROUND","3"},{"FUXI_MTL_SUBMIT_LEAN","1"},{"FUXI_MTL_SUBMIT_LEAN","2"},{"FUXI_MTL_SPLIT_SUBMIT","1"},{"FUXI_MTL_FETCH_SPLIT","1"},{"FUXI_MTL_BUFFER_CACHED","1"},
   {"FUXI_MTL_GPU_PASS_TIMES","1"},{"FUXI_MTL_GPU_DRAW_TIMES","1"},{"FUXI_MTL_RT_SHADOW","1"},{"FUXI_MTL_RT_SHADOW_REUSE","1"},{"FUXI_MTL_RT_RENAME","1"},{"FUXI_MTL_RT_SHADOW_MB","128"}};
+ unsigned long mask=0;unsigned tokens=0;
  for(const char *p=args;*p;){
   p+=strspn(p," \t\r\n");size_t n=strcspn(p," \t\r\n");
-  if(n>5 && !strncmp(p,"fmtl=",5)){
-   unsigned long mask=strtoul(p+5,nullptr,16);
-   for(size_t i=0;i<sizeof(bits)/sizeof(bits[0]);++i)if(mask>>i&1)setenv(bits[i].name,bits[i].value,0);
-   fprintf(stderr,"FUXI MTL: boot options fmtl=%lx\n",mask);return;
-  }
+  if(n>5 && !strncmp(p,"fmtl=",5)){mask|=strtoul(p+5,nullptr,16);++tokens;}
   p+=n;
  }
+ if(!tokens)return;
+ for(size_t i=0;i<sizeof(bits)/sizeof(bits[0]);++i)if(mask>>i&1)setenv(bits[i].name,bits[i].value,0);
+ if(tokens>1)fprintf(stderr,"FUXI MTL: boot options fmtl=%lx tokens=%u\n",mask,tokens);else fprintf(stderr,"FUXI MTL: boot options fmtl=%lx\n",mask);
 }
 inline TranslationPolicy systemTranslationPolicy() {
  static const auto policy=[] {
