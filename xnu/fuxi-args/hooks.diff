@@ -1,0 +1,121 @@
+--- a/pexpert/gen/bootargs.c
++++ b/pexpert/gen/bootargs.c
+@@ -187,13 +187,72 @@
+ 	return arg_found;
+ }
+ 
++#if defined(FUXI)
++#include <pexpert/boot.h>
++#include "fuxi_boot_args.h"
++
++/* /chosen fuxi-args (fuxi_boot_args.h): the boot line, a space, then the property, which the parser scans instead. */
++static char fuxi_boot_line[BOOT_LINE_LENGTH + FUXI_ARGS_MAX];
++static unsigned int fuxi_args_at, fuxi_args_taken;     /* the property's text in fuxi_boot_line; 0: not taken */
++static unsigned int fuxi_args_size;                    /* the property's size in the ADT */
++static int fuxi_args_result = -1;                      /* fuxi_args_merge's answer; -1: no property */
++
++void fuxi_boot_args_adopt(void);
++void fuxi_boot_args_say(void);
++
++/*
++ * PE_init_platform, right after SecureDTInit: no boot-arg has been read yet. It only copies: there is no thread yet,
++ * so no printf; fuxi_boot_args_say reports it.
++ */
++void
++fuxi_boot_args_adopt(void)
++{
++	DTEntry chosen;
++	void const *prop;
++	unsigned int size;
++
++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
++	    SecureDTGetProperty(chosen, "fuxi-args", &prop, &size) != kSuccess) {
++		return;
++	}
++	fuxi_args_size = size;
++	fuxi_args_result = fuxi_args_merge(PE_boot_args(), BOOT_LINE_LENGTH, prop, size, fuxi_boot_line,
++	    (unsigned int)sizeof(fuxi_boot_line), &fuxi_args_at, &fuxi_args_taken);
++}
++
++/* PE_init_iokit, after "iBoot version": what was taken, into boot.log. */
++void
++fuxi_boot_args_say(void)
++{
++	if (fuxi_args_result < 0) {
++		printf("FUXI ARGS: no /chosen fuxi-args, the boot line alone\n");
++	} else if (fuxi_args_result == FUXI_ARGS_TAKEN) {
++		printf("FUXI ARGS: %u bytes from /chosen fuxi-args: %s\n", fuxi_args_taken, fuxi_boot_line + fuxi_args_at);
++	} else {
++		printf("FUXI ARGS: /chosen fuxi-args (%u bytes) not taken, %s: the boot line alone\n",
++		    fuxi_args_size, fuxi_args_why(fuxi_args_result));
++	}
++}
++
++/* What PE_parse_boot_argn and PE_parse_boot_arg_str scan. */
++static char *
++pe_parse_args(void)
++{
++	return fuxi_args_taken ? fuxi_boot_line : PE_boot_args();
++}
++#endif /* FUXI */
++
+ boolean_t
+ PE_parse_boot_argn(
+ 	const char      *arg_string,
+ 	void            *arg_ptr,
+ 	int                     max_len)
+ {
++#if defined(FUXI)
++	return PE_parse_boot_argn_internal(pe_parse_args(), arg_string, arg_ptr, max_len, FALSE);
++#else
+ 	return PE_parse_boot_argn_internal(PE_boot_args(), arg_string, arg_ptr, max_len, FALSE);
++#endif
+ }
+ 
+ boolean_t
+@@ -202,7 +261,11 @@
+ 	char            *arg_ptr,
+ 	int                     strlen)
+ {
++#if defined(FUXI)
++	return PE_parse_boot_argn_internal(pe_parse_args(), arg_string, arg_ptr, strlen, TRUE);
++#else
+ 	return PE_parse_boot_argn_internal(PE_boot_args(), arg_string, arg_ptr, strlen, TRUE);
++#endif
+ }
+ 
+ #if defined(CONFIG_XNUPOST)
+--- a/pexpert/arm/pe_init.c
++++ b/pexpert/arm/pe_init.c
+@@ -25,6 +25,10 @@
+ 
+ /* extern references */
+ extern void     pe_identify_machine(boot_args *bootArgs);
++#if defined(FUXI)
++extern void     fuxi_boot_args_adopt(void);     /* pexpert/gen/bootargs.c: /chosen fuxi-args */
++extern void     fuxi_boot_args_say(void);
++#endif
+ 
+ /* static references */
+ static void     pe_prepare_images(void);
+@@ -252,6 +256,9 @@
+ #if defined(TARGET_OS_OSX) && defined(__arm64__)
+ 	printf("iBoot Stage 2 version: %s\n", iBoot_Stage_2_version);
+ #endif /* defined(TARGET_OS_OSX) && defined(__arm64__) */
++#if defined(FUXI)
++	fuxi_boot_args_say();
++#endif
+ 
+ 	if (kSuccess == SecureDTLookupEntry(0, "/chosen/memory-map", &entry)) {
+ 		boot_progress_element const *bootPict;
+@@ -423,6 +430,10 @@
+ 		 * can be used..
+ 		 */
+ 		SecureDTInit(PE_state.deviceTreeHead, PE_state.deviceTreeSize);
++#if defined(FUXI)
++		/* /chosen fuxi-args joins the boot line before anything reads a boot-arg (fuxi_boot_args.h). */
++		fuxi_boot_args_adopt();
++#endif
+ 		pe_identify_machine(boot_args_ptr);
+ 	} else {
+ 		pe_arm_init_interrupts(args);

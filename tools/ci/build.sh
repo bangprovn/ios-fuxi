@@ -242,6 +242,8 @@ kernel() {
     python3 tools/test-fuxi-apprate.py
     python3 tools/test-fuxi-inject.py
     python3 tools/sync-fuxi-inject.py --check
+    python3 tools/test-fuxi-args.py
+    python3 tools/sync-fuxi-args.py --check
     python3 tools/test-fuxi-audio-amp-on.py
     python3 tools/sync-fuxi-audio.py --check
     python3 tools/test-fuxi-pac.py

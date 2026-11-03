@@ -1,0 +1,32 @@
+# Boot-args a host script may move from the boot line into /chosen fuxi-args (patch 0122).
+# Each one is read only by the kernel, through PE_parse_boot_argn or a TUNABLE, after PE_init_platform; no user-space
+# program reads it from kern.bootargs and no host tool from the payload's line. tools/test-fuxi-args.py checks both
+# against this tree. Everything else stays on the line: Apple's names (launchd and others read kern.bootargs, and
+# debug, serial, wdt, rd and the root's must still work if the property is lost), and what FuxiMetal, libfuxi-sb or
+# tools/fuxi-xnu-monitor.py read (sweetfb_noconsole, fuxibbgpu, fuxigpu{cache,feedback,scanout,overlap,submit},
+# fmtl, fxrate, fuxisbjpeg, fuxiperf).
+# name            read by
+sweetlog          0047 sweet_ufs.c, the persistent console log
+sweetnoexec       0095 kern_exec.c
+sweetnull         0048 kern_exec.c
+sweetsurfrow      0108 IOSurface rows
+fuxigpu           0096 Adreno
+fuxigpuabi        0098 Adreno ABI
+fuxigpulevel      0098 Adreno
+fuxiscante        0098 scanout
+fuxipanel120      0098, 0106
+fuxivsyncte       0106
+fuxiscandouble    0098 scanout
+fuxiscantriple    0098 scanout
+fuxicores         0097 touch boost
+fuxiearly         0098, 0106
+fuxigpuncimport   0098, 0106, 0114
+fuxiath12k        0099
+fuxiwifiios       0104
+fuxiwifiauto      0099
+fuxiwifiwide      xnu/fuxi-ath12k fa_hif.c (lx_os_option)
+fuxiremote        0117
+fxinj             0121
+fuxisbext         0107 TUNABLE
+fuxiaudio         0113
+fuxiaudioamp      0113
