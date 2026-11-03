@@ -48,6 +48,9 @@ DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'BTServer', 'softwareupdate', 
 START_KEYS = ('RunAtLoad', 'KeepAlive', 'StartInterval', 'StartCalendarInterval', 'WatchPaths',
               'QueueDirectories', 'StartOnMount', 'LaunchEvents')
 STDERR_LOG = {'OS_ACTIVITY_DT_MODE': 'YES', 'ACTIVITY_LOG_STDERR': '1', 'CFLOG_FORCE_STDERR': '1'}
+# FUXI_OSLOG_LEVEL=debug: the info and debug messages too (OS_ACTIVITY_MODE), as HakiOS's OSLOG_LEVEL
+if os.environ.get('FUXI_OSLOG_LEVEL'):
+    STDERR_LOG['OS_ACTIVITY_MODE'] = os.environ['FUXI_OSLOG_LEVEL']
 JOBS = '/System/Library/LaunchDaemons'
 JOB_LOGS = '/private/var/fuxi/log'   # fuxi-init's JOB_LOGS
 TTYS = 'jobs/ttys'                   # fuxi-init's TTYS: the labels whose standard error is a terminal
@@ -115,7 +118,7 @@ def main():
     ap.add_argument('--init')
     ap.add_argument('--log', nargs='*', default=[])
     ap.add_argument('--allow', nargs='*', default=[])
-    a = ap.parse_args()
+    a = ap.parse_intermixed_args()
     labels = a.labels or list(DEFAULT_LABELS)
     deny = tuple(w for w in DENY if w not in a.allow)
     ttys = [l for l in a.log if l != 'all']
