@@ -362,7 +362,7 @@ terminate:
  */
 static int fk_inject(const struct fuxi_key_inject *cmd);
 static int fk_script_chan;
-static unsigned fk_script_count;
+static unsigned fk_script_count, fk_script_rounds = 1;
 static const struct { unsigned key, gap_ms; const char *why; } fk_script_steps[] = {
 	{0, 8000, "power (expect lock)"},
 	{0, 8000, "power (expect wake)"},
@@ -387,11 +387,15 @@ fk_script(void *arg, wait_result_t wr)
 	unsigned delay = (unsigned)(uintptr_t)arg;
 	printf("FUXI KEYS: script starts in %u s\n", delay);
 	fk_script_sleep(delay * 1000u);
-	for (unsigned i = 0; i < fk_script_count; ++i) {
-		struct fuxi_key_inject cmd = {fk_script_steps[i].key, FUXI_KEY_INJECT_CLICK, 120};
-		printf("FUXI KEYS: script step %u %s\n", i + 1, fk_script_steps[i].why);
-		(void)fk_inject(&cmd);
-		fk_script_sleep(fk_script_steps[i].gap_ms);
+	/* fuxikeyscriptr=R runs the steps R times: with fuxikeyscriptn=2, R locks and
+	 * wakes by the power key with nobody at the phone (the GPU hang on wake, 3 Nov). */
+	for (unsigned r = 0; r < fk_script_rounds; ++r) {
+		for (unsigned i = 0; i < fk_script_count; ++i) {
+			struct fuxi_key_inject cmd = {fk_script_steps[i].key, FUXI_KEY_INJECT_CLICK, 120};
+			printf("FUXI KEYS: script round %u step %u %s\n", r + 1, i + 1, fk_script_steps[i].why);
+			(void)fk_inject(&cmd);
+			fk_script_sleep(fk_script_steps[i].gap_ms);
+		}
 	}
 	printf("FUXI KEYS: script done\n");
 	(void)thread_terminate(current_thread());
@@ -795,6 +799,10 @@ fuxi_keys_init(void)
 		if (PE_parse_boot_argn("fuxikeyscriptn", &fk_script_count, sizeof(fk_script_count)) &&
 		    (fk_script_count == 0 || fk_script_count > steps)) {
 			fk_script_count = steps;
+		}
+		if (!PE_parse_boot_argn("fuxikeyscriptr", &fk_script_rounds, sizeof(fk_script_rounds)) ||
+		    fk_script_rounds == 0 || fk_script_rounds > 50) {
+			fk_script_rounds = 1;
 		}
 		if (kernel_thread_start(fk_script, (void *)(uintptr_t)script, &thread) == KERN_SUCCESS) {
 			thread_deallocate(thread);
