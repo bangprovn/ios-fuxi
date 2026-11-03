@@ -64,11 +64,23 @@ def main():
     assert 'BSD-2-Clause-Patent' in text and '+      uint64_t slice = 100000000; /* 100 ms */' in text
     turnip = (ROOT/'tools/build-fuxi-turnip.py').read_text()
     order = [turnip.index(f"'tools/patches/{n}'") for n in ('mesa-fuxi-smoke.patch', 'mesa-fuxi-hostimport.patch',
-             'mesa-fuxi-ir3-round-default.patch', 'mesa-fuxi-fence-wait-100ms.patch', 'mesa-fuxi-cached-coherent.patch')]
-    assert order == sorted(order), 'the 100 ms slice patch must apply after mesa-fuxi-smoke.patch, the cached-coherent patch last'
+             'mesa-fuxi-ir3-round-default.patch', 'mesa-fuxi-fence-wait-100ms.patch', 'mesa-fuxi-cached-coherent.patch',
+             'mesa-fuxi-bo-cache.patch')]
+    assert order == sorted(order), 'the 100 ms slice patch must apply after mesa-fuxi-smoke.patch, then cached-coherent, the BO cache last'
     cached = (ROOT/'tools/patches/mesa-fuxi-cached-coherent.patch').read_text()
     assert all(s in cached for s in ('NativeAdrenoAllocCachedCoherent', '.writeback = cached ? 1u : 0u', '.shareability = cached ? 3u : 2u',
                'bo->darwin_cached ? kIOMapDefaultCache : kIOMapWriteCombineCache')), 'cached-coherent BO flags'
+    # UniXNU c7353ea/83cce1d/caffd5d/b624df5: origin and licence kept, a cached BO only goes back to an allocation with the same kernel
+    # cache attributes, no ABI flag our kernel lacks, and the idle/ring-space waits stay bounded (our watchdog makes WaitFence time out).
+    cache = (ROOT/'tools/patches/mesa-fuxi-bo-cache.patch').read_text()
+    head, body = cache[:cache.index('\n--- a/')], cache[cache.index('\n--- a/'):]
+    assert 'BSD-2-Clause-Patent' in head and all(c in head for c in ('c7353ea', '83cce1d', 'caffd5d', 'b624df5')), 'BO cache origin'
+    assert all(s in body for s in ('+   bool read_only, cached;', 'e->cached == cached', 'bo->darwin_read_only, bo->darwin_cached};',
+               '.contiguous = cached ? (uint32_t)NativeAdrenoAllocCachedCoherent : 0u};',
+               '+         .writeback = cached ? 1u : 0u,', 'DISPATCH_SOURCE_TYPE_MEMORYPRESSURE', 'now - retire->cache[i].freed_s > 1')), 'BO cache'
+    assert not any(s in body for s in ('NativeAdrenoParamsOwnedCoherent', 'NativeAdrenoParamsPoolPressure', 'kIOMapCopybackCache',
+                                       "the kernel's hangcheck", 'waiting for ring space')), 'BO cache: UniXNU-only ABI or unbounded wait'
+    assert 'NativeAdrenoParamsOwnedCoherent' not in (ROOT/'xnu/fuxi-adreno/NativeAdrenoABI.h').read_text()
     abi = (ROOT/'xnu/fuxi-adreno/NativeAdrenoABI.h').read_text()
     assert 'NativeAdrenoAllocCachedCoherent = 2' in abi
     print(f'PASS: {len(patches)} patch files well formed; draw-path patches 0009-0015 carry origin/licence; build recipes list them')
