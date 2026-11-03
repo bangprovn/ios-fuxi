@@ -21,7 +21,8 @@ register_functions = actual[actual.index('static uint64_t fp_duty_used(uint64_t 
 register_functions += ''.join(submit.function(actual, n) for n in (
     'fp_read','fp_vote','fp_temperature','fp_init_fail','fp_init_report',
     'fp_apply_cores','fp_initialize','fp_l3_init','fp_l3_update','fp_try_initialize','fp_update_votes','fp_thermal_guard',
-    'fp_arg','fp_configure','fp_worker_locked','fp_worker','fuxi_perf_input','fuxi_perf_swap'))
+    'fp_arg','fp_configure','fp_launch_update','fp_worker_locked','fp_worker','fuxi_perf_input','fuxi_perf_swap',
+    'fuxi_perf_launch'))
 register_functions = "static uint64_t fp_duty_used(uint64_t);\nstatic void fp_worker_locked(thread_call_param_t,thread_call_param_t);\n" + ''.join(
     submit.function(actual, n) for n in ('fp_compile_domain','fp_compile_failed','fp_compile_cut','fp_compile_forget','fp_compile_poll','fp_compile_admitted','fp_compile_command')) + register_functions
 register_functions += actual[actual.index('static int fp_compile_sysctl SYSCTL_HANDLER_ARGS'):actual.index('SYSCTL_PROC(_kern')]
@@ -781,9 +782,105 @@ int main(void) {
  reset_init();fp_l3_enabled=1;fp_worker(0,0);l3_stuck=1;
  ticks=101;fuxi_perf_input();fp_worker(0,0);
  assert(fp_boosted && !fp_l3_ready && l3_writes==2 && strstr(last_log,"L3 off: row 14 read back 0xc, boot row 12 rewritten"));
+ /* fsf/fla pure policy on the observed LUTs: the floor is the slowest row
+  * at/above PCT % of the fastest non-turbo row, capped at high, and none
+  * unless faster than cool. Launch entry/continuation as touch, no duty. */
+ assert(fp_floor_level(observed_rows[1],observed_count[1],60,1401600,2323200,&khz)==11 && khz==1785600);
+ assert(fp_floor_level(observed_rows[2],observed_count[2],60,1363200,2342400,&khz)==10 && khz==1843200);
+ assert(fp_floor_level(observed_rows[1],observed_count[1],90,1401600,2323200,&khz)==15 && khz==2323200);
+ assert(fp_floor_level(observed_rows[1],observed_count[1],55,1401600,2323200,&khz)==10 && khz==1651200);
+ assert(fp_floor_level(observed_rows[1],observed_count[1],50,1401600,2323200,&khz)==-1 && !khz);
+ assert(fp_floor_level(observed_rows[1],observed_count[1],30,1401600,2323200,&khz)==-1 && !khz);
+ assert(fp_floor_level(rows,0,60,0,UINT32_MAX,&khz)==-1 && !khz);
+ assert(!fp_want_launch(0,1,450,1,2000,1999,0));
+ assert(fp_want_launch(0,1,600,1,2000,1000,1000) && !fp_want_launch(0,1,600,1,2001,1000,1000));
+ assert(!fp_want_launch(0,1,601,1,2000,1999,1000));
+ assert(fp_want_launch(1,1,680,1,2000,1999,1000) && !fp_want_launch(1,1,681,1,2000,1999,1000));
+ assert(!fp_want_launch(1,1,450,0,2000,1999,1000) && !fp_want_launch(1,0,450,1,2000,1999,1000));
+ assert(!fp_want_launch(0,1,450,1,2000,0,1000) && !fp_want_launch(0,1,450,1,1998,1999,1000));
+ assert(fp_want_floor(1,680,1,2000,500,1500) && !fp_want_floor(1,681,1,2000,500,1500));
+ assert(!fp_want_floor(1,450,1,2001,500,1500) && !fp_want_floor(1,450,0,2000,500,1500));
+ assert(!fp_want_floor(0,450,1,2000,500,1500) && !fp_want_floor(1,450,1,2000,0,1500));
+ /* Boot-arg bounds; out of range keeps the feature off. */
+ const unsigned fla_args[4][2]={{499,0},{500,500},{3000,3000},{3001,0}};
+ const unsigned fsf_args[4][2]={{29,0},{30,30},{90,90},{91,0}};
+ for(unsigned i=0;i<4;i++) {
+  reset();arg_name="fla";arg_value=fla_args[i][0];fp_configure();
+  assert(fp_launch_ms==fla_args[i][1] && fp_launch_hold==fla_args[i][1] && !fp_floor_pct);
+  reset();arg_name="fsf";arg_value=fsf_args[i][0];fp_configure();
+  assert(fp_floor_pct==fsf_args[i][1] && !fp_launch_hold);
+ }
+ arg_name=0;
+ /* fsf=60 in the worker: floor rows while the input is at most 1.5 s old and
+  * the vote would be cool (start refusal here), silver unchanged, fast
+  * samples while on; then cool, and the hot latch vetoes it. */
+ reset_init();arg_name="fsf";arg_value=60;fp_configure();arg_name=0;log_count=0;
+ all_temp(610);fp_worker(0,0);
+ assert(fp_ready && fp_floor[1]==11 && fp_floor[2]==10 && fp_floor[0]==fp_cool[0] && log_count==2);
+ assert(strstr(last_log,"ready policy launch 0 ms high 2323200/2342400 kHz (silver cool), scroll floor 60% 1785600/1843200 kHz (0 = off, cool 1401600/1363200)"));
+ ticks=101;fuxi_perf_input();fp_worker(0,0);
+ assert(!fp_boosted && fp_floor_on && scheduled==121);
+ assert(regs[1][0x320/4]==11 && regs[2][0x320/4]==10 && regs[0][0x320/4]==fp_cool[0]);
+ ticks=1601;fp_worker(0,0);assert(fp_floor_on && regs[1][0x320/4]==11);
+ ticks=1602;fp_worker(0,0);
+ assert(!fp_floor_on && regs[1][0x320/4]==fp_cool[1] && regs[2][0x320/4]==fp_cool[2] && scheduled==1702);
+ all_temp(620);ticks=1700;fuxi_perf_input();fp_worker(0,0);
+ assert(!fp_floor_on && fp_blocked && regs[1][0x320/4]==fp_cool[1]);
+ ticks=10100;fp_worker(0,0);
+ assert(strstr(last_log,"policy launches 0 launch 0 ms refused 0 floor 1501 ms L3 votes 0"));
+ /* Touch keeps its high vote; when its duty runs out the floor holds. */
+ reset_init();arg_name="fsf";arg_value=60;fp_configure();arg_name=0;fp_worker(0,0);
+ ticks=101;fuxi_perf_input();fp_worker(0,0);
+ assert(fp_boosted && !fp_floor_on && regs[1][0x320/4]==fp_high[1]);
+ ticks=301;fp_worker(0,0);
+ assert(!fp_boosted && fp_floor_on && regs[1][0x320/4]==11 && regs[2][0x320/4]==10);
+ /* fla=2000: an app exec holds gold/prime high (silver cool) for 2 s outside
+  * the touch duty; the touch boost still works and is cut on its own. */
+ reset_init();arg_name="fla";arg_value=2000;fp_configure();arg_name=0;log_count=0;fp_worker(0,0);
+ assert(fp_launch_hold==2000 && log_count==2);
+ assert(strstr(last_log,"ready policy launch 2000 ms high 2323200/2342400 kHz (silver cool), scroll floor 0% "));
+ ticks=200;fuxi_perf_launch("Preferences");
+ assert(scheduled==200 && fp_launch==200 && log_count==3 && strstr(last_log,"launch exec 1 Preferences"));
+ fp_worker(0,0);
+ assert(fp_launch_high && !fp_boosted && fp_launches==1 && scheduled==220);
+ assert(regs[1][0x320/4]==fp_high[1] && regs[2][0x320/4]==fp_high[2] && regs[0][0x320/4]==fp_cool[0]);
+ ticks=300;fuxi_perf_input();fp_worker(0,0);assert(fp_boosted && fp_launch_high);
+ ticks=500;fp_worker(0,0);assert(!fp_boosted && fp_launch_high && regs[1][0x320/4]==fp_high[1]);
+ ticks=2200;fp_worker(0,0);assert(fp_launch_high);
+ unsigned launch_logs=log_count;
+ ticks=2201;fp_worker(0,0);
+ assert(!fp_launch_high && regs[1][0x320/4]==fp_cool[1] && regs[2][0x320/4]==fp_cool[2] && log_count==launch_logs+1);
+ assert(strstr(last_log,"launch boost 2001 ms, ended by hold at 450 dC"));
+ ticks=2210;fuxi_perf_input();fp_worker(0,0);assert(fp_boosted); /* 2 s of launch spent no duty */
+ ticks=10100;fp_worker(0,0);
+ assert(strstr(last_log,"policy launches 1 launch 2001 ms refused 0 floor 0 ms L3 votes 0"));
+ /* Start refusal is counted once per exec and logged; a running launch is
+  * cut by the hot latch. Off: the hook neither wakes nor logs. */
+ reset_init();arg_name="fla";arg_value=2000;fp_configure();arg_name=0;all_temp(610);fp_worker(0,0);
+ ticks=200;fuxi_perf_launch("Camera");fp_worker(0,0);
+ assert(!fp_launch_high && fp_launch_refused==1 && strstr(last_log,"launch boost refused at 610 dC (valid 1 blocked 0 start 600)"));
+ ticks=220;fp_worker(0,0);assert(fp_launch_refused==1 && regs[1][0x320/4]==fp_cool[1]);
+ reset_init();arg_name="fla";arg_value=2000;fp_configure();arg_name=0;fp_worker(0,0);
+ ticks=200;fuxi_perf_launch("Camera");fp_worker(0,0);assert(fp_launch_high);
+ all_temp(620);ticks=220;fp_worker(0,0);
+ assert(!fp_launch_high && fp_blocked && regs[1][0x320/4]==fp_cool[1] && strstr(last_log,"launch boost 20 ms, ended by thermal at 620 dC"));
+ reset_init();fp_worker(0,0);
+ { uint64_t before=scheduled;unsigned lc=log_count;ticks=200;fuxi_perf_launch("Preferences");
+   assert(scheduled==before && log_count==lc && !fp_launch && !fp_launch_seen); }
+ /* Exec lines: the first 8 and every 64th. A launch votes L3 with fl3. */
+ reset_init();arg_name="fla";arg_value=2000;fp_configure();arg_name=0;fp_worker(0,0);
+ for(unsigned n=1;n<=130;n++) {
+  unsigned lc=log_count;ticks=200+n;fuxi_perf_launch("x");
+  assert(log_count==lc+(n<=8 || !(n&63)));
+ }
+ reset_init();fp_l3_enabled=1;arg_name="fla";arg_value=2000;fp_configure();arg_name=0;fp_worker(0,0);
+ ticks=200;fuxi_perf_launch("Preferences");fp_worker(0,0);
+ assert(fp_launch_high && !fp_boosted && regs[5][0x90/4]==14);
+ ticks=2201;fp_worker(0,0);assert(!fp_launch_high && regs[5][0x90/4]==12 && l3_writes==2);
  arg_name=arg_name2=0;
 #undef printf
  puts("PASS: fpk default off, 1401..cap bounds (fpc), base rows 1401/1800/2400 on real LUTs, raised only with valid sample and no thermal latch, compiled cool when hot/no quorum, 500 ms recovery, boost/silver unchanged, fast samples only while active, window line");
+ puts("PASS: fsf floor rows on real LUTs (60/90/55/50/30 %), input-only 1.5 s window, cool-only, hot veto, duty-cut fallback, silver unchanged; fla 2 s launch high outside the touch duty, start refusal once per exec, thermal end, exec log limit, L3 with fl3, boot-arg bounds and off = no wake");
  puts("PASS: fl3 default off/exact 1; L3 read once at ready, boot vote checked against state and LUT before any write; boost row while touch/compile high, boot row on unboost and thermal cut; one ready and one first-boost line; refusals, faults, lost enable and readback mismatch end voting with the boot row");
  puts("PASS: thermal pressure opt-in, read-only sysctl/readiness/no-MMIO, guard/quorum integration, Apple wire values, rising trips/falling hysteresis and no sleeping");
  puts("PASS: compile gate/default off, prime/gold votes, idle/touch precedence, thermal/quorum/duty cuts, cap, nested limit/no renewal, leave without enter, cross-thread isolation, dead-thread cleanup and balanced references");
@@ -936,7 +1033,11 @@ static void reset(void) {
  fp_idle_start=fp_idle_entry=fp_idle_time=fp_idle_entries=fp_idle_transitions=0;
  fp_cap_mhz=fp_base_mhz=0;fp_base_on=0;fp_base_time=fp_base_fallback_time=0;
  memset(fp_base,0,sizeof(fp_base));memset(fp_base_khz,0,sizeof(fp_base_khz));
+ fp_launch_ms=fp_floor_pct=0;
  arg_name=arg_name2=0;fp_configure();
+ fp_launch=fp_launch_last=fp_launch_start=fp_launch_time=fp_launches=fp_launch_refused=fp_floor_time=0;
+ fp_launch_seen=fp_launch_said=0;fp_launch_high=fp_floor_on=0;
+ memset(fp_floor,0,sizeof(fp_floor));memset(fp_floor_khz,0,sizeof(fp_floor_khz));
  fp_recover_since=fp_above_time=fp_cuts=fp_active_start=0;
  fp_duty_count=0;fp_prev_temp=fp_prev_valid=fp_blocked=0;
  fp_pressure_enabled=fp_started=0;fp_pressure=-1;
