@@ -21,6 +21,7 @@
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <dlfcn.h>
+#include <ptrauth.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -150,8 +151,16 @@ typedef uint32_t (*unit_count_t)(void *, uint32_t);
 static void
 show_tables(void)
 {
-	context_init_t init = (context_init_t)dlsym(RTLD_DEFAULT, "_LSContextInit");
-	context_destroy_t destroy = (context_destroy_t)dlsym(RTLD_DEFAULT, "_LSContextDestroy");
+	/*
+	 * _LSContextInit and _LSContextDestroy are not exported: found from the slide of an exported
+	 * neighbour (_LSBindingSetLogFile, 0x186e8d3e8), for build 24A446 only
+	 */
+	void *anchor = dlsym(RTLD_DEFAULT, "_LSBindingSetLogFile");
+	uintptr_t slide = anchor != NULL ? (uintptr_t)ptrauth_strip(anchor, ptrauth_key_function_pointer) - 0x186e8d3e8 : 0;
+	context_init_t init = anchor == NULL ? NULL :
+	    (context_init_t)ptrauth_sign_unauthenticated((void *)(0x186dd6800 + slide), ptrauth_key_function_pointer, 0);
+	context_destroy_t destroy = anchor == NULL ? NULL :
+	    (context_destroy_t)ptrauth_sign_unauthenticated((void *)(0x186dd5aa0 + slide), ptrauth_key_function_pointer, 0);
 	enumerate_tables_t enumerate = (enumerate_tables_t)dlsym(RTLD_DEFAULT, "_CSStoreEnumerateTables");
 	unit_count_t count = (unit_count_t)dlsym(RTLD_DEFAULT, "CSStoreGetUnitCount");
 	void *ctx = NULL, *store;
@@ -167,7 +176,7 @@ show_tables(void)
 		return;
 	}
 	store = *(void **)((char *)ctx + 0x28);
-	fprintf(stderr, "lsprobe: tables: database %p, store %p\n", ctx, store);
+	fprintf(stderr, "lsprobe: tables: slide 0x%lx, database %p, store %p\n", (unsigned long)slide, ctx, store);
 	if (store != NULL) {
 		enumerate(store, ^(uint32_t table, CFStringRef name, const void *bytes, uint32_t size, bool *stop) {
 			(void)bytes;
