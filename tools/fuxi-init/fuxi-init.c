@@ -46,6 +46,8 @@
 #define FILE_LIMIT      (1024 * 1024)
 #define JOB_LOGS        "/private/var/fuxi/log"
 #define DAEMON_LOGS     "/private/var/logs"
+#define CRASH_LOGS      "/private/var/mobile/Library/Logs/CrashReporter"
+#define CRASH_PREFIX    "SpringBoard"    /* the crash reports copied: SpringBoard's */
 #define MAX_JOB_LOGS    512
 /* What usermanagerd's boot task (fuxi-initdisk's BOOT_TASKS) prints last. */
 #define UM_TASK_LOG     "fuxi.boottask.usermanagerd.out"
@@ -537,12 +539,12 @@ restart_usermanagerd(void)
  * points the other jobs' standard output and error at JOB_LOGS/<label>.log. A child of this
  * process, which stays when the parent becomes launchd, copies what they write to the console,
  * each chunk headed by the file name. It copies DAEMON_LOGS too, where some daemons (usermanagerd)
- * write their own log files.
+ * write their own log files, and SpringBoard's crash reports (CRASH_LOGS, with the exception's backtrace).
  */
 static void
 log_relay(void)
 {
-	static const char *const dirs[] = { JOB_LOGS, DAEMON_LOGS };
+	static const char *const dirs[] = { JOB_LOGS, DAEMON_LOGS, CRASH_LOGS };
 	static struct {
 		char path[512];
 		off_t done;
@@ -569,7 +571,8 @@ log_relay(void)
 				ssize_t n;
 				int fd;
 
-				if (e->d_name[0] == '.') {
+				if (e->d_name[0] == '.' ||
+				    (strcmp(dirs[k], CRASH_LOGS) == 0 && strncmp(e->d_name, CRASH_PREFIX, strlen(CRASH_PREFIX)) != 0)) {
 					continue;
 				}
 				snprintf(path, sizeof(path), "%s/%s", dirs[k], e->d_name);
