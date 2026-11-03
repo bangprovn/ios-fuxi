@@ -1112,6 +1112,15 @@ def main():
         assert re.search(r'setObject\("displayMinRefreshInterval", interval\)', display) and \
             display.index('sweet_fb_refresh_publish(this);') < display.index('\tregisterService();\n\tIOLog("SWEET FB: AppleCLCD')
         assert 'displayRefreshStepMachTime' not in display.replace('deliberately not published', '').split('sweet_fb_refresh_publish(AppleCLCD')[1]
+        # DisplayPipePlaneBaseAlignment is the dictionary VideoToolbox and CoreAnimation read (mediaserverd threw
+        # -[__NSCFNumber objectForKey:] on the plain number), with their default 64; stride requirements unpublished.
+        alignment = function(display, 'sweet_fb_alignment_publish')
+        assert 'OSNumber::withNumber(64ULL, 32)' in alignment and 'setObject("PlaneBaseAlignmentLinear", linear)' in alignment \
+            and 'setProperty("DisplayPipePlaneBaseAlignment", alignment)' in alignment
+        assert not re.search(r'setProperty\("DisplayPipePlaneBaseAlignment", \d', display)
+        assert not re.search(r'setProperty\("DisplayPipeStrideRequirements"', display)
+        assert display.index('static void sweet_fb_alignment_publish') < display.index('#if defined(FUXI)\n/* IOMFBDisplayRefresh')
+        assert display.index('sweet_fb_alignment_publish(this);') < display.index('\tregisterService();\n\tIOLog("SWEET FB: AppleCLCD')
         declaration = display[display.index('class AppleCLCD :'):display.index('OSDefineMetaClassAndStructors(AppleCLCD')]
         declaration = declaration.replace(': public IOMobileFramebuffer', '').replace(
             'OSDeclareDefaultStructors(AppleCLCD);', 'public:')

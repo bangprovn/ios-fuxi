@@ -394,6 +394,27 @@ static uint32_t sweet_fb_timer_options(void)
 	return high == 1 ? kIOTimerEventSourceOptionsPriorityHigh : kIOTimerEventSourceOptionsDefault;
 }
 
+/*
+ * DisplayPipePlaneBaseAlignment is a dictionary on a real AppleCLCD. Its readers in the iOS 16.7
+ * shared cache take PlaneBaseAlignmentLinear out of it: VideoToolbox's
+ * FigGetAlignmentForIOSurfaceOutputToDisplayService (CFDictionaryGetValue without a type check)
+ * and CoreAnimation's CA::WindowServer::AppleDisplay (dictionaries only). The plain number 64
+ * published before made mediaserverd throw -[__NSCFNumber objectForKey:] whenever it set up
+ * video output (r-v19 onwards). 64 is the default of both readers, so the value they use stays
+ * the same. DisplayPipeStrideRequirements stays unpublished: both readers then keep their defaults.
+ */
+static void sweet_fb_alignment_publish(IOService *fb)
+{
+	OSDictionary *alignment = OSDictionary::withCapacity(1);
+	OSNumber *linear = OSNumber::withNumber(64ULL, 32);
+	if (alignment && linear && alignment->setObject("PlaneBaseAlignmentLinear", linear)) {
+		fb->setProperty("DisplayPipePlaneBaseAlignment", alignment);
+		IOLog("SWEET FB: DisplayPipePlaneBaseAlignment = { PlaneBaseAlignmentLinear = 64 }\n");
+	}
+	OSSafeReleaseNULL(linear);
+	OSSafeReleaseNULL(alignment);
+}
+
 #if defined(FUXI)
 /* IOMFBDisplayRefresh.displayMinRefreshInterval: seconds in 0.32 fixed point, a 32-bit OSNumber
  * (CA reads it with CFNumberGetValue as int32; NativeMobileDisplay getRefreshAttributes uses 2^32/hz).
@@ -621,7 +642,7 @@ AppleCLCD::start(IOService *provider)
 
 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
 	setProperty("external", false);
-	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+	sweet_fb_alignment_publish(this);
 #if defined(FUXI)
 	int backlight = 0;
 	PE_parse_boot_argn("fuxibacklight", &backlight, sizeof(backlight));
