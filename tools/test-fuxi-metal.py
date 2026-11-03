@@ -1097,7 +1097,8 @@ def main():
         wire = out/'wire.cpp'
         client=(HEADERS/'FuxiAdrenoUserClient.cpp').read_text()
         query=client[client.index(' IOReturn run('):client.index('  if (method==NativeAdrenoMethodWaitFence)')]
-        query=query.replace(' IOReturn run(', 'static int deviceQuery(')+' (void)in;return -1;\n}\n'
+        query=query.replace(' IOReturn run(', 'static int deviceQuery(').replace(', Pages *pages=nullptr)', ')')+' (void)in;return -1;\n}\n'
+        assert 'Pages' not in query.split('\n', 1)[0]
         stubs=('static constexpr int kIOReturnSuccess=0;\nstatic int ccSeq[3]={0,0,0};static unsigned ccCalls,sleeps;\n'
                'static int fuxi_gpu_abi_cached_coherent(int probe){assert(probe==1 && ccCalls<3);return ccSeq[ccCalls++];}\n'
                'static void IOSleep(unsigned ms){assert(ms==2);sleeps++;}\n')

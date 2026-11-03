@@ -26,6 +26,7 @@ static void IOLockUnlock(IOLock *l) {assert(l->held);l->held=0;}
 static uint64_t now,tickScale=1;
 static uint64_t mach_absolute_time() {return now;}
 static void absolutetime_to_nanoseconds(uint64_t t,uint64_t *n) {*n=t*tickScale;}
+static void nanoseconds_to_absolutetime(uint64_t n,uint64_t *t) {*t=n/tickScale;}
 static unsigned delays;static uint64_t delayUs;
 static void delay(unsigned n) {delays++;delayUs+=n;now+=n*1000;}
 static unsigned sleeps;
@@ -119,7 +120,16 @@ int main() {
  assert(!strcmp(logs[0],"FUXI ABI: fence pending per 600 waits us <250 100 <500 100 <1000 100 <2000 0 <4000 100 <8000 0 <16000 0 <32000 0 more 100 untimed 100 ready 50"
   " irq state 3 why 4 n 1 empty 2 foreign 3 wakes 4 timeouts 5 races 6 written 8 maskfix 7 away 9 wake n 4 avg_us 25.3 max_us 91\n"));
  pendStat(5,4,false);assert(logCount==1); // window restarted; a retire stamp before the submit stamp counts as untimed
- puts("PASS: ABI stat aggregation/window reset/log format, sleep slices and sleep accounting, submit_split report (cached-BO line), fence pending histogram");
+ // Outside lock_ (BoAlloc pages before it, BoFree pages after it) and contiguous searches: silent with none, one line per window.
+ logCount=0;tickScale=1;fuxi_gpu_abi_stats_log();assert(!logCount);
+ abiOutside(0,1500);abiOutside(0,2500);abiOutside(1,700);abiOutside(2,1);
+ now=10;assert(contigAsk(131072) && !contigAsk(147456));contigDone(131072,false);
+ assert(!contigAsk(131072) && contigAsk(65536));contigDone(65536,true);
+ now=10+5000000000ull;assert(contigAsk(131072)); // 5 s after the failure
+ fuxi_gpu_abi_stats_log();
+ assert(logCount==1 && !strcmp(logs[0],"FUXI GPU ABI: outside lock_ n/avg/max us alloc 2/2.0/2 free 1/0.7/0 contig tried 2 served 1 failed 1 backoff_skips 1\n"));
+ fuxi_gpu_abi_stats_log();assert(logCount==1); // window restarted
+ puts("PASS: ABI stat aggregation/window reset/log format, sleep slices and sleep accounting, submit_split report (cached-BO line), fence pending histogram, outside-lock_/contiguous line");
 }
 '''
 
