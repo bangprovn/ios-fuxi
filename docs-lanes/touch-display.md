@@ -70,11 +70,8 @@ Guesses (not measured):
 
 ## Not done / next ideas
 
-- **Interrupt-driven touch.** GPIO25 maps to PDC 57, and the TLMM summary IRQ is SPI
-  208. XNU's GIC code (pe_fiq.c, SWEET) only handles PPIs/SGIs today, so this needs
-  three pieces: GICD SPI setup, PDC/TLMM interrupt configuration (PDC may be
-  secure-only) and an IRQ dispatch path. That is too risky without the device;
-  4 ms polling gives most of the benefit.
+- **Interrupt-driven touch:** done on branch `fuxi-touchirq` (3 Nov 2026), see
+  "Touch interrupt" below. It uses the TLMM summary SPI 208, not the PDC.
 - **Real panel off and brightness.** Both need DCS commands over DSI0: 0x28/0x10 for off, 0x51 for brightness.
   With INTF1 autorefresh on, a command-DMA transfer would have to be interleaved
   with autorefresh (disable AR, send, re-enable), and that was the cause of the static in
@@ -129,6 +126,43 @@ On the phone (user):
 Failure signs: `FUXI TOUCH: FIFO read error`, `GPI re-init`, `controller reset
 event`, or a panic in AppleCLCD::vsyncFired / present. Fall back to the 0091d image.
 
+
+## Touch interrupt (2026-11-03)
+
+`fuxi_touch.c` now reads the FIFO when GPIO25 interrupts instead of every 4/8 ms
+(UniXNU-sheng `5872a4f` did this on SM8550 sheng, where 2 ms polling cost 93 of 300 s
+of CPU). Facts, all read, none guessed:
+
+- Stock DT (`dtbo_a` fuxi overlay `fragment@34/fts@0`; the merged DT in
+  `boot-logs/*-probe/live.dtb` at `/soc/qcom,qupv3_1_geni_se@ac0000/spi@a90000/fts@0`):
+  `interrupts = <25 0x2008>` on the TLMM, `fts,irq-gpio = <&tlmm 25 0x2008>`,
+  `fts,irq-flags = <0x2008>`: level low, oneshot.
+- TLMM `/soc/pinctrl@f000000`: `interrupts = <0 208 4>`, SPI 208 level high = INTID 240.
+  GICD `0x17100000` (`/soc/interrupt-controller@17100000`).
+- Pin interrupt registers (Linux 6.6 `pinctrl-sm8550.c`, same as UniXNU): TLMM +
+  0x1000·pin + 0x8 INTR_CFG (enable 0, polarity 1, detection 3:2, raw status 4,
+  target 7:5 = 3 for apps), + 0xc INTR_STATUS (write 0 to acknowledge).
+
+Behaviour: level low as `pinctrl-msm.c` handles it (the handler masks the pin and
+acknowledges it, the thread drains the FIFO and unmasks). INTID 240 goes to logical
+CPU 1 with its own handler there, because `sleh_irq` has one handler per CPU and the
+GPU fence interrupt owns CPU 0 (INTID 332). A thread watchdog every 100 ms, and a
+FIFO read every second, catch a broken path; the driver then polls as before for the
+rest of the boot and logs why once. `fuxitouch_irq=0` polls from the start (only for
+A/B; not on any boot line).
+
+Log lines:
+
+- setup: `FUXI TOUCH IRQ: GPIO25 level low -> TLMM summary SPI 208 (INTID 240) -> cpu 1
+  mpidr … router …, gicd 0xa003 …, intr_cfg …->0x70 read 0x70 (+enable), pending 0:
+  interrupt-driven` (`gicd` = group | enabled<<1 | edge<<2 | priority<<8; `0x70` = apps
+  target, raw status, level, active low, read back before the enable bit is set; a
+  different `read` means the write did not take);
+- then `FUXI TOUCH: sensing, interrupt from GPIO25`;
+- every 60 s when something changed: `FUXI TOUCH IRQ: N interrupts (S spurious, F
+  foreign); reads R on interrupt, T on timer (D with data); M missed, P repaired; mode`.
+  Working means N and R grow with touches while D and M stay at or near 0;
+- once, if it gives up: `FUXI TOUCH IRQ: falling back to polling: <reason>`.
 
 ## UniXNU NativeHidInput report fixes (2026-10-24)
 
