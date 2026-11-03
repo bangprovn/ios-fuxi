@@ -250,7 +250,9 @@ private:
  // A submit may not shed (its rewritten ops point at the shadows), so an IOSurface import inside one that finds the budget full
  // fails backboardd over to the CPU (d-v12-rtb: 1125x2436 import, no shed). Before the rewrite nothing points at them yet: with
  // under submitHeadroom left, the optional memory goes here instead.
- static constexpr size_t submitHeadroom=32u<<20;
+ // 16 MB: one 1125x2436 BGRA import (11.2 MB) and some. At 32 the phone sat under it most of the time (used ~235 MB of 256)
+ // and shed pool memory every 3 s, 95-108 times a run, with 85-92 % single-vsync frames (d-v14-rt1..3) against 92 % before.
+ static constexpr size_t submitHeadroom=16u<<20;
  uint64_t submitSheds=0;
  void shedBeforeSubmit() {
   if(poisoned || ResourceLimits::budget-limits.used>=submitHeadroom)return;
