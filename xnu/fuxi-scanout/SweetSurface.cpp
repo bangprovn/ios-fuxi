@@ -832,8 +832,7 @@ sweet_surface_row_log(SweetSurface *s, uint32_t asked, OSDictionary *props)
 		}
 		it->release();
 	}
-	IOLog("SWEET SURF: row %u -> %u for %ux%u fourcc 0x%08x cache %u explicit %d by %s keys %s (sweetsurfrow=%u)
-",
+	IOLog("SWEET SURF: row %u -> %u for %ux%u fourcc 0x%08x cache %u explicit %d by %s keys %s (sweetsurfrow=%u)\n",
 	    asked, (uint32_t)s->bytesPerRow, s->width, s->height, s->pixelFormat, s->cacheMode,
 	    props->getObject("IOSurfaceBytesPerRow") != NULL, name, keys, sweet_surface_row_mode());
 }
