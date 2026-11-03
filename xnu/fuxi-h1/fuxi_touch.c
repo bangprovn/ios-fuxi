@@ -806,7 +806,7 @@ ft_spi_on(unsigned id, uint64_t affinity, uint32_t *readback, uint64_t *router)
 static bool
 ft_irq_setup(void)
 {
-	uint32_t was = 0, cfg = 0, readback = 0;
+	uint32_t was = 0, cfg = 0, got = 0, readback = 0;
 	uint64_t router = 0;
 	unsigned pending = 0;
 	const char *fail = NULL;
@@ -828,6 +828,7 @@ ft_irq_setup(void)
 		cfg |= FT_IC_APPS | FT_IC_RAW;
 		ft_wr(fi.pin, 0x8, cfg);
 		ft_wr(fi.pin, 0xc, 0);
+		got = ft_rd(fi.pin, 0x8);                /* read back while masked: the log shows what took */
 		pending = ft_spi_bit(0x200, FT_INTID);   /* summary already high from another pin? */
 		fail = ft_irq_install(&fi.mpidr);
 		if (!fail) {
@@ -840,13 +841,13 @@ ft_irq_setup(void)
 			ft_spi_mask(FT_INTID);
 			ft_wr(fi.pin, 0x8, cfg & ~FT_IC_RAW);
 		} else {
-			cfg |= FT_IC_EN;
-			ft_wr(fi.pin, 0x8, cfg);   /* unmasked: a line already low latches now */
+			ft_wr(fi.pin, 0x8, cfg | FT_IC_EN);   /* unmasked: a line already low latches now */
 		}
 	}
 	printf("FUXI TOUCH IRQ: GPIO%u level low -> TLMM summary SPI 208 (INTID %u) -> cpu %d mpidr %#llx router %#llx, "
-	    "gicd %#x (grp|en<<1|edge<<2|prio<<8), intr_cfg %#x->%#x, pending %u: %s%s\n", FT_IRQ, FT_INTID, FT_IRQ_CPU,
-	    fi.mpidr, router, readback, was, cfg, pending, fail ? "failed, polling: " : "interrupt-driven", fail ? fail : "");
+	    "gicd %#x (grp|en<<1|edge<<2|prio<<8), intr_cfg %#x->%#x read %#x (+enable), pending %u: %s%s\n", FT_IRQ,
+	    FT_INTID, FT_IRQ_CPU, fi.mpidr, router, readback, was, cfg, got, pending,
+	    fail ? "failed, polling: " : "interrupt-driven", fail ? fail : "");
 	return !fail;
 }
 

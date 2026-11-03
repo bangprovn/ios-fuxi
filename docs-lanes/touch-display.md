@@ -154,9 +154,10 @@ A/B; not on any boot line).
 Log lines:
 
 - setup: `FUXI TOUCH IRQ: GPIO25 level low -> TLMM summary SPI 208 (INTID 240) -> cpu 1
-  mpidr … router …, gicd 0xa003 …, intr_cfg …->0x71, pending 0: interrupt-driven`
-  (`gicd` = group | enabled<<1 | edge<<2 | priority<<8; `0x71` = apps target, raw
-  status, enabled, level, active low);
+  mpidr … router …, gicd 0xa003 …, intr_cfg …->0x70 read 0x70 (+enable), pending 0:
+  interrupt-driven` (`gicd` = group | enabled<<1 | edge<<2 | priority<<8; `0x70` = apps
+  target, raw status, level, active low, read back before the enable bit is set; a
+  different `read` means the write did not take);
 - then `FUXI TOUCH: sensing, interrupt from GPIO25`;
 - every 60 s when something changed: `FUXI TOUCH IRQ: N interrupts (S spurious, F
   foreign); reads R on interrupt, T on timer (D with data); M missed, P repaired; mode`.
