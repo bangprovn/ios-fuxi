@@ -2,7 +2,7 @@
 """Lay out the tree of the Fuxi init disk (the boot payload's RAM disk, mounted at /fuxi by fuxi/0021).
 
   fuxi-initdisk.py OUT_DIR --os OS.dmg --system-os SYSTEMOS.dmg --app-os APPOS.dmg [--init FILE] [--log all|LABEL...]
-                   [--allow WORD...] [--skip-task TASK...] [LABEL...]
+                   [--allow WORD...] [--skip-task TASK...] [--probe FILE] [LABEL...]
 
 OUT_DIR gets:
   init                      process 1 (tools/fuxi-init, built and signed on the Mac), when --init is given
@@ -118,6 +118,7 @@ def main():
     ap.add_argument('--init')
     ap.add_argument('--log', nargs='*', default=[])
     ap.add_argument('--allow', nargs='*', default=[])
+    ap.add_argument('--probe', help='tools/fuxi-lsprobe, built and signed: run once as mobile (com.fuxi.lsprobe)')
     ap.add_argument('--skip-task', nargs='*', default=[], help='BOOT_TASKS left out (HakiOS has no personas: usermanagerd)')
     a = ap.parse_intermixed_args()
     labels = a.labels or list(DEFAULT_LABELS)
@@ -174,6 +175,16 @@ def main():
         job = {'Label': label, 'ProgramArguments': argv, 'RunAtLoad': True, 'LaunchOnlyOnce': True, 'UserName': 'root'}
         to_console(job, label, a.log, ttys)
         with open(os.path.join(a.out, 'jobs/LaunchDaemons', label + '.plist'), 'wb') as f:
+            plistlib.dump(job, f, fmt=plistlib.FMT_BINARY)
+    if a.probe:
+        # a job as SpringBoard's (mobile, launchd's user domain) that prints what LaunchServices knows of SpringBoard
+        with open(a.probe, 'rb') as f, open(os.path.join(a.out, 'lsprobe'), 'wb') as g:
+            g.write(f.read())
+        os.chmod(os.path.join(a.out, 'lsprobe'), 0o755)
+        job = {'Label': 'com.fuxi.lsprobe', 'ProgramArguments': ['/fuxi/lsprobe'], 'RunAtLoad': True,
+               'LaunchOnlyOnce': True, 'UserName': 'mobile', 'EnvironmentVariables': {'FUXI_LSPROBE_DELAY': '40'}}
+        to_console(job, 'com.fuxi.lsprobe', a.log, ttys)
+        with open(os.path.join(a.out, 'jobs/LaunchDaemons', 'com.fuxi.lsprobe.plist'), 'wb') as f:
             plistlib.dump(job, f, fmt=plistlib.FMT_BINARY)
     missing = [l for l in labels if f'{l}.plist' not in names]
     print(f'{named} named jobs, {on_demand} on demand, of {len(names)}' + (f'; missing labels {missing}' if missing else ''))
