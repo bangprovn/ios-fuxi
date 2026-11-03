@@ -1631,11 +1631,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
    std::optional<Operation> copy;if(!lean)copy.emplace(ops[at]);Operation &op=lean?ops[at]:*copy;const bool render=op.pipeline || op.clearOnly;
    // Anything aliasing a shadowed image's memory other than its own target/sample role needs the linear bytes current first.
    for(auto &e:entries){
-    // By memory, not by object: CA imports the same IOSurface again as another texture over another Buffer (same contents, so
-    // the same shadowKey) to read it back for a blur. Matching only e.l and its own Buffer let that read see stale linear bytes
-    // (hand test h-v15: App Library's background black, app opens torn).
-    Buffer *buf=e.l->backingBuffer;auto sameMemory=[&](Buffer *b){return b && (b==buf || b->shadowKey()==e.key);};
-    auto aliases=[&](Texture *t){return t && (t==e.l || rtKey(t)==e.key || sameMemory(t->backingBuffer));};
+    Buffer *buf=e.l->backingBuffer;auto aliases=[&](Texture *t){return t && (t==e.l || (t->backingBuffer && t->backingBuffer==buf));};
     bool hit=false,write=false;
     if(render){
      for(unsigned i=0;i<std::min(op.colorCount,8u);++i){auto *t=op.color(i).texture;if(aliases(t) && t!=e.l){hit=write=true;}}
@@ -1646,8 +1642,8 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
      // A plain image copy that reads the linear target itself reads the up-to-date shadow instead: no sync-out, the copy engine does not care about tiling.
      if(aliases(op.sourceTexture)){if(op.sourceTexture==e.l && e.newer && op.texture && !aliases(op.texture) && !op.upload && !op.generateMips && !op.src && !op.dst){op.sourceTexture=e.s;++rtShadowRedirects;}else hit=true;}
     }
-    if(sameMemory(op.src))hit=true;if(sameMemory(op.dst))hit=write=true;if(sameMemory(op.indices))hit=true;
-    for(unsigned s=0;s<2;++s)for(unsigned k=0;k<resourceSlots;++k)if(sameMemory(op.buffers[s][k].buffer))hit=write=true;
+    if(buf){if(op.src==buf)hit=true;if(op.dst==buf)hit=write=true;if(op.indices==buf)hit=true;
+     for(unsigned s=0;s<2;++s)for(unsigned k=0;k<resourceSlots;++k)if(op.buffers[s][k].buffer==buf)hit=write=true;}
     if(hit){syncOut(e,false);if(write)e.valid=false;}
    }
    if(render){
