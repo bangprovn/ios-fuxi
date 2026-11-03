@@ -17,14 +17,18 @@ Every step is idempotent and has an undo option.
   --disable-virtualaudio  move it to HAL.disabled again (the current default image)
   --sb-snapshots DYLIB    install libfuxi-sb.dylib as /usr/local/lib/fuxi/ and add
                           it to SpringBoard's DYLD_INSERT_LIBRARIES in the launchd
-                          cache: application snapshots as JPEG/PNG instead of ATX
+                          cache: application snapshots as JPEG/PNG instead of ATX.
+                          launchd drops that entry (DYLD_ in a com.apple job); the
+                          library loads only with boot-arg fxinj=2 (patch 0121)
   --no-sb-snapshots       take it out of the job and remove the library
-  --app-rate DYLIB        install libfuxi-app.dylib as /usr/local/lib/fuxi/ and add
-                          it to runningboardd's DYLD_INSERT_LIBRARIES: runningboardd
-                          then inserts it into every application it starts, which
-                          sees CADisableMinimumFrameDurationOnPhone = YES (frames
-                          above 60 a second) with its signed Info.plist untouched
-  --no-app-rate           take it out of the job and remove the library
+  --app-rate DYLIB        install libfuxi-app.dylib as /usr/local/lib/fuxi/: with
+                          boot-arg fxinj=1 the kernel (patch 0121) inserts it into
+                          every application, which then sees
+                          CADisableMinimumFrameDurationOnPhone = YES (frames above
+                          60 a second) with its signed Info.plist untouched. It
+                          also takes it out of runningboardd's job, where root v26
+                          put it: launchd drops DYLD_ variables of com.apple jobs
+  --no-app-rate           remove the library (and that job entry)
   --quiet-jobs PRESET,... set Disabled=true on the respawn-storm jobs of a preset
                           (marked _FuxiSysDisabled so the undo restores only them):
                             observed  nanotimekitcompaniond (55 execs per boot on
@@ -155,13 +159,6 @@ def sb_job(plist):
     return job
 
 
-def labelled_job(plist, label):
-    for job in plist['LaunchDaemons'].values():
-        if job.get('Label') == label:
-            return job
-    sys.exit('launchd.plist: no job labelled ' + label)
-
-
 def insert_library(root, plist, job, name, lib):
     env = job.setdefault('EnvironmentVariables', {})
     libs = [p for p in env.get('DYLD_INSERT_LIBRARIES', '').split(':') if p]
@@ -201,16 +198,21 @@ def no_sb_snapshots(root):
     root.remove(SB_LIB)
 
 
-def app_rate(root, dylib):
+def stale_app_job(root):
+    """Root v26 named the library in runningboardd's job; launchd drops it there (DYLD_ in a com.apple job)."""
     plist = root.load_launchd()
-    job = labelled_job(plist, APP_JOB)
+    job = next((j for j in plist['LaunchDaemons'].values() if j.get('Label') == APP_JOB), None)
+    if job is not None:
+        take_library(root, plist, job, 'runningboardd', APP_LIB)
+
+
+def app_rate(root, dylib):
     root.install_tree(dylib, APP_LIB)
-    insert_library(root, plist, job, 'runningboardd', APP_LIB)
+    stale_app_job(root)
 
 
 def no_app_rate(root):
-    plist = root.load_launchd()
-    take_library(root, plist, labelled_job(plist, APP_JOB), 'runningboardd', APP_LIB)
+    stale_app_job(root)
     root.remove(APP_LIB)
 
 

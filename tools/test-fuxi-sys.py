@@ -736,31 +736,31 @@ def test_root(tmp):
     bad = subprocess.run([sys.executable, str(TOOLS / 'fuxi-sys-root.py'), '--quiet-jobs', 'nope', str(base)],
                          capture_output=True, text=True)
     assert bad.returncode != 0 and 'unknown preset' in bad.stderr
-    # libfuxi-app.dylib: runningboardd's job (which had no environment) and back
+    # libfuxi-app.dylib: only the file (the kernel inserts it, fxinj=1); a v26 entry in runningboardd's job goes
     app = base.parent / 'libfuxi-app.dylib'
     app.write_bytes(b'\xcf\xfa\xed\xfe')
+    lib = base / 'usr/local/lib/fuxi/libfuxi-app.dylib'
     before = cache.read_bytes()
     out = run_root('--dry-run', '--app-rate', app, base)
-    assert 'would: runningboardd: DYLD_INSERT_LIBRARIES=/usr/local/lib/fuxi/libfuxi-app.dylib' in out
-    assert cache.read_bytes() == before and not (base / 'usr/local/lib/fuxi/libfuxi-app.dylib').exists()
+    assert 'would: install libfuxi-app.dylib -> /usr/local/lib/fuxi/libfuxi-app.dylib' in out
+    assert cache.read_bytes() == before and not lib.exists()
     run_root('--app-rate', app, base)
-    assert (base / 'usr/local/lib/fuxi/libfuxi-app.dylib').stat().st_mode & 0o777 == 0o755
-    jobs = {j['Label']: j for j in load(cache)['LaunchDaemons'].values()}
-    assert jobs['com.apple.runningboardd']['EnvironmentVariables'] == {
+    assert lib.stat().st_mode & 0o777 == 0o755 and cache.read_bytes() == before
+    data = load(cache)
+    data['LaunchDaemons']['/System/Library/LaunchDaemons/com.apple.runningboardd.plist']['EnvironmentVariables'] = {
         'DYLD_INSERT_LIBRARIES': '/usr/local/lib/fuxi/libfuxi-app.dylib'}
-    assert 'libfuxi-app' not in jobs['com.apple.SpringBoard']['EnvironmentVariables'].get('DYLD_INSERT_LIBRARIES', '')
-    snapshot = cache.read_bytes()
-    assert 'already has' in run_root('--app-rate', app, base) and cache.read_bytes() == snapshot
+    cache.write_bytes(plistlib.dumps(data, fmt=plistlib.FMT_BINARY))
+    out = run_root('--app-rate', app, base)
+    assert 'runningboardd: /usr/local/lib/fuxi/libfuxi-app.dylib taken out of DYLD_INSERT_LIBRARIES' in out
+    assert load(cache) == plistlib.loads(before) and lib.is_file()
     run_root('--no-app-rate', base)
-    assert load(cache) == plistlib.loads(before) and not (base / 'usr/local/lib/fuxi/libfuxi-app.dylib').exists()
+    assert load(cache) == plistlib.loads(before) and not lib.exists()
     data = load(cache)
     del data['LaunchDaemons']['/System/Library/LaunchDaemons/com.apple.runningboardd.plist']
     cache.write_bytes(plistlib.dumps(data, fmt=plistlib.FMT_BINARY))
-    bad = subprocess.run([sys.executable, str(TOOLS / 'fuxi-sys-root.py'), '--app-rate', str(app), str(base)],
-                         capture_output=True, text=True)
-    assert bad.returncode != 0 and 'no job labelled com.apple.runningboardd' in bad.stderr
-    assert not (base / 'usr/local/lib/fuxi/libfuxi-app.dylib').exists()
-    print('PASS: fuxi-sys-root.py install/undo, dry run, idempotence, job presets, runningboardd library (synthetic root)')
+    run_root('--app-rate', app, base)                   # no runningboardd job: the file alone
+    assert lib.is_file()
+    print('PASS: fuxi-sys-root.py install/undo, dry run, idempotence, job presets, application library (synthetic root)')
 
 
 def main():
