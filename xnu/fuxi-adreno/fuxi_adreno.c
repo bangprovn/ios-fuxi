@@ -43,6 +43,11 @@ extern unsigned fuxi_gpu_access(uintptr_t, uint64_t *, unsigned, unsigned);
 static void fg_delay(unsigned us) { delay_for_interval(us, NSEC_PER_USEC); }
 static unsigned fg_scanout_requested, fg_scanout_panel120_requested, fg_scanout_double_requested, fg_scanout_triple_requested;
 static unsigned fg_scanout_paneldcs_requested; /* fuxipaneldcs=1..4 accepted by fuxi_gpu_scanout_configure: DSI0 is mapped */
+static unsigned fg_fit_requested, fg_fit_active; /* sweetfbfit mode accepted, 1 or 2 (tail windows mapped); the 4352-pitch layout is live (fuxi_gpu_scanout.inc) */
+/* sweetfbfit corner mask (fuxi_gpu_scanout_fit): black width per image row from the edge, rows with any, runs of equal widths, and the ring
+ * words the mask adds to a copy; all 0 when off. */
+static uint8_t fg_fit_span[128];
+static unsigned fg_fit_spans, fg_fit_runs, fg_fit_mask_words;
 struct fg_window { uint64_t pa, size; uintptr_t va; };
 /* Disjoint apertures; framebuffer A is mapped by SweetFramebuffer.
  * Stage14 uses scratch, never stage15's panel readback/CPU comparator. */
@@ -57,7 +62,13 @@ static struct fg_window fg_windows[] = {
  {0xb8a00000,0x9e4000,0}, /* reserved splash buffer B, fuxiscandouble=1 only */
  {0xb9400000,0x9e4000,0}, /* reserved splash buffer C, fuxiscantriple=1 only */
  {0xae94000,0x4000,0}, /* DSI0 command FIFO, fuxipanel120=1 or fuxipaneldcs=1..4 only */
+ /* sweetfbfit only: the rows of each buffer's 4352-pitch layout past 0x9e4000 (A's surface mapping, the B/C windows), i.e. the end
+  * of the bottom bar (bytes 0x9e4000..0x9f6000), cleared once when the layout starts. B's with double, C's with triple. */
+ {0xb89e4000,0x14000,0}, {0xb93e4000,0x14000,0}, {0xb9de4000,0x14000,0},
 };
+#define FG_FIT_MAIN 0x9e4000u /* bytes of a buffer reachable through A's surface mapping or the B/C windows */
+#define FG_FIT_TAIL(b) (0xb89e4000u + (b)*0xa00000u)
+#define FG_FIT_TAIL_BYTES 0x14000u
 static uint64_t fg_mapped_bytes;
 /* io_map's 8 MiB submap and ALL ml_io_map variants use KMA_NOFAIL.
  * Use kernel_map VA only (no backing RAM) and fallible page-table expansion.
@@ -95,6 +106,8 @@ static kern_return_t fg_map_windows(void)
   if (!fg_scanout_requested && (w->pa == 0xae14000 || w->pa == 0xae34000)) continue;
   if (!fg_scanout_double_requested && w->pa == 0xb8a00000) continue;
   if (!fg_scanout_triple_requested && w->pa == 0xb9400000) continue;
+  if ((w->pa == FG_FIT_TAIL(0) || w->pa == FG_FIT_TAIL(1) || w->pa == FG_FIT_TAIL(2)) && (!fg_fit_requested ||
+      (w->pa == FG_FIT_TAIL(1) && !fg_scanout_double_requested) || (w->pa == FG_FIT_TAIL(2) && !fg_scanout_triple_requested))) continue;
   if (!fg_scanout_panel120_requested && !fg_scanout_paneldcs_requested && w->pa == 0xae94000) continue;
   kern_return_t kr = fg_map_window(w);
   if (kr != KERN_SUCCESS) {
@@ -695,12 +708,13 @@ static void fg_thread(thread_call_param_t arg, thread_call_param_t result)
      gpu_extra[13][2], gpu_extra[11][2]);
  fg_clock_log();
  if (fg_limit < 17 || fg_force == 1) { fg_fail("diagnostic stop after self-test", fg_limit); goto out; }
- /* Double mode validates SRC0 under display ownership, failing closed there. */
+ /* Double mode validates SRC0 under display ownership, failing closed there. sweetfbfit=2 writes every 4352-pitch row of A/B/C. */
+ unsigned fb_map = fg_fit_requested == FUXI_FIT_STRETCH ? FUXI_FIT_STRETCH_MAP : (4320*2400+4095)&~4095u;
  if ((!fg_scanout_double_requested && g3_read(0xae05014) != G4_FB_PA) || g3_read(0xae05024) != 4320 ||
      g3_read(0xae05000) != (2400u<<16 | 1080u) || g3_read(0xae05030) != 0x237ff ||
-     !g_map_at(G3_PT, &g3_next, G4_FB_VA, G4_FB_PA, (4320*2400+4095)&~4095u, 1u<<6) ||
-     (fg_scanout_double_requested && !g_map_at(G3_PT, &g3_next, G4_FB_VA+0xa00000u, 0xb8a00000u, (4320*2400+4095)&~4095u, 1u<<6)) ||
-     (fg_scanout_triple_requested && !g_map_at(G3_PT, &g3_next, G4_FB_VA+0x1400000u, 0xb9400000u, (4320*2400+4095)&~4095u, 1u<<6)) ||
+     !g_map_at(G3_PT, &g3_next, G4_FB_VA, G4_FB_PA, fb_map, 1u<<6) ||
+     (fg_scanout_double_requested && !g_map_at(G3_PT, &g3_next, G4_FB_VA+0xa00000u, 0xb8a00000u, fb_map, 1u<<6)) ||
+     (fg_scanout_triple_requested && !g_map_at(G3_PT, &g3_next, G4_FB_VA+0x1400000u, 0xb9400000u, fb_map, 1u<<6)) ||
      !fg_source_tables()) { fg_fail("scanout geometry/mapping", 4); goto out; }
  uint32_t tlb[128] = {0};
  if (g4_tlb(tlb) || fg_access_failed) { fg_fail("initial TLB sync", 5); goto out; }
@@ -776,6 +790,50 @@ static void fg_rect(unsigned src, unsigned dst, unsigned pitch,
  g3_emit(dx); g3_emit((dx+width-1) | (height-1)<<16);
  g4_event(63); g3_emit(g3_pkt7(0x2c, 1)); g3_emit(3); g4_wfi();
 }
+/* sweetfbfit: the whole 1125x2436 frame at src into 1080 x height at dst (2338 rows, or 2400 in mode 2), one blit. The scale is the ratio of the inclusive source and
+ * destination rects, as Mesa's r2d blits (tu6_blit_image, fd6 emit_blit_texture) program them; SP_PS_2D_SRC_INFO.FILTER (bit 16)
+ * selects bilinear. No row classes: they share the source rows only at 1:1, and a scaled class would start at a fractional source
+ * row. Both pitches are whole 64-byte units instead (source checked by the caller, destination FUXI_FIT_PITCH). */
+static void fg_fit_rect(unsigned src, unsigned dst, unsigned pitch, unsigned height)
+{
+ unsigned sx = (src & 63)/4;
+ g3_emit(g4_pkt4(G4_SP_SRC_INFO, 5));
+ g3_emit(0x00510430); g3_emit((FUXI_FIT_SRC_W+sx) | FUXI_FIT_SRC_H<<15);
+ g3_emit(src & ~63u); g3_emit(0); g3_emit((pitch/64) << 9);
+ g3_emit(g4_pkt4(G4_RB_DST_INFO, 4));
+ g3_emit(0x430); g3_emit(dst & ~63u); g3_emit(0); g3_emit(FUXI_FIT_PITCH/64);
+ g3_emit(g4_pkt4(G4_GRAS_SRC_X, 6));
+ g3_emit(sx<<8); g3_emit((sx+FUXI_FIT_SRC_W-1)<<8); g3_emit(0); g3_emit((FUXI_FIT_SRC_H-1)<<8);
+ g3_emit(0); g3_emit((FUXI_FIT_W-1) | (height-1)<<16);
+ g4_event(63); g3_emit(g3_pkt7(0x2c, 1)); g3_emit(3); g4_wfi();
+}
+/* sweetfbfit corner mask: after the scaled blit, solid black fills (SOLID_COLOR as g4_clear, which the self-test proved) of the
+ * pixels outside the corner arc: one rect per run of image rows with the same black width, mirrored to the four corners (about 65
+ * runs, 260 fills, 7 ring words each). The fills land in the same submission, before the fence and so before any START: every
+ * buffer is shown masked, in double and triple rotation too. dst: the buffer's base; top/height: the image rows. */
+static void fg_fit_box(unsigned x0, unsigned y0, unsigned x1, unsigned y1)
+{
+ g3_emit(g4_pkt4(G4_GRAS_SRC_X+4, 2)); g3_emit(x0 | y0<<16); g3_emit(x1 | y1<<16);
+ g4_event(63); g3_emit(g3_pkt7(0x2c, 1)); g3_emit(3);
+}
+static void fg_fit_mask(unsigned dst, unsigned top, unsigned height)
+{
+ g4_reg(G4_RB_BLIT, 0x10f03080); g4_reg(G4_GRAS_BLIT, 0x10f03080);
+ g3_emit(g4_pkt4(G4_RB_SOLID, 4)); g3_emit(0); g3_emit(0); g3_emit(0); g3_emit(0xff); /* R G B A: FUXI_FIT_BLACK */
+ g3_emit(g4_pkt4(G4_RB_DST_INFO, 4)); g3_emit(0x430); g3_emit(dst & ~63u); g3_emit(0); g3_emit(FUXI_FIT_PITCH/64);
+ for (unsigned j = 0, k; j < fg_fit_spans; j = k) {
+  unsigned b = fg_fit_span[j];
+  for (k = j+1; k < fg_fit_spans && fg_fit_span[k] == b; k++) {}
+  if (!b) continue;
+  fg_fit_box(0, top+j, b-1, top+k-1); fg_fit_box(FUXI_FIT_W-b, top+j, FUXI_FIT_W-1, top+k-1);
+  fg_fit_box(0, top+height-k, b-1, top+height-1-j); fg_fit_box(FUXI_FIT_W-b, top+height-k, FUXI_FIT_W-1, top+height-1-j);
+ }
+ g4_wfi();
+}
+_Static_assert(!(FUXI_FIT_PITCH & 63) && !(FUXI_FIT_Y*FUXI_FIT_PITCH & 63) && FUXI_FIT_PITCH*2400u <= 0xa00000u &&
+    (FUXI_FIT_Y+FUXI_FIT_H-1)*FUXI_FIT_PITCH+FUXI_FIT_W*4 <= FG_FIT_MAIN, "fit image rows stay inside the mapped part of each 10 MiB buffer");
+_Static_assert(FUXI_FIT_STRETCH_MAP <= 0xa00000u && FUXI_FIT_STRETCH_MAP >= 2400u*FUXI_FIT_PITCH && FG_FIT_MAIN+FG_FIT_TAIL_BYTES >= 2400u*FUXI_FIT_PITCH,
+    "mode 2: every 4352-pitch row is in the GPU map and in a CPU window");
 /* Use XNU's forced PoC clean (CVAC on generic ARM64), never invalidate CPU
  * rendered data. Merge touching cache-line intervals; typical full-width
  * 4352-byte surfaces have only 32 bytes padding and clean as ONE range. */
@@ -829,6 +887,8 @@ static int fg_ring_doorbell(void)
 #define FG_CP_STAMP 192u
 static uint32_t fg_cp_submit_lo, fg_cp_n, fg_cp_bad, fg_cp_pitch, fg_cp_rects;
 static uint64_t fg_cp_sum[4], fg_cp_max[4]; /* submit_to_start, blit, flush, poll_late */
+static unsigned fg_cp_masked; /* the last copy had the sweetfbfit corner mask: stamp +216 splits its fills from the blit */
+static uint64_t fg_cp_mask_sum, fg_cp_mask_max;
 static void fg_cp_stamp(unsigned off)
 {
  g3_emit(g3_pkt7(0x3e, 3)); g3_emit(0x980 | (2u<<18) | (1u<<30)); g3_emit(G3_FENCE_VA+off); g3_emit(0);
@@ -836,20 +896,26 @@ static void fg_cp_stamp(unsigned off)
 static void fg_cp_retire(void)
 {
  uint32_t s0 = g3_read(G3_FENCE_PA+FG_CP_STAMP), s1 = g3_read(G3_FENCE_PA+FG_CP_STAMP+8), s2 = g3_read(G3_FENCE_PA+FG_CP_STAMP+16), now = g3_gr(0x980);
+ uint32_t sm = fg_cp_masked ? g3_read(G3_FENCE_PA+FG_CP_STAMP+24) : 0;
  fg_cp_n++; fg_copy_log.s2s_us = fg_copy_log.blit_us = UINT32_MAX;
- if (fg_access_failed || !s0 || !s1 || !s2) fg_cp_bad++;
+ if (fg_access_failed || !s0 || !s1 || !s2 || (fg_cp_masked && !sm)) fg_cp_bad++;
  else {
-  uint32_t v[4] = {s0-fg_cp_submit_lo, s1-s0, s2-s1, now-s2};
+  uint32_t v[4] = {s0-fg_cp_submit_lo, fg_cp_masked ? sm-s0 : s1-s0, s2-s1, now-s2};
+  if (fg_cp_masked) { uint32_t m = s1-sm; fg_cp_mask_sum += m; if (m > fg_cp_mask_max) fg_cp_mask_max = m; }
   for (unsigned i = 0; i < 4; i++) { fg_cp_sum[i] += v[i]; if (v[i] > fg_cp_max[i]) fg_cp_max[i] = v[i]; }
   fg_copy_log.s2s_us = (uint32_t)((uint64_t)v[0]*10/192); fg_copy_log.blit_us = (uint32_t)((uint64_t)v[1]*10/192);
  }
  if (!(fg_cp_n % 600)) {
   #define FG_US(t) ((unsigned long long)((t)*10/192))
-  printf("FUXI GPU: copy_exec blit avg %llu max %llu us, flush avg %llu max %llu us; submit_to_start avg %llu max %llu us; poll_late avg %llu max %llu us (copies %u no_stamp %u pitch %u rect_classes %u)\n",
+  printf("FUXI GPU: copy_exec blit avg %llu max %llu us, flush avg %llu max %llu us; submit_to_start avg %llu max %llu us; poll_late avg %llu max %llu us (copies %u no_stamp %u pitch %u rect_classes %u)%s\n",
       FG_US(fg_cp_sum[1]/600), FG_US(fg_cp_max[1]), FG_US(fg_cp_sum[2]/600), FG_US(fg_cp_max[2]), FG_US(fg_cp_sum[0]/600), FG_US(fg_cp_max[0]),
-      FG_US(fg_cp_sum[3]/600), FG_US(fg_cp_max[3]), fg_cp_n, fg_cp_bad, fg_cp_pitch, fg_cp_rects);
+      FG_US(fg_cp_sum[3]/600), FG_US(fg_cp_max[3]), fg_cp_n, fg_cp_bad, fg_cp_pitch, fg_cp_rects,
+      !fg_fit_active ? "" : fg_fit_requested == FUXI_FIT_STRETCH ? " fit=2" : " fit=1"); /* fit: one scaled bilinear blit, so blit avg is its GPU time */
+  if (fg_cp_masked) /* sweetfbfit corner mask: blit avg above is the scaled blit alone, this its fills */
+   printf("FUXI GPU: fit corner mask avg %llu max %llu us, %u fills per copy (%u runs x 4)\n", FG_US(fg_cp_mask_sum/600), FG_US(fg_cp_mask_max),
+       fg_fit_runs*4, fg_fit_runs);
   #undef FG_US
-  memset(fg_cp_sum, 0, sizeof fg_cp_sum); memset(fg_cp_max, 0, sizeof fg_cp_max);
+  memset(fg_cp_sum, 0, sizeof fg_cp_sum); memset(fg_cp_max, 0, sizeof fg_cp_max); fg_cp_mask_sum = fg_cp_mask_max = 0;
  }
 }
 /* Called once per display tick; never sleeps, spins for completion or submits.
@@ -896,11 +962,15 @@ int fuxi_gpu_copy(unsigned slot, uint64_t generation, uintptr_t source, uint64_t
  unsigned inl = fg_abi_inline && fg_inl_usable(); /* the client root is installed and stays: queue the copy in it */
  if (!inl && fg_client_busy) fg_abi_present_wait = 1;
  if (!fuxi_gpu_ready() || fg_busy || (!inl && fg_client_busy) || slot >= FG_CACHE_SLOTS || fg_generation[slot] != generation) return 0;
- if (!width || !height || width > 1080 || height > 2400 || dx > 1080-width || dy > 2400-height ||
-     (source & 3) || (pitch & 3) || pitch > 131008 || ((uint64_t)sx+width)*4 > pitch ||
+ /* sweetfbfit (fit = mode): (sx,sy) is the frame's origin in the surface, the copy is always the whole frame, and only into the 4352-pitch layout
+  * (before the takeover sets it up, the CPU draws the boot layout). One blit needs the source pitch in 64-byte units too. */
+ unsigned fit = fg_fit_requested, fit_y = FUXI_FIT_MODE_Y(fit), fit_h = FUXI_FIT_MODE_H(fit);
+ if (fit ? !fg_fit_active || !fg_scanout_owned || width != FUXI_FIT_SRC_W || height != FUXI_FIT_SRC_H || dx || dy || (pitch & 63) :
+     !width || !height || width > 1080 || height > 2400 || dx > 1080-width || dy > 2400-height) return 0;
+ if ((source & 3) || (pitch & 3) || pitch > 131008 || ((uint64_t)sx+width)*4 > pitch ||
      length+(source&4095) > FG_SOURCE_BYTES ||
      ((uint64_t)sy+height-1)*pitch+((uint64_t)sx+width)*4 > length) return 0;
- if (fg_scanout_double_active) {
+ if (fg_scanout_double_active && !fit) {
   /* CA supplies a complete surface; expand damage to the complete panel. */
   if (sx < dx || sy < dy) return 0;
   sx -= dx; sy -= dy; dx = dy = 0; width = 1080; height = 2400;
@@ -910,7 +980,7 @@ int fuxi_gpu_copy(unsigned slot, uint64_t generation, uintptr_t source, uint64_t
  if (inl) {
   /* Never refused for a client job: it lands in the same in-order ring. Room for the whole copy (at most about 450 words), else fall back. */
   unsigned used = (g3_wptr-g3_gr(0x806)) & 8191, want = 1u | (fg_scanout_double_requested ? 2u : 0) | (fg_scanout_triple_requested ? 4u : 0);
-  unsigned why = fg_access_failed ? FG_INL_RING : used > 8191-1024 ? FG_INL_RING : (fg_inl_fbmask & want) != want ? FG_INL_BUFFERS : FG_INL_REASONS;
+  unsigned why = fg_access_failed ? FG_INL_RING : used > 8191-1024-(fit ? fg_fit_mask_words : 0) ? FG_INL_RING : (fg_inl_fbmask & want) != want ? FG_INL_BUFFERS : FG_INL_REASONS;
   if (why != FG_INL_REASONS) { fg_inl_fb[why]++; inl = 0; }
  } else if (fg_abi_inline) fg_inl_fb[fg_root_client ? FG_INL_WINDOW : fg_inl_ready == 2 ? FG_INL_WINDOW : FG_INL_NOROOT]++;
  if (!inl && fg_root_client && !fg_inl_to_present()) { fg_inl_fb[fg_client_busy ? FG_INL_CLIENT : FG_INL_SWITCH]++; return 0; }
@@ -942,9 +1012,16 @@ int fuxi_gpu_copy(unsigned slot, uint64_t generation, uintptr_t source, uint64_t
   fg_scanout_copy = fg_scanout_target();
  }
  g_wr(G3_FENCE_PA, FG_CP_STAMP, 0); g_wr(G3_FENCE_PA, FG_CP_STAMP+8, 0); g_wr(G3_FENCE_PA, FG_CP_STAMP+16, 0);
- fg_cp_pitch = pitch; fg_cp_rects = stride < height ? stride : height;
+ fg_cp_masked = fit && fg_fit_spans;
+ if (fg_cp_masked) g_wr(G3_FENCE_PA, FG_CP_STAMP+24, 0);
+ fg_cp_pitch = pitch; fg_cp_rects = fit ? 1 : stride < height ? stride : height;
  g4_wfi(); fg_cp_stamp(FG_CP_STAMP);
  g4_setup();
+ if (fit) {
+  unsigned fb = (inl ? FG_INL_FB_VA : G4_FB_VA)+(fg_scanout_double_active ? fg_scanout_copy*0xa00000u : 0);
+  fg_fit_rect((inl ? FG_INL_SRC_VA : FG_SOURCE_VA)+slot*FG_SOURCE_BYTES+(source&4095)+sy*pitch+sx*4, fb+fit_y*FUXI_FIT_PITCH, pitch, fit_h);
+  if (fg_cp_masked) { fg_cp_stamp(FG_CP_STAMP+24); fg_fit_mask(fb, fit_y, fit_h); } /* the corner mask, after the image */
+ } else
  for (unsigned y = 0; y < stride && y < height; y++)
   fg_rect((inl ? FG_INL_SRC_VA : FG_SOURCE_VA)+slot*FG_SOURCE_BYTES+(source&4095)+(sy+y)*pitch+sx*4,
       (inl ? FG_INL_FB_VA : G4_FB_VA)+(fg_scanout_double_active ? fg_scanout_copy*0xa00000u : 0)+(dy+y)*4320+dx*4, pitch, width, (height-1-y)/stride+1, stride);

@@ -30,11 +30,12 @@ static unsigned fg_abi_inline; static int fg_inl_usable(void) { return 0; }
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
-static char doubleStats[512],ssppLog[512],dpuLog[16384];
+static char doubleStats[512],ssppLog[512],dpuLog[16384],fitLog[512];
 static int scanout_printf(const char *format,...) {
  va_list args;va_start(args,format);
  if(strstr(format,"double=1 flips="))vsnprintf(doubleStats,sizeof(doubleStats),format,args);
  if(strstr(format,"sspp vig0"))vsnprintf(ssppLog,sizeof(ssppLog),format,args);
+ if(strstr(format,"fit "))vsnprintf(fitLog,sizeof(fitLog),format,args);
  if(strstr(format,"dpu smmu") || strstr(format,"dpu stage") || strstr(format,"dpu direct")){size_t n=strlen(dpuLog);if(n<sizeof(dpuLog))vsnprintf(dpuLog+n,sizeof(dpuLog)-n,format,args);}
  va_end(args);return 0;
 }
@@ -111,7 +112,16 @@ static void (*startHook)(void);
 static unsigned modelDrain,modelTe,modelPanel120,modelDouble,modelTriple,parseDouble,parseTriple,modelNc,modelEarly;
 static uint8_t modelB[4320u*2400],modelC[4320u*2400];
 static unsigned failBMap,failCMap;
+/* sweetfbfit: B/C windows at their full 0x9e4000 and the three tail windows (fuxi_adreno.c fg_windows); failTail=b+1 drops b's. */
+static unsigned fg_fit_requested,fg_fit_active,fitModel,failTail;
+static uint8_t fg_fit_span[128];static unsigned fg_fit_spans,fg_fit_runs,fg_fit_mask_words; /* corner mask table (defined in fuxi_adreno.c) */
+static uint8_t fitB[0x9e4000],fitC[0x9e4000],fitTail[3][0x14000];
 static uintptr_t fuxi_gpu_nc_pointer(uint64_t pa,uint64_t size) {
+ if(fitModel) {
+  for(unsigned b=0;b<3;b++)if(pa==0xb89e4000u+b*0xa00000u){assert(size<=0x14000);return failTail==b+1?0:(uintptr_t)fitTail[b];}
+  assert((pa==0xb8a00000u || pa==0xb9400000u) && size<=0x9e4000);
+  return pa==0xb9400000u?(failCMap?0:(uintptr_t)fitC):(failBMap?0:(uintptr_t)fitB);
+ }
  assert((pa==0xb8a00000u || pa==0xb9400000u) && size==4320u*2400);
  return pa==0xb9400000u?(failCMap?0:(uintptr_t)modelC):(failBMap?0:(uintptr_t)modelB);
 }
@@ -181,6 +191,12 @@ static unsigned fg_access(uint64_t pa,uint64_t *value,unsigned wr,unsigned wide)
  return 0;
 }
 '''
+# sweetfbfit geometry (fuxi_adreno.h) and its buffer windows (fuxi_adreno.c), early in the prefix: every model built on it
+# (test-fuxi-panel-dcs keeps only the part before fg_access) compiles the production scanout include.
+PREFIX = PREFIX.replace('static unsigned fg_scanout_paneldcs_requested;\n', 'static unsigned fg_scanout_paneldcs_requested;\n' +
+    '\n'.join(re.findall(r'^#define (?:FUXI_FIT|FG_FIT)_\w+[^\n]*', (ROOT / 'xnu/fuxi-adreno/fuxi_adreno.h').read_text() +
+                         (ROOT / 'xnu/fuxi-adreno/fuxi_adreno.c').read_text(), re.M)) + '\n', 1)
+assert '#define FG_FIT_TAIL(b)' in PREFIX and '#define FUXI_FIT_PITCH' in PREFIX
 TEST = r'''
 static unsigned fg_scanout_owned_for_model(void) {return fg_scanout_owned;}
 static unsigned fg_scanout_double_for_model(void) {return fg_scanout_double_active;}
@@ -202,6 +218,7 @@ static void reset(void) {
  memset(ctl,0,sizeof(ctl));memset(intf,0,sizeof(intf));memset(dsi,0,sizeof(dsi));intf[0x2b4/4]=0x80000001u;
  fg_scanout_requested=fg_scanout_owned=fg_scanout_failed=fg_scanout_writable=0;
  fg_scanout_reserved=fg_busy=fg_client_busy=0;
+ fg_fit_requested=fg_fit_active=fitModel=failTail=0;fitLog[0]=0;
  fg_scanout_checked=fg_scanout_checks=0;
  fg_scanout_te_mode=fg_scanout_wait_te=0;fg_scanout_drain_us=FG_SCAN_DRAIN_US;modelTe=modelDrain=0;
  fg_scanout_panel120_requested=fg_scanout_panel120_attempted=fg_scanout_panel120_active=0;
@@ -1381,6 +1398,164 @@ static void hard_tests(uint8_t *panel) {
  fg_abi_hard=0;fg_abi_spin=0;fg_scanout_te_mode=keepMode;fg_scanout_period_us=16667;fg_scanout_panel120_active=keepP;fg_scanout_back_ready=0;
  fg_scanout_starts=keepStarts;fg_scanout_current_match=keepMatch;fg_scanout_current_mismatch=keepMismatch;fg_scanout_te_frames=keepTe;intf[0x298/4]=keepCount;ctl[0x1c/4]=1;intf[0x2b0/4]=2400;
 }
+
+// sweetfbfit: accepted only with the lane and without direct scanout. Once owned and idle, before B/C copy A: the bars of every
+// buffer black (the last rows through the tail windows), then VIG0 YSTRIDE0 = 4352 (plane-1 half kept) with CTL flush bit 0, before
+// any START, once; stop keeps it. A missing window stops scanout before the stride changes. The oracle fails on a bar pixel only.
+static uint32_t fit_word(const uint8_t *base,const uint8_t *tail,unsigned o) {
+ uint32_t v;memcpy(&v,o<0x9e4000u?base+o:tail+(o-0x9e4000u),4);return v;
+}
+static unsigned fit_bars_black(const uint8_t *base,const uint8_t *tail) {
+ for(unsigned y=0;y<2400;y++){if(y==31)y=2369;for(unsigned x=0;x<1080;x++)if(fit_word(base,tail,y*4352+x*4)!=0xff000000u)return 0;}
+ return 1;
+}
+static unsigned stride_writes(void) {unsigned n=0;for(unsigned i=0;i<traceCount;i++)n+=trace[i].pa==0xae05024;return n;}
+static unsigned fitCorner; /* the corner mask for fit_owned: off in the geometry tests, on in the mask tests */
+static void fit_owned_mode(uint8_t *a,unsigned m,unsigned mode) {
+ reset();fitModel=1;modelDouble=m>0;modelTriple=m==2;modelTe=1;
+ intf[0x294/4]=2400;intf[0x298/4]=(1u<<16)|2500;intf[0x2b0/4]=2400;sspp[0x24/4]=0x10e0u|(7u<<16);ctl[0x18/4]=0x40;
+ memset(a,0x5a,0x9e4000);memset(fitB,0xcc,sizeof(fitB));memset(fitC,0xcc,sizeof(fitC));memset(fitTail,0x77,sizeof(fitTail));
+ fuxi_gpu_scanout_configure((uintptr_t)a,1,0);assert(fuxi_gpu_scanout_fit(mode,fitCorner)==1 && fg_fit_requested==mode && !!fg_fit_spans==!!fitCorner);
+ assert(!fuxi_gpu_scanout_acquire() && fuxi_gpu_scanout_owned() && !fuxi_gpu_scanout_fit_pitch() && !stride_writes());
+ intf[0x298/4]=(2u<<16)|2500;
+}
+static void fit_owned(uint8_t *a,unsigned m) {fit_owned_mode(a,m,1);}
+static void fit_tests(void) {
+ uint8_t *a=malloc(0x9e4000),*src=malloc(4608u*2436);assert(a && src);
+ reset();fuxi_gpu_scanout_configure((uintptr_t)a,0,0);assert(!fuxi_gpu_scanout_fit(1,1) && !fg_fit_requested && strstr(fitLog,"fit refused: needs fuxigpuscanout=1"));
+ reset();fuxi_gpu_scanout_configure((uintptr_t)a,1,0);assert(!fuxi_gpu_scanout_fit(3,1) && !fuxi_gpu_scanout_fit(0,1) && !fg_fit_requested && strstr(fitLog,"fit refused: unknown mode"));
+ reset();modelNc=0x1c00000u;fuxi_gpu_scanout_configure((uintptr_t)a,1,0);
+ assert(fg_scanout_dpu_stage3 && !fuxi_gpu_scanout_fit(1,1) && !fuxi_gpu_scanout_fit(2,1) && !fg_fit_requested && strstr(fitLog,"direct scanout"));
+ reset();modelNc=0x1000000u;fuxi_gpu_scanout_configure((uintptr_t)a,1,0);assert(fuxi_gpu_scanout_fit(1,0)==1 && !fuxi_gpu_scanout_fit_pitch());
+ assert(strstr(fitLog,"fit corner mask off (sweetfbcorner=0)"));{unsigned rows=7;assert(!fuxi_gpu_scanout_fit_corner(&rows) && !rows);}
+ for(unsigned m=0;m<3;m++) {
+  fit_owned(a,m);
+  assert(fuxi_gpu_scanout_acquire()==1 && fuxi_gpu_scanout_fit_pitch()==4352 && fg_fit_active && !starts);
+  assert(sspp[0x24/4]==(4352u|(7u<<16)) && (ctl[0x18/4]&0x41)==0x41 && stride_writes()==1);
+  assert(strstr(fitLog,"fit layout pitch=4352 ystride0=0x710e0->0x71100, bars black in "));
+  assert(fit_bars_black(a,fitTail[0]) && a[31*4352]==0x5a && a[2368*4352+4316]==0x5a); // image rows untouched
+  if(m) assert(fit_bars_black(fitB,fitTail[1]) && !memcmp(fitB,a,4320u*2400)); // B is A's copy, bars included
+  else assert(fitTail[1][0]==0x77);
+  if(m==2) assert(fit_bars_black(fitC,fitTail[2]) && !memcmp(fitC,a,4320u*2400));
+  else assert(fitTail[2][0]==0x77);
+  // Flips and further grants never write the stride again; STARTs keep the SRC0/FLUSH/START order the model asserts.
+  assert(fuxi_gpu_scanout_publish()==1 && starts==1);
+  ctl[0x1c/4]=0;intf[0x298/4]+=1u<<16;assert(fuxi_gpu_scanout_acquire()==1 && fuxi_gpu_scanout_publish()==1 && starts==2);
+  assert(stride_writes()==1 && sspp[0x24/4]==(4352u|(7u<<16)));
+  assert(fg_scanout_stop("fit test")==-1 && sspp[0x24/4]==(4352u|(7u<<16)) && fuxi_gpu_scanout_fit_pitch()==4352);
+ }
+ // A missing tail window (or B's) stops scanout before the stride changes.
+ for(unsigned f=1;f<=2;f++) {
+  fit_owned(a,1);failTail=f;
+  assert(fuxi_gpu_scanout_acquire()==-1 && !fg_fit_active && !stride_writes() && sspp[0x24/4]==(0x10e0u|(7u<<16)) && !starts);
+ }
+ // Oracle: the reference image passes with max_err 0; an image error is measured, never fails; a non-black bar pixel fails.
+ fit_owned(a,0);assert(fuxi_gpu_scanout_acquire()==1);
+ for(unsigned i=0;i<4608u*2436/4;i++)((uint32_t *)src)[i]=i*0x9e3779b1u;
+ fg_scanout_checks=4;fg_scanout_checked=0;fg_scanout_source=(uintptr_t)src;fg_scanout_pitch=4608;
+ fg_scanout_sx=fg_scanout_sy=fg_scanout_dx=fg_scanout_dy=0;fg_scanout_w=1125;fg_scanout_h=2436;
+ for(unsigned y=0;y<2338;y++) {
+  double v=(y+0.5)*2436.0/2338.0-0.5;unsigned y0=(unsigned)v,fy=(unsigned)((v-y0)*256),y1=y0+1<2436?y0+1:y0;
+  for(unsigned x=0;x<1080;x++) {
+   double u=(x+0.5)*1125.0/1080.0-0.5;unsigned x0=(unsigned)u,fx=(unsigned)((u-x0)*256),x1=x0+1<1125?x0+1:x0;
+   for(unsigned c=0;c<4;c++)
+    a[(31+y)*4352+x*4+c]=(uint8_t)(((256-fx)*(256-fy)*src[y0*4608+x0*4+c]+fx*(256-fy)*src[y0*4608+x1*4+c]+
+     (256-fx)*fy*src[y1*4608+x0*4+c]+fx*fy*src[y1*4608+x1*4+c]+32768)>>16);
+  }
+ }
+ assert(fg_scanout_verify() && strstr(fitLog,"fit pixel frame=1 buffer=0 pixels=2525040 bars_nonblack=0 max_err=0 over2=0 "));
+ a[(31+5)*4352+7*4+1]+=9;assert(fg_scanout_verify() && strstr(fitLog,"bars_nonblack=0 max_err=9 over2=1 first=7,5 "));
+ a[2370*4352+4]=1;assert(!fg_scanout_verify() && strstr(fitLog,"bars_nonblack=1 "));a[2370*4352+4]=0; // bottom bar, below the tail
+ memset(&fitTail[0][0x10f04],0,4); // row 2399 x=1: a display-off zero is black (any alpha); the tail is checked too
+ fitTail[0][0x10f00]=1; /* row 2399 x=0 */assert(!fg_scanout_verify() && fg_scanout_checked==4 && strstr(fitLog,"bars_nonblack=1 "));
+ assert(fg_scanout_verify()); // only the first four frames
+
+ // sweetfbfit=2: no bars (the buffers keep their bytes), the same stride switch, once; the windows are still checked.
+ for(unsigned m=0;m<3;m++) {
+  fit_owned_mode(a,m,2);
+  assert(fuxi_gpu_scanout_acquire()==1 && fuxi_gpu_scanout_fit_pitch()==4352 && fg_fit_active && !starts);
+  assert(sspp[0x24/4]==(4352u|(7u<<16)) && (ctl[0x18/4]&0x41)==0x41 && stride_writes()==1);
+  assert(strstr(fitLog,"fit layout pitch=4352 ystride0=0x710e0->0x71100, stretch (no bars) in "));
+  assert(a[0]==0x5a && a[2370*4352]==0x5a && fitTail[0][0]==0x77 && fitTail[0][0x11ffc]==0x77);
+  if(m) assert(!memcmp(fitB,a,4320u*2400) && fitTail[1][0]==0x77);
+  { uint64_t split=0,bytes=0;uintptr_t tail=fuxi_gpu_scanout_fit_tail(&split,&bytes);assert(tail==(uintptr_t)fitTail[0] && split==0x9e4000 && bytes==0x14000); }
+ }
+ fit_owned_mode(a,1,2);failTail=2;assert(fuxi_gpu_scanout_acquire()==-1 && !fg_fit_active && !stride_writes()); // B's tail missing
+ // A CPU frame after a GPU frame in B: the drain copies B's whole 4352-pitch image into A, its tail window included.
+ fit_owned_mode(a,1,2);assert(fuxi_gpu_scanout_acquire()==1 && fg_scanout_copy==1 && fuxi_gpu_scanout_publish()==1 && fg_scanout_front==1);
+ memset(fitB,0x3c,sizeof(fitB));memset(fitTail[1],0x3d,sizeof(fitTail[1]));memset(a,0x11,0x9e4000);memset(fitTail[0],0x12,sizeof(fitTail[0]));
+ ctl[0x1c/4]=0;intf[0x298/4]+=1u<<16;
+ assert(fuxi_gpu_scanout_cpu_acquire()==1 && !fg_scanout_double_active);
+ for(unsigned i=0;i<0x9e4000;i+=997)assert(a[i]==0x3c);
+ assert(a[0x9e4000-1]==0x3c && fitTail[0][0]==0x3d && fitTail[0][0x12000-1]==0x3d && fitTail[0][0x12000]==0x12); // 2400 rows, no more
+ // Mode 1's drain leaves A's tail (its black bar) alone.
+ fit_owned_mode(a,1,1);assert(fuxi_gpu_scanout_acquire()==1 && fuxi_gpu_scanout_publish()==1);
+ memset(fitTail[0],0x12,sizeof(fitTail[0]));ctl[0x1c/4]=0;intf[0x298/4]+=1u<<16;
+ assert(fuxi_gpu_scanout_cpu_acquire()==1 && fitTail[0][0]==0x12);
+ // Oracle, mode 2: the reference stretch (2400 rows from y=0, the last ones through the tail window) passes with max_err 0, no bars.
+ fit_owned_mode(a,0,2);assert(fuxi_gpu_scanout_acquire()==1);
+ fg_scanout_checks=4;fg_scanout_checked=0;fg_scanout_source=(uintptr_t)src;fg_scanout_pitch=4608;
+ fg_scanout_sx=fg_scanout_sy=fg_scanout_dx=fg_scanout_dy=0;fg_scanout_w=1125;fg_scanout_h=2436;
+ for(unsigned y=0;y<2400;y++) {
+  double v=(y+0.5)*2436.0/2400.0-0.5;unsigned y0=(unsigned)v,fy=(unsigned)((v-y0)*256),y1=y0+1<2436?y0+1:y0;
+  for(unsigned x=0;x<1080;x++) {
+   double u=(x+0.5)*1125.0/1080.0-0.5;unsigned x0=(unsigned)u,fx=(unsigned)((u-x0)*256),x1=x0+1<1125?x0+1:x0;
+   for(unsigned c=0;c<4;c++) {
+    unsigned o=y*4352+x*4+c;
+    uint8_t v8=(uint8_t)(((256-fx)*(256-fy)*src[y0*4608+x0*4+c]+fx*(256-fy)*src[y0*4608+x1*4+c]+
+     (256-fx)*fy*src[y1*4608+x0*4+c]+fx*fy*src[y1*4608+x1*4+c]+32768)>>16);
+    if(o<0x9e4000u)a[o]=v8;else fitTail[0][o-0x9e4000u]=v8;
+   }
+  }
+ }
+ assert(fg_scanout_verify() && strstr(fitLog,"fit pixel frame=1 buffer=0 pixels=2592000 bars_nonblack=0 max_err=0 over2=0 "));
+ fitTail[0][(2399*4352-0x9e4000)+5*4+2]+=7;assert(fg_scanout_verify() && strstr(fitLog,"bars_nonblack=0 max_err=7 over2=1 first=5,2399 "));
+ a[0]^=0xff;assert(fg_scanout_verify() && strstr(fitLog,"bars_nonblack=0 ")); // row 0 is image in mode 2: measured, never a bar
+
+ // Corner mask: the kernel's integer table equals a floating-point reference of the same rule for both modes (iPhone X 39 pt = 117 px,
+ // scaled; a pixel is black when its centre lies outside the quarter ellipse); its log line; the oracle checks the mask.
+ for(unsigned mode=1;mode<=2;mode++) {
+  reset();fuxi_gpu_scanout_configure((uintptr_t)a,1,0);assert(fuxi_gpu_scanout_fit(mode,1)==1);
+  unsigned H=mode==2?2400:2338,rows=0,runs=0,area=0;double rx=117*1080/1125.0,ry=117.0*H/2436;
+  const uint8_t *s=fuxi_gpu_scanout_fit_corner(&rows);assert(s==fg_fit_span && rows==(mode==2?104u:102u));
+  for(unsigned j=0;j<128;j++) {
+   double v=ry-(j+0.5);unsigned b=0;
+   if(v>0)while(rx-(b+0.5)>0 && ((rx-(b+0.5))/rx)*((rx-(b+0.5))/rx)+(v/ry)*(v/ry)>1)b++;
+   assert(fg_fit_span[j]==b && (j<rows || !b));area+=b;
+   if(j<rows)runs+=!j || s[j]!=s[j-1];
+   if(b && j<rows-1)assert(s[j]>=s[j+1]); // a staircase
+  }
+  assert(runs==fg_fit_runs && runs==(mode==2?66u:65u) && area==(mode==2?2772u:2707u) && fg_fit_mask_words==19+runs*28);
+  char want[200];snprintf(want,sizeof want,"fit corner mask 117 px (39 pt) -> 112.32 x %s px circular arc, %u rows, %u runs, %u fills and %u ring words per copy",
+      mode==2?"115.27":"112.29",rows,runs,runs*4,fg_fit_mask_words);
+  assert(strstr(fitLog,want));
+  // A pixel 1 px outside the arc on the 45-degree line is black, 1 px inside is not.
+  double d=1-0.70710678118654752; /* 1 - cos 45 */unsigned i=(unsigned)(rx*d),j=(unsigned)(ry*d);assert(i>=1 && j>=1 && s[j-1]>i-1 && s[j+1]<=i+1);
+ }
+ // Oracle with the mask (mode 1): the reference image with black corners passes; a non-black pixel outside the arc fails like a bar;
+ // a pixel just inside is measured only. Mask off: the line keeps its old form (no corners field).
+ fitCorner=1;fit_owned_mode(a,0,1);assert(fuxi_gpu_scanout_acquire()==1);fitCorner=0;
+ fg_scanout_checks=4;fg_scanout_checked=0;fg_scanout_source=(uintptr_t)src;fg_scanout_pitch=4608;
+ fg_scanout_sx=fg_scanout_sy=fg_scanout_dx=fg_scanout_dy=0;fg_scanout_w=1125;fg_scanout_h=2436;
+ for(unsigned y=0;y<2338;y++) {
+  double v=(y+0.5)*2436.0/2338.0-0.5;unsigned y0=(unsigned)v,fy=(unsigned)((v-y0)*256),y1=y0+1<2436?y0+1:y0;
+  unsigned e=y<fg_fit_spans?y:2337-y<fg_fit_spans?2337-y:~0u,cb=e!=~0u?fg_fit_span[e]:0;
+  for(unsigned x=0;x<1080;x++) {
+   if(x<cb || x>=1080-cb){uint32_t k=0xff000000u;memcpy(a+(31+y)*4352+x*4,&k,4);continue;}
+   double u=(x+0.5)*1125.0/1080.0-0.5;unsigned x0=(unsigned)u,fx=(unsigned)((u-x0)*256),x1=x0+1<1125?x0+1:x0;
+   for(unsigned c=0;c<4;c++)
+    a[(31+y)*4352+x*4+c]=(uint8_t)(((256-fx)*(256-fy)*src[y0*4608+x0*4+c]+fx*(256-fy)*src[y0*4608+x1*4+c]+
+     (256-fx)*fy*src[y1*4608+x0*4+c]+fx*fy*src[y1*4608+x1*4+c]+32768)>>16);
+  }
+ }
+ assert(fg_scanout_verify() && strstr(fitLog,"fit pixel frame=1 buffer=0 pixels=2525040 bars_nonblack=0 corners_nonblack=0 max_err=0 over2=0 "));
+ unsigned cb0=fg_fit_span[0];a[(31+0)*4352+(cb0-1)*4]=9;          // the last black pixel of the first image row
+ assert(!fg_scanout_verify() && strstr(fitLog,"bars_nonblack=0 corners_nonblack=1 "));a[(31+0)*4352+(cb0-1)*4]=0;
+ a[(31+0)*4352+cb0*4]^=0x40;                                          // the first image pixel after it: measured, not a failure
+ assert(fg_scanout_verify() && strstr(fitLog,"corners_nonblack=0 max_err=64 over2=1 first="));
+ free(a);free(src);reset();
+ puts("PASS: sweetfbfit corner mask table (integer = float reference, 65/66 runs), log, oracle with mask; modes 1 and 2 scanout: mode 2 without bars, drain of its tail; refused without the lane or with direct scanout; bars black in A/B/C incl. tails, then YSTRIDE0 4352 + flush once before START; kept through flips and stop; window failure stops first; fit oracle");
+}
 int main(void) {
  te_estimator_tests();
  reset();assert(fuxi_gpu_scanout_acquire()==1 && fuxi_gpu_scanout_publish()==0);
@@ -1510,6 +1685,7 @@ int main(void) {
  mid_tests(panel);
  ar_tests(panel);
  hard_tests(panel);
+ fit_tests();
  free(source);free(panel);
  puts("PASS: actual scanout gate, delayed transfer/fence/START ordering, busy reservation, timeout/MMIO/AR fail-close, TE gate/stall fallback/window summary, full crop/alpha/tail pixel oracle");
 }
@@ -1983,7 +2159,8 @@ static int IOLog(const char *format,...) {va_list args;va_start(args,format);vsn
         methods = ''.join(display.function(source, n) for n in (
             'sweet_fb_swap_bin', 'sweet_fb_te_configure', 'AppleCLCD::teVsyncTick', 'AppleCLCD::teVsyncLog',
             'AppleCLCD::presentWantedLocked', 'AppleCLCD::wakePresentLocked', 'sweet_fb_rearm',
-            'AppleCLCD::vsyncFired', 'AppleCLCD::scanoutLog', 'get32', 'AppleCLCD::observeRecord', 'AppleCLCD::recordDone', 'AppleCLCD::consumeRecord', 'AppleCLCD::retireEarly', 'AppleCLCD::releaseRecord',
+            'AppleCLCD::vsyncFired', 'AppleCLCD::scanoutLog', 'get32', 'sweet_fb_fit_col', 'sweet_fb_fit_row', 'sweet_fb_fit_copy',
+            'sweet_fb_fit_corners', 'sweet_fb_fit_bars', 'AppleCLCD::observeRecord', 'AppleCLCD::recordDone', 'AppleCLCD::consumeRecord', 'AppleCLCD::retireEarly', 'AppleCLCD::releaseRecord',
             'AppleCLCD::swapWait', 'AppleCLCD::stopRecords',
             'AppleCLCD::writerRetired', 'AppleCLCD::writerWake', 'AppleCLCD::writerWakeAction',
             'AppleCLCD::presentStep', 'AppleCLCD::fifoDrop', 'AppleCLCD::stageStats', 'AppleCLCD::completePresent', 'AppleCLCD::presentStats', 'AppleCLCD::presentNext', 'AppleCLCD::swap', 'AppleCLCD::present'))

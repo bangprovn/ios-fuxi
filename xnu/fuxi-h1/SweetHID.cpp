@@ -374,6 +374,20 @@ OSDefineMetaClassAndStructors(SweetHIDButtons, IOHIDEventService);
  * app-switcher gesture.
  */
 #define SWEET_TOUCH_EDGE_PX 48
+/*
+ * sweetfbfit: SweetFramebuffer sets sweet_fb_fit when it shows the whole
+ * 1125x2436 frame scaled into 1080x2338 at panel y=31 (FUXI_FIT_* in
+ * fuxi_adreno.h). A panel pixel then maps to x/1080 and (y-31)/2338 of the
+ * frame, i.e. iOS pixels x/0.96 and (y-31)*2436/2338; touches in the black
+ * bars clamp to the frame's first or last row, and edges count from the
+ * frame's top and bottom (the bars included). sweetfbfit=2 (sweet_fb_fit
+ * 2) stretches the frame over the whole panel: x/1080 and y/2400, i.e.
+ * iOS pixels x/0.96 and y*2436/2400, edges as the panel's.
+ */
+#define SWEET_FIT_W 1080
+#define SWEET_FIT_H 2338
+#define SWEET_FIT_Y 31
+extern "C" int sweet_fb_fit; /* 0 crop, 1 scaled with bars, 2 stretched */
 class SweetHIDTouch : public IOHIDEventService {
 	OSDeclareDefaultStructors(SweetHIDTouch);
 public:
@@ -526,9 +540,12 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
 
 	IOLockLock(fLock);
 	bool was = fDown[finger];
-	/* Panel pixels -> the presented 1125x2436 display (SweetFramebuffer.cpp). */
-	IOFixed nx = (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
-	IOFixed ny = (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
+	/* Panel pixels -> the presented 1125x2436 display (SweetFramebuffer.cpp), with sweetfbfit through its scale (and bars). */
+	int fit = sweet_fb_fit;
+	int top = fit == 1 ? SWEET_FIT_Y : 0, bottom = fit == 1 ? SWEET_FIT_Y + SWEET_FIT_H - 1 : 2399;
+	int fy = y < top ? top : (y > bottom ? bottom : y);
+	IOFixed nx = fit ? (IOFixed)(((int64_t)x << 16) / SWEET_FIT_W) : (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
+	IOFixed ny = fit ? (IOFixed)(((int64_t)(fy - top) << 16) / (bottom - top + 1)) : (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
 	bool moved = down && (nx != fX[finger] || ny != fY[finger]);
 	if (was == down && !moved) {
 		IOLockUnlock(fLock);
@@ -536,7 +553,7 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
 	}
 	if (!was && down) {
 		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > 1079 - SWEET_TOUCH_EDGE_PX ||
-		    y < SWEET_TOUCH_EDGE_PX || y > 2399 - SWEET_TOUCH_EDGE_PX;
+		    y < top + SWEET_TOUCH_EDGE_PX || y > bottom - SWEET_TOUCH_EDGE_PX;
 	}
 
 	collection = IOHIDEvent::digitizerEvent(now, 0, kIOHIDDigitizerTransducerTypeHand, false, 0, 0, 0);
@@ -622,18 +639,22 @@ SweetHIDTouch::report(UInt32 mask, const int *x, const int *y)
 	uint64_t now = mach_absolute_time();
 
 	IOLockLock(fLock);
+	/* As touch(): sweetfbfit maps through the scale (and bars). */
+	int fit = sweet_fb_fit;
+	int top = fit == 1 ? SWEET_FIT_Y : 0, bottom = fit == 1 ? SWEET_FIT_Y + SWEET_FIT_H - 1 : 2399;
 	for (int i = 0; i < SWEET_TOUCH_FINGERS; i++) {
 		UInt32 bit = 1u << i;
 		bool down = (mask & bit) != 0;
 		int px = x[i] < 0 ? 0 : (x[i] > 1079 ? 1079 : x[i]);
 		int py = y[i] < 0 ? 0 : (y[i] > 2399 ? 2399 : y[i]);
+		int fy = py < top ? top : (py > bottom ? bottom : py);
 		old |= fDown[i] ? bit : 0;
 		/* A lift keeps the last reported position, not the leave payload. */
-		nx[i] = down ? (IOFixed)(((int64_t)(px + fOffX) << 16) / fLogicalW) : fX[i];
-		ny[i] = down ? (IOFixed)(((int64_t)(py + fOffY) << 16) / fLogicalH) : fY[i];
+		nx[i] = !down ? fX[i] : fit ? (IOFixed)(((int64_t)px << 16) / SWEET_FIT_W) : (IOFixed)(((int64_t)(px + fOffX) << 16) / fLogicalW);
+		ny[i] = !down ? fY[i] : fit ? (IOFixed)(((int64_t)(fy - top) << 16) / (bottom - top + 1)) : (IOFixed)(((int64_t)(py + fOffY) << 16) / fLogicalH);
 		edge[i] = !fDown[i] && down ?
 		    px < SWEET_TOUCH_EDGE_PX || px > 1079 - SWEET_TOUCH_EDGE_PX ||
-		    py < SWEET_TOUCH_EDGE_PX || py > 2399 - SWEET_TOUCH_EDGE_PX : fEdge[i];
+		    py < top + SWEET_TOUCH_EDGE_PX || py > bottom - SWEET_TOUCH_EDGE_PX : fEdge[i];
 		if (fDown[i] != down || (down && (nx[i] != fX[i] || ny[i] != fY[i]))) {
 			changed |= bit;
 		}

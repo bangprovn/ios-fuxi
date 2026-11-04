@@ -33,6 +33,9 @@ PREFIX = r'''
 #define FG_ABI_WAKE() ((void)0)
 static unsigned fg_abi_present_wait, fg_client_busy, fg_scanout_owned, fg_scanout_writable, fg_scanout_requested, fg_scanout_preclean;
 static unsigned fg_scanout_double_active,fg_scanout_front,fg_scanout_back_ready,fg_scanout_ready_drops,fg_scanout_triple_requested,fg_scanout_double_requested,fg_scanout_ready,fg_scanout_copy;
+static unsigned fg_scanout_fifo_q,fg_scanout_fifo_buf; /* fuxiearly bit 4 (fuxi_gpu_scanout.inc): off here */
+static unsigned fg_fit_requested,fg_fit_active; /* sweetfbfit (fuxi_adreno.c / fuxi_gpu_scanout.inc) */
+static uint8_t fg_fit_span[128]; static unsigned fg_fit_spans,fg_fit_runs,fg_fit_mask_words; /* corner mask table (fuxi_gpu_scanout_fit) */
 static uintptr_t fg_scanout_source;
 static unsigned fg_scanout_pitch,fg_scanout_sx,fg_scanout_sy,fg_scanout_dx,fg_scanout_dy,fg_scanout_w,fg_scanout_h;
 static unsigned scanoutStops,verifyBad,dcvsKicks;
@@ -71,6 +74,7 @@ static uint64_t fg_generation[4], model_l2[512];
 #define FG_INL_SRC_VA 0x90000000u
 #define FG_CP_STAMP 192u
 static uint32_t fg_cp_submit_lo, fg_cp_n, fg_cp_bad, fg_cp_pitch, fg_cp_rects; static uint64_t fg_cp_sum[4], fg_cp_max[4];
+static unsigned fg_cp_masked; static uint64_t fg_cp_mask_sum, fg_cp_mask_max;
 static struct { uint32_t s2s_us, blit_us, ahead, buffer, te, xfer_us, parked; } fg_copy_log; static unsigned inflight_model, cf_logs;
 static unsigned fg_abi_inflight(void) { return inflight_model; } static void fg_cf_log(void) { cf_logs++; }
 enum { FG_PK_COPY, FG_PK_IDLE, FG_PK_CAP, FG_PK_SUBMIT, FG_PK_NOTDUE, FG_PK_OTHER, FG_PK_REASONS };
@@ -112,7 +116,8 @@ static uint64_t clean_bytes;
 static unsigned gbif, reset_held, faulted_sids;
 static uint8_t *source_buf, *panel;
 static unsigned expected_pages[4096], paddr_missing;
-static unsigned pdst[2400*1080], pdata[2400*1080];
+#define PENDING_MAX (2400*1080+32768) /* a whole panel plus the sweetfbfit corner fills */
+static unsigned pdst[PENDING_MAX], pdata[PENDING_MAX];
 static unsigned fg_access(uint64_t pa, uint64_t *v, unsigned wr, unsigned wide)
 {
  assert(!wide);
@@ -140,10 +145,10 @@ static void CleanPoC_DcacheRegion_Force(uint64_t va,uint64_t n)
  cache_clean=1; clean_bytes+=n;
 }
 static int g4_tlb(uint32_t *d) { (void)d; return ++tlbs==fail_tlb ? 0xe03 : 0; }
-static uint32_t model_stamp[3], stamp_clock=1000;
+static uint32_t model_stamp[4], stamp_clock=1000;
 static unsigned g3_gr(unsigned reg) { return reg==0x806 ? rptr : reg==0x807 ? wptr : reg==0x210 && mode==6 ? 2 : reg==0x980 ? stamp_clock : 0; }
-static unsigned g3_read(uint64_t pa) { if(pa>=G3_FENCE_PA+192 && pa<=G3_FENCE_PA+208) return model_stamp[(pa-G3_FENCE_PA-192)/8]; assert(pa==G3_FENCE_PA+64); return mode==8 && ticks<completion ? 0 : fence; }
-static void g_wr(uint64_t base, uint32_t off, uint32_t v) { assert(base==G3_FENCE_PA && off>=192 && off<=208 && !v); model_stamp[(off-192)/8]=0; }
+static unsigned g3_read(uint64_t pa) { if(pa>=G3_FENCE_PA+192 && pa<=G3_FENCE_PA+216) return model_stamp[(pa-G3_FENCE_PA-192)/8]; assert(pa==G3_FENCE_PA+64); return mode==8 && ticks<completion ? 0 : fence; }
+static void g_wr(uint64_t base, uint32_t off, uint32_t v) { assert(base==G3_FENCE_PA && off>=192 && off<=216 && !v); model_stamp[(off-192)/8]=0; }
 #define GPU_GMU_CORE 0x03d6a000ULL
 #define FG_GMU_AHB_FENCE_STATUS (GPU_GMU_CORE+0x9313*4)
 #define FG_GMU_AHB_FENCE_CLR (GPU_GMU_CORE+0x9314*4)
@@ -192,6 +197,56 @@ static uint32_t translated_pixel(unsigned va)
  assert(off<FG_SOURCE_BYTES);
  uint32_t got; memcpy(&got,source_buf+off,4); return got;
 }
+/* A scaled 2D blit (SP_PS_2D_SRC_INFO.FILTER set), modelled on Mesa's r2d semantics, not measured on the hardware: inclusive source
+ * rect in 24.8 (whole pixels here) and destination rect, scale = their extents' ratio, bilinear with 8-bit weights sampling at
+ * (d+0.5)*S/D-0.5, edges clamped to SP_PS_2D_SRC_SIZE. Every input comes from the registers the driver wrote. */
+static unsigned scaled_blits;
+static uint8_t *fitpanel; /* 3 x 10 MiB: every byte the GPU may map for a buffer */
+static void scaled_blit(const uint32_t *regs)
+{
+ assert(!((regs[0x8401]|regs[0x8402]|regs[0x8403]|regs[0x8404])&255));
+ unsigned sx0=regs[0x8401]>>8, sx1=regs[0x8402]>>8, sy0=regs[0x8403]>>8, sy1=regs[0x8404]>>8;
+ unsigned dx0=regs[0x8405]&0x3fff, dy0=regs[0x8405]>>16, dx1=regs[0x8406]&0x3fff, dy1=regs[0x8406]>>16;
+ unsigned sw=sx1-sx0+1, sh=sy1-sy0+1, dw=dx1-dx0+1, dh=dy1-dy0+1, iw=regs[0xb2c1]&0x7fff, ih=(regs[0xb2c1]>>15)&0x7fff;
+ unsigned sp=(regs[0xb2c4]>>9)*64, dp=regs[0x8c1a]*64;
+ assert(sx1>=sx0 && sy1>=sy0 && dx1>=dx0 && dy1>=dy0 && sw>=dw && sh>=dh && sx1<iw && sy1<ih);
+ assert(!((regs[0xb2c2]|regs[0x8c18])&63) && sp>=iw*4 && dp>=(dx1+1)*4);
+ for(unsigned y=0;y<dh;y++) {
+  unsigned ny=(unsigned)(((uint64_t)(2*y+1)*sh-dh)*256/(2*dh)), fy=ny&255, y0=sy0+(ny>>8), y1=y0+1<ih?y0+1:y0;
+  for(unsigned x=0;x<dw;x++) {
+   unsigned nx=(unsigned)(((uint64_t)(2*x+1)*sw-dw)*256/(2*dw)), fx=nx&255, x0=sx0+(nx>>8), x1=x0+1<iw?x0+1:x0;
+   uint32_t p[4]={translated_pixel(regs[0xb2c2]+y0*sp+x0*4),translated_pixel(regs[0xb2c2]+y0*sp+x1*4),
+                  translated_pixel(regs[0xb2c2]+y1*sp+x0*4),translated_pixel(regs[0xb2c2]+y1*sp+x1*4)},v=0;
+   for(unsigned c=0;c<32;c+=8)
+    v|=(((256-fx)*(256-fy)*((p[0]>>c)&255)+fx*(256-fy)*((p[1]>>c)&255)+(256-fx)*fy*((p[2]>>c)&255)+fx*fy*((p[3]>>c)&255)+32768)>>16)<<c;
+   unsigned dst=regs[0x8c18]+(dy0+y)*dp+(dx0+x)*4-(regs[0x8c18]>=FG_INL_FB_VA ? FG_INL_FB_VA : G4_FB_VA);
+   unsigned buffer=dst/0xa00000u;
+   dst-=buffer*0xa00000u;
+   assert(buffer<3 && (!fg_scanout_triple_requested || !fg_scanout_back_ready || buffer!=fg_scanout_ready));
+   /* inside the buffer's GPU mapping: 0x9e4000, or every 4352-pitch row in mode 2 (else an SMMU fault) */
+   assert(dst+4<=(fg_fit_requested==FUXI_FIT_STRETCH ? FUXI_FIT_STRETCH_MAP : 0x9e4000u));
+   assert((!fg_scanout_double_active || buffer!=fg_scanout_front) && pending<PENDING_MAX);
+   pdst[pending]=0x80000000u|(dst+buffer*0xa00000u); pdata[pending++]=v;
+  }
+ }
+ scaled_blits++;
+}
+static unsigned solid_fills;
+static void solid_fill(const uint32_t *regs)
+{
+ assert(regs[0x8400]==0x10f03080 && regs[0x8c00]==0x10f03080 && regs[0x8c17]==0x430);
+ unsigned dx0=regs[0x8405]&0x3fff, dy0=regs[0x8405]>>16, dx1=regs[0x8406]&0x3fff, dy1=regs[0x8406]>>16, dp=regs[0x8c1a]*64;
+ uint32_t v=(regs[0x8c2e]&255)|(regs[0x8c2d]&255)<<8|(regs[0x8c2c]&255)<<16|(regs[0x8c2f]&255)<<24; /* BGRA in memory */
+ assert(dx1>=dx0 && dy1>=dy0 && dx1<1080 && dy1<2400 && !(regs[0x8c18]&63) && dp==4352);
+ for(unsigned y=dy0;y<=dy1;y++) for(unsigned x=dx0;x<=dx1;x++) {
+  unsigned dst=regs[0x8c18]+y*dp+x*4-(regs[0x8c18]>=FG_INL_FB_VA ? FG_INL_FB_VA : G4_FB_VA), buffer=dst/0xa00000u;
+  dst-=buffer*0xa00000u;
+  assert(buffer<3 && (!fg_scanout_double_active || buffer!=fg_scanout_front) && (!fg_scanout_triple_requested || !fg_scanout_back_ready || buffer!=fg_scanout_ready));
+  assert(dst+4<=(fg_fit_requested==FUXI_FIT_STRETCH ? FUXI_FIT_STRETCH_MAP : 0x9e4000u) && pending<PENDING_MAX);
+  pdst[pending]=0x80000000u|(dst+buffer*0xa00000u); pdata[pending++]=v;
+ }
+ solid_fills++;
+}
 static int g3_gw(unsigned reg,unsigned value)
 {
  assert(reg==0x807 && value<8192 && cache_clean);
@@ -202,7 +257,7 @@ static int g3_gw(unsigned reg,unsigned value)
  unsigned total=(value-rptr)&8191;
  if(value<rptr) wrap_count++;
  if(total>maxwords) maxwords=total;
- assert(total && total<16*32+128);
+ assert(total && total<16*32+128+fg_fit_mask_words);
  uint32_t regs[0xc000]={0};
  unsigned pos=rptr, left=total, br=0, blits=0, fences=0;
  while(left) {
@@ -218,6 +273,11 @@ static int g3_gw(unsigned reg,unsigned value)
    for(unsigned i=0;i<n;i++) a[i]=ring[pos++&8191];
    left-=n;
    if(op==0x17) { assert(n==1 && a[0]==((1u<<27)|1)); br=1; }
+   else if(op==0x2c && regs[G4_RB_BLIT]==0x10f03080) { assert(br && n==1 && a[0]==3); solid_fill(regs); blits++; }
+   else if(op==0x2c && regs[G4_SP_SRC_INFO]==0x510430) {
+    assert(br && n==1 && a[0]==3 && regs[G4_RB_BLIT]==0x10f03000 && regs[G4_GRAS_BLIT]==0x10f03000);
+    scaled_blit(regs); blits++;
+   }
    else if(op==0x2c) {
     assert(br && n==1 && a[0]==3 && regs[G4_SP_SRC_INFO]==0x500430);
     assert(regs[G4_RB_BLIT]==0x10f03000 && regs[G4_GRAS_BLIT]==0x10f03000);
@@ -241,16 +301,16 @@ static int g3_gw(unsigned reg,unsigned value)
     }
     blits++;
    } else if(op==0x46 && n==1 && a[0]==26) {
-    for(unsigned i=0;i<pending;i++) memcpy(panel+pdst[i],&pdata[i],4);
+    for(unsigned i=0;i<pending;i++) memcpy(pdst[i]&0x80000000u ? fitpanel+(pdst[i]&0x7fffffffu) : panel+pdst[i],&pdata[i],4);
     pending=0;
    } else if(op==0x46 && n==4) {
     assert(!pending && a[0]==(49u|1u<<27) && a[1]==G3_FENCE_VA+64 && !a[2]);
     fence=a[3]; fences++;
-   } else if(op==0x3e) { assert(n==3 && a[0]==(0x980|(2u<<18)|(1u<<30)) && a[1]>=G3_FENCE_VA+192 && a[1]<=G3_FENCE_VA+208 && !a[2]); model_stamp[(a[1]-G3_FENCE_VA-192)/8]=(stamp_clock+=100);
+   } else if(op==0x3e) { assert(n==3 && a[0]==(0x980|(2u<<18)|(1u<<30)) && a[1]>=G3_FENCE_VA+192 && a[1]<=G3_FENCE_VA+216 && !a[2]); model_stamp[(a[1]-G3_FENCE_VA-192)/8]=(stamp_clock+=100);
    } else assert((op==0x26 && n==0) || (op==0x65 && n==1 && a[0]==12) || (op==0x46 && n==1));
   }
  }
- assert(blits && blits<=16 && fences==1);
+ assert(blits && blits<=16+fg_fit_runs*4 && fences==1);
  rptr=wptr=value;
  return 1;
 }
@@ -258,6 +318,7 @@ static void reset(void)
 {
  fg_scanout_owned=fg_scanout_writable=fg_scanout_requested=scanoutStops=verifyBad=0;
  fg_scanout_triple_requested=fg_scanout_ready=fg_scanout_copy=0;
+ fg_fit_requested=fg_fit_active=scaled_blits=solid_fills=0;fg_fit_spans=fg_fit_runs=fg_fit_mask_words=0;memset(fg_fit_span,0,sizeof fg_fit_span);
  fg_scanout_double_active=fg_scanout_front=fg_scanout_back_ready=fg_scanout_ready_drops=0;
  fg_faults=fg_suspends=fg_reset_held=0;
  fg_state=1; fg_force=fg_seq=fg_access_failed=mode=fail_tlb=tlbs=isolated=doorbells=0;
@@ -453,6 +514,110 @@ int main(void)
  assert(!fuxi_gpu_copy(0,1,(uintptr_t)source_buf,4544u*100,4544,22,18,0,0,17,3,&times));
  assert(doorbells==before && fg_scanout_ready_drops==drops && fg_scanout_back_ready);
  puts("PASS: actual PM4 double/triple targets, full crops from damage, front/ready exclusion, submit preserves triple ready, incomplete-source refusal");
+ /* sweetfbfit: the whole 1125x2436 frame (origin 3,2 in a stride-4608 surface whose base is 20 bytes past a 64-byte line) becomes ONE
+  * bilinear blit into 1080x2338 at y=31 of the target, pitch 4352. Expected pixels come from the constants, the model's from the
+  * registers. The bars, the rows past the image and the front/ready buffers keep the 0x6b fill. */
+ {
+  const unsigned P=4608, OX=3, OY=2, OFF=20, LEN=(OY+2436)*P;
+  fitpanel=malloc(3*0xa00000u);assert(fitpanel);
+  for(unsigned mode=1;mode<=2;mode++)
+  for(unsigned m=0;m<3;m++) {
+   const unsigned TOP=mode==2?0:31, H=mode==2?2400:2338;
+   reset();fg_fit_requested=mode;fg_fit_active=1;fg_scanout_owned=fg_scanout_requested=fg_scanout_writable=1;memset(fitpanel,0x6b,3*0xa00000u);
+   fg_scanout_double_active=m>0;fg_scanout_triple_requested=m==2;fg_scanout_front=0;fg_scanout_back_ready=m==2;fg_scanout_ready=1;
+   assert(fuxi_gpu_map(0,1,(uintptr_t)source_buf+OFF,LEN,&times));
+   unsigned rung=doorbells;
+   assert(model_copy(0,1,(uintptr_t)source_buf+OFF,LEN,P,OX,OY,0,0,1125,2436,&times)==1);
+   assert(doorbells==rung+1 && scaled_blits==1 && fg_cp_rects==1 && fg_cp_pitch==P);
+   assert(fg_scanout_sx==OX && fg_scanout_sy==OY && fg_scanout_w==1125 && fg_scanout_h==2436 && !fg_scanout_dx && !fg_scanout_dy);
+   unsigned target=m==0?0:m==1?1:2;
+   uint8_t *t=fitpanel+target*0xa00000u;
+   for(unsigned y=0;y<H;y++) {
+    unsigned ny=(unsigned)(((uint64_t)(2*y+1)*2436-H)*256/(2*H)), fy=ny&255, y0=ny>>8, y1=y0+1<2436?y0+1:y0;
+    for(unsigned x=0;x<1080;x++) {
+     unsigned nx=(unsigned)(((uint64_t)(2*x+1)*1125-1080)*256/2160), fx=nx&255, x0=nx>>8, x1=x0+1<1125?x0+1:x0;
+     const uint8_t *r0=source_buf+OFF+(OY+y0)*P+OX*4, *r1=source_buf+OFF+(OY+y1)*P+OX*4;
+     for(unsigned c=0;c<4;c++) {
+      unsigned v=((256-fx)*(256-fy)*r0[x0*4+c]+fx*(256-fy)*r0[x1*4+c]+(256-fx)*fy*r1[x0*4+c]+fx*fy*r1[x1*4+c]+32768)>>16;
+      assert(t[(TOP+y)*4352+x*4+c]==v);
+     }
+    }
+    for(unsigned b=1080*4;b<4352;b++) assert(t[(TOP+y)*4352+b]==0x6b); /* the row's pitch padding */
+   }
+   for(unsigned i=0;i<TOP*4352;i++) assert(t[i]==0x6b);
+   for(unsigned i=(TOP+H)*4352;i<0xa00000u;i++) assert(t[i]==0x6b);
+   for(unsigned b=0;b<3;b++) if(b!=target) for(unsigned i=0;i<0xa00000u;i+=4099) assert(fitpanel[b*0xa00000u+i]==0x6b);
+   for(unsigned i=0;i<3*4320*2400;i+=4099) assert(panel[i]==0x6b); /* the 1:1 model is never written */
+   assert(fuxi_gpu_unmap(0,&times));
+  }
+  /* Refused (the CPU draws): fit requested but the layout not live yet, display not owned, any other rect, a source pitch that is
+   * not whole 64-byte units. Nothing is rung. */
+  reset();fg_fit_requested=1;fg_scanout_owned=fg_scanout_requested=fg_scanout_writable=1;
+  assert(fuxi_gpu_map(0,1,(uintptr_t)source_buf,2436u*4544,&times));
+  unsigned rung=doorbells;
+  assert(!fuxi_gpu_copy(0,1,(uintptr_t)source_buf,2436u*4544,4544,0,0,0,0,1125,2436,&times));
+  fg_fit_active=1;fg_scanout_owned=0;
+  assert(!fuxi_gpu_copy(0,1,(uintptr_t)source_buf,2436u*4544,4544,0,0,0,0,1125,2436,&times));
+  fg_scanout_owned=1;
+  assert(!fuxi_gpu_copy(0,1,(uintptr_t)source_buf,2436u*4544,4544,22,18,0,0,1080,2400,&times));
+  assert(!fuxi_gpu_copy(0,1,(uintptr_t)source_buf,2436u*4544,4544,0,0,0,0,1125,2435,&times));
+  assert(!fuxi_gpu_copy(0,1,(uintptr_t)source_buf,2436u*4544,4544,0,0,1,0,1125,2436,&times));
+  assert(!fuxi_gpu_copy(0,1,(uintptr_t)source_buf,2436u*4544,4520,0,0,0,0,1125,2436,&times));
+  assert(!fuxi_gpu_copy(0,1,(uintptr_t)source_buf,2435u*4544,4544,0,0,0,0,1125,2436,&times)); /* short source */
+  assert(doorbells==rung && !fg_busy);
+  assert(model_copy(0,1,(uintptr_t)source_buf,2436u*4544,4544,0,0,0,0,1125,2436,&times)==1 && scaled_blits==1);
+  assert(fuxi_gpu_unmap(0,&times));
+  free(fitpanel);fitpanel=0;
+ }
+
+ /* sweetfbfit corner mask: after the one scaled blit, solid black fills cover exactly the table's spans at the image's four corners
+  * (pixels outside the arc), every other pixel is the blit's; one fill per run of equal spans per corner; the +216 stamp splits
+  * the cost (blit avg = blit alone, mask avg = fills). */
+ {
+  const unsigned P=4608, LEN=2436*P;
+  fitpanel=malloc(3*0xa00000u);assert(fitpanel);
+  for(unsigned mode=1;mode<=2;mode++) {
+   const unsigned TOP=mode==2?0:31, H=mode==2?2400:2338;
+   reset();fg_fit_requested=mode;fg_fit_active=1;fg_scanout_owned=fg_scanout_requested=fg_scanout_writable=1;
+   fg_scanout_double_active=1;fg_scanout_triple_requested=1;fg_scanout_front=0;fg_scanout_ready=1;fg_scanout_back_ready=1;
+   memset(fitpanel,0x6b,3*0xa00000u);
+   double rx=117*1080/1125.0, ry=117.0*H/2436;unsigned runs=0;
+   for(unsigned j=0;j<128;j++) {
+    double v=ry-(j+0.5);unsigned b=0;
+    if(v>0)while(rx-(b+0.5)>0 && ((rx-(b+0.5))/rx)*((rx-(b+0.5))/rx)+(v/ry)*(v/ry)>1)b++;
+    fg_fit_span[j]=(uint8_t)b;if(b)fg_fit_spans=j+1;
+   }
+   for(unsigned j=0;j<fg_fit_spans;j++)runs+=!j || fg_fit_span[j]!=fg_fit_span[j-1];
+   fg_fit_runs=runs;fg_fit_mask_words=19+runs*28;
+   assert(fg_fit_spans==(mode==2?104u:102u) && runs==(mode==2?66u:65u) && fg_fit_span[0]==102);
+   assert(fuxi_gpu_map(0,1,(uintptr_t)source_buf,LEN,&times));
+   unsigned w0=g3_wptr;
+   assert(model_copy(0,1,(uintptr_t)source_buf,LEN,P,0,0,0,0,1125,2436,&times)==1);
+   assert(scaled_blits==1 && solid_fills==runs*4 && fg_cp_masked && ((g3_wptr-w0)&8191)<=150+fg_fit_mask_words);
+   uint8_t *t=fitpanel+2*0xa00000u;unsigned black=0;
+   for(unsigned y=0;y<H;y++) {
+    unsigned ny=(unsigned)(((uint64_t)(2*y+1)*2436-H)*256/(2*H)), fy=ny&255, y0=ny>>8, y1=y0+1<2436?y0+1:y0;
+    unsigned e=y<fg_fit_spans?y:H-1-y<fg_fit_spans?H-1-y:~0u, cb=e!=~0u?fg_fit_span[e]:0;
+    for(unsigned x=0;x<1080;x++) {
+     uint32_t got;memcpy(&got,t+(TOP+y)*4352+x*4,4);
+     if(x<cb || x>=1080-cb){assert(got==0xff000000u);black++;continue;}
+     unsigned nx=(unsigned)(((uint64_t)(2*x+1)*1125-1080)*256/2160), fx=nx&255, x0=nx>>8, x1=x0+1<1125?x0+1:x0;
+     const uint8_t *r0=source_buf+y0*P, *r1=source_buf+y1*P;
+     for(unsigned c=0;c<4;c++)
+      assert(t[(TOP+y)*4352+x*4+c]==(((256-fx)*(256-fy)*r0[x0*4+c]+fx*(256-fy)*r0[x1*4+c]+(256-fx)*fy*r1[x0*4+c]+fx*fy*r1[x1*4+c]+32768)>>16));
+    }
+   }
+   unsigned area=0;for(unsigned j=0;j<fg_fit_spans;j++)area+=fg_fit_span[j];
+   assert(black==4*area && area==(mode==2?2772u:2707u));
+   for(unsigned i=0;i<TOP*4352;i++)assert(t[i]==0x6b); /* the bars are not the mask's */
+   for(unsigned b=0;b<2;b++)for(unsigned i=0;i<0xa00000u;i+=4099)assert(fitpanel[b*0xa00000u+i]==0x6b); /* front and ready untouched */
+   assert(fg_cp_n && fg_cp_mask_sum>0 && model_stamp[3]>model_stamp[0] && model_stamp[1]>model_stamp[3]); /* blit, then the fills */
+   assert(fuxi_gpu_unmap(0,&times));
+  }
+  free(fitpanel);fitpanel=0;
+ }
+ puts("PASS: sweetfbfit corner mask: one scaled blit, then one solid black fill per run and corner (65 x 4 mode 1, 66 x 4 mode 2), exactly the arc's outside, bilinear inside, bars and other buffers untouched, cost stamp");
+ puts("PASS: sweetfbfit one bilinear blit per frame, pitch 4352: mode 1 1125x2436->1080x2338 at y=31, mode 2 ->1080x2400 at y=0 inside its larger map; single/double/triple targets, bars and other buffers untouched, refusals");
  /* Independent windows and generations; unmapping one preserves the others. */
  reset();
  for(unsigned slot=0;slot<4;slot++) {
@@ -495,9 +660,10 @@ def main():
             assert a + n <= b or b + m <= a, 'overlapping platform mappings'
     functions = ''.join(function(probe, n) for n in ('g3_parity', 'g3_pkt7', 'g4_pkt4', 'g4_reg', 'g4_event', 'g4_wfi', 'g4_setup', 'g4_end'))
     functions += function((ROOT / 'xnu/fuxi-adreno/fuxi_gpu_scanout.inc').read_text(), 'fg_scanout_target')
-    functions += ''.join(function(adapter, n) for n in ('fg_fail', 'fg_isolate', 'fuxi_gpu_unmap', 'fuxi_gpu_map', 'fg_rect', 'fg_clean', 'fg_ring_doorbell', 'fg_cp_stamp', 'fg_cp_retire', 'fuxi_gpu_poll', 'fuxi_gpu_copy'))
+    functions += ''.join(function(adapter, n) for n in ('fg_fail', 'fg_isolate', 'fuxi_gpu_unmap', 'fuxi_gpu_map', 'fg_rect', 'fg_fit_rect', 'fg_fit_box', 'fg_fit_mask', 'fg_clean', 'fg_ring_doorbell', 'fg_cp_stamp', 'fg_cp_retire', 'fuxi_gpu_poll', 'fuxi_gpu_copy'))
     functions = re.sub(r'__asm__ volatile\([^;]*\);', ';', functions)
     constants = '\n'.join(line for line in sync.added_file('gpu-a740.h').splitlines() if line.startswith('#define G4_'))
+    constants += '\n' + '\n'.join(re.findall(r'^#define FUXI_FIT_\w+[ (][^\n]*', sync.added_file('fuxi_adreno.h'), re.M))
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / 'test.c'
         path.write_text(PREFIX + constants + '\n' + functions + MODEL)

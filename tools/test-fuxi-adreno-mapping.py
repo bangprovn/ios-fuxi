@@ -18,6 +18,7 @@ spec.loader.exec_module(submit)
 PREFIX = r'''
 static unsigned fg_scanout_requested, fg_scanout_panel120_requested, fg_scanout_double_requested, fg_scanout_triple_requested;
 static unsigned fg_scanout_paneldcs_requested;
+static unsigned fg_fit_requested; /* sweetfbfit: maps the three tail windows */
 #include <assert.h>
 #define FG_GUARD
 static unsigned fg_abi_enabled;
@@ -149,9 +150,9 @@ static unsigned g3_read(uint64_t a) {
  return 0;
 }
 static unsigned g3_gr(unsigned a) { (void)a; return 0; }
-static unsigned fbMaps,failFbMap;
+static unsigned fbMaps,failFbMap,fbMapSize;
 static int g_map_at(uint64_t p,unsigned *n,unsigned va,unsigned pa,unsigned size,unsigned attr)
-{ (void)p;(void)n;assert(size==((4320*2400+4095)&~4095u) && attr==(1u<<6));
+{ (void)p;(void)n;assert(size==(fg_fit_requested==2?0x9f6000u:((4320*2400+4095)&~4095u)) && attr==(1u<<6));fbMapSize=size; /* sweetfbfit=2: every 4352-pitch row */
  assert((va==G4_FB_VA && pa==G4_FB_PA) || (fg_scanout_double_requested && va==G4_FB_VA+0xa00000u && pa==0xb8a00000u) || (fg_scanout_triple_requested && va==G4_FB_VA+0x1400000u && pa==0xb9400000u));return ++fbMaps!=failFbMap; }
 static int fg_source_tables(void) { return 1; }
 static int g4_tlb(uint32_t *p) { (void)p;return 0; }
@@ -182,7 +183,7 @@ static void reset(void)
  fail_alloc=fail_enter=invalid_reservation=0;
  live=cursor=removed=0;
  fg_scanout_requested=fg_scanout_panel120_requested=fg_scanout_double_requested=fg_scanout_triple_requested=1;
- fg_scanout_paneldcs_requested=0;
+ fg_scanout_paneldcs_requested=0;fg_fit_requested=1;
  fg_limit=17; enable_arg=1; gPhysSize=FG_RAM_SIZE;
  valid_handoff=abi_inits=abi_publishes=abi_fail=fg_abi_enabled=fbMaps=failFbMap=0;
  level_arg=clock_logs=g_gpu_selected=fg_clock_measure=0;
@@ -193,14 +194,14 @@ int main(void)
  (void)g_gpu_bw_packet;(void)g_gpu_bw_index;(void)g_gpu_level;
  uint64_t total=0;
  for(unsigned i=0;i<COUNT;i++) total+=fg_windows[i].size;
- assert(total==0x3554000); /* Existing windows + optional DPU, DSI0 and buffers B/C windows. */
- reset();fg_scanout_requested=fg_scanout_panel120_requested=fg_scanout_double_requested=fg_scanout_triple_requested=0;assert(fg_map_windows()==KERN_SUCCESS);
- assert(live==total-49152-2*0x9e4000 && fg_mapped_bytes==total-49152-2*0x9e4000 && alloc_calls==COUNT-5);
+ assert(total==0x3590000); /* Existing windows + optional DPU, DSI0, buffers B/C and the three sweetfbfit tail windows. */
+ reset();fg_scanout_requested=fg_scanout_panel120_requested=fg_scanout_double_requested=fg_scanout_triple_requested=fg_fit_requested=0;assert(fg_map_windows()==KERN_SUCCESS);
+ assert(live==total-49152-2*0x9e4000-3*0x14000 && fg_mapped_bytes==total-49152-2*0x9e4000-3*0x14000 && alloc_calls==COUNT-8);
  assert(!fuxi_gpu_nc_pointer(0xb8a00000,4320u*2400));
  assert(!fuxi_gpu_nc_pointer(0xb9400000,4320u*2400));
  assert(!fg_pointer(0xae16000) && !fg_pointer(0xae36000) && !fg_pointer(0xae94000));
  reset();fg_scanout_double_requested=fg_scanout_triple_requested=0;assert(fg_map_windows()==KERN_SUCCESS);
- assert(!fuxi_gpu_nc_pointer(0xb8a00000,4320u*2400) && live==total-2*0x9e4000);
+ assert(!fuxi_gpu_nc_pointer(0xb8a00000,4320u*2400) && live==total-2*0x9e4000-2*0x14000); /* A's fit tail stays */
  reset();fg_scanout_panel120_requested=0;assert(fg_map_windows()==KERN_SUCCESS);
  assert(live==total-16384 && fg_mapped_bytes==total-16384 && alloc_calls==COUNT-1);
  assert(fg_pointer(0xae16000) && fg_pointer(0xae36000) && !fg_pointer(0xae94000));
@@ -289,7 +290,15 @@ int main(void)
   assert(fg_state==1 && fbMaps==doubleMode+1);
  }
  reset();fg_scanout_triple_requested=0;assert(fg_map_windows()==KERN_SUCCESS);
- assert(live==total-0x9e4000 && fuxi_gpu_nc_pointer(0xb8a00000,4320u*2400) && !fuxi_gpu_nc_pointer(0xb9400000,4320u*2400));
+ assert(live==total-0x9e4000-0x14000 && fuxi_gpu_nc_pointer(0xb8a00000,4320u*2400) && !fuxi_gpu_nc_pointer(0xb9400000,4320u*2400));
+ assert(fuxi_gpu_nc_pointer(0xb89e4000,0x12000) && fuxi_gpu_nc_pointer(0xb93e4000,0x12000) && !fuxi_gpu_nc_pointer(0xb9de4000,0x12000));
+ /* sweetfbfit's tails: only with it (B's with double, C's with triple), each the 4352-pitch rows past its buffer's 0x9e4000. */
+ reset();fg_fit_requested=0;assert(fg_map_windows()==KERN_SUCCESS);
+ assert(live==total-3*0x14000 && alloc_calls==COUNT-3);
+ for(unsigned b=0;b<3;b++) assert(!fuxi_gpu_nc_pointer(0xb89e4000u+b*0xa00000u,0x12000) && fuxi_gpu_nc_pointer(0xb8000000u+b*0xa00000u+4096,4096)==(b?fuxi_gpu_nc_pointer(0xb8000000u+b*0xa00000u,4096)+4096:0));
+ reset();assert(fg_map_windows()==KERN_SUCCESS && live==total);
+ for(unsigned b=0;b<3;b++) assert(fuxi_gpu_nc_pointer(0xb89e4000u+b*0xa00000u,0x12000) && !fuxi_gpu_nc_pointer(0xb89e4000u+b*0xa00000u-4,8));
+ assert(0x9e4000u+0x12000u==4352u*2400 && 0x9e4000u+0x14000u<=0xa00000u && 0xb9de4000u+0x14000u<=0xbab00000u);
  reset();valid_handoff=1;failFbMap=3;
  fuxi_gpu_start(G4_FB_PA,1080,2400,4320);fg_thread(NULL,NULL);
  assert(fg_state==2 && fbMaps==3 && !abi_publishes); // C mapping fails closed
@@ -298,6 +307,13 @@ int main(void)
  fuxi_gpu_start(G4_FB_PA,1080,2400,4320);fg_thread(NULL,NULL);
  assert(fg_state==2 && fbMaps==2 && !abi_publishes); // B mapping fails closed
  assert(0xb8a00000u+0x9e4000u<=0xbab00000u && 0xb8000000u+4320u*2400<=0xb8a00000u);
+ /* sweetfbfit=2 maps every 4352-pitch row of A/B/C for the GPU (2400 x 4352 bytes, 4 KiB pages); mode 1 the boot size. */
+ for(unsigned mode=1;mode<=2;mode++) {
+  reset();valid_handoff=1;fg_fit_requested=mode;
+  fuxi_gpu_start(G4_FB_PA,1080,2400,4320);fg_thread(NULL,NULL);
+  assert(fg_state==1 && fbMaps==3 && fbMapSize==(mode==2?0x9f6000u:0x9e4000u));
+ }
+ assert(0x9f6000u==((4352u*2400+4095)&~4095u) && 0x9f6000u<=0xa00000u);
  /* ABI MMIO/table setup must precede publishing ready to the display;
   * service publication must follow it. Failure only withholds the ABI. */
  for(unsigned fail=0;fail<2;fail++) {
@@ -331,9 +347,10 @@ def main():
     functions += ''.join(submit.function(adapter, n) for n in ('fg_thread', 'fuxi_gpu_start'))
     handoff = (ROOT / 'shim/fuxi-probe/gpu-handoff.h').read_text()
     clock = (ROOT / 'shim/fuxi-probe/gpu-clock.h').read_text() + (ROOT / 'xnu/fuxi-adreno/fuxi_gpu_dcvs.h').read_text()
+    fit = '\n'.join(re.findall(r'^#define FUXI_FIT_\w+[ (][^\n]*', submit.sync.added_file('fuxi_adreno.h'), re.M)) + '\n'
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / 'mapping.c'
-        path.write_text('#include <stdint.h>\n' + handoff + clock + PREFIX + declarations + functions + MODEL)
+        path.write_text('#include <stdint.h>\n' + handoff + clock + fit + PREFIX + declarations + functions + MODEL)
         exe = Path(d) / 'mapping'
         subprocess.run(['clang', '-std=gnu11', '-O1', '-g', '-Wall', '-Wextra', '-Werror',
                         '-fsanitize=address,undefined', str(path), '-o', str(exe)], check=True)

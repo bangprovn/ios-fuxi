@@ -68,6 +68,38 @@ int fuxi_gpu_scanout_pending(void);
 int fuxi_gpu_scanout_double(void);
 int fuxi_gpu_scanout_triple(void);
 int fuxi_gpu_scanout_cpu_acquire(void);
+/* sweetfbfit=1 (default off, read by SweetFramebuffer): the whole presented 1125x2436 frame is shown scaled into 1080x2338 at y=31
+ * with black bars of 31 rows above and below (x 0.96, y 2338/2436), as the iPhone 12/13 mini shows the 1125x2436 frame. The GPU copy
+ * is one bilinear 2D blit, which needs a destination pitch in 64-byte units: from the scanout takeover on, A/B/C use a 4352-byte
+ * pitch (VIG0 SRC_YSTRIDE0, written once after the bars of every buffer are black; the image rows never touch the bars). fit:
+ * call after configure with the mode, 1 accepted (needs fuxigpuscanout, refused with direct scanout). fit_pitch: FUXI_FIT_PITCH once
+ * the display fetches that layout, else 0 (CPU writers keep the boot pitch, the boot layout's bars are theirs to clear).
+ * sweetfbfit=2 (FUXI_FIT_STRETCH): the same frame stretched non-uniformly to the full 1080x2400 panel at y=0 as HakiOS does (x 0.96,
+ * y 2400/2436), no bars, same pitch. Its last rows lie past A's surface mapping and the B/C windows (0x9e4000 bytes): the GPU maps
+ * FUXI_FIT_STRETCH_MAP of each buffer, and CPU frames write them through fit_tail (A's tail window: its VA, *split = the byte
+ * offset where it starts, *bytes its size; 0 before the GPU side has mapped it). */
+#define FUXI_FIT_SRC_W 1125u
+#define FUXI_FIT_SRC_H 2436u
+#define FUXI_FIT_W 1080u
+#define FUXI_FIT_H 2338u
+#define FUXI_FIT_Y 31u
+#define FUXI_FIT_PITCH 4352u
+#define FUXI_FIT_BLACK 0xff000000u
+#define FUXI_FIT_STRETCH 2u
+#define FUXI_FIT_MODE_Y(m) ((m) == FUXI_FIT_STRETCH ? 0u : FUXI_FIT_Y)
+#define FUXI_FIT_MODE_H(m) ((m) == FUXI_FIT_STRETCH ? 2400u : FUXI_FIT_H)
+#define FUXI_FIT_STRETCH_MAP ((FUXI_FIT_PITCH*2400u + 4095u) & ~4095u)
+/* Corner mask (both modes, on unless sweetfbcorner=0): black outside the iPhone X display corner at the four corners of the
+ * displayed image, as a real panel's corners hide the square window corners iOS draws at the end of its zoom animations. The
+ * radius is iOS's DeviceCornerRadius for this identity, 39 pt = 117 px at @3x (inferred: /product has no display-corner-radius,
+ * as on a real iPhone X, which reports 39.0 through MobileGestalt's fallback), scaled by the mode's factors: a circular (mode 1) or
+ * slightly elliptical (mode 2) quarter with a hard 1-px staircase, not Apple's continuous curve. fit_corner: the black width of each image row from the top (and, mirrored, bottom) edge, *rows of them;
+ * NULL and 0 when off. */
+#define FUXI_FIT_CORNER_PX 117u
+const uint8_t *fuxi_gpu_scanout_fit_corner(unsigned *rows);
+int fuxi_gpu_scanout_fit(unsigned mode, unsigned corner);
+unsigned fuxi_gpu_scanout_fit_pitch(void);
+uintptr_t fuxi_gpu_scanout_fit_tail(uint64_t *split, uint64_t *bytes);
 int fuxi_gpu_scanout_reserve(void);
 /* fuxigpuncimport bit 20 (1048576, default off): SweetSurface cleans the copy source to PoC
  * before the ring reservation, outside the GPU lock, and fuxi_gpu_copy then skips its own

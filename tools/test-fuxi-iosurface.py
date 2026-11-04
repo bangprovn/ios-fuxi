@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Offline production IOSurface use traps, shared ABI, cleanup and seed accounting."""
+"""Offline production IOSurface use traps, shared ABI, cleanup and seed accounting; lock-result plane layout."""
 import importlib.util
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 
@@ -106,6 +107,133 @@ int main() {
 }
 '''
 
+# The lock result as IOSurface.framework (iOS 16.7, dyld cache 20H392) reads it. IOSurfaceClient keeps the result at
+# +0x68, so client offset - 0x68 = result offset. From the disassembly of IOSurfaceClientGet*:
+#   PlaneCount ldr w [x0,#0xa0]; BytesPerRow (no planes) [#0x90]; height [#0x8c]; base offset [#0x94]; base [#0x68]
+#   per plane i, at x0 + i*0x80: width +0xd0, height +0xd4, offset +0xdc (BaseAddressOfPlane = base + it),
+#   BytesPerRowOfPlane +0xe0, SizeOfPlane +0xe4, BytesPerElementOfPlane +0xe8, ElementWidth/Height +0xea/+0xeb;
+#   ldrb +0x124 == 1 (compressed) makes BaseAddressOfPlane and BytesPerRowOfPlane answer 0;
+#   plane index >= PlaneCount: 0, except plane 0 of a planeless surface (the surface's own row and offset).
+# CoreVideo's CVPixelBufferBacking::getBytesPerRowOfPlane tail-calls IOSurfaceGetBytesPerRowOfPlane.
+PLANES_PREFIX = r'''
+#include <cassert>
+#include <cstdarg>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
+#define SWEET_SURFACE_RESULT_SIZE 0xa68
+#define SWEET_SURFACE_TIMESTAMPS 0x800
+#define strlcpy test_strlcpy
+static size_t test_strlcpy(char *d,const char *s,size_t n) {size_t l=strlen(s);if(n){size_t c=l<n-1?l:n-1;memcpy(d,s,c);d[c]=0;}return l;}
+#define bzero(p,n) memset((p),0,(n))
+static int argMode=-1;   /* -1 boot-arg absent */
+static bool PE_parse_boot_argn(const char *name,void *v,int size) {
+ assert(!strcmp(name,"sweetsurfplanerow") && size==4);if(argMode<0)return false;*(uint32_t *)v=(uint32_t)argMode;return true;}
+struct IOLock {bool held=false;};
+static IOLock surfaceLock,*sweet_surface_lock=&surfaceLock;
+static void IOLockLock(IOLock *p) {assert(!p->held);p->held=true;}
+static void IOLockUnlock(IOLock *p) {assert(p->held);p->held=false;}
+static const char *procName="mediaserverd";
+static void proc_selfname(char *buf,int size) {test_strlcpy(buf,procName,(size_t)size);}
+static std::vector<std::string> logs;
+__attribute__((format(printf,1,2))) static void IOLog(const char *fmt,...) {
+ char b[512];va_list ap;va_start(ap,fmt);vsnprintf(b,sizeof(b),fmt,ap);va_end(ap);logs.push_back(b);}
+#define SWEET_SURFACE_MAX_PLANES 20
+'''
+
+PLANES_TEST = r'''
+struct SweetSurface {
+ uint32_t id=812,width=336,height=200,bytesPerRow=0,offset=0,pixelFormat=0x34323076,allocSize=0x1d000;
+ uint16_t bytesPerElement=0;uint8_t elementWidth=1,elementHeight=1;
+ uint32_t cacheMode=0,planeCount=2,parentID=0;
+ sweet_surface_plane planes[SWEET_SURFACE_MAX_PLANES]={};
+};
+struct Map {uint64_t a;uint64_t getAddress(){return a;}};
+struct SweetSurfaceRef {SweetSurface *surface;Map *data,*state;};
+'''
+
+PLANES_MAIN = r'''
+static uint32_t rd32(const uint8_t *c,uint32_t o) {uint32_t v;memcpy(&v,c+o,4);return v;}
+static uint64_t rd64(const uint8_t *c,uint32_t o) {uint64_t v;memcpy(&v,c+o,8);return v;}
+/* IOSurfaceClient as the framework lays it out: the result copied to +0x68. */
+struct Client {uint8_t b[0x68+SWEET_SURFACE_RESULT_SIZE]={};};
+static uint32_t planeCount(const Client &c) {return rd32(c.b,0xa0);}
+static uint64_t bytesPerRowOfPlane(const Client &c,uint32_t i) {
+ if(planeCount(c)<=i)return i==0?rd32(c.b,0x90):0;
+ if(c.b[i*0x80+0x124]==1)return 0;return rd32(c.b,i*0x80+0xe0);}
+static uint64_t baseAddressOfPlane(const Client &c,uint32_t i) {
+ if(planeCount(c)<=i)return i==0?rd64(c.b,0x68)+rd32(c.b,0x94):0;
+ if(c.b[i*0x80+0x124]==1)return 0;return rd64(c.b,0x68)+rd32(c.b,i*0x80+0xdc);}
+static uint32_t widthOfPlane(const Client &c,uint32_t i) {return planeCount(c)>i?rd32(c.b,i*0x80+0xd0):0;}
+static uint32_t heightOfPlane(const Client &c,uint32_t i) {return planeCount(c)>i?rd32(c.b,i*0x80+0xd4):i?0:rd32(c.b,0x8c);}
+static uint32_t sizeOfPlane(const Client &c,uint32_t i) {return planeCount(c)>i?rd32(c.b,i*0x80+0xe4):0;}
+static Client lockResult(SweetSurface &s,uint64_t base) {
+ Map data{base},state{0x2000000};SweetSurfaceRef ref{&s,&data,&state};Client c;
+ sweet_surface_fill_result(&s,&ref,c.b+0x68);return c;}
+/* H264SW.videocodec +0x13894: the destination advances by (2*row - width) as a 32-bit value added zero-extended. */
+static uint64_t h264RowPairStep(uint64_t row,uint32_t width) {return width+(uint64_t)(uint32_t)(2*(uint32_t)row-width);}
+
+int main(int argc,char **argv) {
+ argMode=argc>1?atoi(argv[1]):-1;
+ /* mediaserverd's decoder output (r-tour-k0ee, h-fit2b): 420v 336x200, planes at +0x40 and +0x13840, row 384. */
+ SweetSurface s;s.planes[0]={336,208,384,0x40,384*208,1,1,1};s.planes[1]={168,104,384,0x13840,384*104,2,1,1};
+ Client c=lockResult(s,0x106b4c000);
+ assert(planeCount(c)==2 && widthOfPlane(c,0)==336 && heightOfPlane(c,1)==104 && sizeOfPlane(c,1)==384*104);
+ assert(baseAddressOfPlane(c,0)==0x106b4c040 && baseAddressOfPlane(c,1)==0x106b5f840);   /* the crash's x7 and plane 1 */
+ for(uint32_t i=0;i<2;i++)assert(c.b[i*0x80+0x124]==0);   /* never "compressed" */
+ uint16_t bpe;memcpy(&bpe,c.b+0x80+0xe8,2);assert(bpe==2 && c.b[0xea]==1 && c.b[0xeb]==1);
+ if(argMode==0){
+  /* The layout before the fix: the row sat at +8, every plane row reads 0, and H264SW's step is
+   * (uint32)(0 - 336) + 336 = 4 GiB: the crash's x10 = x7 + 0x100000000. */
+  assert(rd32(c.b,0xd8)==384 && bytesPerRowOfPlane(c,0)==0 && bytesPerRowOfPlane(c,1)==0);
+  assert(h264RowPairStep(bytesPerRowOfPlane(c,0),336)==0x100000000ull);
+  puts("PASS: sweetsurfplanerow=0 keeps the old plane layout (row 0, the 4 GiB H264SW step)");return 0;
+ }
+ assert(rd32(c.b,0xd8)==0 && rd32(c.b,0x80+0xd8)==0);   /* +8 of a plane stays reserved */
+ assert(bytesPerRowOfPlane(c,0)==384 && bytesPerRowOfPlane(c,1)==384);
+ assert(h264RowPairStep(bytesPerRowOfPlane(c,0),336)==2*384);   /* two rows down, inside the plane */
+ /* A planeless surface still answers its own row and offset for plane 0. */
+ SweetSurface flat;flat.planeCount=0;flat.bytesPerRow=4608;flat.offset=0;flat.pixelFormat=0x42475241;flat.width=1125;flat.height=2436;
+ Client f=lockResult(flat,0x200000000);
+ assert(planeCount(f)==0 && bytesPerRowOfPlane(f,0)==4608 && bytesPerRowOfPlane(f,1)==0 && baseAddressOfPlane(f,0)==0x200000000);
+ /* Each process gets at most 4 plane lines, 16 processes at most; lines read the rows back from the result. */
+ logs.clear();
+ for(int k=0;k<6;k++)sweet_surface_plane_log(&s,c.b+0x68,k==5);
+ assert(logs.size()==4 && !surfaceLock.held);
+ assert(logs[0]=="SWEET SURF: planes mediaserverd id 812 fmt 0x34323076 336x200 n 2 p0 row 384 off 64 p1 row 384 off 79936\n");
+ static char names[20][16];
+ for(int p=0;p<20;p++){snprintf(names[p],sizeof(names[p]),"proc%d",p);procName=names[p];sweet_surface_plane_log(&s,c.b+0x68,true);}
+ assert(logs.size()==4+15);   /* mediaserverd took the first of 16 slots */
+ assert(logs.back().find(" cached\n")!=std::string::npos);
+ for(auto &l:logs)assert(l.size()<200);
+ puts(argMode<0?"PASS: plane rows at +0x10 where IOSurface.framework reads them (default), H264SW step two rows, planeless plane 0, bounded plane lines":
+      "PASS: sweetsurfplanerow=1 plane rows at +0x10");
+ return 0;
+}
+'''
+
+
+def planes_model(source, header, tmp):
+    plane = re.search(r'struct sweet_surface_plane \{.*?\};', header, re.S)[0]
+    methods = ''.join(unixnu.function(source, name) for name in (
+        'put32', 'put64', 'sweet_surface_plane_row_fixed', 'sweet_surface_fill_result'))
+    start = source.index('#define SWEET_SURFACE_PLANE_PROCS')
+    end = source.index('\n}\n', source.index('sweet_surface_plane_log(SweetSurface *s')) + 3
+    methods += source[start:end] + '\n'
+    assert re.search(r'if \(s->planeCount > 1\) \{\n\t+sweet_surface_plane_log\(s, out, existing\);', source)
+    assert source.count('sweet_surface_fill_result(s, ref, out);') == 1
+    path = Path(tmp) / 'planes.cpp'
+    path.write_text(PLANES_PREFIX + plane + '\n' + PLANES_TEST + methods + PLANES_MAIN)
+    exe = Path(tmp) / 'planes'
+    subprocess.run(['clang++', '-std=c++17', '-Wall', '-Wextra', '-Werror',
+                    '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
+                    str(path), '-o', str(exe)], check=True)
+    for mode in ([], ['1'], ['0']):
+        subprocess.run([str(exe)] + mode, check=True)
+
 
 def main():
     source = (ROOT / 'xnu/fuxi-scanout/SweetSurface.cpp').read_text()
@@ -130,6 +258,7 @@ def main():
                         '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
                         str(path), '-o', str(exe)], check=True)
         subprocess.run([str(exe)], check=True)
+        planes_model(source, (ROOT / 'xnu/fuxi-scanout/SweetSurface.h').read_text(), tmp)
 
 
 if __name__ == '__main__':
