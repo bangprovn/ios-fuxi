@@ -2377,7 +2377,11 @@ run: about today's 626 us (10.96 MB read + 10.10 MB written against 10.37 +
 channel difference from a bilinear reference sampling at (d+0.5)xS/D-0.5 with
 8-bit weights. A small value (0-2) confirms the 2D engine's rect mapping;
 a large one, or a visible half-pixel shift, means the hardware samples
-differently. USB screenshots (req 0x4e) refuse while the stride is 4352.
+differently. USB screenshots (req 0x4e) accept the 4352 stride too (branch
+fuxi-shot4352): the wire is still the packed 1080x2400 image the monitor
+expects, each 4320-byte row read from the start of a 4352-byte one, and a
+512-byte request that crosses a row end is copied in two parts, both bounded
+by stride x 2400. Any other stride is still refused.
 
 **Mode 1 on device** (h-fit1, kernel 5d8b606-mac): pixel check passed on all
 four frames, `bars_nonblack=0 max_err=2`, no panics; the owner has seen it.

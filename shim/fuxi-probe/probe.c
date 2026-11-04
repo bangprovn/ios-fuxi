@@ -1213,15 +1213,27 @@ ud_setup(void)
         if (off > 0x13e000000ULL || n > 0x13e000000ULL-off) ok=false;
         else memcpy(data, (const void *)(uintptr_t)(0x8c0000000ULL+off), n);
     } else if (type == 0xc0 && req == 0x4e) {
+        /* The offset always indexes a packed 1080x2400 BGRA image (rows of 4320 bytes).
+         * sweetfbfit's 4352-byte pitch (FUXI SCANOUT: fit layout) keeps each row's 1080
+         * pixels at x 0: a chunk that crosses a row end is copied in two parts, each
+         * bounded by the real buffer, pitch*2400. Pitch 4320 stays one copy. */
         uint32_t index=(uint32_t)st[4] | ((uint32_t)st[5]<<8);
         uint64_t off=(uint64_t)value | ((uint64_t)index<<16);
         const uint64_t size=1080ULL*2400*4;
         n=length > 512 ? 512 : length;
-        uint32_t base=usb_rd(0xae05000,0x14);
+        uint32_t base=usb_rd(0xae05000,0x14), pitch=usb_rd(0xae05000,0x24);
         if (off>size || n>size-off || (base!=0xb8000000 && base!=0xb8a00000 && base!=0xb9400000) ||
-            usb_rd(0xae05000,0x24)!=4320 || usb_rd(0xae05000,0x30)!=0x237ff)
+            (pitch!=4320 && pitch!=4352) || usb_rd(0xae05000,0x30)!=0x237ff)
             ok=false;
-        else memcpy(data,(const void *)(uintptr_t)((uint64_t)base+off),n);
+        else for (uint32_t done=0;done<n;) {
+            uint64_t row=(off+done)/4320, col=(off+done)%4320;
+            uint64_t at=row*pitch+col, fbsize=(uint64_t)pitch*2400;
+            uint32_t part=n-done;
+            if (pitch!=4320 && part>4320-col) part=(uint32_t)(4320-col);
+            if (at>fbsize || part>fbsize-at) { ok=false; break; }
+            memcpy(data+done,(const void *)(uintptr_t)((uint64_t)base+at),part);
+            done+=part;
+        }
     } else if (type == 0xc0 && req == 0x4f) {
         /* Read-only display pipeline windows from live FDT: MDP top, CTL0,
          * INTF1 (+tear irq), DSC0 enc/ctl, PP0/PP1, DSI0 controller. MDSS top

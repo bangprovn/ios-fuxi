@@ -1800,6 +1800,8 @@ def main():
         compile_run(tmp, 'gate', PREFIX + display.TE_OBSERVER + display.PRESENT_TIMES + inc + kick + TEST)
         # Compile the exact USB screenshot request body; intercept the physical
         # memcpy to assert its address and bounds without touching device memory.
+        # With a model frame set, the copy reads it as the buffer at base, so a whole
+        # 512-byte sweep can be compared with the packed image the monitor expects.
         probe = (ROOT / 'shim/fuxi-probe/probe.c').read_text()
         body = probe.split('} else if (type == 0xc0 && req == 0x4e) {', 1)[1].split(
             '} else if (type == 0xc0 && req == 0x4f)', 1)[0]
@@ -1809,36 +1811,72 @@ def main():
 #include <stdbool.h>
 #include <stdio.h>
 static uint32_t base,pitch=4320,format=0x237ff;
-static uint64_t copiedFrom;static unsigned copiedBytes;
+static uint64_t copiedFrom,firstFrom;static unsigned copiedBytes,firstBytes,copies;
+static const uint8_t *frame;static uint8_t chunk[512];
 static uint32_t usb_rd(unsigned block,unsigned offset) {
  assert(block==0xae05000);return offset==0x14?base:offset==0x24?pitch:format;
 }
 static void mock_copy(void *dst,const void *src,unsigned n) {
- (void)dst;copiedFrom=(uintptr_t)src;copiedBytes=n;
+ uint64_t at=(uint64_t)(uintptr_t)src-base;
+ assert((uintptr_t)src>=base && at<=(uint64_t)pitch*2400 && n<=(uint64_t)pitch*2400-at); // inside the real buffer
+ if(!copies){firstFrom=(uintptr_t)src;firstBytes=n;}
+ copiedFrom=(uintptr_t)src;copiedBytes=n;copies++;
+ if(frame)for(unsigned i=0;i<n;i++)((uint8_t *)dst)[i]=frame[at+i];
 }
 #define memcpy mock_copy
 static bool screenshot(uint64_t requestedOffset,unsigned length) {
- uint8_t st[6]={0},data[512];unsigned n=0;bool ok=true;
+ uint8_t st[6]={0},*data=chunk;unsigned n=0;bool ok=true;
  uint16_t value=requestedOffset;st[4]=requestedOffset>>16;st[5]=requestedOffset>>24;
- copiedFrom=copiedBytes=0;
+ copiedFrom=firstFrom=copiedBytes=firstBytes=copies=0;
 """ + body + r"""
  return ok;
 }
+static uint8_t fb[4352u*2400],img[4320u*2400];
+static void sweep(void) {   // the monitor's save_framebuffer: 20250 requests of 512 bytes
+ const unsigned size=4320u*2400;
+ for(unsigned off=0;off<size;off+=512) {
+  assert(screenshot(off,512) && copies==(pitch==4320 ? 1u : 1u+(off%4320+512>4320)));
+  for(unsigned i=0;i<512;i++)img[off+i]=chunk[i];
+ }
+}
 int main(void) {
  const unsigned size=4320u*2400;
+ for(unsigned i=0;i<sizeof fb;i++)fb[i]=(uint8_t)(i^(i>>8)^(i>>16)^(i%4352>=4320 ? 0xa5 : 0)); // row tails differ too
  for(unsigned b=0;b<3;b++) {
   base=0xb8000000u+b*0xa00000u;
-  assert(screenshot(123,1024) && copiedFrom==(uint64_t)base+123 && copiedBytes==512);
+  assert(screenshot(123,1024) && copiedFrom==(uint64_t)base+123 && copiedBytes==512 && copies==1);
+  assert(screenshot(4096,512) && copiedFrom==(uint64_t)base+4096 && copiedBytes==512 && copies==1); // across a row end: one copy
   assert(screenshot(size-512,512) && copiedFrom==(uint64_t)base+size-512);
   assert(screenshot(size,0) && !copiedBytes);
   assert(!screenshot(size,1) && !copiedFrom && !copiedBytes);
   assert(!screenshot(size-511,512) && !copiedFrom);
   assert(!screenshot(size+1,0));
  }
+ frame=fb;sweep();for(unsigned i=0;i<size;i++)assert(img[i]==fb[i]);frame=0;
+ // sweetfbfit's 4352-byte pitch: the same packed 1080x2400 image on the wire, each row its 4352-byte row's first 4320 bytes.
+ pitch=4352;
+ for(unsigned b=0;b<3;b++) {
+  base=0xb8000000u+b*0xa00000u;
+  assert(screenshot(123,1024) && copiedFrom==(uint64_t)base+123 && copiedBytes==512 && copies==1);
+  assert(screenshot(4096,512) && copies==2 && firstFrom==(uint64_t)base+4096 && firstBytes==224 &&
+         copiedFrom==(uint64_t)base+4352 && copiedBytes==288);                       // row 0's last 224 bytes, row 1's first 288
+  assert(screenshot(4320,512) && copies==1 && copiedFrom==(uint64_t)base+4352);        // row 1 starts after row 0's padding
+  assert(screenshot(size-512,512) && copies==1 && copiedFrom==(uint64_t)base+2399u*4352+3808 && copiedBytes==512);
+  assert(screenshot(size,0) && !copies);
+  assert(!screenshot(size,1) && !copies);
+  assert(!screenshot(size-511,512) && !copies);
+  assert(!screenshot(size+1,0));
+  frame=fb;sweep();frame=0;
+  for(unsigned y=0;y<2400;y++)for(unsigned x=0;x<4320;x++)assert(img[y*4320+x]==fb[y*4352+x]);
+ }
  base=0xb9e00000u;assert(!screenshot(0,512) && !copiedFrom);
  base=0xb8000000u;pitch=1;assert(!screenshot(0,512));
+ pitch=4336;assert(!screenshot(0,512) && !copies);
+ pitch=8704;assert(!screenshot(0,512) && !copies);
+ pitch=4352u|(7u<<16);assert(!screenshot(0,512) && !copies);  // the whole register, plane-1 half included
+ pitch=4352;format=0;assert(!screenshot(0,512) && !copies);
  pitch=4320;format=0;assert(!screenshot(0,512));
- puts("PASS: actual USB screenshot request, current A/B/C base, one-frame bounds, pitch/format refusals and length cap");
+ puts("PASS: actual USB screenshot request, current A/B/C base, one-frame bounds, 4320 and sweetfbfit 4352 pitch (packed sweep, split rows, real-buffer bounds), pitch/format refusals and length cap");
  return 0;
 }
 """)
