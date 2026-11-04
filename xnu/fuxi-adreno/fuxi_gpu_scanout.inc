@@ -162,16 +162,22 @@ void fuxi_gpu_scanout_configure(uintptr_t pixels, unsigned enabled, unsigned che
    printf("FUXI SCANOUT: dcs refused fuxipaneldcs=%u: needs fuxigpuscanout=1 sweetfb_noconsole=1; nothing sent\n", dcs);
  }
 }
-/* sweetfbfit (fuxi_adreno.h), asked by SweetFramebuffer after configure and before fuxi_gpu_start maps the tail windows. */
-int fuxi_gpu_scanout_fit(void)
+/* sweetfbfit (fuxi_adreno.h): mode 1 scaled with bars, 2 stretched; asked by SweetFramebuffer after configure and before
+ * fuxi_gpu_start maps the tail windows and the buffers. */
+int fuxi_gpu_scanout_fit(unsigned mode)
 {
- const char *why = !fg_scanout_requested ? "needs fuxigpuscanout=1 sweetfb_noconsole=1" :
+ const char *why = mode != 1 && mode != FUXI_FIT_STRETCH ? "unknown mode" : !fg_scanout_requested ? "needs fuxigpuscanout=1 sweetfb_noconsole=1" :
      fg_scanout_dpu_stage3 ? "direct scanout (fuxigpuncimport bits 22+23+24) is on" : NULL;
  if (why) { printf("FUXI SCANOUT: fit refused: %s; centred crop kept\n", why); return 0; }
- fg_fit_requested = 1;
+ fg_fit_requested = mode;
  return 1;
 }
 unsigned fuxi_gpu_scanout_fit_pitch(void) { return __atomic_load_n(&fg_fit_active, __ATOMIC_ACQUIRE) ? FUXI_FIT_PITCH : 0; }
+uintptr_t fuxi_gpu_scanout_fit_tail(uint64_t *split, uint64_t *bytes)
+{
+ *split = FG_FIT_MAIN; *bytes = FG_FIT_TAIL_BYTES;
+ return fg_fit_requested ? fuxi_gpu_nc_pointer(FG_FIT_TAIL(0), FG_FIT_TAIL_BYTES) : 0;
+}
 int fuxi_gpu_scanout_preclean(void) { return fg_scanout_preclean; }
 void fuxi_gpu_scanout_stamps(struct fg_present_times *times)
 {
@@ -2252,20 +2258,25 @@ static int fg_fit_fill(unsigned b, unsigned from, unsigned to)
   *(volatile uint32_t *)(o < FG_FIT_MAIN ? base + o : tail + (o - FG_FIT_MAIN)) = FUXI_FIT_BLACK;
  return 1;
 }
-/* Once, owned, with no transfer running and before any copy: the bars of every buffer black, then VIG0's stride. The panel keeps
- * showing its last transfer; the stride latches at the next START, which is always a frame written in this layout. Never undone:
- * fg_scanout_stop restores only A's address. */
+/* Once, owned, with no transfer running and before any copy: the bars of every buffer black (mode 2 has none: the windows are only
+ * checked), then VIG0's stride. The panel keeps showing its last transfer; the stride latches at the next START, which is always a
+ * frame written in this layout. Never undone: fg_scanout_stop restores only A's address. */
 static int fg_fit_init(void)
 {
  unsigned n = fg_scanout_triple_requested ? 3u : fg_scanout_double_requested ? 2u : 1u, stride, flush;
+ unsigned top = FUXI_FIT_MODE_Y(fg_fit_requested), end = top + FUXI_FIT_MODE_H(fg_fit_requested);
  for (unsigned b = 0; b < n; b++)
-  if (!fg_fit_fill(b, 0, FUXI_FIT_Y*FUXI_FIT_PITCH) || !fg_fit_fill(b, (FUXI_FIT_Y+FUXI_FIT_H)*FUXI_FIT_PITCH, 2400u*FUXI_FIT_PITCH))
+  if (!fg_fit_fill(b, 0, top*FUXI_FIT_PITCH) || !fg_fit_fill(b, end*FUXI_FIT_PITCH, 2400u*FUXI_FIT_PITCH))
    return fg_scanout_stop("fit buffer mapping");
  __asm__ volatile("dsb sy" ::: "memory");
  if (!fg_scanout_read(0xae05024, &stride) || !fg_scanout_write(0xae05024, (stride & 0xffff0000u) | FUXI_FIT_PITCH) ||
      !fg_scanout_read(FG_SCAN_CTL+0x18, &flush) || !fg_scanout_write(FG_SCAN_CTL+0x18, flush | 1u)) return fg_scanout_stop("fit stride");
  __asm__ volatile("dsb sy" ::: "memory");
  __atomic_store_n(&fg_fit_active, 1, __ATOMIC_RELEASE);
+ if (fg_fit_requested == FUXI_FIT_STRETCH)
+  printf("FUXI SCANOUT: fit layout pitch=%u ystride0=%#x->%#x, stretch (no bars) in %u buffer(s); latched at the next START\n",
+      FUXI_FIT_PITCH, stride, (stride & 0xffff0000u) | FUXI_FIT_PITCH, n);
+ else
  printf("FUXI SCANOUT: fit layout pitch=%u ystride0=%#x->%#x, bars black in %u buffer(s); latched at the next START\n",
      FUXI_FIT_PITCH, stride, (stride & 0xffff0000u) | FUXI_FIT_PITCH, n);
  return 1;
@@ -2484,6 +2495,16 @@ static int fg_scanout_cpu_acquire_locked(void)
  } else if (newest && newest < 3) {
   for (unsigned i = 0; i < 1080u*2400; i++)
    ((volatile uint32_t *)fg_scanout_pixels)[i] = ((const volatile uint32_t *)fg_scanout_pixels_at(newest))[i];
+  if (fg_fit_active && fg_fit_requested == FUXI_FIT_STRETCH) {
+   /* sweetfbfit=2: the bytes past 1080x2400 words up to FG_FIT_MAIN, then the tail window, are image too; mode 1 keeps its black
+    * bar there. */
+   uintptr_t from = fuxi_gpu_nc_pointer(FG_FIT_TAIL(newest), FG_FIT_TAIL_BYTES), to = fuxi_gpu_nc_pointer(FG_FIT_TAIL(0), FG_FIT_TAIL_BYTES);
+   if (!from || !to) return fg_scanout_stop("fit tail mapping");
+   for (unsigned i = 1080u*2400; i < FG_FIT_MAIN/4; i++)
+    ((volatile uint32_t *)fg_scanout_pixels)[i] = ((const volatile uint32_t *)fg_scanout_pixels_at(newest))[i];
+   for (unsigned i = 0; i < (2400u*FUXI_FIT_PITCH - FG_FIT_MAIN)/4; i++)
+    ((volatile uint32_t *)to)[i] = ((const volatile uint32_t *)from)[i];
+  }
  }
  if (!fg_scanout_address(0xb8000000u)) return fg_scanout_stop("CPU restore A");
  if (fg_scanout_back_ready) fg_scanout_ready_drops++;
@@ -2824,8 +2845,8 @@ void fuxi_gpu_scanout_release(void)
  * CPU row-copy oracle, after the fence and before releasing the source pin.
  * Scalar aligned device loads only; no CPU framebuffer writes in this check.
  */
-/* sweetfbfit check (fuxigpuscanoutcheck=1, the first frames): the bars must be black (else the check fails, as a 1:1 mismatch
- * does); the image is only measured against a bilinear reference with 8-bit weights sampling at (d+0.5)*src/dst-0.5, the
+/* sweetfbfit check (fuxigpuscanoutcheck=1, the first frames; mode 2 has no bars, its reference is the stretch): the bars must be
+ * black (else the check fails, as a 1:1 mismatch does); the image is only measured against a bilinear reference with 8-bit weights sampling at (d+0.5)*src/dst-0.5, the
  * Vulkan convention Mesa relies on for these blits. max_err and over2 (pixels with a channel off by more than 2) show whether the
  * 2D engine filters and maps the rects that way; they never fail the check. */
 static unsigned fg_fit_pos(unsigned d, unsigned dn, unsigned sn, unsigned *f)
@@ -2841,23 +2862,24 @@ static int fg_fit_verify(void)
  uintptr_t base = b ? fuxi_gpu_nc_pointer(0xb8000000u + b*0xa00000u, FG_FIT_MAIN) : fg_scanout_pixels;
  uintptr_t tail = fuxi_gpu_nc_pointer(FG_FIT_TAIL(b), FG_FIT_TAIL_BYTES);
  if (!base || !tail || fg_scanout_w != FUXI_FIT_SRC_W || fg_scanout_h != FUXI_FIT_SRC_H) return 0;
- unsigned bars = 0, over = 0, worst = 0, first_x = 0, first_y = 0;
+ unsigned bars = 0, over = 0, worst = 0, first_x = 0, first_y = 0, top = FUXI_FIT_MODE_Y(fg_fit_requested), fh = FUXI_FIT_MODE_H(fg_fit_requested);
  __asm__ volatile("dsb sy" ::: "memory");
  for (unsigned y = 0; y < 2400u; y++) {
-  if (y == FUXI_FIT_Y) y += FUXI_FIT_H;
+  if (y == top) y += fh;
+  if (y >= 2400u) break; /* mode 2: every row is image */
   for (unsigned x = 0; x < 1080u; x++) {
    unsigned o = y*FUXI_FIT_PITCH + x*4;
    bars += (*(const volatile uint32_t *)(o < FG_FIT_MAIN ? base + o : tail + (o - FG_FIT_MAIN)) & 0xffffffu) != 0; /* any alpha: display-off fills 0 */
   }
  }
  const uint8_t *src = (const uint8_t *)(fg_scanout_source + (uint64_t)fg_scanout_sy*fg_scanout_pitch + fg_scanout_sx*4);
- for (unsigned y = 0; y < FUXI_FIT_H; y++) {
-  unsigned fy, y0 = fg_fit_pos(y, FUXI_FIT_H, FUXI_FIT_SRC_H, &fy), y1 = y0+1 < FUXI_FIT_SRC_H ? y0+1 : y0;
+ for (unsigned y = 0; y < fh; y++) {
+  unsigned fy, y0 = fg_fit_pos(y, fh, FUXI_FIT_SRC_H, &fy), y1 = y0+1 < FUXI_FIT_SRC_H ? y0+1 : y0;
   const uint8_t *r0 = src + (uint64_t)y0*fg_scanout_pitch, *r1 = src + (uint64_t)y1*fg_scanout_pitch;
-  uintptr_t dst = base + (FUXI_FIT_Y+y)*FUXI_FIT_PITCH;
+  unsigned row = (top+y)*FUXI_FIT_PITCH;
   for (unsigned x = 0; x < FUXI_FIT_W; x++) {
-   unsigned fx, x0 = fg_fit_pos(x, FUXI_FIT_W, FUXI_FIT_SRC_W, &fx), x1 = x0+1 < FUXI_FIT_SRC_W ? x0+1 : x0, err = 0;
-   uint32_t got = *(const volatile uint32_t *)(dst + x*4);
+   unsigned fx, x0 = fg_fit_pos(x, FUXI_FIT_W, FUXI_FIT_SRC_W, &fx), x1 = x0+1 < FUXI_FIT_SRC_W ? x0+1 : x0, err = 0, o = row + x*4;
+   uint32_t got = *(const volatile uint32_t *)(o < FG_FIT_MAIN ? base + o : tail + (o - FG_FIT_MAIN));
    for (unsigned c = 0; c < 32; c += 8) {
     unsigned v = ((256-fx)*(256-fy)*r0[x0*4+c/8] + fx*(256-fy)*r0[x1*4+c/8] + (256-fx)*fy*r1[x0*4+c/8] + fx*fy*r1[x1*4+c/8] + 32768) >> 16;
     unsigned g = (got >> c) & 255u, d = g > v ? g - v : v - g;
@@ -2869,7 +2891,7 @@ static int fg_fit_verify(void)
  }
  absolutetime_to_nanoseconds(mach_absolute_time()-began, &ns);
  printf("FUXI SCANOUT: fit pixel frame=%u buffer=%u pixels=%u bars_nonblack=%u max_err=%u over2=%u first=%u,%u check_us=%llu\n",
-     ++fg_scanout_checked, b, FUXI_FIT_W*FUXI_FIT_H, bars, worst, over, first_x, first_y, (unsigned long long)(ns/1000));
+     ++fg_scanout_checked, b, FUXI_FIT_W*fh, bars, worst, over, first_x, first_y, (unsigned long long)(ns/1000));
  return !bars;
 }
 static int fg_scanout_verify(void)

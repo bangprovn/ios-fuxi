@@ -57,7 +57,7 @@ void fuxi_perf_swap(void);
 
 extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
 extern "C" { int sweet_fb_display_off; }        /* read by bsd/dev/fuxi_touch.c */
-extern "C" { int sweet_fb_fit; }        /* sweetfbfit accepted: read by SweetHID's touch mapping */
+extern "C" { int sweet_fb_fit; }        /* sweetfbfit mode accepted (0 off, 1, 2): read by SweetHID's touch mapping */
 
 #if defined(SWEET)
 #include <IOKit/IOService.h>
@@ -118,7 +118,8 @@ enum {
  * Boot-arg sweetfb_native=1 presents the real panel size instead.
  * Boot-arg sweetfbfit=1 (FUXI, needs the GPU scanout) shows the whole
  * 1125x2436 frame instead, scaled into 1080x2338 at y=31 between black
- * bars (FUXI_FIT_* in fuxi_adreno.h); userland sees no difference.
+ * bars (FUXI_FIT_* in fuxi_adreno.h); sweetfbfit=2 stretches it to the
+ * full 1080x2400 panel (y 2400/2436, no bars). Userland sees no difference.
  */
 #define SWEET_FB_LOGICAL_W              1125
 #define SWEET_FB_LOGICAL_H              2436
@@ -210,10 +211,10 @@ public:
 	uint8_t       fScanoutLog;  /* 1 summary, 2 also per frame (fuxigpuscanoutlog=1) */
  uint32_t      fScanoutFrames, fScanoutGpu, fScanoutCpu, fScanoutDefers;
  uint64_t      fScanoutTime, fScanoutMax, fScanoutBytes, fScanoutPrepare;
- /* sweetfbfit=1 accepted: frames are scaled whole into the panel (GPU bilinear, CPU nearest); fFitBars is the pitch whose bars this
-  * object last made black (the boot layout before the takeover; the GPU side clears the 4352 layout's), fScanoutGpuTime/CpuTime the
-  * copy time per path for the summary line. */
- bool          fFit;
+ /* sweetfbfit mode accepted (1 scaled with bars, 2 stretched, 0 off): frames are scaled whole into the panel (GPU bilinear, CPU
+  * nearest); fFitBars is the pitch whose bars this object last made black (the boot layout before the takeover; the GPU side
+  * clears the 4352 layout's), fScanoutGpuTime/CpuTime the copy time per path for the summary line. */
+ uint8_t       fFit;
  uint32_t      fFitBars;
  uint64_t      fScanoutGpuTime, fScanoutCpuTime;
 #if defined(FUXI)
@@ -681,14 +682,18 @@ AppleCLCD::start(IOService *provider)
  if (fScanout) { sweet_console_muted = 1; fConsolePaused = true; }
  fuxi_gpu_scanout_configure(fPixels, fScanout, check);
  uint32_t fit = 0;
- if (PE_parse_boot_argn("sweetfbfit", &fit, sizeof(fit)) && fit == 1) {
-  if (fLogicalW != FUXI_FIT_SRC_W || fLogicalH != FUXI_FIT_SRC_H || fWidth != FUXI_FIT_W || fHeight != 2400 || fRowBytes != 4320)
+ if (PE_parse_boot_argn("sweetfbfit", &fit, sizeof(fit))) {
+  if (fit != 1 && fit != FUXI_FIT_STRETCH)
+   IOLog("SWEET FB: fit refused: sweetfbfit=%u (1 scaled with bars, 2 stretched to the panel); centred crop kept\n", fit);
+  else if (fLogicalW != FUXI_FIT_SRC_W || fLogicalH != FUXI_FIT_SRC_H || fWidth != FUXI_FIT_W || fHeight != 2400 || fRowBytes != 4320)
    IOLog("SWEET FB: fit refused: needs the %ux%u frame on the 1080x2400 stride 4320 panel (sweetfb_native off); centred crop kept\n",
        FUXI_FIT_SRC_W, FUXI_FIT_SRC_H);
-  else fFit = fuxi_gpu_scanout_fit() == 1;
+  else if (fuxi_gpu_scanout_fit(fit) == 1) fFit = (uint8_t)fit;
  }
  sweet_fb_fit = fFit;
- if (fFit) IOLog("SWEET FB: fit %ux%u -> %ux%u at y=%u (bilinear; CPU fallback nearest)\n",
+ if (fFit == FUXI_FIT_STRETCH) IOLog("SWEET FB: fit %ux%u -> %ux%u at y=%u (stretch, bilinear; CPU fallback nearest)\n",
+     FUXI_FIT_SRC_W, FUXI_FIT_SRC_H, FUXI_FIT_W, FUXI_FIT_MODE_H(fFit), FUXI_FIT_MODE_Y(fFit));
+ else if (fFit) IOLog("SWEET FB: fit %ux%u -> %ux%u at y=%u (bilinear; CPU fallback nearest)\n",
      FUXI_FIT_SRC_W, FUXI_FIT_SRC_H, FUXI_FIT_W, FUXI_FIT_H, FUXI_FIT_Y);
  uint32_t nc = 0;
  PE_parse_boot_argn("fuxigpuncimport", &nc, sizeof(nc));
@@ -925,11 +930,14 @@ get32(const uint8_t *p, uint32_t off)
 #if defined(FUXI)
 /*
  * sweetfbfit CPU frames, nearest neighbour (the fallback; GPU frames are
- * bilinear). Panel pixel (px, 31+py) shows the logical pixel whose area
- * holds the panel pixel's centre, the GPU filter's sample position:
- * x ((2px+1)*1125)/2160, y ((2py+1)*2436)/4676. Only image rows are
- * written, never past the mapped bytes; volatile stores, as the panel
- * mapping is write-combined. Returns the bytes written.
+ * bilinear). Panel pixel (px, top+py) of the top..top+height image shows
+ * the logical pixel whose area holds the panel pixel's centre, the GPU
+ * filter's sample position: x ((2px+1)*1125)/2160, y ((2py+1)*2436)/
+ * (2*height): 31 and 2338 rows in mode 1, 0 and 2400 in mode 2. Only
+ * image rows are written: below `mapped` bytes through the panel
+ * mapping, past it through `tail` (mode 2's last rows; 0 = stop there).
+ * Volatile stores, as both mappings are uncached. Returns the bytes
+ * written.
  */
 static inline uint32_t
 sweet_fb_fit_col(uint32_t px)
@@ -938,14 +946,15 @@ sweet_fb_fit_col(uint32_t px)
 }
 
 static inline uint32_t
-sweet_fb_fit_row(uint32_t py)
+sweet_fb_fit_row(uint32_t py, uint32_t height)
 {
-	return ((2 * py + 1) * FUXI_FIT_SRC_H) / (2 * FUXI_FIT_H);
+	return ((2 * py + 1) * FUXI_FIT_SRC_H) / (2 * height);
 }
 
 static uint64_t
-sweet_fb_fit_copy(uintptr_t pixels, uint32_t pitch, uint64_t mapped, uintptr_t source, uint64_t sourceBytes,
-    uint32_t bpr, int32_t sx, int32_t sy, int32_t dx, int32_t dy, int32_t w, int32_t h)
+sweet_fb_fit_copy(uintptr_t pixels, uint32_t pitch, uint64_t mapped, uintptr_t tail, uint64_t tailBytes, uint32_t top,
+    uint32_t height, uintptr_t source, uint64_t sourceBytes, uint32_t bpr, int32_t sx, int32_t sy, int32_t dx, int32_t dy,
+    int32_t w, int32_t h)
 {
 	uint32_t px0 = 0, px1, py0 = 0, py1;
 	uint64_t bytes = 0;
@@ -958,38 +967,54 @@ sweet_fb_fit_copy(uintptr_t pixels, uint32_t pitch, uint64_t mapped, uintptr_t s
 	}
 	for (px1 = px0; px1 < FUXI_FIT_W && sweet_fb_fit_col(px1) < (uint32_t)(dx + w); px1++) {
 	}
-	while (py0 < FUXI_FIT_H && sweet_fb_fit_row(py0) < (uint32_t)dy) {
+	while (py0 < height && sweet_fb_fit_row(py0, height) < (uint32_t)dy) {
 		py0++;
 	}
-	for (py1 = py0; py1 < FUXI_FIT_H && sweet_fb_fit_row(py1) < (uint32_t)(dy + h); py1++) {
+	for (py1 = py0; py1 < height && sweet_fb_fit_row(py1, height) < (uint32_t)(dy + h); py1++) {
 	}
 	if (px0 >= px1) {
 		return 0;
 	}
 	uint32_t right = (uint32_t)sx + sweet_fb_fit_col(px1 - 1) - (uint32_t)dx;
 	for (uint32_t py = py0; py < py1; py++) {
-		uint64_t row = (uint64_t)(FUXI_FIT_Y + py) * pitch;
-		uint64_t from = (uint64_t)((uint32_t)sy + sweet_fb_fit_row(py) - (uint32_t)dy) * bpr;
-		if (row + (uint64_t)px1 * 4 > mapped || from + ((uint64_t)right + 1) * 4 > sourceBytes) {
+		uint64_t row = (uint64_t)(top + py) * pitch;
+		uint64_t from = (uint64_t)((uint32_t)sy + sweet_fb_fit_row(py, height) - (uint32_t)dy) * bpr;
+		if (from + ((uint64_t)right + 1) * 4 > sourceBytes) {
 			break;
 		}
-		volatile uint32_t *out = (volatile uint32_t *)(pixels + row);
 		const uint32_t *in = (const uint32_t *)(source + from);
-		for (uint32_t px = px0; px < px1; px++) {
-			out[px] = in[(uint32_t)sx + sweet_fb_fit_col(px) - (uint32_t)dx];
+		if (row + (uint64_t)px1 * 4 <= mapped) {
+			volatile uint32_t *out = (volatile uint32_t *)(pixels + row);
+			for (uint32_t px = px0; px < px1; px++) {
+				out[px] = in[(uint32_t)sx + sweet_fb_fit_col(px) - (uint32_t)dx];
+			}
+			bytes += (uint64_t)(px1 - px0) * 4;
+			continue;
 		}
-		bytes += (uint64_t)(px1 - px0) * 4;
+		/* A row at or past the end of the panel mapping: the rest goes through the tail window. */
+		for (uint32_t px = px0; px < px1; px++) {
+			uint64_t o = row + (uint64_t)px * 4;
+			if (o + 4 > mapped && (!tail || o - mapped + 4 > tailBytes)) {
+				return bytes;
+			}
+			*(volatile uint32_t *)(o + 4 <= mapped ? pixels + o : tail + (o - mapped)) =
+			    in[(uint32_t)sx + sweet_fb_fit_col(px) - (uint32_t)dx];
+			bytes += 4;
+		}
 	}
 	return bytes;
 }
 
-/* The bars of the boot (4320-pitch) layout, used before the takeover sets up the 4352 one. */
+/* The bars of the boot (4320-pitch) layout, the rows outside top..top+height, before the takeover sets up the 4352 one. */
 static void
-sweet_fb_fit_bars(uintptr_t pixels, uint32_t pitch)
+sweet_fb_fit_bars(uintptr_t pixels, uint32_t pitch, uint32_t top, uint32_t height)
 {
 	for (uint32_t y = 0; y < 2400; y++) {
-		if (y == FUXI_FIT_Y) {
-			y += FUXI_FIT_H;
+		if (y == top) {
+			y += height;
+		}
+		if (y >= 2400) {
+			break;
 		}
 		volatile uint32_t *row = (volatile uint32_t *)(pixels + (uint64_t)y * pitch);
 		for (uint32_t x = 0; x < FUXI_FIT_W; x++) {
@@ -1482,7 +1507,7 @@ AppleCLCD::present(const SwapRecord &record)
              if (FlogEntry *e = flogFind(fFlogGpuID)) { e->ready = record.ready; e->submit = times.submitted; }
              if (read.held) { sweet_surface_present_end(); read.held = false; }
              if (fEarlyRetire) retireEarly(record);
-             fScanoutBytes = fFit ? (uint64_t)FUXI_FIT_W * FUXI_FIT_H * 4 :
+             fScanoutBytes = fFit ? (uint64_t)FUXI_FIT_W * FUXI_FIT_MODE_H(fFit) * 4 :
                  fuxi_gpu_scanout_double() ? (uint64_t)1080 * 2400 * 4 : (uint64_t)w * h * 4;
 				fShadowValid = false;
 				gpuFrame = true;
@@ -1527,11 +1552,16 @@ AppleCLCD::present(const SwapRecord &record)
 					/* After cpu_acquire: the layout the display fetches now (4352 once the takeover set it, else the boot pitch). */
 					uint32_t pitch = fuxi_gpu_scanout_fit_pitch();
 					if (!pitch) pitch = fRowBytes;
+					uint32_t top = FUXI_FIT_MODE_Y(fFit), height = FUXI_FIT_MODE_H(fFit);
 					if (fFitBars != pitch) {
-						if (pitch == fRowBytes) sweet_fb_fit_bars(fPixels, pitch);
+						if (pitch == fRowBytes) sweet_fb_fit_bars(fPixels, pitch, top, height);
 						fFitBars = pitch; /* the GPU side made the 4352 layout's bars black */
 					}
-					written = sweet_fb_fit_copy(fPixels, pitch, (uint64_t)fRowBytes * fHeight, src + s->offset,
+					/* Mode 2 at 4352: the last rows go through A's tail window, which starts at the end of this mapping. */
+					uint64_t mapped = (uint64_t)fRowBytes * fHeight, split = 0, tailBytes = 0;
+					uintptr_t tail = fFit == FUXI_FIT_STRETCH && pitch == FUXI_FIT_PITCH ? fuxi_gpu_scanout_fit_tail(&split, &tailBytes) : 0;
+					if (tail) mapped = split;
+					written = sweet_fb_fit_copy(fPixels, pitch, mapped, tail, tailBytes, top, height, src + s->offset,
 					    s->memory->getLength() - s->offset, s->bytesPerRow, sx, sy, dx, dy, w, h);
 				} else
 				if (fUnixnuDiff) {
@@ -1813,8 +1843,8 @@ AppleCLCD::scanoutLog(bool gpu, uint64_t bytes, uint64_t copy, uint64_t prepare)
       fScanoutFrames, gpu ? "GPU" : "CPU", bytes, ns/1000, prep/1000);
  /* sweetfbfit: the same summary, then the copy time per path (GPU: submit to retire of the scaled blit; CPU: the nearest copy). */
  if (fScanoutFrames % 120 == 0 && fFit)
-  IOLog("FUXI SCANOUT: summary frames=%u GPU=%u CPU=%u copy_avg_us=%llu copy_max_us=%llu deferred=%u fit=1 gpu_copy_avg_us=%llu cpu_copy_avg_us=%llu\n",
-      fScanoutFrames, fScanoutGpu, fScanoutCpu, fScanoutTime/1000/fScanoutFrames, fScanoutMax/1000, fScanoutDefers,
+  IOLog("FUXI SCANOUT: summary frames=%u GPU=%u CPU=%u copy_avg_us=%llu copy_max_us=%llu deferred=%u fit=%u gpu_copy_avg_us=%llu cpu_copy_avg_us=%llu\n",
+      fScanoutFrames, fScanoutGpu, fScanoutCpu, fScanoutTime/1000/fScanoutFrames, fScanoutMax/1000, fScanoutDefers, (unsigned)fFit,
       fScanoutGpu ? fScanoutGpuTime/1000/fScanoutGpu : 0ULL, fScanoutCpu ? fScanoutCpuTime/1000/fScanoutCpu : 0ULL);
  else if (fScanoutFrames % 120 == 0)
   IOLog("FUXI SCANOUT: summary frames=%u GPU=%u CPU=%u copy_avg_us=%llu copy_max_us=%llu deferred=%u\n",

@@ -1409,20 +1409,22 @@ static unsigned fit_bars_black(const uint8_t *base,const uint8_t *tail) {
  return 1;
 }
 static unsigned stride_writes(void) {unsigned n=0;for(unsigned i=0;i<traceCount;i++)n+=trace[i].pa==0xae05024;return n;}
-static void fit_owned(uint8_t *a,unsigned m) {
+static void fit_owned_mode(uint8_t *a,unsigned m,unsigned mode) {
  reset();fitModel=1;modelDouble=m>0;modelTriple=m==2;modelTe=1;
  intf[0x294/4]=2400;intf[0x298/4]=(1u<<16)|2500;intf[0x2b0/4]=2400;sspp[0x24/4]=0x10e0u|(7u<<16);ctl[0x18/4]=0x40;
  memset(a,0x5a,0x9e4000);memset(fitB,0xcc,sizeof(fitB));memset(fitC,0xcc,sizeof(fitC));memset(fitTail,0x77,sizeof(fitTail));
- fuxi_gpu_scanout_configure((uintptr_t)a,1,0);assert(fuxi_gpu_scanout_fit()==1 && fg_fit_requested);
+ fuxi_gpu_scanout_configure((uintptr_t)a,1,0);assert(fuxi_gpu_scanout_fit(mode)==1 && fg_fit_requested==mode);
  assert(!fuxi_gpu_scanout_acquire() && fuxi_gpu_scanout_owned() && !fuxi_gpu_scanout_fit_pitch() && !stride_writes());
  intf[0x298/4]=(2u<<16)|2500;
 }
+static void fit_owned(uint8_t *a,unsigned m) {fit_owned_mode(a,m,1);}
 static void fit_tests(void) {
  uint8_t *a=malloc(0x9e4000),*src=malloc(4608u*2436);assert(a && src);
- reset();fuxi_gpu_scanout_configure((uintptr_t)a,0,0);assert(!fuxi_gpu_scanout_fit() && !fg_fit_requested && strstr(fitLog,"fit refused: needs fuxigpuscanout=1"));
+ reset();fuxi_gpu_scanout_configure((uintptr_t)a,0,0);assert(!fuxi_gpu_scanout_fit(1) && !fg_fit_requested && strstr(fitLog,"fit refused: needs fuxigpuscanout=1"));
+ reset();fuxi_gpu_scanout_configure((uintptr_t)a,1,0);assert(!fuxi_gpu_scanout_fit(3) && !fuxi_gpu_scanout_fit(0) && !fg_fit_requested && strstr(fitLog,"fit refused: unknown mode"));
  reset();modelNc=0x1c00000u;fuxi_gpu_scanout_configure((uintptr_t)a,1,0);
- assert(fg_scanout_dpu_stage3 && !fuxi_gpu_scanout_fit() && !fg_fit_requested && strstr(fitLog,"direct scanout"));
- reset();modelNc=0x1000000u;fuxi_gpu_scanout_configure((uintptr_t)a,1,0);assert(fuxi_gpu_scanout_fit()==1 && !fuxi_gpu_scanout_fit_pitch());
+ assert(fg_scanout_dpu_stage3 && !fuxi_gpu_scanout_fit(1) && !fuxi_gpu_scanout_fit(2) && !fg_fit_requested && strstr(fitLog,"direct scanout"));
+ reset();modelNc=0x1000000u;fuxi_gpu_scanout_configure((uintptr_t)a,1,0);assert(fuxi_gpu_scanout_fit(1)==1 && !fuxi_gpu_scanout_fit_pitch());
  for(unsigned m=0;m<3;m++) {
   fit_owned(a,m);
   assert(fuxi_gpu_scanout_acquire()==1 && fuxi_gpu_scanout_fit_pitch()==4352 && fg_fit_active && !starts);
@@ -1464,8 +1466,50 @@ static void fit_tests(void) {
  memset(&fitTail[0][0x10f04],0,4); // row 2399 x=1: a display-off zero is black (any alpha); the tail is checked too
  fitTail[0][0x10f00]=1; /* row 2399 x=0 */assert(!fg_scanout_verify() && fg_scanout_checked==4 && strstr(fitLog,"bars_nonblack=1 "));
  assert(fg_scanout_verify()); // only the first four frames
+
+ // sweetfbfit=2: no bars (the buffers keep their bytes), the same stride switch, once; the windows are still checked.
+ for(unsigned m=0;m<3;m++) {
+  fit_owned_mode(a,m,2);
+  assert(fuxi_gpu_scanout_acquire()==1 && fuxi_gpu_scanout_fit_pitch()==4352 && fg_fit_active && !starts);
+  assert(sspp[0x24/4]==(4352u|(7u<<16)) && (ctl[0x18/4]&0x41)==0x41 && stride_writes()==1);
+  assert(strstr(fitLog,"fit layout pitch=4352 ystride0=0x710e0->0x71100, stretch (no bars) in "));
+  assert(a[0]==0x5a && a[2370*4352]==0x5a && fitTail[0][0]==0x77 && fitTail[0][0x11ffc]==0x77);
+  if(m) assert(!memcmp(fitB,a,4320u*2400) && fitTail[1][0]==0x77);
+  { uint64_t split=0,bytes=0;uintptr_t tail=fuxi_gpu_scanout_fit_tail(&split,&bytes);assert(tail==(uintptr_t)fitTail[0] && split==0x9e4000 && bytes==0x14000); }
+ }
+ fit_owned_mode(a,1,2);failTail=2;assert(fuxi_gpu_scanout_acquire()==-1 && !fg_fit_active && !stride_writes()); // B's tail missing
+ // A CPU frame after a GPU frame in B: the drain copies B's whole 4352-pitch image into A, its tail window included.
+ fit_owned_mode(a,1,2);assert(fuxi_gpu_scanout_acquire()==1 && fg_scanout_copy==1 && fuxi_gpu_scanout_publish()==1 && fg_scanout_front==1);
+ memset(fitB,0x3c,sizeof(fitB));memset(fitTail[1],0x3d,sizeof(fitTail[1]));memset(a,0x11,0x9e4000);memset(fitTail[0],0x12,sizeof(fitTail[0]));
+ ctl[0x1c/4]=0;intf[0x298/4]+=1u<<16;
+ assert(fuxi_gpu_scanout_cpu_acquire()==1 && !fg_scanout_double_active);
+ for(unsigned i=0;i<0x9e4000;i+=997)assert(a[i]==0x3c);
+ assert(a[0x9e4000-1]==0x3c && fitTail[0][0]==0x3d && fitTail[0][0x12000-1]==0x3d && fitTail[0][0x12000]==0x12); // 2400 rows, no more
+ // Mode 1's drain leaves A's tail (its black bar) alone.
+ fit_owned_mode(a,1,1);assert(fuxi_gpu_scanout_acquire()==1 && fuxi_gpu_scanout_publish()==1);
+ memset(fitTail[0],0x12,sizeof(fitTail[0]));ctl[0x1c/4]=0;intf[0x298/4]+=1u<<16;
+ assert(fuxi_gpu_scanout_cpu_acquire()==1 && fitTail[0][0]==0x12);
+ // Oracle, mode 2: the reference stretch (2400 rows from y=0, the last ones through the tail window) passes with max_err 0, no bars.
+ fit_owned_mode(a,0,2);assert(fuxi_gpu_scanout_acquire()==1);
+ fg_scanout_checks=4;fg_scanout_checked=0;fg_scanout_source=(uintptr_t)src;fg_scanout_pitch=4608;
+ fg_scanout_sx=fg_scanout_sy=fg_scanout_dx=fg_scanout_dy=0;fg_scanout_w=1125;fg_scanout_h=2436;
+ for(unsigned y=0;y<2400;y++) {
+  double v=(y+0.5)*2436.0/2400.0-0.5;unsigned y0=(unsigned)v,fy=(unsigned)((v-y0)*256),y1=y0+1<2436?y0+1:y0;
+  for(unsigned x=0;x<1080;x++) {
+   double u=(x+0.5)*1125.0/1080.0-0.5;unsigned x0=(unsigned)u,fx=(unsigned)((u-x0)*256),x1=x0+1<1125?x0+1:x0;
+   for(unsigned c=0;c<4;c++) {
+    unsigned o=y*4352+x*4+c;
+    uint8_t v8=(uint8_t)(((256-fx)*(256-fy)*src[y0*4608+x0*4+c]+fx*(256-fy)*src[y0*4608+x1*4+c]+
+     (256-fx)*fy*src[y1*4608+x0*4+c]+fx*fy*src[y1*4608+x1*4+c]+32768)>>16);
+    if(o<0x9e4000u)a[o]=v8;else fitTail[0][o-0x9e4000u]=v8;
+   }
+  }
+ }
+ assert(fg_scanout_verify() && strstr(fitLog,"fit pixel frame=1 buffer=0 pixels=2592000 bars_nonblack=0 max_err=0 over2=0 "));
+ fitTail[0][(2399*4352-0x9e4000)+5*4+2]+=7;assert(fg_scanout_verify() && strstr(fitLog,"bars_nonblack=0 max_err=7 over2=1 first=5,2399 "));
+ a[0]^=0xff;assert(fg_scanout_verify() && strstr(fitLog,"bars_nonblack=0 ")); // row 0 is image in mode 2: measured, never a bar
  free(a);free(src);reset();
- puts("PASS: sweetfbfit scanout: refused without the lane or with direct scanout; bars black in A/B/C incl. tails, then YSTRIDE0 4352 + flush once before START; kept through flips and stop; window failure stops first; fit oracle");
+ puts("PASS: sweetfbfit modes 1 and 2 scanout: mode 2 without bars, drain of its tail; refused without the lane or with direct scanout; bars black in A/B/C incl. tails, then YSTRIDE0 4352 + flush once before START; kept through flips and stop; window failure stops first; fit oracle");
 }
 int main(void) {
  te_estimator_tests();

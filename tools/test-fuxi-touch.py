@@ -350,10 +350,30 @@ static void fit_mapping() {
    ft_report(0);
   }
  }
+ // sweetfbfit=2: x/1080 and y/2400 of the frame (iOS x/0.96, y*2436/2400), no bars to clamp, the panel's own edges.
+ for(int batch=0;batch<2;batch++) {
+  reset(batch);sweet_fb_fit=2;
+  struct {int x,y;} pts[]={{0,0},{1079,2399},{540,1200},{100,30},{100,2369},{-5,3000},{777,1500}};
+  for(auto &q:pts) {
+   ft.x[3]=q.x;ft.y[3]=q.y;ft_report(1u<<3);
+   int x=q.x<0?0:q.x>1079?1079:q.x, y=q.y<0?0:q.y>2399?2399:q.y;
+   assert(field(child(3),kIOHIDEventFieldDigitizerX)==(int)(((int64_t)x<<16)/1080));
+   assert(field(child(3),kIOHIDEventFieldDigitizerY)==(int)(((int64_t)y<<16)/2400));
+   double iy=field(child(3),kIOHIDEventFieldDigitizerY)/65536.0*2436;
+   assert(iy>=y*2436.0/2400-0.04 && iy<=y*2436.0/2400+0.0001);
+   ft_report(0);
+  }
+  struct {int y;bool edge;} rows[]={{0,true},{47,true},{48,false},{2399-48,false},{2399-47,true},{2399,true}};
+  for(auto &r:rows) {
+   ft.x[1]=540;ft.y[1]=r.y;ft_report(1u<<1);
+   assert(!!(field(child(1),kIOHIDEventFieldDigitizerEventMask)&kIOHIDDigitizerEventFromEdgeTip)==r.edge);
+   ft_report(0);
+  }
+ }
  sweet_fb_fit=0;reset();ft.x[2]=410;ft.y[2]=700;ft_report(1u<<2);
  assert(field(child(2),kIOHIDEventFieldDigitizerX)==((410+22)*65536/1125) && field(child(2),kIOHIDEventFieldDigitizerY)==((700+18)*65536/2436));
  ft_report(0);
- puts("PASS: sweetfbfit touch: x/1080, (y-31)/2338, bars clamp, frame edges, batched and per-finger paths; off path unchanged");
+ puts("PASS: sweetfbfit touch: mode 1 x/1080, (y-31)/2338, bars clamp, frame edges; mode 2 x/1080, y/2400, panel edges; batched and per-finger paths; off path unchanged");
 }
 int main() {
  batching();coordinates_edges_and_legacy();allocation_failures();fifo_tests();randomized_sets();fit_mapping();

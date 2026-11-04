@@ -170,6 +170,10 @@ static uint64_t mach_absolute_time(void) {return ticks;}
 static unsigned fg_abi_present_wait;
 #define G4_FB_PA 0xb8000000ULL
 #define G4_FB_MAP 10371072u
+static unsigned fg_fit_requested; /* sweetfbfit mode (fuxi_adreno.c): 2 maps every 4352-pitch row */
+#define FUXI_FIT_PITCH 4352u
+#define FUXI_FIT_STRETCH 2u
+#define FUXI_FIT_STRETCH_MAP ((FUXI_FIT_PITCH*2400u + 4095u) & ~4095u)
 #define FG_CACHE_SLOTS 4u
 #define FG_SOURCE_VA 0x50000000u
 #define FG_SOURCE_L3 8u
@@ -729,6 +733,16 @@ int main(void) {
   uint32_t ttbrC=(uint32_t)FG_ABI_PT;
   #define DONE_UP_TO(n) g_wr(G3_FENCE_PA,FG_ABI_FENCE_OFF+4,(n))
   seed();ncimportArg=2097152;assert(fg_abi_init() && !fg_abi_inline); /* 512 is required */
+  /* sweetfbfit=2: the client root maps every 4352-pitch row of each buffer; off and mode 1 stop at the boot size. */
+  for(unsigned mode=0;mode<=2;mode++) {
+   seed();ncimportArg=512|2097152;fg_fit_requested=mode;fg_scanout_double_requested=1;fg_scanout_triple_requested=0;memset(presentL2,0,sizeof presentL2);presentL2[128+3]=0x41000|3;
+   assert(fg_abi_init() && fg_abi_inline && fg_inl_setup());
+   volatile uint64_t *a4=(volatile uint64_t *)G_PTR(FG_INL_L3+4u*4096),*b4=(volatile uint64_t *)G_PTR(FG_INL_L3+9u*4096);
+   unsigned last=(mode==2?FUXI_FIT_STRETCH_MAP:G4_FB_MAP)/4096-1;
+   assert(a4[last&511]==((G4_FB_PA+last*4096ULL)|3|(3u<<8)|(1u<<10)|(1u<<6)) && !a4[(last+1)&511]);
+   assert(b4[last&511]==((0xb8a00000ULL+last*4096ULL)|3|(3u<<8)|(1u<<10)|(1u<<6)) && !b4[(last+1)&511]);
+  }
+  fg_fit_requested=0;
   seed();ncimportArg=512|2097152;fg_scanout_double_requested=1;fg_scanout_triple_requested=0;memset(presentL2,0,sizeof presentL2);presentL2[128+3]=0x41000|3;
   assert(fg_abi_init() && fg_abi_inline && !fg_inl_ready && !fg_inl_usable());assert(!fuxi_gpu_abi_map(va,source,bytes,3,0,2));
   assert(!fuxi_gpu_abi_submit(ad,sz,1,&f1) && f1==1 && fg_root_client && fg_inl_ready==1 && fg_inl_usable() && sregs[(g_cb(g3_bank)+0x20)/4]==ttbrC && fg_inl_fbmask==3);

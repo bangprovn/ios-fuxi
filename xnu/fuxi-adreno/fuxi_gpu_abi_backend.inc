@@ -461,10 +461,11 @@ static int fg_inl_setup(void)
  g_zero(FG_INL_L2, (1+FG_INL_TABLES)*4096);
  static const uint64_t pa[3] = {G4_FB_PA, 0xb8a00000ULL, 0xb9400000ULL};
  unsigned want = 1u | (fg_scanout_double_requested ? 2u : 0) | (fg_scanout_triple_requested ? 4u : 0);
- _Static_assert(G4_FB_MAP <= 0xa00000u, "framebuffer exceeds its 10 MiB window");
+ _Static_assert(G4_FB_MAP <= 0xa00000u && FUXI_FIT_STRETCH_MAP <= 5u*0x200000u, "framebuffer exceeds its 10 MiB window");
+ unsigned fb_map = fg_fit_requested == FUXI_FIT_STRETCH ? FUXI_FIT_STRETCH_MAP : G4_FB_MAP; /* sweetfbfit=2 writes every 4352-pitch row */
  for (unsigned b = 0; b < 3; b++) {
   if (!(want & (1u<<b))) continue;
-  for (unsigned pg = 0; pg < G4_FB_MAP/4096; pg++) {
+  for (unsigned pg = 0; pg < fb_map/4096; pg++) {
    unsigned t = b*5+(pg>>9);
    volatile uint64_t *l3 = (volatile uint64_t *)G_PTR_RANGE(FG_INL_L3+(uint64_t)t*4096,4096);
    l2[((FG_INL_FB_VA>>21)&511)+t] = (FG_INL_L3+(uint64_t)t*4096) | 3;

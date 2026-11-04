@@ -72,8 +72,12 @@ int fuxi_gpu_scanout_cpu_acquire(void);
  * with black bars of 31 rows above and below (x 0.96, y 2338/2436), as the iPhone 12/13 mini shows the 1125x2436 frame. The GPU copy
  * is one bilinear 2D blit, which needs a destination pitch in 64-byte units: from the scanout takeover on, A/B/C use a 4352-byte
  * pitch (VIG0 SRC_YSTRIDE0, written once after the bars of every buffer are black; the image rows never touch the bars). fit:
- * call after configure, 1 accepted (needs fuxigpuscanout, refused with direct scanout). fit_pitch: FUXI_FIT_PITCH once the display
- * fetches that layout, else 0 (CPU writers keep the boot pitch, the boot layout's bars are theirs to clear). */
+ * call after configure with the mode, 1 accepted (needs fuxigpuscanout, refused with direct scanout). fit_pitch: FUXI_FIT_PITCH once
+ * the display fetches that layout, else 0 (CPU writers keep the boot pitch, the boot layout's bars are theirs to clear).
+ * sweetfbfit=2 (FUXI_FIT_STRETCH): the same frame stretched non-uniformly to the full 1080x2400 panel at y=0 as HakiOS does (x 0.96,
+ * y 2400/2436), no bars, same pitch. Its last rows lie past A's surface mapping and the B/C windows (0x9e4000 bytes): the GPU maps
+ * FUXI_FIT_STRETCH_MAP of each buffer, and CPU frames write them through fit_tail (A's tail window: its VA, *split = the byte
+ * offset where it starts, *bytes its size; 0 before the GPU side has mapped it). */
 #define FUXI_FIT_SRC_W 1125u
 #define FUXI_FIT_SRC_H 2436u
 #define FUXI_FIT_W 1080u
@@ -81,8 +85,13 @@ int fuxi_gpu_scanout_cpu_acquire(void);
 #define FUXI_FIT_Y 31u
 #define FUXI_FIT_PITCH 4352u
 #define FUXI_FIT_BLACK 0xff000000u
-int fuxi_gpu_scanout_fit(void);
+#define FUXI_FIT_STRETCH 2u
+#define FUXI_FIT_MODE_Y(m) ((m) == FUXI_FIT_STRETCH ? 0u : FUXI_FIT_Y)
+#define FUXI_FIT_MODE_H(m) ((m) == FUXI_FIT_STRETCH ? 2400u : FUXI_FIT_H)
+#define FUXI_FIT_STRETCH_MAP ((FUXI_FIT_PITCH*2400u + 4095u) & ~4095u)
+int fuxi_gpu_scanout_fit(unsigned mode);
 unsigned fuxi_gpu_scanout_fit_pitch(void);
+uintptr_t fuxi_gpu_scanout_fit_tail(uint64_t *split, uint64_t *bytes);
 int fuxi_gpu_scanout_reserve(void);
 /* fuxigpuncimport bit 20 (1048576, default off): SweetSurface cleans the copy source to PoC
  * before the ring reservation, outside the GPU lock, and fuxi_gpu_copy then skips its own

@@ -198,6 +198,7 @@ static uint32_t translated_pixel(unsigned va)
  * rect in 24.8 (whole pixels here) and destination rect, scale = their extents' ratio, bilinear with 8-bit weights sampling at
  * (d+0.5)*S/D-0.5, edges clamped to SP_PS_2D_SRC_SIZE. Every input comes from the registers the driver wrote. */
 static unsigned scaled_blits;
+static uint8_t *fitpanel; /* 3 x 10 MiB: every byte the GPU may map for a buffer */
 static void scaled_blit(const uint32_t *regs)
 {
  assert(!((regs[0x8401]|regs[0x8402]|regs[0x8403]|regs[0x8404])&255));
@@ -219,8 +220,10 @@ static void scaled_blit(const uint32_t *regs)
    unsigned buffer=dst/0xa00000u;
    dst-=buffer*0xa00000u;
    assert(buffer<3 && (!fg_scanout_triple_requested || !fg_scanout_back_ready || buffer!=fg_scanout_ready));
-   assert(dst<4320*2400 && (!fg_scanout_double_active || buffer!=fg_scanout_front) && pending<2400*1080);
-   pdst[pending]=dst+buffer*4320*2400; pdata[pending++]=v;
+   /* inside the buffer's GPU mapping: 0x9e4000, or every 4352-pitch row in mode 2 (else an SMMU fault) */
+   assert(dst+4<=(fg_fit_requested==FUXI_FIT_STRETCH ? FUXI_FIT_STRETCH_MAP : 0x9e4000u));
+   assert((!fg_scanout_double_active || buffer!=fg_scanout_front) && pending<2400*1080);
+   pdst[pending]=0x80000000u|(dst+buffer*0xa00000u); pdata[pending++]=v;
   }
  }
  scaled_blits++;
@@ -278,7 +281,7 @@ static int g3_gw(unsigned reg,unsigned value)
     }
     blits++;
    } else if(op==0x46 && n==1 && a[0]==26) {
-    for(unsigned i=0;i<pending;i++) memcpy(panel+pdst[i],&pdata[i],4);
+    for(unsigned i=0;i<pending;i++) memcpy(pdst[i]&0x80000000u ? fitpanel+(pdst[i]&0x7fffffffu) : panel+pdst[i],&pdata[i],4);
     pending=0;
    } else if(op==0x46 && n==4) {
     assert(!pending && a[0]==(49u|1u<<27) && a[1]==G3_FENCE_VA+64 && !a[2]);
@@ -496,8 +499,11 @@ int main(void)
   * registers. The bars, the rows past the image and the front/ready buffers keep the 0x6b fill. */
  {
   const unsigned P=4608, OX=3, OY=2, OFF=20, LEN=(OY+2436)*P;
+  fitpanel=malloc(3*0xa00000u);assert(fitpanel);
+  for(unsigned mode=1;mode<=2;mode++)
   for(unsigned m=0;m<3;m++) {
-   reset();fg_fit_requested=fg_fit_active=1;fg_scanout_owned=fg_scanout_requested=fg_scanout_writable=1;
+   const unsigned TOP=mode==2?0:31, H=mode==2?2400:2338;
+   reset();fg_fit_requested=mode;fg_fit_active=1;fg_scanout_owned=fg_scanout_requested=fg_scanout_writable=1;memset(fitpanel,0x6b,3*0xa00000u);
    fg_scanout_double_active=m>0;fg_scanout_triple_requested=m==2;fg_scanout_front=0;fg_scanout_back_ready=m==2;fg_scanout_ready=1;
    assert(fuxi_gpu_map(0,1,(uintptr_t)source_buf+OFF,LEN,&times));
    unsigned rung=doorbells;
@@ -505,22 +511,23 @@ int main(void)
    assert(doorbells==rung+1 && scaled_blits==1 && fg_cp_rects==1 && fg_cp_pitch==P);
    assert(fg_scanout_sx==OX && fg_scanout_sy==OY && fg_scanout_w==1125 && fg_scanout_h==2436 && !fg_scanout_dx && !fg_scanout_dy);
    unsigned target=m==0?0:m==1?1:2;
-   uint8_t *t=panel+target*4320*2400;
-   for(unsigned y=0;y<2338;y++) {
-    unsigned ny=(unsigned)(((uint64_t)(2*y+1)*2436-2338)*256/4676), fy=ny&255, y0=ny>>8, y1=y0+1<2436?y0+1:y0;
+   uint8_t *t=fitpanel+target*0xa00000u;
+   for(unsigned y=0;y<H;y++) {
+    unsigned ny=(unsigned)(((uint64_t)(2*y+1)*2436-H)*256/(2*H)), fy=ny&255, y0=ny>>8, y1=y0+1<2436?y0+1:y0;
     for(unsigned x=0;x<1080;x++) {
      unsigned nx=(unsigned)(((uint64_t)(2*x+1)*1125-1080)*256/2160), fx=nx&255, x0=nx>>8, x1=x0+1<1125?x0+1:x0;
      const uint8_t *r0=source_buf+OFF+(OY+y0)*P+OX*4, *r1=source_buf+OFF+(OY+y1)*P+OX*4;
      for(unsigned c=0;c<4;c++) {
       unsigned v=((256-fx)*(256-fy)*r0[x0*4+c]+fx*(256-fy)*r0[x1*4+c]+(256-fx)*fy*r1[x0*4+c]+fx*fy*r1[x1*4+c]+32768)>>16;
-      assert(t[(31+y)*4352+x*4+c]==v);
+      assert(t[(TOP+y)*4352+x*4+c]==v);
      }
     }
-    for(unsigned b=1080*4;b<4352;b++) assert(t[(31+y)*4352+b]==0x6b); /* the row's pitch padding */
+    for(unsigned b=1080*4;b<4352;b++) assert(t[(TOP+y)*4352+b]==0x6b); /* the row's pitch padding */
    }
-   for(unsigned i=0;i<31*4352;i++) assert(t[i]==0x6b);
-   for(unsigned i=2369*4352;i<4320*2400;i++) assert(t[i]==0x6b);
-   for(unsigned b=0;b<3;b++) if(b!=target) for(unsigned i=0;i<4320*2400;i+=4099) assert(panel[b*4320*2400+i]==0x6b);
+   for(unsigned i=0;i<TOP*4352;i++) assert(t[i]==0x6b);
+   for(unsigned i=(TOP+H)*4352;i<0xa00000u;i++) assert(t[i]==0x6b);
+   for(unsigned b=0;b<3;b++) if(b!=target) for(unsigned i=0;i<0xa00000u;i+=4099) assert(fitpanel[b*0xa00000u+i]==0x6b);
+   for(unsigned i=0;i<3*4320*2400;i+=4099) assert(panel[i]==0x6b); /* the 1:1 model is never written */
    assert(fuxi_gpu_unmap(0,&times));
   }
   /* Refused (the CPU draws): fit requested but the layout not live yet, display not owned, any other rect, a source pitch that is
@@ -540,8 +547,9 @@ int main(void)
   assert(doorbells==rung && !fg_busy);
   assert(model_copy(0,1,(uintptr_t)source_buf,2436u*4544,4544,0,0,0,0,1125,2436,&times)==1 && scaled_blits==1);
   assert(fuxi_gpu_unmap(0,&times));
+  free(fitpanel);fitpanel=0;
  }
- puts("PASS: sweetfbfit one bilinear 1125x2436->1080x2338 blit at y=31, pitch 4352, single/double/triple targets, bars and other buffers untouched, refusals");
+ puts("PASS: sweetfbfit one bilinear blit per frame, pitch 4352: mode 1 1125x2436->1080x2338 at y=31, mode 2 ->1080x2400 at y=0 inside its larger map; single/double/triple targets, bars and other buffers untouched, refusals");
  /* Independent windows and generations; unmapping one preserves the others. */
  reset();
  for(unsigned slot=0;slot<4;slot++) {
@@ -587,7 +595,7 @@ def main():
     functions += ''.join(function(adapter, n) for n in ('fg_fail', 'fg_isolate', 'fuxi_gpu_unmap', 'fuxi_gpu_map', 'fg_rect', 'fg_fit_rect', 'fg_clean', 'fg_ring_doorbell', 'fg_cp_stamp', 'fg_cp_retire', 'fuxi_gpu_poll', 'fuxi_gpu_copy'))
     functions = re.sub(r'__asm__ volatile\([^;]*\);', ';', functions)
     constants = '\n'.join(line for line in sync.added_file('gpu-a740.h').splitlines() if line.startswith('#define G4_'))
-    constants += '\n' + '\n'.join(re.findall(r'^#define FUXI_FIT_\w+ [^\n]*', sync.added_file('fuxi_adreno.h'), re.M))
+    constants += '\n' + '\n'.join(re.findall(r'^#define FUXI_FIT_\w+[ (][^\n]*', sync.added_file('fuxi_adreno.h'), re.M))
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / 'test.c'
         path.write_text(PREFIX + constants + '\n' + functions + MODEL)

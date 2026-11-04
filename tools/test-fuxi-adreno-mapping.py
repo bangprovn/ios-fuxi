@@ -150,9 +150,9 @@ static unsigned g3_read(uint64_t a) {
  return 0;
 }
 static unsigned g3_gr(unsigned a) { (void)a; return 0; }
-static unsigned fbMaps,failFbMap;
+static unsigned fbMaps,failFbMap,fbMapSize;
 static int g_map_at(uint64_t p,unsigned *n,unsigned va,unsigned pa,unsigned size,unsigned attr)
-{ (void)p;(void)n;assert(size==((4320*2400+4095)&~4095u) && attr==(1u<<6));
+{ (void)p;(void)n;assert(size==(fg_fit_requested==2?0x9f6000u:((4320*2400+4095)&~4095u)) && attr==(1u<<6));fbMapSize=size; /* sweetfbfit=2: every 4352-pitch row */
  assert((va==G4_FB_VA && pa==G4_FB_PA) || (fg_scanout_double_requested && va==G4_FB_VA+0xa00000u && pa==0xb8a00000u) || (fg_scanout_triple_requested && va==G4_FB_VA+0x1400000u && pa==0xb9400000u));return ++fbMaps!=failFbMap; }
 static int fg_source_tables(void) { return 1; }
 static int g4_tlb(uint32_t *p) { (void)p;return 0; }
@@ -307,6 +307,13 @@ int main(void)
  fuxi_gpu_start(G4_FB_PA,1080,2400,4320);fg_thread(NULL,NULL);
  assert(fg_state==2 && fbMaps==2 && !abi_publishes); // B mapping fails closed
  assert(0xb8a00000u+0x9e4000u<=0xbab00000u && 0xb8000000u+4320u*2400<=0xb8a00000u);
+ /* sweetfbfit=2 maps every 4352-pitch row of A/B/C for the GPU (2400 x 4352 bytes, 4 KiB pages); mode 1 the boot size. */
+ for(unsigned mode=1;mode<=2;mode++) {
+  reset();valid_handoff=1;fg_fit_requested=mode;
+  fuxi_gpu_start(G4_FB_PA,1080,2400,4320);fg_thread(NULL,NULL);
+  assert(fg_state==1 && fbMaps==3 && fbMapSize==(mode==2?0x9f6000u:0x9e4000u));
+ }
+ assert(0x9f6000u==((4352u*2400+4095)&~4095u) && 0x9f6000u<=0xa00000u);
  /* ABI MMIO/table setup must precede publishing ready to the display;
   * service publication must follow it. Failure only withholds the ABI. */
  for(unsigned fail=0;fail<2;fail++) {
@@ -340,9 +347,10 @@ def main():
     functions += ''.join(submit.function(adapter, n) for n in ('fg_thread', 'fuxi_gpu_start'))
     handoff = (ROOT / 'shim/fuxi-probe/gpu-handoff.h').read_text()
     clock = (ROOT / 'shim/fuxi-probe/gpu-clock.h').read_text() + (ROOT / 'xnu/fuxi-adreno/fuxi_gpu_dcvs.h').read_text()
+    fit = '\n'.join(re.findall(r'^#define FUXI_FIT_\w+[ (][^\n]*', submit.sync.added_file('fuxi_adreno.h'), re.M)) + '\n'
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / 'mapping.c'
-        path.write_text('#include <stdint.h>\n' + handoff + clock + PREFIX + declarations + functions + MODEL)
+        path.write_text('#include <stdint.h>\n' + handoff + clock + fit + PREFIX + declarations + functions + MODEL)
         exe = Path(d) / 'mapping'
         subprocess.run(['clang', '-std=gnu11', '-O1', '-g', '-Wall', '-Wextra', '-Werror',
                         '-fsanitize=address,undefined', str(path), '-o', str(exe)], check=True)

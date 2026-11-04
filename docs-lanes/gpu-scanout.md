@@ -2379,6 +2379,26 @@ channel difference from a bilinear reference sampling at (d+0.5)xS/D-0.5 with
 a large one, or a visible half-pixel shift, means the hardware samples
 differently. USB screenshots (req 0x4e) refuse while the stride is 4352.
 
+**Mode 1 on device** (h-fit1, kernel 5d8b606-mac): pixel check passed on all
+four frames, `bars_nonblack=0 max_err=2`, no panics; the owner has seen it.
+
+**`sweetfbfit=2`: stretch.** The same frame stretched non-uniformly to the whole
+1080x2400 panel at y=0, as HakiOS does: x 0.96, y 2400/2436 = 0.98522 (about a
+2.6 % vertical squeeze), no bars, bilinear, same 4352 layout and stride switch
+(`fg_fit_init` only checks the windows). Differences from mode 1: every row is
+image, so rows 2383-2399 lie past the GPU's former 0x9e4000 map of each
+buffer; mode 2 maps `FUXI_FIT_STRETCH_MAP` (0x9f6000) of A/B/C in the present
+root and in the inline client root (mode 1 and off keep the boot size). CPU
+frames write those rows through A's tail window (`fuxi_gpu_scanout_fit_tail`;
+before the GPU side maps it a frame stops at the mapping's end), and the CPU
+drain also copies the newest buffer's last rows into A. Touch: x/1080 and
+y/2400 of the frame (y_ios = y x 2436/2400), the panel's own edges. Lines:
+`SWEET FB: fit 1125x2436 -> 1080x2400 at y=0 (stretch, bilinear; CPU fallback nearest)`,
+`FUXI SCANOUT: fit layout pitch=4352 ystride0=0x10e0->0x1100, stretch (no bars) in N buffer(s)`,
+copy_exec `fit=2`, summary `fit=2`; the pixel check reports `bars_nonblack=0`
+always and `max_err` against the reference stretch. Any other `sweetfbfit`
+value logs `SWEET FB: fit refused: sweetfbfit=N (1 scaled with bars, 2 stretched to the panel); centred crop kept`.
+
 Host tests: `test-fuxi-adreno.py` (one blit per frame, registers through a
 Mesa-semantics bilinear model, single/double/triple targets, bars and other
 buffers untouched, refusals), `test-fuxi-adreno-mapping.py` (tail windows),
