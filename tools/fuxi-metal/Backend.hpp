@@ -117,7 +117,7 @@ struct VariantKey {
  explicit VariantKey(const DrawInput &input){for(unsigned i=0;i<resourceSlots;++i){auto *w=&words[i*8];w[0]=input.formats[i];w[1]=input.filters[i];memcpy(w+2,&input.lodMin[i],4);memcpy(w+3,&input.lodMax[i],4);for(unsigned stage=0;stage<2;++stage){w[4+stage*2]=input.buffers[stage][i].length!=0;w[5+stage*2]=input.buffers[stage][i].bytes;}}}
  bool operator==(const VariantKey &other) const {return words==other.words;}
 };
-struct Pipeline {uint32_t id{},fragInstr{},fragSamples{},fragLoops{},fragKills{},fragHash{},unrolled{};ShadowWindow shadowWindows[2][resourceSlots]{};std::array<uint32_t,resourceSlots> textureTypes{};size_t references=1,retainedBytes=0;bool writesStorage=false;void *translation{};CompileOptions options{};uint32_t fetchMask{};bool orderedColorAccess=false;std::vector<std::pair<uint32_t,VkRenderPass>> renders;VkPipeline pipeline{},stripPipeline{};std::array<VkPipeline,2> linePipelines{};std::array<VkPipeline,4> nfPipelines{};Translation recipe{};VkPipelineLayout layout{};VkRenderPass render{};uint32_t pushOffset{},pushSize{},pushStages{};uint8_t pushBytes[128]{};VkDescriptorSetLayout setLayout{};VkSampler bakedSamplers[16]{};BakedSampler bakedSamplerInfo[16]{};MipAccess mipAccess[2];uint32_t readOnlyStorage[2]{};std::vector<Descriptor> descriptors;std::vector<Buffer *> constantBlobs;std::vector<std::string> blobKeys;std::vector<std::array<uint8_t,32>> blobHashes;std::vector<std::pair<VariantKey,Pipeline *>> variants;
+struct Pipeline {uint32_t id{},fragInstr{},fragSamples{},fragLoops{},fragKills{},fragHash{},unrolled{};ShadowWindow shadowWindows[2][resourceSlots]{};std::array<uint32_t,resourceSlots> textureTypes{};uint32_t textureSlots=0;size_t references=1,retainedBytes=0;bool writesStorage=false;void *translation{};CompileOptions options{};uint32_t fetchMask{};bool orderedColorAccess=false;std::vector<std::pair<uint32_t,VkRenderPass>> renders;VkPipeline pipeline{},stripPipeline{};std::array<VkPipeline,2> linePipelines{};std::array<VkPipeline,4> nfPipelines{};Translation recipe{};VkPipelineLayout layout{};VkRenderPass render{};uint32_t pushOffset{},pushSize{},pushStages{};uint8_t pushBytes[128]{};VkDescriptorSetLayout setLayout{};VkSampler bakedSamplers[16]{};BakedSampler bakedSamplerInfo[16]{};MipAccess mipAccess[2];uint32_t readOnlyStorage[2]{};std::vector<Descriptor> descriptors;std::vector<Buffer *> constantBlobs;std::vector<std::string> blobKeys;std::vector<std::array<uint8_t,32>> blobHashes;std::vector<std::pair<VariantKey,Pipeline *>> variants;
 };
 struct BufferBind {Buffer *buffer{};uint64_t offset{};bool bytes=false;uint32_t end{};
  uint64_t length() const{return end?end:buffer?buffer->length:0;}};
@@ -425,7 +425,7 @@ private:
 
  uint32_t timestampBits=0;float timestampPeriod=0;
  VkPhysicalDeviceMemoryProperties memory{}; uint32_t family{};
- bool orderedColorAccess=false;bool hostImport=false,explicitPitch=false;uint64_t explicitPitchImports=0;VkDeviceSize hostAlignment{};VkFormatFeatureFlags linearFeatures{},optimalFeatures{};
+ bool orderedColorAccess=false;bool hostImport=false,explicitPitch=false;uint64_t explicitPitchImports=0,surfaceShadowImports=0;VkDeviceSize hostAlignment{};VkFormatFeatureFlags linearFeatures{},optimalFeatures{};
  PFN_vkGetPhysicalDeviceFormatProperties GetPhysicalDeviceFormatProperties{};
  PFN_vkGetPhysicalDeviceExternalBufferProperties GetPhysicalDeviceExternalBufferProperties{};
  PFN_vkGetMemoryHostPointerPropertiesEXT GetMemoryHostPointerPropertiesEXT{};
@@ -881,10 +881,16 @@ public:
  // format: the Metal pixel format CA asks for (BGRA8 for 'BGRA'; with 64-byte rows reported, also R8/RG8/RGBA8 surfaces such as
  // Safari's 433x433 'LA08', whose refusal failed backboardd over to the CPU on 3 Nov). A format without linear colour-attachment
  // support is imported for sampling and transfers only.
- Texture *importTexture(void *base,size_t bytes,size_t row,uint32_t width=256,uint32_t height=256,size_t offset=0,uint64_t identity=0,uint32_t format=80) {
+ // A plane of a multi-plane surface is the same import at that plane's offset and row (420v/420f video frames and snapshots: luma as
+ // R8 at plane 0, CbCr as RG8 at plane 1). sampledOnly: the client asked for a ShaderRead-only texture. Such a plane that Turnip cannot
+ // alias at its offset and row (an explicit linear row must be a multiple of 64 bytes and the binding offset of 64: SpringBoard's
+ // 788-wide 420f snapshots have 800-byte rows) is sampled through an optimal shadow instead, copied from the whole surface imported as a
+ // buffer, as linearTexture does for a client buffer (refreshed when its rows' hash changes). Other refusals throw as before.
+ Texture *importTexture(void *base,size_t bytes,size_t row,uint32_t width=256,uint32_t height=256,size_t offset=0,uint64_t identity=0,uint32_t format=80,bool sampledOnly=false) {
   std::unique_lock<std::mutex> guard(mutex);requireLive();
-  std::array<uint64_t,8> key{identity,uint64_t(uintptr_t(base)),bytes,row,offset,width,height,format};
-  if(identity){auto hit=imports.find(key);if(hit!=imports.end()){++hit->second->references;++surfaceImportHits;return hit->second;}++surfaceImportMisses;}
+  std::array<uint64_t,8> key{identity,uint64_t(uintptr_t(base)),bytes,row,offset,width,height,format},shadowKey=key;shadowKey[7]|=uint64_t(1)<<32;
+  if(identity){auto hit=imports.find(key);if(hit==imports.end() && sampledOnly)hit=imports.find(shadowKey);
+   if(hit!=imports.end()){++hit->second->references;++surfaceImportHits;return hit->second;}++surfaceImportMisses;}
   if(!supportsHostImport())throw std::runtime_error("IOSurface same-memory import requires VK_EXT_external_memory_host / NativeAdreno HostImport");
   const VkFormat vkFormat=pixelFormat(format);const size_t texel=texelBytes(format);
   VkFormatFeatureFlags have=linearFeatures;
@@ -902,12 +908,19 @@ public:
   info.usage=(attachment?((orderedColorAccess?VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT:0)|VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT):0)|VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT;
   VkExternalImageFormatProperties ep{};ep.sType=VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES;
   VkImageFormatProperties2 props{};props.sType=VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2;props.pNext=&ep;
-  check(GetPhysicalDeviceImageFormatProperties2(physical,&info,&props));
+  // An external linear image the driver does not offer is a refusal of this texture, not a device fault: a non-BGRA plane is
+  // asked for again without the attachment usage (it is sampled), then refused without latching backboardd onto the CPU.
+  auto formatResult=GetPhysicalDeviceImageFormatProperties2(physical,&info,&props);
+  if(formatResult==VK_ERROR_FORMAT_NOT_SUPPORTED && vkFormat!=VK_FORMAT_B8G8R8A8_UNORM && (info.usage&VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)){
+   info.usage=VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT;formatResult=GetPhysicalDeviceImageFormatProperties2(physical,&info,&props);}
+  if(formatResult==VK_ERROR_FORMAT_NOT_SUPPORTED)throw std::runtime_error("IOSurface linear external image format unavailable");
+  check(formatResult);
   auto features=ep.externalMemoryProperties.externalMemoryFeatures;
   if(!(features&VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) || (features&VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT) ||
      !(ep.externalMemoryProperties.compatibleHandleTypes&external.handleType) || props.imageFormatProperties.maxExtent.width<width || props.imageFormatProperties.maxExtent.height<height)
    throw std::runtime_error("IOSurface linear sampled/transfer import unsupported");
   auto *t=new Texture{};t->blendable=have&VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT;t->format=format;t->vkFormat=vkFormat;t->width=width;t->height=height;t->usage=info.usage;t->tiling=VK_IMAGE_TILING_LINEAR;t->imported=true;t->defined=true;t->layout=VK_IMAGE_LAYOUT_PREINITIALIZED;
+  std::string shadowWhy;
   try {
    VkExternalMemoryImageCreateInfo ei{};ei.sType=VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;ei.handleTypes=external.handleType;
    VkImageCreateInfo ii{};ii.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;ii.pNext=&ei;ii.imageType=info.type;ii.format=info.format;
@@ -917,30 +930,61 @@ public:
    // Turnip picks a 256-byte pitch for a plain linear BGRA8 image; Apple's IOSurface rows are 64-byte aligned and the
    // clients that fill them keep the row they asked for (the switcher's decoded snapshot cards, 3 Nov). Then the image is
    // made again as an explicit DRM_FORMAT_MOD_LINEAR layout at the surface's own row, which Turnip allows for 64-byte rows.
-   if(layout.rowPitch!=row && explicitPitch && row%64==0 && row>=size_t(width)*texel) {
+   // The same when the plain layout's 4 KiB rounding would run past the surface (a last plane near the end of its allocation).
+   if((layout.rowPitch!=row || req.size>bytes-offset || layout.size>bytes-offset) && explicitPitch && row%64==0 && row>=size_t(width)*texel) {
     DestroyImage(device,t->image,nullptr);t->image=VK_NULL_HANDLE;
     VkSubresourceLayout plane{};plane.rowPitch=row;
     VkImageDrmFormatModifierExplicitCreateInfoEXT ex{};ex.sType=VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT;
     ex.drmFormatModifier=0;ex.drmFormatModifierPlaneCount=1;ex.pPlaneLayouts=&plane;ei.pNext=&ex;   // 0: DRM_FORMAT_MOD_LINEAR
     ii.tiling=VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
-    check(CreateImage(device,&ii,nullptr,&t->image));GetImageMemoryRequirements(device,t->image,&req);
-    sub.aspectMask=VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT;GetImageSubresourceLayout(device,t->image,&sub,&layout);
-    if(++explicitPitchImports<=16)fprintf(stderr,"FUXI MTL: IOSurface import at its own row %zu (%ux%u; Vulkan linear pitch would differ)\n",row,width,height);
+    // Turnip refusing the explicit layout refuses this texture (or sends a sampled plane to the shadow), not the device.
+    auto created=CreateImage(device,&ii,nullptr,&t->image);
+    if(created!=VK_SUCCESS){t->image=VK_NULL_HANDLE;char why[96];snprintf(why,sizeof why,"IOSurface explicit row %zu refused rc=%d",row,int(created));
+     if(!sampledOnly)throw std::runtime_error(why);shadowWhy=why;}
+    else {GetImageMemoryRequirements(device,t->image,&req);
+     sub.aspectMask=VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT;GetImageSubresourceLayout(device,t->image,&sub,&layout);
+     if(++explicitPitchImports<=16)fprintf(stderr,"FUXI MTL: IOSurface import at its own row %zu (%ux%u; Vulkan linear pitch would differ)\n",row,width,height);}
    }
-   if(!req.alignment || offset%req.alignment || layout.offset || layout.rowPitch!=row || req.size>bytes-offset || layout.size>bytes-offset)throw std::runtime_error("IOSurface/Vulkan linear image layout mismatch");
+   if(shadowWhy.empty() && (!req.alignment || offset%req.alignment || layout.offset || layout.rowPitch!=row || req.size>bytes-offset || layout.size>bytes-offset)){
+    char why[224];snprintf(why,sizeof why,"IOSurface/Vulkan linear image layout mismatch offset=%zu alignment=%llu row=%zu pitch=%llu size=%llu room=%zu",
+     offset,(unsigned long long)req.alignment,row,(unsigned long long)layout.rowPitch,(unsigned long long)std::max(req.size,layout.size),bytes-offset);
+    if(!sampledOnly)throw std::runtime_error(why);
+    shadowWhy=why;
+   }
+  }catch(...) {guard.unlock();destroy(t);throw;}
+  if(!shadowWhy.empty()){destroyTextureUnlocked(t);guard.unlock();return importShadowed(base,bytes,row,width,height,offset,identity,format,shadowKey,shadowWhy);}
+  try {
+   VkMemoryRequirements req{};GetImageMemoryRequirements(device,t->image,&req);
    VkMemoryHostPointerPropertiesEXT hp{};hp.sType=VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT;
-   check(GetMemoryHostPointerPropertiesEXT(device,external.handleType,base,&hp));
+   // A host pointer the kernel will not import is a refusal of this texture (importCheck), as for a no-copy buffer.
+   importCheck(GetMemoryHostPointerPropertiesEXT(device,external.handleType,base,&hp));
    uint32_t type=0;while(type<memory.memoryTypeCount && (!(req.memoryTypeBits&hp.memoryTypeBits&(1u<<type)) || !(memory.memoryTypes[type].propertyFlags&VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)))++type;
    if(type==memory.memoryTypeCount)throw std::runtime_error("IOSurface host memory type mismatch");
    VkImportMemoryHostPointerInfoEXT hi{};hi.sType=VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;hi.handleType=external.handleType;hi.pHostPointer=base;
    VkMemoryAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;ai.pNext=&hi;ai.allocationSize=bytes;ai.memoryTypeIndex=type;t->memoryType=type;
    reserveMemoryUnlocked(ai.allocationSize);t->charged=ai.allocationSize;
-   // Import/charge the whole surface, binding the image at its plane's offset.
-   check(frameKernelCall([&]{return AllocateMemory(device,&ai,nullptr,&t->memory);}));if(systemTranslationPolicy().frameTrace)++frameCounts.allocations;++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;t->memoryBytes=ai.allocationSize;t->allocated=bytes;check(frameKernelCall([&]{return BindImageMemory(device,t->image,t->memory,offset);}));
+   // Import/charge the whole surface, binding the image at its plane's offset. A host import the kernel refuses refuses this texture only.
+   importCheck(frameKernelCall([&]{return AllocateMemory(device,&ai,nullptr,&t->memory);}));if(systemTranslationPolicy().frameTrace)++frameCounts.allocations;++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;t->memoryBytes=ai.allocationSize;t->allocated=bytes;check(frameKernelCall([&]{return BindImageMemory(device,t->image,t->memory,offset);}));
    check(frameKernelCall([&]{return MapMemory(device,t->memory,0,VK_WHOLE_SIZE,0,&t->mapped);}));
    VkImageViewCreateInfo vi{};vi.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;vi.image=t->image;vi.viewType=VK_IMAGE_VIEW_TYPE_2D;vi.format=info.format;
    vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};check(CreateImageView(device,&vi,nullptr,&t->view));if(identity){t->importKey=key;t->importCached=true;imports.emplace(key,t);}return t;
   }catch(...) {guard.unlock();destroy(t);throw;}
+ }
+ // importTexture's sampled fallback (no lock held): the whole surface imported as a buffer and a linear texture over it at the plane's
+ // offset and row, which linearTexture aliases when Turnip can and otherwise backs with an optimal shadow refreshed from those rows.
+ // Shared like a direct import under shadowKey (a format with bit 32 set).
+ Texture *importShadowed(void *base,size_t bytes,size_t row,uint32_t width,uint32_t height,size_t offset,uint64_t identity,uint32_t format,const std::array<uint64_t,8> &shadowKey,const std::string &why) {
+  Buffer *b=importBuffer(base,bytes);Texture *t=nullptr;
+  try {t=linearTexture(b,format,1,width,height,offset,row);}catch(...){destroy(b);throw;}
+  destroy(b); // the texture holds its own reference to the buffer
+  std::lock_guard<std::mutex> guard(mutex);
+  if(identity){auto hit=imports.find(shadowKey);
+   if(hit!=imports.end()){++hit->second->references;destroyTextureUnlocked(t);return hit->second;}
+   t->importKey=shadowKey;t->importCached=true;imports.emplace(shadowKey,t);}
+  const uint64_t n=++surfaceShadowImports;
+  if(logSampled(n))fprintf(stderr,"FUXI MTL: IOSurface plane import via %s format=%u %ux%u offset=%zu row=%zu count=%llu reason=%s\n",
+   t->shadow?"shadow":"buffer alias",format,width,height,offset,row,(unsigned long long)n,why.c_str());
+  return t;
  }
  static size_t texelBytes(uint32_t f){return metalTexelBytes(f);}
  // MTLTextureType 0 is 1D, 2 is 2D and 7 is 3D; the sampled view must match the SPIR-V Dim the translator declares.
@@ -1050,6 +1094,7 @@ public:
  void destroy(Pipeline *p){std::lock_guard<std::mutex> guard(mutex);destroyPipelineUnlocked(p);}
 
  bool supportsOrderedColorAccess() const {return orderedColorAccess;}
+ uint32_t declaredTextures(const Pipeline *p) const {return p?p->textureSlots:0;}
  bool requiresSampling(const Pipeline *p) const {return std::any_of(p->descriptors.begin(),p->descriptors.end(),[](const Descriptor &d){return d.type==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || d.type==VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;});}
  // Called with the backend lock held on a compile miss/product-hit: remember how to rebuild this pipeline in a later run.
  void recordRecipe(const uint8_t *identity,void *v,const char *vn,void *f,const char *fn,const CompileOptions &options) {
@@ -1229,7 +1274,9 @@ public:
  Pipeline *createPipeline(Translation translated,const CompileOptions &options) {
   auto &tr=Translator::get();auto *p=new Pipeline{};p->options=options;{static std::atomic<uint32_t> serial{0};p->id=++serial;auto st=spirvStats(translated.fragment,translated.fragmentCount);p->fragInstr=st.instr;p->fragSamples=st.samples;p->fragLoops=st.loops;p->fragKills=st.kills;p->fragHash=spirvHash(translated.fragment,translated.fragmentCount);}
   if(tr.shadow_windows){ShadowWindow windows[2][resourceSlots]{};if(tr.shadow_windows(translated.handle,&windows[0][0])==1)memcpy(p->shadowWindows,windows,sizeof(windows));}
-  p->textureTypes.fill(2);if(tr.texture_type)for(unsigned slot=0;slot<resourceSlots;++slot)p->textureTypes[slot]=tr.texture_type(translated.handle,slot);
+  // textureSlots: the fragment textures the shader declares (bit per slot), known only from an adapter with texture_type. Each must be bound:
+  // the bridge has no neutral image for an empty slot, so a draw without one would fail its whole submit (declaredTextures).
+  p->textureTypes.fill(2);if(tr.texture_type)for(unsigned slot=0;slot<resourceSlots;++slot){p->textureTypes[slot]=tr.texture_type(translated.handle,slot);if(p->textureTypes[slot]!=UINT32_MAX)p->textureSlots|=1u<<slot;}
   auto cleanup=[&]{if(translated.handle)tr.free(translated.handle);};
   try {
    p->retainedBytes=sizeof(Pipeline)+(translated.vertexCount+translated.fragmentCount)*4;

@@ -39,6 +39,7 @@
 #include "HostImportRange.hpp"
 #include "SurfaceLease.hpp"
 #include "VertexProfile.hpp"
+#include "LinearLayout.hpp"
 #ifndef FUXI_MTL_BACKEND_HEADER
 #define FUXI_MTL_BACKEND_HEADER "Backend.hpp"
 #endif
@@ -174,6 +175,7 @@ static std::atomic<uint64_t> failureCount{0},completedDraws{0};
 extern "C" uint64_t fuxi_metal_failure_count() {return failureCount.load();}
 extern "C" uint64_t fuxi_metal_completed_draws() {return completedDraws.load();}
 extern "C" uint64_t fuxi_metal_dropped_draws() {return fuxi::droppedDraws.load();}
+extern "C" uint64_t fuxi_metal_unbound_texture_draws() {return fuxi::unboundTextureDraws.load();}
 extern "C" uint64_t fuxi_metal_pipeline_cache_hits() {return selectedBackend==fuxi::MetalBackend::native?nativeMetric(0):fuxi::Backend::pipelineHits.load();}
 extern "C" uint64_t fuxi_metal_pipeline_cache_misses() {return selectedBackend==fuxi::MetalBackend::native?nativeMetric(1):fuxi::Backend::pipelineMisses.load();}
 extern "C" uint64_t fuxi_metal_pipeline_cache_load_result() {return fuxi::Backend::pipelineCacheLoadResult.load();}
@@ -257,6 +259,27 @@ static void failureLog(const char *format,...) {
  if(fuxi::backboardGate.blocked()){
   fprintf(stderr,"FUXI MTL: backboardd gate exit for CPU respawn\n");fflush(stderr);FUXI_MTL_BACKBOARD_EXIT();
  }
+}
+// A refusal of one texture the client can live without: the client gets nil and the GPU path stays (no gate fault, no CPU respawn,
+// not in failureCount). Core Animation's IOSurface wrap (create_surface_from_iosurface, docs-lanes/metal.md) cleans up after a nil
+// texture; a draw it still makes without the texture is left out (dropUnboundTextureDraw). Each kind (field, Metal format, fourcc,
+// plane) prints its first line in full; later refusals only count, with a short line for the first eight and then powers of two.
+// A real device fault (a Vulkan error latched by check(), a poisoned device) still goes through failureLog.
+static std::atomic<uint64_t> softRefusalCount{0};
+extern "C" uint64_t fuxi_metal_soft_refusals() {return softRefusalCount.load();}
+static void softRefusal(const char *kind,const char *format,...) {
+ struct Kind {char text[128];uint64_t count;};static Kind kinds[64];static size_t kindCount;static std::mutex lock;
+ const uint64_t total=++softRefusalCount;uint64_t count=0;bool fresh=false;size_t known=0;
+ {std::lock_guard<std::mutex> guard(lock);
+  for(size_t i=0;i<kindCount && !count;++i)if(!strncmp(kinds[i].text,kind,sizeof kinds[i].text-1))count=++kinds[i].count;
+  if(!count && kindCount<64){snprintf(kinds[kindCount].text,sizeof kinds[kindCount].text,"%s",kind);kinds[kindCount++].count=count=1;fresh=true;}
+  known=kindCount;}
+ if(fresh){
+  char message[4096];va_list args;va_start(args,format);vsnprintf(message,sizeof(message),format,args);va_end(args);
+  size_t length=strlen(message);while(length && (message[length-1]=='\n' || message[length-1]=='\r'))message[--length]=0;
+  for(size_t i=0;i<length;++i)if(message[i]=='\n' || message[i]=='\r')message[i]=' ';
+  fprintf(stderr,"%s soft=1 kind=%u total=%llu (this texture only; GPU path kept)\n",message,(unsigned)known,(unsigned long long)total);
+ }else if(fuxi::logSampled(total))fprintf(stderr,"FUXI MTL: soft refusals total=%llu kinds=%zu last=%s count=%llu\n",(unsigned long long)total,known,kind,(unsigned long long)count);
 }
 static void unsupported(id object, SEL selector) {
  if(clientMode==fuxi::ClientMode::census) {censusLog(object,selector,false);return;}
@@ -690,12 +713,15 @@ static NSString *textureDescriptorText(MTLTextureDescriptor *d) {
   (unsigned long)d.cpuCacheMode,(unsigned long)d.hazardTrackingMode,(unsigned long)d.usage,
   (unsigned long)w.red,(unsigned long)w.green,(unsigned long)w.blue,(unsigned long)w.alpha,d.allowGPUOptimizedContents,(unsigned long)d.resourceOptions];
 }
-static bool textureValue(MTLTextureDescriptor *d,const char *field,uint64_t value,bool accepted) {
- if(!accepted)failureLog("FUXI MTL: texture reject %s %llu desc=%s\n",field,(unsigned long long)value,textureDescriptorText(d).UTF8String);
+// soft: an IOSurface texture's refusal fails that texture only (softRefusal); other textures' still fail the device.
+static bool textureValue(MTLTextureDescriptor *d,const char *field,uint64_t value,bool accepted,bool soft=false) {
+ if(!accepted && soft){char kind[128];snprintf(kind,sizeof kind,"%s format=%lu",field,(unsigned long)(d?d.pixelFormat:0));
+  softRefusal(kind,"FUXI MTL: texture reject %s %llu desc=%s",field,(unsigned long long)value,textureDescriptorText(d).UTF8String);}
+ else if(!accepted)failureLog("FUXI MTL: texture reject %s %llu desc=%s\n",field,(unsigned long long)value,textureDescriptorText(d).UTF8String);
  return accepted;
 }
-static bool textureDescriptorAccepted(MTLTextureDescriptor *d,uint32_t dimension) {
-#define CHECK(field,value,accepted) do {__typeof__(value) actual=(value);if(!textureValue(d,field,(uint64_t)actual,(accepted)))return false;}while(0)
+static bool textureDescriptorAccepted(MTLTextureDescriptor *d,uint32_t dimension,bool soft=false) {
+#define CHECK(field,value,accepted) do {__typeof__(value) actual=(value);if(!textureValue(d,field,(uint64_t)actual,(accepted),soft))return false;}while(0)
  CHECK("descriptor",d,actual!=nil);
  CHECK("textureType",d.textureType,(actual==MTLTextureType2D || actual==MTLTextureType1D || actual==MTLTextureType3D));
  CHECK("textureType.shapeUsage",d.textureType,fuxi::textureShapeAccepted((uint32_t)actual,(uint32_t)d.height,(uint32_t)d.usage,(uint32_t)d.depth,(uint32_t)d.mipmapLevelCount));
@@ -710,7 +736,7 @@ static bool textureDescriptorAccepted(MTLTextureDescriptor *d,uint32_t dimension
 #undef CHECK
  return true;
 }
-@interface FuxiTexture : FuxiResource { @public fuxi::Texture *_texture; MTLTextureUsage _usage; IOSurfaceRef _surface; BOOL _shared,_memoryless,_surfaceLockHeld;FuxiTexture *_viewParent;FuxiBuffer *_backingBuffer;NSUInteger _backingOffset,_backingRow;uint32_t _baseLevel,_levelCount;MTLCPUCacheMode _cacheMode;NSString *_descriptorText; }
+@interface FuxiTexture : FuxiResource { @public fuxi::Texture *_texture; MTLTextureUsage _usage; IOSurfaceRef _surface; NSUInteger _plane; BOOL _shared,_memoryless,_surfaceLockHeld;FuxiTexture *_viewParent;FuxiBuffer *_backingBuffer;NSUInteger _backingOffset,_backingRow;uint32_t _baseLevel,_levelCount;MTLCPUCacheMode _cacheMode;NSString *_descriptorText; }
 @end
 @implementation FuxiTexture
 - (void)rejectSelector:(SEL)selector {
@@ -738,7 +764,7 @@ static bool textureDescriptorAccepted(MTLTextureDescriptor *d,uint32_t dimension
 - (MTLStorageMode)storageMode {CENSUS();return _memoryless?MTLStorageModeMemoryless:(_surface || _shared)?MTLStorageModeShared:MTLStorageModePrivate;}
 - (MTLTextureUsage)usage {CENSUS();return _usage;}
 - (IOSurfaceRef)iosurface {CENSUS();return _viewParent?[_viewParent iosurface]:_surface;}
-- (NSUInteger)iosurfacePlane {CENSUS();return 0;}
+- (NSUInteger)iosurfacePlane {CENSUS();return _viewParent?[_viewParent iosurfacePlane]:_plane;}
 - (MTLTextureSwizzleChannels)swizzle {CENSUS();return MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed,MTLTextureSwizzleGreen,MTLTextureSwizzleBlue,MTLTextureSwizzleAlpha);}
 - (MTLCPUCacheMode)cpuCacheMode {CENSUS();return _cacheMode;}
 - (MTLHazardTrackingMode)hazardTrackingMode {CENSUS();return MTLHazardTrackingModeTracked;}
@@ -1151,6 +1177,11 @@ static uint64_t refreshCommandShadows(FuxiCommandBuffer *command){
  [self active];if(!_pipeline || !_pipeline->_pipeline){fuxi::dropPipelineDraw();return;}
  // Metal ignores an empty draw.
  if(!count)return;
+ // A refused texture fails that draw only (softRefusal): a slot the shader reads with nothing bound would fail the submit.
+ if(uint32_t declared=owner(_command->_queue->_device)->backend->declaredTextures(_pipeline->_pipeline)){
+  uint32_t bound=0;for(unsigned slot=0;slot<fuxi::resourceSlots;++slot)if(_samples[slot])bound|=1u<<slot;
+  if(uint32_t missing=declared&~bound){fuxi::dropUnboundTextureDraw(missing,(_pipeline->_descriptorText?:@"pipeline=model").UTF8String);return;}
+ }
  if((t!=MTLPrimitiveTypeTriangle && t!=MTLPrimitiveTypeTriangleStrip && t!=MTLPrimitiveTypeLine && t!=MTLPrimitiveTypeLineStrip) || count>65536 || start>65536-count)
   invalid([NSString stringWithFormat:@"draw bounds/topology type=%lu start=%lu count=%lu indexed=%d",(unsigned long)t,(unsigned long)start,(unsigned long)count,indices!=nil]);
  if(t==MTLPrimitiveTypeLine)count&=~NSUInteger(1);
@@ -1931,19 +1962,29 @@ static NSString *surfaceDescriptorText(IOSurfaceRef surface,NSUInteger plane){
  // Every refusal reports the surface, so even RGB8_444_2P (542) refusals include both planes' layout rather than only an
  // unknown Metal format. The text is made only for a line that prints it: CA wraps its surfaces every frame.
  auto layout=[&]()->NSString *{return surfaceDescriptorText(surface,plane);};
-#define CHECK(field,value,accepted) do {__typeof__(value) actual=(value);if(!(accepted)){failureLog("FUXI MTL: texture reject %s %llu desc=%s %s\n",field,(unsigned long long)actual,textureDescriptorText(d).UTF8String,layout().UTF8String);return nil;}}while(0)
+ const MTLPixelFormat wanted=d?d.pixelFormat:MTLPixelFormatInvalid;
+ const uint32_t fourcc=surface?IOSurfaceGetPixelFormat(surface):0;
+ // A refusal here fails this texture only (softRefusal): CA cleans up after a nil IOSurface texture, and a draw it still makes
+ // without it is left out. Before 4 Nov a video frame's plane refusal sent backboardd to the CPU for the rest of the boot (h-daily2).
+#define CHECK(field,value,accepted) do {__typeof__(value) actual=(value);if(!(accepted)){char kind[128];snprintf(kind,sizeof kind,"%s format=%lu fourcc=0x%08x plane=%lu",field,(unsigned long)wanted,fourcc,(unsigned long)plane); \
+ softRefusal(kind,"FUXI MTL: texture reject %s %llu desc=%s %s",field,(unsigned long long)actual,textureDescriptorText(d).UTF8String,layout().UTF8String);return nil;}}while(0)
  CHECK("IOSurface.present",surface,actual!=nullptr);
- size_t planes=IOSurfaceGetPlaneCount(surface);
- // The pinned bridge has no two-plane RGB rendering/sampling contract. Never
- // reinterpret _RB4 as BGRA or silently discard its red/blue plane.
- CHECK("IOSurface.planeCount",planes,actual<=1);
- CHECK("IOSurface.plane",plane,actual==0);
+ const size_t planes=IOSurfaceGetPlaneCount(surface);
  // 'BGRA' as BGRA8, and (64-byte rows reported) any single-plane surface CA reads as R8, RG8 or RGBA8 with the matching
  // element size, e.g. Safari's 'LA08' as RG8 (3 Nov; its refusal failed backboardd over to the CPU).
- const MTLPixelFormat wanted=d.pixelFormat;
  const bool otherFormat=wanted==MTLPixelFormatR8Unorm || wanted==MTLPixelFormatRG8Unorm || wanted==MTLPixelFormatRGBA8Unorm;
- CHECK("IOSurface.fourcc",IOSurfaceGetPixelFormat(surface),actual==0x42475241 || otherFormat);
- if(!textureDescriptorAccepted(d,owner(self)->backend->maxTextureDimension()))return nil;
+ // A plane of a multi-plane surface: Core Animation (no YCbCr formats advertised) makes one texture per plane of a 420v/420f
+ // video frame or snapshot, plane 0 (luma) as R8 at the plane's size and plane 1 (CbCr) as RG8 at half size, and converts to
+ // RGB in its own shader. Each plane is that plane's rows, read as the asked format with the plane's element size (checked below)
+ // and 1x1 elements. Never reinterpret a plane as BGRA8 (_RB4's planes stay refused) nor read past the surface's planes.
+ CHECK("IOSurface.plane",plane,planes?actual<planes:actual==0);
+ if(planes>1){
+  CHECK("IOSurface.planeFormat",wanted,otherFormat);
+  CHECK("IOSurface.planeElementWidth",IOSurfaceGetElementWidthOfPlane(surface,plane),actual==1);
+  CHECK("IOSurface.planeElementHeight",IOSurfaceGetElementHeightOfPlane(surface,plane),actual==1);
+ }
+ CHECK("IOSurface.fourcc",fourcc,actual==0x42475241 || otherFormat);
+ if(!textureDescriptorAccepted(d,owner(self)->backend->maxTextureDimension(),true))return nil;
  size_t width=planes?IOSurfaceGetWidthOfPlane(surface,plane):IOSurfaceGetWidth(surface);
  size_t height=planes?IOSurfaceGetHeightOfPlane(surface,plane):IOSurfaceGetHeight(surface);
  size_t row=planes?IOSurfaceGetBytesPerRowOfPlane(surface,plane):IOSurfaceGetBytesPerRow(surface);
@@ -1953,20 +1994,36 @@ static NSString *surfaceDescriptorText(IOSurfaceRef surface,NSUInteger plane){
  CHECK("IOSurface.textureType",d.textureType,actual==MTLTextureType2D);CHECK("IOSurface.mipmapLevelCount",d.mipmapLevelCount,actual==1);CHECK("IOSurface.storageMode",d.storageMode,actual==MTLStorageModeShared);
  CHECK("IOSurface.hostImport",owner(self)->backend->supportsHostImport(),actual);
  CHECK("IOSurface.lock",IOSurfaceLock(surface,kIOSurfaceLockAvoidSync,nullptr),actual==0);
-#undef CHECK
- FuxiTexture *t=[FuxiTexture new];t->_descriptorText=[textureDescriptorText(d) copy];t->_cacheMode=d.cpuCacheMode;t->_device=[self retain];t->_usage=d.usage;
+ FuxiTexture *t=[FuxiTexture new];t->_descriptorText=[textureDescriptorText(d) copy];t->_cacheMode=d.cpuCacheMode;t->_device=[self retain];t->_usage=d.usage;t->_plane=plane;
  t->_surface=(IOSurfaceRef)CFRetain(surface);t->_surfaceLockHeld=YES;IOSurfaceIncrementUseCount(surface);
+ // A plane only sampled (CA's video and snapshot planes: usage ShaderRead) may be read through a shadow when Turnip cannot alias
+ // its rows in place (Backend::importTexture). The offset is from the surface's base: the whole allocation is imported.
+ const bool sampledOnly=d.usage==MTLTextureUsageShaderRead;size_t offset=0;
  try {
   void *base=IOSurfaceGetBaseAddress(surface);void *start=planes?IOSurfaceGetBaseAddressOfPlane(surface,plane):base;
   if(!base || !start || uintptr_t(start)<uintptr_t(base))throw std::runtime_error("IOSurface plane base address");
-  size_t offset=uintptr_t(start)-uintptr_t(base);
-  t->_texture=owner(self)->backend->importTexture(base,IOSurfaceGetAllocSize(surface),row,(uint32_t)width,(uint32_t)height,offset,IOSurfaceGetID(surface),(uint32_t)wanted);
- }catch(const std::exception &e) {failureLog("FUXI MTL: texture reject IOSurfaceImport 0 desc=%s %s reason=%s\n",textureDescriptorText(d).UTF8String,layout().UTF8String,e.what());[t release];return nil;}
+  offset=uintptr_t(start)-uintptr_t(base);
+  t->_texture=owner(self)->backend->importTexture(base,IOSurfaceGetAllocSize(surface),row,(uint32_t)width,(uint32_t)height,offset,IOSurfaceGetID(surface),(uint32_t)wanted,sampledOnly);
+ }catch(const std::exception &e) {
+  // A Vulkan error inside (check) has already latched backboardd's gate: that is a device fault and still exits for the CPU respawn.
+  if(fuxi::backboardGate.blocked() || owner(self)->backend->poisoned)failureLog("FUXI MTL: texture reject IOSurfaceImport 0 desc=%s %s reason=%s\n",textureDescriptorText(d).UTF8String,layout().UTF8String,e.what());
+  else {char kind[128];snprintf(kind,sizeof kind,"IOSurfaceImport format=%lu fourcc=0x%08x plane=%lu %.56s",(unsigned long)wanted,fourcc,(unsigned long)plane,fuxi::linearShadowKind(e.what()).c_str());
+   softRefusal(kind,"FUXI MTL: texture reject IOSurfaceImport 0 desc=%s %s reason=%s",textureDescriptorText(d).UTF8String,layout().UTF8String,e.what());}
+  [t release];return nil;
+ }
+#undef CHECK
  if(gpuScanout){IOSurfaceUnlock(surface,0,nullptr);t->_surfaceLockHeld=NO;}
  // Every pass is counted (cache hits included: d-ft-v27 printed 2614 lines in 200 s); the first eight and then powers of two
  // are printed, and the cache period line has the count.
  const uint64_t passes=++fuxi::surfacePassLogs;
- if(fuxi::logSampled(passes))fprintf(stderr,"FUXI MTL: IOSurface import PASS %s %lux%lu same-memory %s count=%llu\n",wanted==MTLPixelFormatBGRA8Unorm?"BGRA8":wanted==MTLPixelFormatR8Unorm?"R8":wanted==MTLPixelFormatRG8Unorm?"RG8":"RGBA8",(unsigned long)d.width,(unsigned long)d.height,layout().UTF8String,(unsigned long long)passes);return t;
+ const char *name=wanted==MTLPixelFormatBGRA8Unorm?"BGRA8":wanted==MTLPixelFormatR8Unorm?"R8":wanted==MTLPixelFormatRG8Unorm?"RG8":"RGBA8";
+ if(fuxi::logSampled(passes))fprintf(stderr,"FUXI MTL: IOSurface import PASS %s %lux%lu same-memory %s count=%llu\n",name,(unsigned long)d.width,(unsigned long)d.height,layout().UTF8String,(unsigned long long)passes);
+ // Planes of multi-plane surfaces: the first eight and then powers of two (cache hits included), with the plane's own layout.
+ static std::atomic<uint64_t> planePasses{0};
+ if(planes>1){const uint64_t n=++planePasses;
+  if(fuxi::logSampled(n))fprintf(stderr,"FUXI MTL: IOSurface plane import PASS fourcc=0x%08x plane=%lu/%lu %s %lux%lu row=%lu offset=%lu path=%s usage=0x%lx count=%llu\n",
+   fourcc,(unsigned long)plane,(unsigned long)planes,name,(unsigned long)width,(unsigned long)height,(unsigned long)row,(unsigned long)offset,t->_texture->shadow?"shadow":"same-memory",(unsigned long)d.usage,(unsigned long long)n);}
+ return t;
 }
 // Repeat, mirror repeat, clamp-to-zero and clamp-to-border map to core Vulkan; mirror clamp-to-edge stays refused.
 static bool fuxiAddressMode(MTLSamplerAddressMode m) {return m==MTLSamplerAddressModeClampToEdge || m==MTLSamplerAddressModeRepeat ||

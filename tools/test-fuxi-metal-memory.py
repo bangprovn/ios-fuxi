@@ -31,6 +31,18 @@ def main():
             assert p.returncode==0,p.stderr
             assert 'AddressSanitizer' not in p.stderr and 'runtime error:' not in p.stderr,p.stderr
             print(p.stdout,end='')
+        # Single planes of 420v/420f surfaces (in place at their offsets and rows, or through a shadow), with and without the shadow hash.
+        subprocess.run(common+['-fsanitize=address,undefined','-DFUXI_MTL_HOST_TEST',
+            '-DFUXI_MTL_ICD="'+str(d/'proxy.so')+'"',str(ROOT/'tools/fuxi-metal/PlaneImportTests.cpp'),
+            '-ldl','-pthread','-o',str(d/'planes')],check=True)
+        for extra in ({},{'FUXI_MTL_SHADOW_HASH':'0'}):
+            env=dict(os.environ,ASAN_OPTIONS='detect_leaks=0',LP_NUM_THREADS='2',SOFTWARE_ICD=str(args.icd),**extra)
+            p=subprocess.run([str(d/'planes')],env=env,text=True,capture_output=True,timeout=60)
+            assert p.returncode==0,p.stderr
+            assert 'AddressSanitizer' not in p.stderr and 'runtime error:' not in p.stderr,p.stderr
+            assert 'FUXI MTL: IOSurface plane import via shadow format=10 20x9 offset=0 row=40' in p.stderr,p.stderr
+            assert 'backboardd gate' not in p.stderr,p.stderr
+            print(p.stdout,end='')
 
 
 if __name__=='__main__':main()

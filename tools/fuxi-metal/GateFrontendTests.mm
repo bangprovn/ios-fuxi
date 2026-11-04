@@ -137,6 +137,21 @@ int main() {
    for(unsigned i=0;i<120;++i)draw(0);assert(!good());
    for(unsigned i=0;i<fuxi::BackboardGate::goodFrames-1;++i)draw(1);assert(!good());draw(1);assert(good());
    [texture release];[queue release];[device release];
+   // A refused IOSurface texture fails that texture only (h-daily2: a video plane's refusal sent backboardd to the CPU): the
+   // armed gate stays good and nothing exits, while a plane the backend can import still imports.
+   {fuxi::Backend::modelHostImport=true;id surfaceDevice=[cls alloc];FuxiOwner *surfaceState=[FuxiOwner new];surfaceState->backend=new fuxi::Backend;
+    objc_setAssociatedObject(surfaceDevice,&ownerKey,surfaceState,OBJC_ASSOCIATION_RETAIN_NONATOMIC);[surfaceState release];
+    IOSurfaceRef video=IOSurfaceCreate((CFDictionaryRef)@{(id)kIOSurfaceWidth:@332,(id)kIOSurfaceHeight:@198,(id)kIOSurfacePixelFormat:@0x34323076,(id)kIOSurfaceAllocSize:@131072,
+     (id)kIOSurfacePlaneInfo:@[@{(id)kIOSurfacePlaneWidth:@332,(id)kIOSurfacePlaneHeight:@198,(id)kIOSurfacePlaneBytesPerElement:@1,(id)kIOSurfacePlaneBytesPerRow:@384,(id)kIOSurfacePlaneOffset:@64,(id)kIOSurfacePlaneSize:@79872},
+      @{(id)kIOSurfacePlaneWidth:@166,(id)kIOSurfacePlaneHeight:@99,(id)kIOSurfacePlaneBytesPerElement:@2,(id)kIOSurfacePlaneBytesPerRow:@384,(id)kIOSurfacePlaneOffset:@79936,(id)kIOSurfacePlaneSize:@39936}]});
+    assert(video);auto failures=failureCount.load();
+    MTLTextureDescriptor *bgra=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:332 height:198 mipmapped:NO];bgra.usage=MTLTextureUsageShaderRead;bgra.storageMode=MTLStorageModeShared;
+    assert(![surfaceDevice newTextureWithDescriptor:bgra iosurface:video plane:0] && ![surfaceDevice newTextureWithDescriptor:bgra iosurface:video plane:3]);
+    MTLTextureDescriptor *r8=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm width:332 height:198 mipmapped:NO];r8.usage=MTLTextureUsageShaderRead;r8.storageMode=MTLStorageModeShared;
+    FuxiTexture *luma=(FuxiTexture *)[surfaceDevice newTextureWithDescriptor:r8 iosurface:video plane:0];
+    assert(luma && luma.iosurfacePlane==0 && fuxi::Backend::importOffset==64);
+    assert(!fuxi::backboardGate.blocked() && backboardExits==0 && failureCount==failures && good());
+    [luma release];CFRelease(video);[surfaceDevice release];}
    // Even a failure after qualification and beyond the ordinary log cap latches.
    failureCount=64;failureLog("test failure after good\n");assert(fuxi::backboardGate.blocked());
    // A latched render server exits so launchd respawns it on the CPU path.

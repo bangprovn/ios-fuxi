@@ -102,8 +102,61 @@ int main(){@autoreleasepool {
   (id)kIOSurfacePlaneInfo:@[@{(id)kIOSurfacePlaneWidth:@8,(id)kIOSurfacePlaneHeight:@8,(id)kIOSurfacePlaneBytesPerElement:@1,(id)kIOSurfacePlaneBytesPerRow:@64,(id)kIOSurfacePlaneOffset:@0,(id)kIOSurfacePlaneSize:@512},
    @{(id)kIOSurfacePlaneWidth:@8,(id)kIOSurfacePlaneHeight:@8,(id)kIOSurfacePlaneBytesPerElement:@2,(id)kIOSurfacePlaneBytesPerRow:@64,(id)kIOSurfacePlaneOffset:@4096,(id)kIOSurfacePlaneSize:@512}]});
  assert(surface && IOSurfaceGetPlaneCount(surface)==2);d.pixelFormat=(MTLPixelFormat)542;
+ auto hardFailures=failureCount.load(),soft=softRefusalCount.load();
  assert(![device newTextureWithDescriptor:d iosurface:surface plane:0]);
  assert(![device newTextureWithDescriptor:d iosurface:surface plane:1]);CFRelease(surface);
+ // An IOSurface texture refusal fails that texture only: no failure count (backboardd's gate would not latch), one soft count each.
+ assert(failureCount==hardFailures && softRefusalCount==soft+2);
+ // h-daily2's 420v H.264 frame (mediaserverd, 332x198): CA wraps plane 0 as R8 at the plane's size and plane 1 as RG8 at half size,
+ // sampled only. Each imports the whole allocation at its own offset and row.
+ surface=IOSurfaceCreate((CFDictionaryRef)@{(id)kIOSurfaceWidth:@332,(id)kIOSurfaceHeight:@198,(id)kIOSurfacePixelFormat:@0x34323076,(id)kIOSurfaceAllocSize:@131072,
+  (id)kIOSurfacePlaneInfo:@[@{(id)kIOSurfacePlaneWidth:@332,(id)kIOSurfacePlaneHeight:@198,(id)kIOSurfacePlaneBytesPerElement:@1,(id)kIOSurfacePlaneBytesPerRow:@384,(id)kIOSurfacePlaneOffset:@64,(id)kIOSurfacePlaneSize:@79872},
+   @{(id)kIOSurfacePlaneWidth:@166,(id)kIOSurfacePlaneHeight:@99,(id)kIOSurfacePlaneBytesPerElement:@2,(id)kIOSurfacePlaneBytesPerRow:@384,(id)kIOSurfacePlaneOffset:@79936,(id)kIOSurfacePlaneSize:@39936}]});
+ assert(surface && IOSurfaceGetPlaneCount(surface)==2 && IOSurfaceGetBytesPerRowOfPlane(surface,1)==384);
+ MTLTextureDescriptor *luma=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm width:332 height:198 mipmapped:NO];
+ luma.usage=MTLTextureUsageShaderRead;luma.storageMode=MTLStorageModeShared;
+ MTLTextureDescriptor *chroma=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRG8Unorm width:166 height:99 mipmapped:NO];
+ chroma.usage=MTLTextureUsageShaderRead;chroma.storageMode=MTLStorageModeShared;
+ hardFailures=failureCount.load();soft=softRefusalCount.load();
+ FuxiTexture *y=(FuxiTexture *)[device newTextureWithDescriptor:luma iosurface:surface plane:0];
+ assert(y && y.iosurface==surface && y.iosurfacePlane==0 && y.pixelFormat==MTLPixelFormatR8Unorm && y.width==332 && y.height==198);
+ assert(fuxi::Backend::importBase==IOSurfaceGetBaseAddress(surface) && fuxi::Backend::importBytes==131072 && fuxi::Backend::importOffset==64 && fuxi::Backend::importRow==384);
+ assert(fuxi::Backend::importFormat==MTLPixelFormatR8Unorm && fuxi::Backend::importSampledOnly && !y->_texture->shadow);
+ FuxiTexture *cbcr=(FuxiTexture *)[device newTextureWithDescriptor:chroma iosurface:surface plane:1];
+ assert(cbcr && cbcr.iosurfacePlane==1 && cbcr.pixelFormat==MTLPixelFormatRG8Unorm && fuxi::Backend::importOffset==79936 && fuxi::Backend::importRow==384 && fuxi::Backend::importFormat==MTLPixelFormatRG8Unorm);
+ FuxiTexture *lumaView=(FuxiTexture *)[y newTextureViewWithPixelFormat:MTLPixelFormatR8Unorm];assert(lumaView && lumaView.iosurfacePlane==0);[lumaView release];
+ // Refused, softly: a plane as BGRA8 (never reinterpreted), a plane the surface lacks, a size or element size not the plane's.
+ MTLTextureDescriptor *wrong=[luma copy];wrong.pixelFormat=MTLPixelFormatBGRA8Unorm;assert(![device newTextureWithDescriptor:wrong iosurface:surface plane:0]);
+ assert(![device newTextureWithDescriptor:luma iosurface:surface plane:2]);
+ assert(![device newTextureWithDescriptor:luma iosurface:surface plane:1]);
+ wrong.pixelFormat=MTLPixelFormatRG8Unorm;assert(![device newTextureWithDescriptor:wrong iosurface:surface plane:0]);[wrong release];
+ assert(failureCount==hardFailures && softRefusalCount==soft+4);
+ // A rendered plane is not sampled-only: the backend may not shadow it.
+ luma.usage=MTLTextureUsageShaderRead|MTLTextureUsageRenderTarget;FuxiTexture *drawn=(FuxiTexture *)[device newTextureWithDescriptor:luma iosurface:surface plane:0];
+ assert(drawn && !fuxi::Backend::importSampledOnly);[drawn release];luma.usage=MTLTextureUsageShaderRead;
+ // A draw whose shader declares a texture slot left empty (CA got nil for a refused texture) is left out, not the submit.
+ {FuxiPipeline *yuv=[FuxiPipeline new];yuv->_device=[device retain];yuv->_pipeline=new fuxi::Pipeline{};yuv->_pipeline->textureSlots=0x3;
+  auto target=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:8 height:8 mipmapped:NO];target.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead;
+  FuxiTexture *rt=(FuxiTexture *)[device newTextureWithDescriptor:target];auto yuvPass=ios16PassDefaults();yuvPass.colorAttachments[0].texture=(id)rt;
+  yuvPass.colorAttachments[0].loadAction=MTLLoadActionClear;yuvPass.colorAttachments[0].storeAction=MTLStoreActionStore;
+  auto dropped=fuxi::unboundTextureDraws.load();
+  c=(FuxiCommandBuffer *)[q commandBuffer];r=(FuxiRender *)[c renderCommandEncoderWithDescriptor:yuvPass];[r setRenderPipelineState:yuv];
+  [r setFragmentTexture:y atIndex:0];[r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+  assert(!c->_rejected && c->_ops.empty() && fuxi::unboundTextureDraws==dropped+1);
+  [r setFragmentTexture:cbcr atIndex:1];[r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+  assert(!c->_rejected && c->_ops.size()==1 && c->_ops[0].samples[0]==y->_texture && c->_ops[0].samples[1]==cbcr->_texture && fuxi::unboundTextureDraws==dropped+1);
+  [r endEncoding];assert(failureCount==hardFailures);[rt release];[yuv release];}
+ [y release];[cbcr release];CFRelease(surface);
+ // SpringBoard's 420f snapshot (788x1706, 800-byte rows, plane 1 at 1364800): rows no linear image aliases, so the sampled planes go
+ // through the backend's shadow (modeled: marked shadow).
+ surface=IOSurfaceCreate((CFDictionaryRef)@{(id)kIOSurfaceWidth:@788,(id)kIOSurfaceHeight:@1706,(id)kIOSurfacePixelFormat:@0x34323066,(id)kIOSurfaceAllocSize:@2048000,
+  (id)kIOSurfacePlaneInfo:@[@{(id)kIOSurfacePlaneWidth:@788,(id)kIOSurfacePlaneHeight:@1706,(id)kIOSurfacePlaneBytesPerElement:@1,(id)kIOSurfacePlaneBytesPerRow:@800,(id)kIOSurfacePlaneOffset:@0,(id)kIOSurfacePlaneSize:@1364800},
+   @{(id)kIOSurfacePlaneWidth:@394,(id)kIOSurfacePlaneHeight:@853,(id)kIOSurfacePlaneBytesPerElement:@2,(id)kIOSurfacePlaneBytesPerRow:@800,(id)kIOSurfacePlaneOffset:@1364800,(id)kIOSurfacePlaneSize:@682400}]});
+ assert(surface && IOSurfaceGetPlaneCount(surface)==2);
+ luma.width=788;luma.height=1706;chroma.width=394;chroma.height=853;
+ y=(FuxiTexture *)[device newTextureWithDescriptor:luma iosurface:surface plane:0];assert(y && y->_texture->shadow && fuxi::Backend::importRow==800 && fuxi::Backend::importOffset==0);
+ cbcr=(FuxiTexture *)[device newTextureWithDescriptor:chroma iosurface:surface plane:1];assert(cbcr && cbcr->_texture->shadow && fuxi::Backend::importOffset==1364800);
+ [y release];[cbcr release];CFRelease(surface);assert(failureCount==hardFailures);
  [modelPipeline release];[buffer release];[copy release];[nested release];[t release];assert(view.width==6);[view release];[q release];[device release];
  puts("PASS: native M9k descriptor/level transfers/views/blits/generation encoding/render attachment/private heap/purge/sampler/refusal controls");
 }}

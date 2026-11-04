@@ -26,7 +26,7 @@ struct PrepareWrite {Buffer *buffer;uint64_t offset,bytes;};
 struct Texture : TextureLevels {size_t allocated{},charged{};uint32_t format=80;Buffer *backingBuffer{};size_t backingOffset{},backingRow{};bool shadow=false;std::vector<uint8_t> pixels{};
  size_t offset(uint32_t level) const {size_t o=0;for(uint32_t l=0;l<level;++l)o+=levelWidth(l)*levelHeight(l)*levelDepth(l)*metalTexelBytes(format);return o;}
 };
-struct Pipeline {ShadowWindow shadowWindows[2][resourceSlots]{};CompileOptions options{};bool sampled=false;size_t references=1;};
+struct Pipeline {ShadowWindow shadowWindows[2][resourceSlots]{};CompileOptions options{};bool sampled=false;size_t references=1;uint32_t textureSlots=0;};
 struct Sampler {};
 struct Viewport {float x,y,width,height,minDepth,maxDepth;};
 struct Rect {struct {int32_t x,y;}offset;struct {uint32_t width,height;}extent;};
@@ -75,14 +75,17 @@ public:
  static size_t texelBytes(uint32_t f){return metalTexelBytes(f);}
  bool supportsOrderedColorAccess() const {return false;}
  static inline bool modelHostImport=false;
- static inline void *importBase=nullptr;static inline size_t importBytes=0,importRow=0,importOffset=0;
+ static inline void *importBase=nullptr;static inline size_t importBytes=0,importRow=0,importOffset=0;static inline uint32_t importFormat=0;static inline bool importSampledOnly=false;
  bool supportsHostImport() const {return modelHostImport;}
  bool supportsExplicitPitch() const {return false;}
- Texture *importTexture(void *base,size_t bytes,size_t row,uint32_t width=256,uint32_t height=256,size_t offset=0,uint64_t=0,uint32_t format=80) {
+ // Records the last import's layout. A sampled-only plane whose row or offset is not a multiple of 64 bytes is marked shadow, as the
+ // production backend backs it (Backend::importShadowed); the model refuses nothing for alignment.
+ Texture *importTexture(void *base,size_t bytes,size_t row,uint32_t width=256,uint32_t height=256,size_t offset=0,uint64_t=0,uint32_t format=80,bool sampledOnly=false) {
   if(!modelHostImport || !base || !limits.rows(width,height,metalTexelBytes(format),row,offset,bytes))throw std::runtime_error("modeled host import bounds");
-  importBase=base;importBytes=bytes;importRow=row;importOffset=offset;
-  limits.reserve(bytes);auto *t=new Texture{};t->width=width;t->height=height;t->allocated=t->charged=bytes;t->defined=true;return t;
+  importBase=base;importBytes=bytes;importRow=row;importOffset=offset;importFormat=format;importSampledOnly=sampledOnly;
+  limits.reserve(bytes);auto *t=new Texture{};t->format=format;t->width=width;t->height=height;t->allocated=t->charged=bytes;t->defined=true;t->shadow=sampledOnly && (row%64 || offset%64);return t;
  }
+ uint32_t declaredTextures(const Pipeline *p) const {return p?p->textureSlots:0;}
  Buffer *importBuffer(void *,size_t) {throw std::runtime_error("no modeled host buffer import");}
  Texture *linearTexture(Buffer *b,uint32_t format,uint32_t usage,uint32_t width,uint32_t height,size_t offset,size_t row,bool=false) {
   requireLive();auto pixel=texelBytes(format);
