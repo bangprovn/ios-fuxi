@@ -4,6 +4,20 @@
  * The small IODisplay metaclass lets the public IODisplayLib parameter helpers
  * resolve this service directly or by walking AppleCLCD's children. It does
  * not implement IOGraphics power policy or the private AppleARMBacklight ABI.
+ *
+ * The service conforms to AppleARMBacklight (an empty metaclass of that name:
+ * this kernel has no AppleARMPlatform, so the name is free). iOS 16.7 cache,
+ * unslid addresses: QuartzCore takes its libEDR client path (EDRClient::client
+ * 0x18833a168, EDRRegisterCallbackBlockOnQueue at 0x1882d6200, partly under a
+ * CA mutex) as soon as backlight-control matches (CADeviceHasBacklight byte set
+ * at 0x1884cb7c0). Its server, com.apple.libEDR.Notification, is started by
+ * CoreBrightness only through -[CBDisplayModuleiOS initWithBacklight:queue:
+ * display:] -> DisplayCreateWithID 0x1af0d8510 -> CBEDRServerStartServer, and
+ * -[CBDisplayContaineriOS setupInternalModules] creates that module only when
+ * IOObjectConformsTo(backlight, "AppleARMBacklight") (0x1af0cec74). Without the
+ * conformance the client's 5000 ms RPCs (EDRIsEnabled 0x1bef757e8) time out
+ * and backboardd rendered about one frame per 5 s (h-e0); UniXNU-sheng saw the
+ * same stall on iOS 17 (int-236) and fixed it with this conformance.
  */
 #if defined(FUXI)
 #include <IOKit/IOService.h>
@@ -83,7 +97,13 @@ class IODisplay : public IOService {
 };
 OSDefineMetaClassAndStructors(IODisplay, IOService);
 
-class FuxiBacklight : public IODisplay {
+/* Name only: CoreBrightness's internal-display modules and QuartzCore's EDR server need IOObjectConformsTo(..., "AppleARMBacklight"). */
+class AppleARMBacklight : public IODisplay {
+	OSDeclareDefaultStructors(AppleARMBacklight);
+};
+OSDefineMetaClassAndStructors(AppleARMBacklight, IODisplay);
+
+class FuxiBacklight : public AppleARMBacklight {
 	OSDeclareDefaultStructors(FuxiBacklight);
 	IOLock *fLock;
 	uint32_t fRequested;
@@ -101,7 +121,7 @@ public:
 	IOReturn newUserClient(task_t task, void *securityID, UInt32 type,
 	    OSDictionary *properties, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
 };
-OSDefineMetaClassAndStructors(FuxiBacklight, IODisplay);
+OSDefineMetaClassAndStructors(FuxiBacklight, AppleARMBacklight);
 
 class FuxiBacklightUserClient : public IOUserClient {
 	OSDeclareDefaultStructors(FuxiBacklightUserClient);
@@ -149,7 +169,7 @@ bool FuxiBacklight::start(IOService *provider)
 	if (!fLock || !setProperty("backlight-control", kOSBooleanTrue) ||
 	    !publishBrightness(fRequested)) return false;
 	setName("FuxiBacklight");
-	IOLog("FUXI BACKLIGHT: published observation-only brightness min=0 max=%u value=%u\n",
+	IOLog("FUXI BACKLIGHT: published observation-only brightness min=0 max=%u value=%u conforms=AppleARMBacklight\n",
 	    FUXI_BACKLIGHT_MAX, fRequested);
 	registerService();
 	if (enable == 3)

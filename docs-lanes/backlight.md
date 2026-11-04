@@ -893,6 +893,47 @@ as a plist with the stated integer values. No kernel source or generated patch
 changed, so no new kernel-gate host test is applicable. No kernel link, device
 experiment, root edit or performance acceptance result is claimed.
 
+## Round 5: backboardd stalls on libEDR; AppleARMBacklight conformance (4 Nov 2026)
+
+**OBSERVED** (`h-e0`, kernel 3fe7fd6, boot line identical to `h-v33b` apart
+from `fuxibacklight=1`): backboardd drew 78 GPU frames in about 10 minutes,
+`hz=0.00-0.50`, first frame at 11.4 s; `h-v33b` drew 6,927 frames. No
+failures, `first_frame_ms=11367`, and no `brightness #` line although the
+slider was moved. One frame every ~5 s, and the earlier +5.2 s first-frame
+delay of mode 1, match a 5 s Mach RPC timeout.
+
+**Static chain** in the local iOS 16.7 shared cache (`~/work/dsc`, unslid;
+read with a small Mach-O/selector reader and capstone):
+
+| Step | Address | Finding |
+| --- | --- | --- |
+| QuartzCore `___CADeviceHasBacklight_block_invoke` | `0x1884cb7b4`/`0x1884cb7c0` | `IOServiceGetMatchingService({backlight-control=true})` sets the cached byte `0x1dcdf8538` |
+| QuartzCore libEDR registration | `0x1882d5fe8` | Only when that byte is 1: `EDRClient::client` (`0x18833a168`, `EDRCreateClientForDisplayWithTimeoutAndCallback`), then `EDRRegisterCallbackBlockOnQueue` (`0x1882d6200`) with a CA mutex taken |
+| libEDR client | `0x1bef7ba34`, `0x1bef7d7d8` | Connects to `com.apple.libEDR.Notification` (`bootstrap_look_up`, 10 000 parameter); RPCs are `mach_msg` with send+receive timeouts, e.g. `EDRIsEnabled` passes 5000 ms (`0x1bef757e8`) |
+| CoreBrightness server start | `0x1af095398` | `CBEDRServerStartServer` (dlsym'd `EDRServerStartService`) is reached from `DisplayCreateWithID` (`0x1af0d8510` → `0x1af0e0e2c`, unless `DisplaySyncBrightnessTransactions`) and `-[CBEDRModule initWithQueue:display:colorModule:andDisplayModule:]` |
+| CoreBrightness `-[CBDisplayContaineriOS setupInternalModules]` | `0x1af0cec74` | Creates `-[CBDisplayModuleiOS initWithBacklight:queue:display:]` (`0x1af035708`, which calls `DisplayCreateWithID`) and the brightness control modules **only if `IOObjectConformsTo(backlight, "AppleARMBacklight")`**; otherwise only the IOHIDDevice (external display) branch |
+| `-[CBDisplayContaineriOS findBacklight]` | `0x1af0cb398` | Same conformance picks the color-module type (1 vs 2); the color module is created either way, which is why mode 1 still logged the whitepoint/CCT reads |
+
+So with `backlight-control` alone QuartzCore becomes a libEDR client of a
+server nobody starts, and no brightness module exists to send `setProperties`.
+UniXNU-sheng reached the same conclusion on device for iOS 17 (commit 978e3f7,
+record int-236: "the display server waited forever on a libEDR notification
+nobody serves") and fixed it by making its backlight conform to
+`AppleARMBacklight` (`package/AppleARMBacklight.cpp`, `publishFirst`).
+
+**Change:** `FuxiBacklight : AppleARMBacklight : IODisplay : IOService`.
+`AppleARMBacklight` is an empty metaclass: this kernel loads no AppleARMPlatform,
+so the name is free (UniXNU's duplicate-class panic, int-229, cannot happen).
+Our kernel has no sandbox, so no `iokit-set-properties` class rule applies.
+Gates, properties, interest modes and the parser are unchanged; the publish
+line now ends in `conforms=AppleARMBacklight`.
+
+**Acceptance (device, not yet run):** `fuxibacklight=1`, otherwise the
+`h-v33b` line. Require backboardd `hz` back near the no-service boot, first
+frame near 7-9 s, and `FUXI BACKLIGHT: brightness #... requested=...` when
+the slider moves. Record any `open`/`method` lines: the display module may
+now open the service's user client (all selectors still return unsupported).
+
 ## Kernel auto-lock (`fuxiautolock=S`)
 
 The kernel side of auto-lock lives in `xnu/fuxi-h1/fuxi_keys.c`. After the

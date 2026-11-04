@@ -43,7 +43,13 @@ assert notify.index('fbl_withhold_on(present, enable, on)') < notify.index('getC
 assert 'OFF-only interest experiment enabled; ON withheld' in start
 assert 'on ? kIOMessageDeviceHasPoweredOn : kIOMessageDeviceWillPowerOff' in notify
 assert 'service->messageClients(message)' in notify
-assert 'class FuxiBacklight : public IODisplay' in source
+# CoreBrightness creates its internal display module (and with it the libEDR server QuartzCore waits on once
+# backlight-control matches) only for a service conforming to AppleARMBacklight: the chain must carry that name.
+assert 'class AppleARMBacklight : public IODisplay' in source
+assert 'OSDefineMetaClassAndStructors(AppleARMBacklight, IODisplay);' in source
+assert 'class FuxiBacklight : public AppleARMBacklight' in source
+assert 'OSDefineMetaClassAndStructors(FuxiBacklight, AppleARMBacklight);' in source
+assert start.index('setProperty("backlight-control", kOSBooleanTrue)') < start.index('conforms=AppleARMBacklight')
 for key in ('min', 'max', 'value'):
     assert f'brightness->setObject("{key}"' in source
 for signature in ('getProperty(const OSSymbol *key) const',
