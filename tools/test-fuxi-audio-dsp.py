@@ -49,6 +49,78 @@ int eno_rdwrt(void), eno_ioctl(void), eno_stop(void), eno_reset(void), eno_selec
 """
 
 
+HAPTIC_RUN = r"""
+#include <math.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+typedef char *caddr_t;
+typedef int wait_result_t;
+typedef void *event_t;
+typedef void (*thread_continue_t)(void *, wait_result_t);
+#define THREAD_UNINT 0
+#define THREAD_CONTINUE_NULL ((thread_continue_t)0)
+#define NSEC_PER_MSEC 1000000ull
+#define pragma_unused(...)
+struct uio { const uint8_t *p; long left; };
+static long uio_resid(struct uio *u) { return u->left; }
+static int uiomove(caddr_t dst, int n, struct uio *u) { memcpy(dst, u->p, (size_t)n); u->p += n; u->left -= n; return 0; }
+static uint64_t now;
+static uint64_t mach_absolute_time(void) { return now; }
+static void absolutetime_to_nanoseconds(uint64_t t, uint64_t *ns) { *ns = t; }
+static void assert_wait_timeout(event_t e, int i, uint32_t a, uint64_t b) { (void)e; (void)i; (void)a; (void)b; }
+static int thread_block(thread_continue_t c) { (void)c; return 0; }
+#include "haptics.c"
+/* what the plug-in sends: writes of 480 frames */
+static void put(const int16_t *s, unsigned n) {
+ for (unsigned at = 0; at < n; at += 480) {
+  struct uio u = { (const uint8_t *)(s + at), (long)((n - at < 480 ? n - at : 480) * 2) };
+  now += 10000000ull;
+  if (fh_write(&u) != 0 || u.left != 0) abort();
+ }
+}
+static int16_t wave[48000 * 2];
+int main(void) {
+ unsigned n = 0;
+ (void)fh_thread; (void)fh_on; (void)fh_opens;
+ n += 4800;                                                        /* 100 ms of silence */
+ for (unsigned i = 0; i < 480; i++) wave[n + i] = (int16_t)(20000 * sin(2 * M_PI * 160 * i / 48000.0));  /* a tap: 10 ms at 160 Hz */
+ n += 480 + 4800;
+ for (unsigned i = 0; i < 19200; i++) wave[n + i] = (int16_t)(15000 * sin(2 * M_PI * 145 * i / 48000.0)); /* a vibration: 400 ms at 145 Hz */
+ n += 19200 + 4800;
+ for (unsigned i = 0; i < 960; i++) wave[n + i] = (int16_t)((i & 1) ? 200 : -200);                /* under the threshold: nothing */
+ n += 960 + 2400;
+ put(wave, n);
+ if (fh_head != 2 || fh_lost != 0 || fh_in) { printf("events %u lost %u in %d\n", fh_head, fh_lost, fh_in); return 1; }
+ for (unsigned k = 0; k < 2; k++) {
+  const struct fh_event *e = &fh_queue[k];
+  unsigned ms = e->frames / 48, hz = (unsigned)((uint64_t)e->crossings_loud * 24000u / e->frames), rms = fh_isqrt(e->sum_sq_loud / e->frames);
+  printf("event %u: ms %u peak %u rms %u hz %u\n", e->number, ms, e->peak, rms, hz);
+ }
+ return 0;
+}
+"""
+
+
+def haptic_events(tmp):
+    """The haptics sink's events, from a tap and a vibration written as the plug-in writes them."""
+    text = (ROOT / 'xnu/fuxi-audio/fuxi_audio_dsp.c').read_text()
+    (tmp / 'haptics.c').write_text(text[text.index('/* ---- the haptics sink, fuxihaptic=1'):text.index('/* ---- the bottom amplifier')])
+    (tmp / 'run.c').write_text(HAPTIC_RUN)
+    exe = tmp / 'run'
+    subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-Wno-unknown-pragmas', '-Wno-unused-parameter', '-fsanitize=address,undefined', '-g',
+                    str(tmp / 'run.c'), '-lm', '-o', str(exe)], check=True)
+    out = subprocess.run([str(exe)], capture_output=True, text=True, check=True).stdout
+    lines = [l.split() for l in out.splitlines() if l.startswith('event ')]
+    assert len(lines) == 2, out
+    tap, vib = ({k: int(v) for k, v in zip(l[2::2], l[3::2])} for l in lines)
+    assert 9 <= tap['ms'] <= 10 and 19000 <= tap['peak'] <= 20000 and 13000 <= tap['rms'] <= 14500 and 120 <= tap['hz'] <= 200, tap
+    assert 398 <= vib['ms'] <= 400 and 14900 <= vib['peak'] <= 15000 and 10300 <= vib['rms'] <= 10700 and 140 <= vib['hz'] <= 150, vib
+    print('haptics sink: ' + '; '.join(out.splitlines()))
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix='fuxi-dsp-') as tmp:
         stubs = Path(tmp)
@@ -81,6 +153,14 @@ def main():
     down = mic[mic.index('fa_mic_down(void)'):mic.index('fa_mic_pump(void)')]
     assert down.index('au_mic_down(&fa_mic)') < down.index('fa_votes_drop()') and down.index('au_mic_down(&fa_mic)') < down.index('"mic clock off"')
     assert 'fa_votes++ != 0' in text and '--fa_votes != 0' in text and text.count('au_gl_prm_step(') == 2
+    # The haptics sink: behind fuxihaptic=1 alone, a node and a thread, and nothing in it reaches a register, a mapping or the DSP.
+    hap = text[text.index('/* ---- the haptics sink, fuxihaptic=1'):text.index('/* ---- the bottom amplifier')]
+    for word in ('volatile', 'ml_io_map', '_wr(', '_rd(', 'au_', 'fa_amp', 'fa_mic', 'fuxi_ar_', 'fa_g.', 'smmu', 'spmi', '0x7f'):
+        assert word not in hap.lower(), word
+    assert 'fh_on = PE_parse_boot_argn("fuxihaptic", &haptic, sizeof(haptic)) && haptic == 1;' in text and '"fuxihaptic") != NULL' in text
+    assert 'if (minor(dev) == 2) {\n\t\treturn fh_write(uio);' in text
+    with tempfile.TemporaryDirectory(prefix='fuxi-haptic-') as tmp:
+        haptic_events(Path(tmp))
     subprocess.run(['python3', str(ROOT / 'tools/sync-fuxi-audio.py'), '--check'], check=True, capture_output=True)
     hook = (ROOT / 'xnu/patches/0118-fuxi-audio-dsp.patch').read_text()
     assert 'fuxi_audio_dsp_init();' in hook and 'bsd/dev/fuxi_audio_dsp.c' in hook and 'bsd/dev/fuxi_audioreach.c' in hook

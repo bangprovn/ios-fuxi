@@ -6,6 +6,8 @@
  * fuxiaudioamp=1, with fuxiaudio=2: the bottom amplifier as well, its pins and up while there are samples, at -30 dB, with analog at 0.5 dB. a-spk1: the owner heard iOS's alert tones through it,
  * clear and clean, and very quiet. =2 is -20 dB and =3 is -12 dB: each only with the owner's word. Off without it, and then the two functions it calls do nothing at all.
  * fuxiaudio=3: as 2, and /dev/fuxiaudiomic gives what the mic hears to whoever has it open: 48 kHz, one channel of 16 bits, never holding the reader. fuxiaudio=4: as 3, with eight seconds of it taken at the start and counted, with nobody reading.
+ * fuxihaptic=1, with or without fuxiaudio: /dev/fuxihaptic takes what iOS plays on FuxiAudio's "Actuator" (its haptics, 48 kHz, one channel of 16 bits) and says each event's length,
+ * peak, RMS and pitch. It drives nothing: the motor is the PMIC's haptics block, and writing it waits for the owner's word.
  * The loader has put apps_smmu's streams 0x1001/0x80 and 0x1061 into context bank 4 (poke 2 and 18); this does not touch the SMMU. The buffer is outside the bank XNU owns. */
 #ifdef FUXI
 #include <stdint.h>
@@ -404,6 +406,7 @@ static uint32_t fa_ring_head, fa_ring_tail, fa_dropped;
 static int fa_dev_read(dev_t dev, struct uio *uio, int flags);
 static int fa_dev_open(dev_t dev, int flags, int mode, proc_t p);
 static int fa_dev_close(dev_t dev, int flags, int mode, proc_t p);
+static int fh_write(struct uio *uio);
 
 static uint32_t
 fa_ring_count(void)
@@ -414,9 +417,12 @@ fa_ring_count(void)
 static int
 fa_dev_write(dev_t dev, struct uio *uio, int flags)
 {
-#pragma unused(dev, flags)
+#pragma unused(flags)
 	uint32_t chunk[256];
 
+	if (minor(dev) == 2) {
+		return fh_write(uio);
+	}
 	while (uio_resid(uio) >= 4) {
 		int error;
 		uint32_t frames = uio_resid(uio) / 4 > 256 ? 256u : (uint32_t)(uio_resid(uio) / 4);
@@ -453,6 +459,151 @@ static const struct cdevsw fa_cdevsw = {
 	.d_reserved_2 = eno_putc,
 	.d_type       = 0,
 };
+
+/* ---- the haptics sink, fuxihaptic=1: /dev/fuxihaptic, minor 2, what the plug-in's "Actuator" stream carries. One writer at a time, never held: another at the same
+ * moment is counted and its samples dropped. An event is what lies between silences of 30 ms or more (|x| at most 256), as HakiOS cut them on a phone, and one
+ * under 60 ms is a tap. This file's own thread says each: when, how long, peak, RMS and a pitch from its zero crossings. Nothing here reaches a register. ---- */
+#define FH_QUIET        256u
+#define FH_GAP          (30u * 48u)     /* frames: 30 ms of 48 kHz */
+#define FH_TAP_MS       60u
+#define FH_QUEUE        16u             /* a power of two */
+
+struct fh_event {
+	uint64_t at;                    /* mach_absolute_time() of the write its first loud sample came in */
+	uint64_t sum_sq, sum_sq_loud;   /* squares so far, and as they were at its last loud sample */
+	uint32_t frames;                /* from its first loud sample to its last */
+	uint32_t peak, crossings, crossings_loud, number;
+};
+static bool fh_on;
+static uint32_t fh_busy, fh_head, fh_tail, fh_lost, fh_collided, fh_count, fh_taps, fh_opens, fh_quiet_run;
+static struct fh_event fh_queue[FH_QUEUE], fh_now;
+static bool fh_in;
+static int32_t fh_prev;
+static uint64_t fh_frames, fh_start, fh_written_at;
+
+static uint32_t
+fh_isqrt(uint64_t x)
+{
+	uint64_t r = 0, bit = 1ull << 62;
+
+	while (bit > x) {
+		bit >>= 2;
+	}
+	while (bit != 0) {
+		if (x >= r + bit) {
+			x -= r + bit;
+			r = (r >> 1) + bit;
+		} else {
+			r >>= 1;
+		}
+		bit >>= 2;
+	}
+	return (uint32_t)r;
+}
+
+/* The event so far is over: into the queue for the thread, or counted as lost if the thread is that far behind. With fh_busy held. */
+static void
+fh_finish(void)
+{
+	uint32_t head = fh_head;
+
+	fh_in = false;
+	fh_now.number = ++fh_count;
+	if (head - __atomic_load_n(&fh_tail, __ATOMIC_ACQUIRE) >= FH_QUEUE) {
+		fh_lost++;
+		return;
+	}
+	fh_queue[head & (FH_QUEUE - 1)] = fh_now;
+	__atomic_store_n(&fh_head, head + 1, __ATOMIC_RELEASE);
+}
+
+static int
+fh_write(struct uio *uio)
+{
+	int16_t chunk[256];
+	uint64_t now = mach_absolute_time();
+
+	if (__atomic_exchange_n(&fh_busy, 1u, __ATOMIC_ACQUIRE) != 0) {
+		fh_collided++;
+		return 0;
+	}
+	while (uio_resid(uio) >= 2) {
+		int error;
+		uint32_t n = uio_resid(uio) / 2 > 256 ? 256u : (uint32_t)(uio_resid(uio) / 2);
+
+		if ((error = uiomove((caddr_t)chunk, (int)(n * 2), uio)) != 0) {
+			__atomic_store_n(&fh_busy, 0u, __ATOMIC_RELEASE);
+			return error;
+		}
+		for (uint32_t i = 0; i < n; i++, fh_frames++) {
+			int32_t v = chunk[i];
+			uint32_t a = (uint32_t)(v < 0 ? -v : v);
+
+			if (a > FH_QUIET && !fh_in) {
+				memset(&fh_now, 0, sizeof(fh_now));
+				fh_now.at = now;
+				fh_start = fh_frames;
+				fh_prev = 0;
+				fh_in = true;
+			}
+			if (!fh_in) {
+				continue;
+			}
+			fh_now.sum_sq += (uint64_t)((int64_t)v * v);
+			if ((v < 0 && fh_prev > 0) || (v > 0 && fh_prev < 0)) {
+				fh_now.crossings++;
+			}
+			fh_prev = v != 0 ? v : fh_prev;
+			if (a > FH_QUIET) {
+				fh_quiet_run = 0;
+				fh_now.frames = (uint32_t)(fh_frames - fh_start + 1);
+				fh_now.peak = a > fh_now.peak ? a : fh_now.peak;
+				fh_now.sum_sq_loud = fh_now.sum_sq;
+				fh_now.crossings_loud = fh_now.crossings;
+			} else if (++fh_quiet_run >= FH_GAP) {
+				fh_finish();
+			}
+		}
+	}
+	fh_written_at = now;
+	__atomic_store_n(&fh_busy, 0u, __ATOMIC_RELEASE);
+	return 0;
+}
+
+static void
+fh_thread(void *arg, wait_result_t result)
+{
+#pragma unused(arg, result)
+	uint32_t tail = 0;
+
+	for (;;) {
+		assert_wait_timeout((event_t)&fh_queue, THREAD_UNINT, 50, NSEC_PER_MSEC);
+		thread_block(THREAD_CONTINUE_NULL);
+		/* The stream stopped in the middle of an event: it ends where it stopped. */
+		if (fh_in && __atomic_exchange_n(&fh_busy, 1u, __ATOMIC_ACQUIRE) == 0) {
+			uint64_t ns;
+
+			absolutetime_to_nanoseconds(mach_absolute_time() - fh_written_at, &ns);
+			if (fh_in && ns > 100 * NSEC_PER_MSEC) {
+				fh_finish();
+			}
+			__atomic_store_n(&fh_busy, 0u, __ATOMIC_RELEASE);
+		}
+		while (tail != __atomic_load_n(&fh_head, __ATOMIC_ACQUIRE)) {
+			const struct fh_event *e = &fh_queue[tail & (FH_QUEUE - 1)];
+			uint32_t frames = e->frames != 0 ? e->frames : 1u, ms = frames / 48u;
+			uint64_t at;
+			bool tap = ms < FH_TAP_MS;
+
+			absolutetime_to_nanoseconds(e->at, &at);
+			fh_taps += tap;
+			printf("FUXI HAPTIC: #%u %s at %llu ms: %u ms, peak %u, rms %u, about %u Hz; %u taps so far, %u lost, %u collided\n", e->number, tap ? "tap" : "vibration",
+			    (unsigned long long)(at / NSEC_PER_MSEC), ms, e->peak, fh_isqrt(e->sum_sq_loud / frames), (uint32_t)((uint64_t)e->crossings_loud * 24000u / frames),
+			    fh_taps, fh_lost, fh_collided);
+			__atomic_store_n(&fh_tail, ++tail, __ATOMIC_RELEASE);
+		}
+	}
+}
 
 /* ---- the bottom amplifier, fuxiaudioamp=1: au_amp_on.h's sequence, as the loader's au_tone_stage() ran it ---- */
 #define FA_SE0  0x00880000ull
@@ -844,6 +995,9 @@ fa_dev_open(dev_t dev, int flags, int mode, proc_t p)
 	if (minor(dev) == 1) {
 		fa_mic_wanted = true;
 	}
+	if (minor(dev) == 2) {
+		printf("FUXI HAPTIC: the actuator's stream is open (%u), %u events so far\n", ++fh_opens, fh_count);
+	}
 	return 0;
 }
 
@@ -853,6 +1007,9 @@ fa_dev_close(dev_t dev, int flags, int mode, proc_t p)
 #pragma unused(flags, mode, p)
 	if (minor(dev) == 1) {
 		fa_mic_wanted = false;
+	}
+	if (minor(dev) == 2) {
+		printf("FUXI HAPTIC: the actuator's stream is closed, %u events so far\n", fh_count);
 	}
 	return 0;
 }
@@ -1024,14 +1181,29 @@ fa_thread(void *arg, wait_result_t result)
 void
 fuxi_audio_dsp_init(void)
 {
-	int on = 0;
+	int on = 0, haptic = 0, major = -1;
 	thread_t thread;
 
-	if (!PE_parse_boot_argn("fuxiaudio", &on, sizeof(on)) || on <= 0) {
+	if (!PE_parse_boot_argn("fuxiaudio", &on, sizeof(on)) || on < 0) {
+		on = 0;
+	}
+	fh_on = PE_parse_boot_argn("fuxihaptic", &haptic, sizeof(haptic)) && haptic == 1;
+	if (on == 0 && !fh_on) {
 		return;
 	}
+	if (on >= 2 || fh_on) {
+		major = cdevsw_add(-1, &fa_cdevsw);
+	}
+	if (fh_on) {
+		fh_on = major >= 0 && devfs_make_node(makedev(major, 2), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "fuxihaptic") != NULL &&
+		    kernel_thread_start(fh_thread, NULL, &thread) == KERN_SUCCESS;
+		if (fh_on) {
+			thread_deallocate(thread);
+		}
+		printf("FUXI HAPTIC: /dev/fuxihaptic %s: what iOS plays on the actuator is counted and said; no motor is driven\n", fh_on ? "is there" : "could not be made");
+	}
 	if (on >= 2) {
-		int major = cdevsw_add(-1, &fa_cdevsw), amp = 0;
+		int amp = 0;
 
 		if (PE_parse_boot_argn("fuxiaudioamp", &amp, sizeof(amp)) && fa_amp_asked(amp)) {
 			fa_se0 = ml_io_map((vm_offset_t)FA_SE0, 0x4000);
@@ -1056,6 +1228,9 @@ fuxi_audio_dsp_init(void)
 			fa_mic_on = mapped && fa_mic_buffer != 0 && devfs_make_node(makedev(major, 1), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "fuxiaudiomic") != NULL;
 			printf("FUXI AUDIO: the mic can be asked for: %d\n", fa_mic_on);
 		}
+	}
+	if (on == 0) {
+		return;
 	}
 	if (kernel_thread_start(fa_thread, (void *)(uintptr_t)on, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);

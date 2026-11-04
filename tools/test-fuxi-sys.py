@@ -376,6 +376,11 @@ int main(void) {
  AudioObjectPropertyAddress cur = { kAudioSelectorControlPropertyCurrentItem, kAudioObjectPropertyScopeGlobal, 0 };
  assert(interface.SetPropertyData(drv, OBJECT_CODEC_SOURCE, 1, &cur, 0, NULL, 4, &imic) == 0);
  assert(interface.SetPropertyData(drv, OBJECT_CODEC_SOURCE, 1, &cur, 0, NULL, 4, &bad) == kAudioHardwareIllegalOperationError);
+ /* VirtualAudio's choice as a list: taken when it names 'imic', refused otherwise, and an empty or ragged one is the wrong size */
+ UInt32 two[2] = { 'smic', 'imic' }, none[2] = { 'smic', 'fmic' };
+ assert(interface.SetPropertyData(drv, OBJECT_CODEC_SOURCE, 1, &cur, 0, NULL, 8, two) == 0);
+ assert(interface.SetPropertyData(drv, OBJECT_CODEC_SOURCE, 1, &cur, 0, NULL, 8, none) == kAudioHardwareIllegalOperationError);
+ assert(interface.SetPropertyData(drv, OBJECT_CODEC_SOURCE, 1, &cur, 0, NULL, 6, two) == kAudioHardwareBadPropertySizeError);
  /* formats */
  AudioStreamBasicDescription f; UInt32 size = 0;
  AudioObjectPropertyAddress fa = { kAudioStreamPropertyVirtualFormat, kAudioObjectPropertyScopeGlobal, 0 };
@@ -419,8 +424,10 @@ int main(void) {
  assert(interface.DoIOOperation(drv, OBJECT_SPEAKER, OBJECT_SPEAKER_OUTPUT, 1, kAudioServerPlugInIOOperationWriteMix, 128, NULL, buf, NULL) == 0);
  assert(written == 128);
  buf[3] = 1000;
+ assert(interface.StartIO(drv, OBJECT_ACTUATOR, 1) == 0 && haptic_fd < 0);
  assert(interface.DoIOOperation(drv, OBJECT_ACTUATOR, OBJECT_ACTUATOR_OUTPUT, 1, kAudioServerPlugInIOOperationWriteMix, 64, NULL, buf, NULL) == 0);
  assert(haptic_said == 1);
+ assert(interface.StopIO(drv, OBJECT_ACTUATOR, 1) == 0 && written == 128);
  assert(interface.StopIO(drv, OBJECT_CODEC, 1) == 0 && interface.StopIO(drv, OBJECT_SPEAKER, 1) == 0);
  assert(interface.StopIO(drv, OBJECT_HAWKING, 1) == 0 && interface.StopIO(drv, OBJECT_HAWKING, 1) == 0);
  assert(interface.StartIO(drv, OBJECT_HAWKING_INPUT, 1) == kAudioHardwareBadObjectError);
@@ -438,12 +445,17 @@ def test_audio(tmp):
         (inc / rel).write_text(text)
     source = (TOOLS / 'fuxi-audio/FuxiAudio.c').read_text()
     assert source.startswith('/*\n * MIT License') and 'Ported from HackiOS hackios-xnu-userland userland/src/audio_plugin.c (MIT)' in source
-    assert not re.search(r'(?<![A-Za-z_])(open|ioctl)\(', source), 'the plug-in must not touch device nodes'
+    # The kernel's own three nodes and nothing else: the speaker's sink, the mic's source, the haptics' sink. No ioctl.
+    opened = re.findall(r'(?<![A-Za-z_])open\(([^)]*)\)', source)
+    assert sorted(opened) == sorted(['"/dev/fuxiaudio", O_WRONLY', '"/dev/fuxiaudiomic", O_RDONLY', '"/dev/fuxihaptic", O_WRONLY | O_NONBLOCK']), opened
+    assert not re.search(r'(?<![A-Za-z_])ioctl\(', source), 'the plug-in must not ioctl'
     out = build_and_run(tmp, 'audio', '#include <assert.h>\n#include <stdio.h>\n' + source + AUDIO_TEST,
                         ['-I', str(inc), '-Wno-multichar', '-Wno-four-char-constants'])
     assert 'audio model ok' in out
     assert 'fuxi: audio: Speaker, Hawking, Actuator and Codec are with the HAL' in out
-    assert 'fuxi: audio: the actuator plays: 64 frames, peak 1000' in out
+    assert 'fuxi: audio: the actuator plays: 64 frames, peak 1000 of 32768 (no motor driver: not felt)' in out
+    assert 'fuxi: audio: Actuator playing, kernel sink absent' in out and 'fuxi: audio: Actuator stopped' in out
+    assert "fuxi: audio: the codec's data source asked for: 8 bytes, 0x736d6963 0x696d6963" in out
     with open(TOOLS / 'fuxi-audio/Info.plist', 'rb') as f:
         info = plistlib.load(f)
     factory = info['CFPlugInTypes']['443ABAB8-E7B3-491A-B985-BEB9187030DB'][0]

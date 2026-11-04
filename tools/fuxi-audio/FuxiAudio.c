@@ -46,8 +46,8 @@
  *   "Codec"     one input of one channel with the data source 'imic': the built-in microphone
  *
  * What is mixed for the speaker goes to /dev/fuxiaudio when the kernel has it (fuxiaudio=2, xnu/fuxi-audio/fuxi_audio_dsp.c),
- * which feeds the ADSP, and is otherwise counted and dropped; the microphone comes from /dev/fuxiaudiomic when the kernel has it (fuxiaudio=3), and other inputs are silence. HackiOS's other kernel sinks (-mic, -haptic)
- * and the volume ioctl are left out. The device's clock is the system's: it claims
+ * which feeds the ADSP, and is otherwise counted and dropped; the microphone comes from /dev/fuxiaudiomic when the kernel has it (fuxiaudio=3), and other inputs are silence;
+ * the actuator's haptics go to /dev/fuxihaptic when the kernel has it (fuxihaptic=1), which only counts them so far. HackiOS's volume ioctl is left out. The device's clock is the system's: it claims
  * to play exactly FUXI_AUDIO_RATE frames a second of mach_absolute_time(), and the HAL's I/O thread
  * paces itself by that. Installed only by tools/fuxi-sys-root.py --audio-plugin (off by default).
  */
@@ -792,9 +792,26 @@ set_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
 		return 0;
 	}
 	if (object == OBJECT_CODEC_SOURCE) {
-		/* the one microphone there is */
-		return size == sizeof(UInt32) ? (*(const UInt32 *)data == MIC_SOURCE ? 0 : kAudioHardwareIllegalOperationError) :
-		       kAudioHardwareBadPropertySizeError;
+		/*
+		 * The one microphone there is. The current item is a list of the items chosen, and VirtualAudio's choice
+		 * ('ssrc' on the codec's input) came here in some other size than one item on every input route (r-v19:
+		 * "error 561211770 (!siz) setting property data for property [ssrc/inpt/0]"). Any whole list that names
+		 * 'imic' is taken; what was asked is said the first times.
+		 */
+		static unsigned said;
+		const UInt32 *items = data;
+		UInt32 n = size / sizeof(UInt32);
+		Boolean ours = false;
+
+		for (UInt32 i = 0; i < n; i++) {
+			ours = ours || items[i] == MIC_SOURCE;
+		}
+		if (said < 4) {
+			said++;
+			say("fuxi: audio: the codec's data source asked for: %u bytes, %#x %#x%s\n", (unsigned)size, n > 0 ? (unsigned)items[0] : 0u,
+			    n > 1 ? (unsigned)items[1] : 0u, ours ? "" : ", refused");
+		}
+		return n == 0 || size % sizeof(UInt32) != 0 ? kAudioHardwareBadPropertySizeError : ours ? 0 : kAudioHardwareIllegalOperationError;
 	}
 	if (address->mSelector == kAudioStreamPropertyIsActive) {
 		if (size != sizeof(UInt32)) {
@@ -825,13 +842,14 @@ set_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
  * Said when it starts and stops, with how long it ran and how much of that was the mic's.
  */
 static UInt64 mic_frames, mic_heard;
-static int mic_fd = -1;
+static int mic_fd = -1, mic_peak;
 
 static void
 codec_open(void)
 {
 	mic_frames = 0;
 	mic_heard = 0;
+	mic_peak = 0;
 	mic_fd = open("/dev/fuxiaudiomic", O_RDONLY);
 	say("fuxi: audio: the microphone is listened to (%s)\n", mic_fd >= 0 ? "kernel capture" : "silence: no capture path");
 }
@@ -839,8 +857,9 @@ codec_open(void)
 static void
 codec_close(void)
 {
-	say("fuxi: audio: the microphone stops: %llu.%02llu s given, %llu.%02llu s of them heard\n", mic_frames / FUXI_AUDIO_RATE,
-	    mic_frames % FUXI_AUDIO_RATE * 100 / FUXI_AUDIO_RATE, mic_heard / FUXI_AUDIO_RATE, mic_heard % FUXI_AUDIO_RATE * 100 / FUXI_AUDIO_RATE);
+	say("fuxi: audio: the microphone stops: %llu.%02llu s given, %llu.%02llu s of them heard, peak %d of 32768\n", mic_frames / FUXI_AUDIO_RATE,
+	    mic_frames % FUXI_AUDIO_RATE * 100 / FUXI_AUDIO_RATE, mic_heard / FUXI_AUDIO_RATE, mic_heard % FUXI_AUDIO_RATE * 100 / FUXI_AUDIO_RATE,
+	    mic_peak);
 	if (mic_fd >= 0) {
 		close(mic_fd);
 		mic_fd = -1;
@@ -853,10 +872,22 @@ codec_read(int16_t *samples, UInt32 frames)
 	ssize_t got = mic_fd >= 0 ? read(mic_fd, samples, (size_t)frames * 2) : 0;
 	UInt32 heard = got > 0 ? (UInt32)got / 2 : 0;
 
+	if (heard > 0 && mic_heard == 0) {
+		say("fuxi: audio: the microphone's first samples, %llu.%02llu s after the input started\n", mic_frames / FUXI_AUDIO_RATE,
+		    mic_frames % FUXI_AUDIO_RATE * 100 / FUXI_AUDIO_RATE);
+	}
+	for (UInt32 i = 0; i < heard; i++) {
+		int v = samples[i] < 0 ? -samples[i] : samples[i];
+
+		mic_peak = v > mic_peak ? v : mic_peak;
+	}
 	memset(samples + heard, 0, (size_t)(frames - heard) * 2);
 	mic_heard += heard;
 	mic_frames += frames;
 }
+
+static void actuator_open(void);
+static void actuator_close(void);
 
 static OSStatus
 start_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unused UInt32 client)
@@ -870,7 +901,9 @@ start_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unu
 	if (d->running++ == 0) {
 		d->anchor = mach_absolute_time();
 		d->periods = 0;
-		if (d->output != 0) {
+		if (d->object == OBJECT_ACTUATOR) {
+			actuator_open();
+		} else if (d->output != 0) {
 			written = 0;
 			if (d->object == OBJECT_SPEAKER && speaker_fd < 0) {
 				speaker_fd = open("/dev/fuxiaudio", O_WRONLY);
@@ -897,6 +930,9 @@ stop_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unus
 	if (d->running != 0 && --d->running == 0) {
 		if (d->object == OBJECT_CODEC) {
 			codec_close();
+		} else if (d->object == OBJECT_ACTUATOR) {
+			actuator_close();
+			say("fuxi: audio: Actuator stopped\n");
 		} else if (d->output != 0) {
 			say("fuxi: audio: %s stopped after %llu.%02llu s\n", CFStringGetCStringPtr(d->uid,
 			    kCFStringEncodingUTF8), written / FUXI_AUDIO_RATE, written % FUXI_AUDIO_RATE * 100 / FUXI_AUDIO_RATE);
@@ -952,16 +988,39 @@ begin_end_io_operation(__unused AudioServerPlugInDriverRef driver, __unused Audi
 /*
  * What iOS plays on the actuator -- the haptics: the system's feedbacks and the ringer's vibration,
  * as waveforms of one channel (iOS plays on this device at all only when the device tree says the
- * phone's haptics are "closed-loop": tools/mkadt-fuxi.py --product-haptics). There is no motor
- * driver here yet, so the samples are discarded. Said the first times, with how loud.
+ * phone's haptics are "closed-loop": tools/mkadt-fuxi.py --product-haptics, boot/add-haptics-adt.py).
+ * To the kernel's /dev/fuxihaptic when it has one (fuxihaptic=1), which counts and says each event
+ * and drives no motor yet; never waited on, as the speaker's sink. Said the first times, with how loud.
  */
 static unsigned haptic_said;
+static int haptic_fd = -1;
+
+static void
+actuator_open(void)
+{
+	if (haptic_fd < 0) {
+		haptic_fd = open("/dev/fuxihaptic", O_WRONLY | O_NONBLOCK);
+	}
+	say("fuxi: audio: Actuator playing, kernel sink %s\n", haptic_fd >= 0 ? "open" : "absent (no motor driver: not felt)");
+}
+
+static void
+actuator_close(void)
+{
+	if (haptic_fd >= 0) {
+		close(haptic_fd);
+		haptic_fd = -1;
+	}
+}
 
 static void
 actuator_write(const int16_t *samples, UInt32 frames)
 {
 	int peak = 0;
 
+	if (haptic_fd >= 0) {
+		(void)write(haptic_fd, samples, (size_t)frames * 2);
+	}
 	for (UInt32 i = 0; i < frames; i++) {
 		int v = samples[i] < 0 ? -samples[i] : samples[i];
 
@@ -969,8 +1028,8 @@ actuator_write(const int16_t *samples, UInt32 frames)
 	}
 	if (peak > 0 && haptic_said < 12) {
 		haptic_said++;
-		say("fuxi: audio: the actuator plays: %u frames, peak %d of 32768 (no motor driver: not felt)\n",
-		    (unsigned)frames, peak);
+		say("fuxi: audio: the actuator plays: %u frames, peak %d of 32768%s\n", (unsigned)frames, peak,
+		    haptic_fd >= 0 ? "" : " (no motor driver: not felt)");
 	}
 }
 

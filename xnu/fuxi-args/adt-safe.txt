@@ -30,3 +30,4 @@ fxinj             0121
 fuxisbext         0107 TUNABLE
 fuxiaudio         0113
 fuxiaudioamp      0113
+fuxihaptic        0113 the haptics sink
