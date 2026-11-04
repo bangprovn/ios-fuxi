@@ -6,6 +6,8 @@
  * Requests (vendor, device):
  *  IN  0x5a 'AS' (0x4153) wIndex=group 0..4: read-only snapshot page.
  *  IN  0x5a 'AU' (0x4155): firmware staging status.
+ *  IN  0x5a 'AL' (0x414c) wIndex 0 or 1: the firmware built into the loader Image, if any: what is there, or (1) take it as
+ *      staged, so no OUT 0x5b is needed (au_embedded()).
  *  IN  0x5a 'AB' (0x4142): stage 2, boot the ADSP from staged firmware (once).
  *  IN  0x5a 'AR' (0x4152): re-read the stage-2 report without running it.
  *  IN  0x5a 'AX' (0x4158) wIndex: stage 2 with options, and only then: bit 0 creates the AP's outbound SMP2P item 429
@@ -77,6 +79,7 @@ static uint32_t au_rep[128];   /* last snapshot group */
 static uint32_t au_boot[128];  /* stage-2 report, frozen after the one run */
 static uint32_t au_faults;
 static uint32_t au_len[2], au_hash[2], au_done[2];
+static uint64_t au_emb[2];     /* non-zero: that image is the one built into the loader Image ('AL'), read where it lies */
 
 static uint32_t au_rd(uint64_t pa)
 {
@@ -267,9 +270,10 @@ static void au_snapshot(unsigned group)
 }
 
 /* ---- firmware staging over control OUT ---- */
-static uint32_t au_fnv(uint32_t h, const uint8_t *p, unsigned n)
+/* FNV-1a over the low n bytes of w, first byte lowest (as a little-endian load gives them). */
+static uint32_t au_fnv(uint32_t h, uint64_t w, unsigned n)
 {
- for (unsigned i = 0; i < n; i++) h = (h ^ p[i]) * 16777619u;
+ for (unsigned i = 0; i < n; i++, w >>= 8) h = (h ^ (uint8_t)w) * 16777619u;
  return h;
 }
 /* A control OUT's data stage lands at UD_DATA (probe.c), 0x2f00 bytes before the end of the 16 KiB DMA area; WinUSB takes
@@ -287,22 +291,33 @@ static bool au_out_ok(uint16_t value, uint16_t index, uint16_t length)
  /* The loader image and the FDT must not sit in the staging window. */
  if ((uintptr_t)_head < hi && lo < (uintptr_t)_end) return false;
  if (probe_fdt_address() < hi && lo < probe_fdt_address() + probe_fdt_bytes()) return false;
- if (index & 0x4000) { if (chunk) return false; au_len[img] = au_hash[img] = au_done[img] = 0; }
+ if (index & 0x4000) { if (chunk) return false; au_len[img] = au_hash[img] = au_done[img] = 0; au_emb[img] = 0; }
  if (au_done[img] || (au_len[img] & 511u) || chunk != au_len[img] / 512 || length > cap - au_len[img]) return false;
  return true;
 }
+/* The MMU and caches are off here (SCTLR_EL1 0x30d00808 in every probe report): each load and store is a Device-nGnRnE access to
+ * DRAM and each instruction a fetch from it. The byte loop this replaces went through a stack buffer, five such accesses a byte,
+ * and cost about 1 us a byte: 42 s of the ADSP's 39.7 MB. Now one load and one store each 8 bytes, hashed in registers; the same
+ * bytes and the same FNV-1a. Both ends are 8-byte aligned (UD_DATA in the 16 KiB-aligned DMA area, the stage at a multiple of
+ * 512); a ragged tail goes a byte at a time. */
 static void au_out_data(uint16_t index, const volatile uint8_t *src, uint16_t length)
 {
  unsigned img = index >> 15;
  uint64_t dst = AU_STAGE + (img ? AU_CAP0 : 0) + au_len[img];
- uint8_t tmp[512];
- if (!au_len[img]) au_hash[img] = 2166136261u;
- for (unsigned at = 0; at < length; at += 512) {
-  unsigned n = length - at < 512u ? length - at : 512u;
-  for (unsigned i = 0; i < n; i++) tmp[i] = src[at + i];
-  for (unsigned i = 0; i < n; i++) *(volatile uint8_t *)(uintptr_t)(dst + at + i) = tmp[i];
-  au_hash[img] = au_fnv(au_hash[img], tmp, n);
+ uint32_t h = au_len[img] ? au_hash[img] : 2166136261u;
+ unsigned i = 0;
+ if (!(((uintptr_t)src | dst) & 7))
+  for (; i + 8 <= length; i += 8) {
+   uint64_t w = *(const volatile uint64_t *)((uintptr_t)src + i);
+   *(volatile uint64_t *)(uintptr_t)(dst + i) = w;
+   h = au_fnv(h, w, 8);
+  }
+ for (; i < length; i++) {
+  uint8_t c = src[i];
+  *(volatile uint8_t *)(uintptr_t)(dst + i) = c;
+  h = au_fnv(h, c, 1);
  }
+ au_hash[img] = h;
  au_len[img] += length;
  if (length & 511u) au_done[img] = 1;
  __asm__ volatile("dsb sy" ::: "memory");
@@ -314,6 +329,42 @@ static uint32_t au_status(uint32_t *r)
  r[7] = (uint32_t)AU_STAGE; r[8] = (uint32_t)(AU_STAGE >> 32);
  r[9] = AU_CAP0; r[10] = AU_CAP1; r[11] = au_boot[0] ? au_boot[1] : 0;
  return 12 * 4;
+}
+/* 'AL' (0x414c): the ADSP's firmware built into the loader Image (shim/fuxi-loader/build.sh with FUXI_ADSP_DTB and FUXI_ADSP_FW),
+ * which ABL loaded with the rest of it over fastboot, so nothing goes over EP0. wIndex 0 says what is there, 1 takes it as staged:
+ * stage 2 then reads both images where they lie. The CRC-32s are the build's, of the files, for the host to match against its own;
+ * nothing here hashes 40 MB with the caches off. TrustZone authenticates every segment stage 2 loads, as for uploaded firmware.
+ * Words: 1 taken, 2-5 dtb length, CRC, address low, high, 6-9 the same for adsp, 10 why not (1 none built in, 2 launched or stage 2
+ * has run, 3 over the caps or misaligned). */
+#if defined(FUXI_XNU_LOADER)
+extern const uint8_t _adsp_dtb_start[], _adsp_dtb_end[], _adsp_fw_start[], _adsp_fw_end[];
+extern const uint32_t _adsp_crc[2];
+#endif
+static uint32_t au_embedded(uint16_t index, uint32_t *r)
+{
+ uint64_t at[2] = {0, 0}, len[2] = {0, 0};
+ uint32_t crc[2] = {0, 0};
+#if defined(FUXI_XNU_LOADER)
+ at[0] = (uintptr_t)_adsp_dtb_start; len[0] = (uintptr_t)_adsp_dtb_end - at[0]; crc[0] = _adsp_crc[0];
+ at[1] = (uintptr_t)_adsp_fw_start; len[1] = (uintptr_t)_adsp_fw_end - at[1]; crc[1] = _adsp_crc[1];
+#endif
+ for (unsigned i = 0; i < 16; i++) r[i] = 0;
+ r[0] = 0xa0d1f0f2;
+ for (unsigned i = 0; i < 2; i++) {
+  r[2 + 4 * i] = (uint32_t)len[i]; r[3 + 4 * i] = crc[i];
+  r[4 + 4 * i] = (uint32_t)at[i]; r[5 + 4 * i] = (uint32_t)(at[i] >> 32);
+ }
+ if (!len[0] || !len[1]) r[10] = 1;
+ else if (len[0] > AU_CAP0 || len[1] > AU_CAP1 || ((at[0] | at[1]) & 7)) r[10] = 3;
+ else if (monitor_report[MON_LAUNCH] || au_boot[0]) r[10] = 2;
+ else if (index == 1) {
+  for (unsigned i = 0; i < 2; i++) {
+   au_emb[i] = at[i]; au_len[i] = (uint32_t)len[i]; au_hash[i] = crc[i]; au_done[i] = 1;
+  }
+  __asm__ volatile("dsb sy" ::: "memory");
+  r[1] = 1;
+ }
+ return 16 * 4;
 }
 
 /* ---- stage 2: ADSP PAS boot (Linux 6.12 qcom_q6v5_pas.c adsp_load/adsp_start,
@@ -396,6 +447,7 @@ static uint32_t au_pas_load(uint32_t *d, struct au_plan *p, unsigned pas, uint64
   if (x0 || x1) return 0x111;
  }
  uint64_t reloc = p->relocate ? p->min : region;
+ uint64_t t0 = rsr("cntpct_el0");
  for (unsigned i = 1; i < p->phnum; i++) {
   uint64_t ph = p->img + p->phoff + 32u * i;
   uint32_t off = au_le32(ph + 4), pa = au_le32(ph + 12), file = au_le32(ph + 16);
@@ -406,6 +458,7 @@ static uint32_t au_pas_load(uint32_t *d, struct au_plan *p, unsigned pas, uint64
   au_copy(region + o, p->img + off, file, mem - file);
   d[12] += file; d[13] += mem - file;
  }
+ d[14] = (uint32_t)((rsr("cntpct_el0") - t0) * 1000 / rsr("cntfrq_el0")); /* ms of the copies and zeroing */
  return au_faults ? 0x113 : 0;
 }
 static uint32_t au_qmp_wait(uint32_t off, uint32_t want, bool eq)
@@ -522,8 +575,8 @@ static uint32_t au_outbound(uint32_t *d)
 static uint32_t au_boot_run(uint32_t *r)
 {
  uint64_t x0, x1;
- struct au_plan dtb = {.img = AU_STAGE, .bytes = au_len[0]};
- struct au_plan fw = {.img = AU_STAGE + AU_CAP0, .bytes = au_len[1]};
+ struct au_plan dtb = {.img = au_emb[0] ? au_emb[0] : AU_STAGE, .bytes = au_len[0]};
+ struct au_plan fw = {.img = au_emb[1] ? au_emb[1] : AU_STAGE + AU_CAP0, .bytes = au_len[1]};
  au_faults = 0;
  r[3] = 1; /* step: prechecks */
  if (!au_done[0] || !au_done[1]) return 0x100;
@@ -1337,6 +1390,7 @@ static uint32_t audio_request(uint16_t value, uint16_t index, uint8_t *out)
   memcpy(out, au_rep, sizeof(au_rep)); return sizeof(au_rep);
  }
  if (value == 0x4155) { uint32_t r[12]; uint32_t n = au_status(r); memcpy(out, r, n); return n; }
+ if (value == 0x414c && index <= 1) { uint32_t r[16]; uint32_t n = au_embedded(index, r); memcpy(out, r, n); return n; }
  if (value == 0x4142 && !monitor_report[MON_LAUNCH]) {
   au_boot_stage();
   memcpy(out, au_boot, sizeof(au_boot)); return sizeof(au_boot);

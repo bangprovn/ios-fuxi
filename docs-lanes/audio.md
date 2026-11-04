@@ -178,7 +178,20 @@ The host squashes `.mdt` + `.bNN` into one ELF and stages it over control OUT
 into 0x8d0000000 (dtb up to 1 MiB, adsp up to 80 MiB). Writes must be
 sequential, and a short chunk closes the image. The device checks the length
 and FNV-1a hash. The staging window must not overlap the loader or FDT, and
-it is refused after a launch. `boot` then runs once per loader boot:
+it is refused after a launch.
+
+The upload is slow because the loader runs with the MMU and both caches off
+(probe reports: SCTLR_EL1 0x30d00808), so every access is Device-nGnRnE and
+every instruction is fetched from DRAM; USB is high speed. A byte loop through
+a stack buffer cost about 1 us a byte: 42 s for adsp's 39.7 MB at 4 KiB a
+transfer. From branch fuxi-adsp-fast it copies 8 bytes a load and hashes them
+in registers. Better still, `shim/fuxi-loader/build.sh` with `FUXI_ADSP_DTB`
+and `FUXI_ADSP_FW` builds both squashed MBNs into the Image after the payload
+(4 KiB aligned, +40 MB, ABL loads it over SuperSpeed fastboot), and `upload`
+first asks `'AL'` (0x414c): when the Image carries the same files (sizes and
+CRC-32), it takes them as staged and sends nothing. Stage 2 then reads them
+where they lie; TrustZone authenticates them as any other. `--no-embedded`
+forces the upload. `boot` then runs once per loader boot:
 
 1. Precheck: both images complete; ADSP not already ready (smp2p 443).
 2. dtb (pas 0x24): ELF/phdr/hash bounds; metadata -> `init_image`;

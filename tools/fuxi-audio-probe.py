@@ -4,7 +4,10 @@
   snapshot [--groups 0,1,2,3]  read-only snapshot pages (group 4 = SCM queries)
   squash DIR NAME OUT          merge NAME.mdt + NAME.bNN into one MBN (no device)
   upload --dtb F --fw F        stage squashed adsp_dtb/adsp MBNs over control OUT; --chunk 4096 sends 4 KiB a transfer
-                               (loaders from fuxi-audio2 on; an older loader refuses it, and the image restarts at 512)
+                               (loaders from fuxi-audio2 on; an older loader refuses it, and the image restarts at 512).
+                               First asks 'AL': when the boot image carries these very files (fuxi-adsp-fast's build.sh with
+                               FUXI_ADSP_DTB/FUXI_ADSP_FW; same sizes and CRC-32), they are taken from RAM and nothing is sent.
+                               --no-embedded skips that
   boot                         stage 2: PAS-boot the ADSP once, then decode
   report                       re-read the frozen stage-2 report
   glink [--seconds N] [--answer] [--gpr] [--prm]  after a boot that reached ready: GLINK with the DSP, polled; no data is sent unless --gpr asks the APM its state; --prm then votes LPASS on and off; --graph between them opens, configures and closes the TDM graph, never starting it; --play also starts it and gives it a second of zeros, no pin muxed
@@ -17,6 +20,7 @@ import math
 import struct
 import sys
 import time
+import zlib
 from pathlib import Path
 
 VID, PID, PRODUCT = 0x1209, 0x0001, 'Fuxi hardware probe'
@@ -130,7 +134,7 @@ def decode_boot(r):
         out.append(f'  {name}: bytes={d[0]} phnum={d[1]} hdr={d[2]} hash={d[3]} loads={d[4]} reloc={d[5]} '
                    f'min={d[6]:#x} max={d[7]:#x}')
         out.append(f'        init_image x0={d[8]:#x} x1={d[9]:#x} mem_setup x0={d[10]:#x} x1={d[11]:#x} '
-                   f'copied={d[12]} zeroed={d[13]}')
+                   f'copied={d[12]} zeroed={d[13]}' + (f' in {d[14]} ms' if d[14] else ''))  # loaders before fuxi-adsp-fast: 0
     q = r[32:40]
     out.append(f'  qmp mbox off={q[0]:#x} size={q[1]} link_ack={q[2]:#x} ch_ack={q[3]:#x} opened={q[4]} sent={q[5]}')
     out.append(f'  rsc lcx={r[40]:#x} lmx={r[41]:#x}  release lcx={r[42]:#x} lmx={r[43]:#x} released={r[15]:#x}')
@@ -389,6 +393,73 @@ def fnv(data):
     return h
 
 
+def fnv_file(path, pad):
+    """FNV-1a of the file, then of one zero byte if the upload pads it. Kept beside it in NAME.fnv1a by size and mtime: pure Python
+    takes about 4.6 s for the ADSP's 39.7 MB, on every upload otherwise. A cache that cannot be written is only slower."""
+    st = path.stat()
+    key = f'{st.st_size} {st.st_mtime_ns}'
+    cache = path.with_name(path.name + '.fnv1a')
+    h = None
+    try:
+        seen, value = cache.read_text().split(';')
+        if seen == key:
+            h = int(value, 16)
+    except (OSError, ValueError):
+        pass
+    if h is None:
+        h = fnv(path.read_bytes())
+        try:
+            cache.write_text(f'{key};{h:#x}')
+        except OSError:
+            pass
+    return (h * 16777619) & 0xffffffff if pad else h  # (h ^ 0) * prime
+
+
+def crc_file(path):
+    crc = 0
+    with path.open('rb') as f:
+        for block in iter(lambda: f.read(1 << 20), b''):
+            crc = zlib.crc32(block, crc)
+    return crc
+
+
+EMBED_WHY = {1: 'none built into this boot image', 2: 'too late: launched, or stage 2 has run', 3: 'built in, but over the caps or misaligned'}
+
+
+def take_embedded(req, paths):
+    """'AL' (audio.c au_embedded): the firmware the loader Image carries. Taken only when both images are there and are these
+    files by size and CRC-32; then nothing is sent and stage 2 reads them where ABL put them. False: upload as before."""
+    import usb.core
+    try:
+        r = struct.unpack('<16I', req(0x414c, 0, 64))
+    except (usb.core.USBError, struct.error):
+        print('  no built-in firmware request on this loader: uploading', flush=True)
+        return False
+    want = [(p.stat().st_size, crc_file(p)) for p in paths]
+    have = [(r[2], r[3]), (r[6], r[7])]
+    if r[0] != 0xa0d1f0f2 or r[10]:
+        print(f'  built-in firmware: {EMBED_WHY.get(r[10], hex(r[0]) + " " + str(r[10]))}: uploading', flush=True)
+        return False
+    if have != want:
+        show = lambda pairs: ', '.join(f'{n} bytes crc {c:#010x}' for n, c in pairs)
+        print(f'  the boot image carries other firmware ({show(have)}; the files: {show(want)}): uploading', flush=True)
+        return False
+    start = time.monotonic()
+    r = struct.unpack('<16I', req(0x414c, 1, 64))
+    if r[1] != 1:
+        print(f'  built-in firmware not taken: {EMBED_WHY.get(r[10], r[10])}: uploading', flush=True)
+        return False
+    st = struct.unpack('<12I', req(0x4155, 0, 48))
+    for img in (0, 1):
+        at = r[4 + 4 * img] | r[5 + 4 * img] << 32
+        got_len, got_crc, done = st[1 + 3 * img:4 + 3 * img]
+        print(f'  image {img}: {want[img][0]} bytes in {time.monotonic() - start:.1f} s, built into the boot image at {at:#x}', flush=True)
+        print(f'image {img}: device len={got_len} crc={got_crc:#x} done={done}; host len={want[img][0]} crc={want[img][1]:#x}')
+        if got_len != want[img][0] or got_crc != want[img][1] or done != 1:
+            raise SystemExit('built-in firmware mismatch')
+    return True
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('cmd', choices=['mic-cap', 'mic-cap2', 'mic-loop', 'mic-loop-no-bias', 'snapshot', 'squash', 'upload', 'boot', 'report', 'decode', 'stop', 'glink', 'smmu', 'poke', 'amp', 'tone', 'mic'])
@@ -411,6 +482,7 @@ def main():
     ap.add_argument('--dtb', type=Path)
     ap.add_argument('--fw', type=Path)
     ap.add_argument('--chunk', type=int, default=512, help='upload: bytes a control OUT, a multiple of 512 up to 4096')
+    ap.add_argument('--no-embedded', action='store_true', help="upload: send the files even if the boot image carries them ('AL')")
     ap.add_argument('--timeout', type=int, default=60000, help='control timeout ms')
     ap.add_argument('--save', type=Path, help='append raw 512-byte pages here')
     ap.add_argument('--raw', action='store_true')
@@ -455,9 +527,12 @@ def main():
         if a.chunk % 512 or not 512 <= a.chunk <= 4096:
             ap.error('--chunk is a multiple of 512, from 512 to 4096')
         dev.ctrl_transfer(0xc0, 0x54, 30, 0, 8, timeout=a.timeout)  # reset deadline: +30 min
+        if not a.no_embedded and take_embedded(req, (a.dtb, a.fw)):
+            return 0
         for img, path in ((0, a.dtb), (1, a.fw)):
             data = path.read_bytes()
-            if len(data) % 512 == 0:
+            pad = len(data) % 512 == 0
+            if pad:
                 data += b'\0'  # the device closes an image on a chunk that is not a multiple of 512; trailing pad is harmless
             size, start = a.chunk, time.monotonic()
             off = 0
@@ -479,7 +554,7 @@ def main():
                 off += len(part)
             print(f'  image {img}: {len(data)} bytes in {time.monotonic() - start:.1f} s, {size}-byte chunks', flush=True)
             st = struct.unpack('<12I', req(0x4155, 0, 48))
-            want = fnv(data)
+            want = fnv_file(path, pad)
             got_len, got_hash, done = st[1 + 3 * img:4 + 3 * img]
             print(f'image {img}: device len={got_len} hash={got_hash:#x} done={done}; host len={len(data)} hash={want:#x}')
             if got_len != len(data) or got_hash != want:

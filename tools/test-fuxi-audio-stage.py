@@ -24,6 +24,7 @@ static uint8_t *stage;
 enum { MON_LAUNCH = 0 };
 static uint32_t monitor_report[4], au_boot[128];
 static uint32_t au_len[2], au_hash[2], au_done[2];
+static uint64_t au_emb[2];
 char _head[1], _end[1];
 static uint64_t probe_fdt_address(void) { return 1; }
 static uint64_t probe_fdt_bytes(void) { return 1; }
@@ -46,7 +47,8 @@ int main(void) {
  size_t sizes[] = { 16184, 39721400, 1 + 512 * 3, 4096 * 3 + 7 };
  for (unsigned k = 0; k < 4; k++) {
   size_t len = sizes[k];
-  uint8_t *data = malloc(len + 1);
+  /* odd k: a source one byte off, so the byte path stages it; even k: the 8-byte path */
+  uint8_t *raw = malloc(len + 2), *data = raw + (k & 1);
   srand(k + 1);
   for (size_t i = 0; i < len; i++) data[i] = (uint8_t)rand();
   if (len % 512 == 0) data[len++] = 0;
@@ -59,8 +61,11 @@ int main(void) {
    /* after the end, nothing more */
    if (au_out_ok((uint16_t)(len / 512), (uint16_t)(img << 15), 512)) { printf("taken after the end\n"); return 1; }
   }
-  free(data);
+  free(raw);
  }
+ /* a restart drops the built-in image ('AL'): what follows is staged again */
+ au_emb[1] = 0x1000;
+ if (!au_out_ok(0, 0x8000 | 0x4000, 512) || au_emb[1] || au_len[1] || au_done[1]) { puts("restart kept the built-in image"); return 1; }
  /* refusals: too long, out of order, a ragged middle chunk, a restart that is not at 0 */
  uint8_t junk[8192] = { 0 };
  if (au_out_ok(0, 0x4000, 4097) || au_out_ok(0, 0x4000, 0)) { puts("size not refused"); return 1; }
@@ -73,7 +78,7 @@ int main(void) {
  if (!au_done[0] || au_out_ok(11, 0, 512)) { puts("not closed by a ragged chunk"); return 1; }
  monitor_report[MON_LAUNCH] = 1;
  if (au_out_ok(0, 0x4000, 512)) { puts("taken after the launch"); return 1; }
- puts("staging ok: 512 and 4096-byte chunks, the same bytes and hash; refusals");
+ puts("staging ok: 512 and 4096-byte chunks, aligned and not, the same bytes and hash; refusals; a restart drops a built-in image");
  return 0;
 }
 """

@@ -59,6 +59,42 @@ for src, name in ((gmu, 'gpu'), (sqe, 'sqe'), (zap, 'zap')):
     lines += [f'.global _{name}_fw_end', f'_{name}_fw_end:']
 pathlib.Path(dst).write_text('\n'.join(lines) + '\n')
 FWPY
+# Optional: the ADSP's squashed firmware inside the Image (FUXI_ADSP_DTB and FUXI_ADSP_FW, both or neither), after the payload.
+# ABL loads it with the rest over fastboot (SuperSpeed), and the probe's 'AL' request hands it to stage 2 in place, instead of
+# 39.7 MB over EP0 (about 42 s). Without them the section holds two zero CRCs and nothing else. Private firmware: only the
+# ignored build directory receives bytes; the .S names the files.
+python3 - "${FUXI_ADSP_DTB:-}" "${FUXI_ADSP_FW:-}" "$out/adsp-fw.S" <<'ADSPPY'
+import json, pathlib, sys, zlib
+dtb, fw, dst = sys.argv[1:]
+if bool(dtb) != bool(fw):
+    sys.exit('FUXI_ADSP_DTB and FUXI_ADSP_FW go together')
+found = []
+for src, cap in ((dtb, 0x100000), (fw, 0x5000000)):  # audio.c AU_CAP0, AU_CAP1
+    if not src:
+        continue
+    path = pathlib.Path(src).resolve(strict=True)
+    size, crc = path.stat().st_size, 0
+    with path.open('rb') as f:
+        head = f.read(52)
+        assert head[:4] == b'\x7fELF' and head[4:6] == b'\x01\x01', f'{path}: not a squashed ELF32 LE MBN'
+        crc = zlib.crc32(head)
+        for block in iter(lambda: f.read(1 << 20), b''):
+            crc = zlib.crc32(block, crc)
+    assert 52 <= size <= cap, f'{path}: {size} bytes, over the stage cap {cap:#x}'
+    found.append((path, size, crc))
+lines = ['.section .adsp_fw,"a"', '.balign 8', '.global _adsp_crc', '_adsp_crc:',
+         '.long ' + (', '.join(f'{crc:#x}' for _, _, crc in found) if found else '0, 0')]
+for name, entry in zip(('dtb', 'fw'), found or (None, None)):
+    if entry:
+        lines.append('.balign 4096')
+    lines += [f'.global _adsp_{name}_start', f'_adsp_{name}_start:']
+    if entry:
+        lines.append('.incbin ' + json.dumps(str(entry[0])))
+    lines += [f'.global _adsp_{name}_end', f'_adsp_{name}_end:']
+pathlib.Path(dst).write_text('\n'.join(lines) + '\n')
+if found:
+    print('Verified ADSP firmware built in: ' + ', '.join(f'{p.name} {size} bytes crc {crc:#010x}' for p, size, crc in found))
+ADSPPY
 # incbin avoids C absolute pointers in an Image loaded at an arbitrary PA.
 printf '.section .payload,"a"\n.incbin "%s"\n' "$payload" > "$out/payload.S"
 flags=(--target=aarch64-none-elf -O2 -ffreestanding -fno-builtin -nostdlib
@@ -72,7 +108,8 @@ for source in start.S loader.c ../console.c ../fuxi-probe/probe.c ../../xnu/fuxi
 done
 "$CLANG" "${flags[@]}" -c "$out/payload.S" -o "$out/payload.o"
 "$CLANG" "${flags[@]}" -c "$out/gpu-fw.S" -o "$out/gpu-fw.o"
-"$LLD" -T loader.ld --build-id=none "$out/start.o" "$out/loader.o" "$out/console.o" "$out/probe.o" "$out/fuxi_audioreach.o" "$out/fuxi_gpr.o" "$out/gpu-fw.o" "$out/payload.o" -o "$out/loader.elf"
+"$CLANG" "${flags[@]}" -c "$out/adsp-fw.S" -o "$out/adsp-fw.o"
+"$LLD" -T loader.ld --build-id=none "$out/start.o" "$out/loader.o" "$out/console.o" "$out/probe.o" "$out/fuxi_audioreach.o" "$out/fuxi_gpr.o" "$out/gpu-fw.o" "$out/payload.o" "$out/adsp-fw.o" -o "$out/loader.elf"
 python3 - "$out/loader.elf" "$READELF" <<'GPUCHECK'
 import re, subprocess, sys
 sections = subprocess.check_output([sys.argv[2], '-SW', sys.argv[1]], text=True)

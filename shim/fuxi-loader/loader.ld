@@ -17,6 +17,7 @@ SECTIONS {
  _payload_start = .;
  .payload : { *(.payload) }
  _payload_end = .;
+ .adsp_fw : { *(.adsp_fw) }
  _image_end = .;
  _end = .;
  /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) }
