@@ -170,7 +170,7 @@ static uint64_t mach_absolute_time(void) {return ticks;}
 static unsigned fg_abi_present_wait;
 #define G4_FB_PA 0xb8000000ULL
 #define G4_FB_MAP 10371072u
-static unsigned fg_fit_requested; /* sweetfbfit mode (fuxi_adreno.c): 2 maps every 4352-pitch row */
+static unsigned fg_fit_requested, fg_fit_mask_words; /* sweetfbfit mode (fuxi_adreno.c): 2 maps every 4352-pitch row; ring words of its corner mask */
 #define FUXI_FIT_PITCH 4352u
 #define FUXI_FIT_STRETCH 2u
 #define FUXI_FIT_STRETCH_MAP ((FUXI_FIT_PITCH*2400u + 4095u) & ~4095u)

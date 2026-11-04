@@ -2399,6 +2399,40 @@ copy_exec `fit=2`, summary `fit=2`; the pixel check reports `bars_nonblack=0`
 always and `max_err` against the reference stretch. Any other `sweetfbfit`
 value logs `SWEET FB: fit refused: sweetfbfit=N (1 scaled with bars, 2 stretched to the panel); centred crop kept`.
 
+**Corner mask** (both modes, on by default; `sweetfbcorner=0` turns it off).
+SpringBoard's zoom animations draw a window with iPhone X rounded corners and
+then drop the mask; on a real iPhone the panel's corners hide the square
+corners left behind, here they showed. Every presented frame now gets black
+outside a rounded rectangle at the four corners of the displayed image (mode
+1: the 1080x2338 image at y=31, inside the bars; mode 2: the panel). Radius:
+iOS's DeviceCornerRadius for this identity, 39 pt = 117 px at @3x. Our ADT
+copies D22AP's /product, which has no `display-corner-radius`; MobileGestalt
+then takes its legacy fallback, and a real iPhone X (same tree) reports 39.0,
+so 39 pt is inferred, not read on our device. Scaled: 112.32 x 112.29 px in
+mode 1, 112.32 x 115.27 in mode 2 (slightly elliptical). Shape: a pixel is
+black when its centre lies outside the quarter circle/ellipse, a hard 1-px
+staircase; Apple's continuous-curvature corner and anti-aliasing are not
+reproduced (the 2D engine cannot blend). The table (black width per image row
+from each edge: 102 rows, 65 runs in mode 1; 104 rows, 66 runs in mode 2,
+2707/2772 px per corner) is computed once in integers.
+
+GPU frames: the same submission, after the scaled blit and before the fence,
+runs one solid black fill (SOLID_COLOR, as the self-test's proven clear) per
+run of rows with the same width, mirrored to the four corners: 260 fills
+(mode 1), 7 ring words each, about 1.84 K ring words per copy. A blit from a
+constant mask cannot work (no blending: it would overwrite the inside pixels);
+a per-frame CPU write would sit between the fence and START. Because the fills
+precede the fence, every buffer is shown masked, in double and triple
+rotation too, with no flicker. The inline-mode ring room check and the
+parked-job reserve include the extra words. A stamp at fence page +216 splits
+the cost: `copy_exec blit avg` is then the scaled blit alone and a new line
+`FUXI GPU: fit corner mask avg N max M us, 260 fills per copy (65 runs x 4)`
+gives the fills (estimate before any device run: well under 0.1 ms). CPU
+frames blacken the same pixels after their copy. Start line:
+`FUXI SCANOUT: fit corner mask 117 px (39 pt) -> 112.32 x 112.29 px circular arc, 102 rows, 65 runs, 260 fills and 1839 ring words per copy`.
+The pixel check adds `corners_nonblack=` (must be 0, else it fails like the
+bars) and still measures every other pixel.
+
 Host tests: `test-fuxi-adreno.py` (one blit per frame, registers through a
 Mesa-semantics bilinear model, single/double/triple targets, bars and other
 buffers untouched, refusals), `test-fuxi-adreno-mapping.py` (tail windows),

@@ -328,6 +328,8 @@ static unsigned scanFitPitch; /* sweetfbfit: 4352 once the GPU side switched the
 static unsigned fuxi_gpu_scanout_fit_pitch(void) {return scanFitPitch;}
 static uint8_t *scanFitTail; /* sweetfbfit=2: A's tail window model (0x14000 bytes from offset 0x9e4000) */
 static uintptr_t fuxi_gpu_scanout_fit_tail(uint64_t *split,uint64_t *bytes) {*split=0x9e4000;*bytes=0x14000;return (uintptr_t)scanFitTail;}
+static const uint8_t *scanFitSpans;static unsigned scanFitRows; /* corner mask table (NULL: off) */
+static const uint8_t *fuxi_gpu_scanout_fit_corner(unsigned *rows) {*rows=scanFitRows;return scanFitSpans;}
 static bool teAvailable;
 static uint64_t teEdge,tePeriod=16667000;
 static unsigned teFrame;
@@ -1116,6 +1118,45 @@ int main(void) {
  assert(panel2[(2382*4352)/4]==source2[(OY+row(2382))*SW+OX+col(0)] && panel2[0x9e4000/4]==0x5a5a5a5au);
  IOLockLock(st.fLock);st.stopRecords();IOLockUnlock(st.fLock);assert(refs==baseRefs);
  inputSurface=savedInput;scanFitPitch=0;scanFitTail=nullptr;gpuMode=0;summaryLog[0]=0;
+ {
+ // Corner mask on CPU frames: every fit CPU frame blackens the table's spans at the image's four corners after its copy (mode 1 at
+ // y=31..2368; mode 2 at 0..2399, the bottom ones partly through the tail window); all other image pixels stay the copy's.
+ const unsigned SW=1125,SH=2436;
+ static uint32_t panel3[4352*2400/4],source3[1125*2436];static uint8_t tail3[0x14000],spans[128];
+ for(unsigned i=0;i<SW*SH;i++)source3[i]=0x20000000u|i;
+ Memory m3={sizeof(source3)};SweetSurface s3;s3.address=(uintptr_t)source3;s3.memory=&m3;s3.width=SW;s3.height=SH;s3.bytesPerRow=SW*4;
+ SweetSurface *savedInput=inputSurface;inputSurface=&s3;
+ for(unsigned mode=1;mode<=2;mode++) {
+  const unsigned TOP=mode==2?0:31,H=mode==2?2400:2338;
+  double rx=117*1080/1125.0,ry=117.0*H/2436;unsigned rows=0;
+  for(unsigned j=0;j<128;j++){double v=ry-(j+0.5);unsigned b=0;
+   if(v>0)while(rx-(b+0.5)>0 && ((rx-(b+0.5))/rx)*((rx-(b+0.5))/rx)+(v/ry)*(v/ry)>1)b++;spans[j]=(uint8_t)b;if(b)rows=j+1;}
+  scanFitSpans=spans;scanFitRows=rows;
+  OSArray c3;AppleCLCD cf={};IOTimerEventSource t3;cf.fClients=&c3;cf.fLock=&lock;cf.fVsync=&t3;
+  cf.fConsolePaused=true;cf.fFlushTicks=1;cf.fTickAbs=8333;cf.fScanout=true;cf.fFit=(uint8_t)mode;
+  cf.fWidth=1080;cf.fHeight=2400;cf.fRowBytes=4320;cf.fLogicalW=1125;cf.fLogicalH=2436;cf.fOffX=22;cf.fOffY=18;cf.fPixels=(uintptr_t)panel3;
+  scanOwned=false;scanAcquire=1;scanCpuAcquire=1;scanPublish=0;pollMode=1;gpuMode=0;scanFitPitch=4352;scanFitTail=tail3;unsigned baseRefs=refs;
+  uint8_t frame[SWEET_FB_SWAP_REC_SIZE]={};put32(frame,0x104,1);put32(frame,0x54,1);put32(frame,0xcc,1125);put32(frame,0xd0,2436);
+  memset(panel3,0x5a,sizeof(panel3));memset(tail3,0x5a,sizeof(tail3));
+  offer(cf,frame);cf.vsyncFired(&cf,&t3);assert(!cf.fDirty);
+  unsigned black=0;
+  for(unsigned y=0;y<H;y++) {
+   unsigned e=y<rows?y:H-1-y<rows?H-1-y:~0u,cb=e!=~0u?spans[e]:0,ly=(unsigned)((y+0.5)*2436.0/H);
+   for(unsigned x=0;x<1080;x++) {
+    uint64_t o=(uint64_t)(TOP+y)*4352+x*4;uint32_t v;
+    if(o>=0x9e4000){assert(mode==2);memcpy(&v,tail3+(o-0x9e4000),4);}else memcpy(&v,(uint8_t *)panel3+o,4);
+    if(x<cb || x>=1080-cb){assert(v==0xff000000u);black++;}
+    else assert(v==source3[ly*SW+(unsigned)((x+0.5)*1125.0/1080.0)]);
+   }
+  }
+  unsigned area=0;for(unsigned j=0;j<rows;j++)area+=spans[j];
+  assert(black==4*area && area==(mode==2?2772u:2707u));
+  if(mode==1)for(unsigned i=0;i<31*4352/4;i++)assert(panel3[i]==0x5a5a5a5au); // the 4352 layout's bars are the GPU side's
+  IOLockLock(cf.fLock);cf.stopRecords();IOLockUnlock(cf.fLock);assert(refs==baseRefs);
+ }
+ scanFitSpans=nullptr;scanFitRows=0;scanFitTail=nullptr;scanFitPitch=0;inputSurface=savedInput;
+ puts("PASS: sweetfbfit corner mask on CPU frames: modes 1 and 2, four corners black (2707/2772 px each), the rest the nearest copy, tail window");
+ }
  puts("PASS: sweetfbfit=2 framebuffer: whole-frame GPU request, 1080x2400 bytes, nearest stretch at 4320 and 4352 pitch through the tail window, no bars, summary fit=2");
  }
  puts("PASS: actual framebuffer present/tick/swap: demand wake/idle, GPU retirement/fallback, blanking and shadow invalidation");
@@ -1234,7 +1275,7 @@ def main():
         methods = ''.join(function(display, name) for name in (
             'sweet_fb_swap_bin', 'sweet_fb_te_configure', 'AppleCLCD::teVsyncTick', 'AppleCLCD::teVsyncLog',
             'AppleCLCD::presentWantedLocked', 'AppleCLCD::wakePresentLocked', 'sweet_fb_rearm',
-            'AppleCLCD::vsyncFired', 'AppleCLCD::scanoutLog', 'get32', 'sweet_fb_fit_col', 'sweet_fb_fit_row', 'sweet_fb_fit_copy', 'sweet_fb_fit_bars', 'AppleCLCD::observeRecord', 'AppleCLCD::recordDone', 'AppleCLCD::consumeRecord', 'AppleCLCD::retireEarly', 'AppleCLCD::releaseRecord',
+            'AppleCLCD::vsyncFired', 'AppleCLCD::scanoutLog', 'get32', 'sweet_fb_fit_col', 'sweet_fb_fit_row', 'sweet_fb_fit_copy', 'sweet_fb_fit_corners', 'sweet_fb_fit_bars', 'AppleCLCD::observeRecord', 'AppleCLCD::recordDone', 'AppleCLCD::consumeRecord', 'AppleCLCD::retireEarly', 'AppleCLCD::releaseRecord',
             'AppleCLCD::swapWait', 'AppleCLCD::stopRecords',
             'AppleCLCD::writerRetired', 'AppleCLCD::writerWake', 'AppleCLCD::writerWakeAction',
             'AppleCLCD::presentStep', 'AppleCLCD::fifoDrop', 'AppleCLCD::stageStats', 'AppleCLCD::completePresent', 'AppleCLCD::presentStats', 'AppleCLCD::presentNext', 'AppleCLCD::swap', 'AppleCLCD::present'))

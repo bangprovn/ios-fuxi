@@ -89,7 +89,15 @@ int fuxi_gpu_scanout_cpu_acquire(void);
 #define FUXI_FIT_MODE_Y(m) ((m) == FUXI_FIT_STRETCH ? 0u : FUXI_FIT_Y)
 #define FUXI_FIT_MODE_H(m) ((m) == FUXI_FIT_STRETCH ? 2400u : FUXI_FIT_H)
 #define FUXI_FIT_STRETCH_MAP ((FUXI_FIT_PITCH*2400u + 4095u) & ~4095u)
-int fuxi_gpu_scanout_fit(unsigned mode);
+/* Corner mask (both modes, on unless sweetfbcorner=0): black outside the iPhone X display corner at the four corners of the
+ * displayed image, as a real panel's corners hide the square window corners iOS draws at the end of its zoom animations. The
+ * radius is iOS's DeviceCornerRadius for this identity, 39 pt = 117 px at @3x (inferred: /product has no display-corner-radius,
+ * as on a real iPhone X, which reports 39.0 through MobileGestalt's fallback), scaled by the mode's factors: a circular (mode 1) or
+ * slightly elliptical (mode 2) quarter with a hard 1-px staircase, not Apple's continuous curve. fit_corner: the black width of each image row from the top (and, mirrored, bottom) edge, *rows of them;
+ * NULL and 0 when off. */
+#define FUXI_FIT_CORNER_PX 117u
+const uint8_t *fuxi_gpu_scanout_fit_corner(unsigned *rows);
+int fuxi_gpu_scanout_fit(unsigned mode, unsigned corner);
 unsigned fuxi_gpu_scanout_fit_pitch(void);
 uintptr_t fuxi_gpu_scanout_fit_tail(uint64_t *split, uint64_t *bytes);
 int fuxi_gpu_scanout_reserve(void);

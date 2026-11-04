@@ -162,14 +162,55 @@ void fuxi_gpu_scanout_configure(uintptr_t pixels, unsigned enabled, unsigned che
    printf("FUXI SCANOUT: dcs refused fuxipaneldcs=%u: needs fuxigpuscanout=1 sweetfb_noconsole=1; nothing sent\n", dcs);
  }
 }
-/* sweetfbfit (fuxi_adreno.h): mode 1 scaled with bars, 2 stretched; asked by SweetFramebuffer after configure and before
- * fuxi_gpu_start maps the tail windows and the buffers. */
-int fuxi_gpu_scanout_fit(unsigned mode)
+/* sweetfbfit corner mask (fuxi_adreno.h): rx = 117*1080/1125 and ry = 117*height/2436 panel pixels, each reduced to num/den. A
+ * pixel (i,j) from the image's corner is black when its centre lies outside the quarter ellipse: with U = 2 num_x - den_x (2i+1) and
+ * V = 2 num_y - den_y (2j+1) (the centre's distance from the arc's centre in 1/(2 den) units), U^2 ry^2 + V^2 rx^2 > rx^2 ry^2 for
+ * rx = 2 num_x, ry = 2 num_y; every product stays below 2^57. Integer only (no FP in the kernel). */
+static uint64_t fg_fit_gcd(uint64_t a, uint64_t b) { while (b) { uint64_t r = a % b; a = b; b = r; } return a; }
+static void fg_fit_corner_table(unsigned height)
+{
+ uint64_t nx = (uint64_t)FUXI_FIT_CORNER_PX*FUXI_FIT_W, dx = FUXI_FIT_SRC_W, ny = (uint64_t)FUXI_FIT_CORNER_PX*height, dy = FUXI_FIT_SRC_H;
+ uint64_t g = fg_fit_gcd(nx, dx); nx /= g; dx /= g;
+ g = fg_fit_gcd(ny, dy); ny /= g; dy /= g;
+ uint64_t rx = 2*nx, ry = 2*ny, rr = rx*rx*ry*ry;
+ fg_fit_spans = fg_fit_runs = 0;
+ for (unsigned j = 0; j < sizeof(fg_fit_span); j++) {
+  fg_fit_span[j] = 0;
+  if (dy*(2*j+1) >= ry) continue;
+  uint64_t v = ry - dy*(2*j+1);
+  unsigned b = 0;
+  while (dx*(2*b+1) < rx) {
+   uint64_t u = rx - dx*(2*b+1);
+   if (u*u*ry*ry + v*v*rx*rx <= rr) break;
+   b++;
+  }
+  fg_fit_span[j] = (uint8_t)b;
+  if (b) fg_fit_spans = j+1;
+ }
+ for (unsigned j = 0; j < fg_fit_spans; j++) fg_fit_runs += !j || fg_fit_span[j] != fg_fit_span[j-1];
+ fg_fit_mask_words = 4 + 5 + 5 + 1 + 4 + fg_fit_runs*4*7; /* blit modes, solid colour, destination, WFI, the +216 stamp; 7 per fill */
+}
+const uint8_t *fuxi_gpu_scanout_fit_corner(unsigned *rows)
+{
+ *rows = fg_fit_spans;
+ return fg_fit_spans ? fg_fit_span : NULL;
+}
+/* sweetfbfit (fuxi_adreno.h): mode 1 scaled with bars, 2 stretched, corner 1 masks the corners; asked by SweetFramebuffer after
+ * configure and before fuxi_gpu_start maps the tail windows and the buffers. */
+int fuxi_gpu_scanout_fit(unsigned mode, unsigned corner)
 {
  const char *why = mode != 1 && mode != FUXI_FIT_STRETCH ? "unknown mode" : !fg_scanout_requested ? "needs fuxigpuscanout=1 sweetfb_noconsole=1" :
      fg_scanout_dpu_stage3 ? "direct scanout (fuxigpuncimport bits 22+23+24) is on" : NULL;
  if (why) { printf("FUXI SCANOUT: fit refused: %s; centred crop kept\n", why); return 0; }
  fg_fit_requested = mode;
+ fg_fit_spans = fg_fit_runs = fg_fit_mask_words = 0;
+ if (corner) {
+  unsigned h = FUXI_FIT_MODE_H(mode);
+  fg_fit_corner_table(h);
+  unsigned rx = (FUXI_FIT_CORNER_PX*FUXI_FIT_W*100u + FUXI_FIT_SRC_W/2)/FUXI_FIT_SRC_W, ry = (FUXI_FIT_CORNER_PX*h*100u + FUXI_FIT_SRC_H/2)/FUXI_FIT_SRC_H;
+  printf("FUXI SCANOUT: fit corner mask %u px (39 pt) -> %u.%02u x %u.%02u px circular arc, %u rows, %u runs, %u fills and %u ring words per copy\n",
+      FUXI_FIT_CORNER_PX, rx/100, rx%100, ry/100, ry%100, fg_fit_spans, fg_fit_runs, fg_fit_runs*4, fg_fit_mask_words);
+ } else printf("FUXI SCANOUT: fit corner mask off (sweetfbcorner=0)\n");
  return 1;
 }
 unsigned fuxi_gpu_scanout_fit_pitch(void) { return __atomic_load_n(&fg_fit_active, __ATOMIC_ACQUIRE) ? FUXI_FIT_PITCH : 0; }
@@ -2845,8 +2886,8 @@ void fuxi_gpu_scanout_release(void)
  * CPU row-copy oracle, after the fence and before releasing the source pin.
  * Scalar aligned device loads only; no CPU framebuffer writes in this check.
  */
-/* sweetfbfit check (fuxigpuscanoutcheck=1, the first frames; mode 2 has no bars, its reference is the stretch): the bars must be
- * black (else the check fails, as a 1:1 mismatch does); the image is only measured against a bilinear reference with 8-bit weights sampling at (d+0.5)*src/dst-0.5, the
+/* sweetfbfit check (fuxigpuscanoutcheck=1, the first frames; mode 2 has no bars, its reference is the stretch): the bars and the
+ * corner-mask pixels must be black (else the check fails, as a 1:1 mismatch does); the rest of the image is only measured against a bilinear reference with 8-bit weights sampling at (d+0.5)*src/dst-0.5, the
  * Vulkan convention Mesa relies on for these blits. max_err and over2 (pixels with a channel off by more than 2) show whether the
  * 2D engine filters and maps the rects that way; they never fail the check. */
 static unsigned fg_fit_pos(unsigned d, unsigned dn, unsigned sn, unsigned *f)
@@ -2873,13 +2914,16 @@ static int fg_fit_verify(void)
   }
  }
  const uint8_t *src = (const uint8_t *)(fg_scanout_source + (uint64_t)fg_scanout_sy*fg_scanout_pitch + fg_scanout_sx*4);
+ unsigned corners = 0;
  for (unsigned y = 0; y < fh; y++) {
+  unsigned edge = y < fg_fit_spans ? y : fh-1-y < fg_fit_spans ? fh-1-y : ~0u, cb = edge != ~0u ? fg_fit_span[edge] : 0;
   unsigned fy, y0 = fg_fit_pos(y, fh, FUXI_FIT_SRC_H, &fy), y1 = y0+1 < FUXI_FIT_SRC_H ? y0+1 : y0;
   const uint8_t *r0 = src + (uint64_t)y0*fg_scanout_pitch, *r1 = src + (uint64_t)y1*fg_scanout_pitch;
   unsigned row = (top+y)*FUXI_FIT_PITCH;
   for (unsigned x = 0; x < FUXI_FIT_W; x++) {
    unsigned fx, x0 = fg_fit_pos(x, FUXI_FIT_W, FUXI_FIT_SRC_W, &fx), x1 = x0+1 < FUXI_FIT_SRC_W ? x0+1 : x0, err = 0, o = row + x*4;
    uint32_t got = *(const volatile uint32_t *)(o < FG_FIT_MAIN ? base + o : tail + (o - FG_FIT_MAIN));
+   if (x < cb || x >= FUXI_FIT_W - cb) { corners += (got & 0xffffffu) != 0; continue; } /* outside the corner arc: black */
    for (unsigned c = 0; c < 32; c += 8) {
     unsigned v = ((256-fx)*(256-fy)*r0[x0*4+c/8] + fx*(256-fy)*r0[x1*4+c/8] + (256-fx)*fy*r1[x0*4+c/8] + fx*fy*r1[x1*4+c/8] + 32768) >> 16;
     unsigned g = (got >> c) & 255u, d = g > v ? g - v : v - g;
@@ -2890,9 +2934,13 @@ static int fg_fit_verify(void)
   }
  }
  absolutetime_to_nanoseconds(mach_absolute_time()-began, &ns);
+ if (fg_fit_spans)
+  printf("FUXI SCANOUT: fit pixel frame=%u buffer=%u pixels=%u bars_nonblack=%u corners_nonblack=%u max_err=%u over2=%u first=%u,%u check_us=%llu\n",
+      ++fg_scanout_checked, b, FUXI_FIT_W*fh, bars, corners, worst, over, first_x, first_y, (unsigned long long)(ns/1000));
+ else
  printf("FUXI SCANOUT: fit pixel frame=%u buffer=%u pixels=%u bars_nonblack=%u max_err=%u over2=%u first=%u,%u check_us=%llu\n",
      ++fg_scanout_checked, b, FUXI_FIT_W*fh, bars, worst, over, first_x, first_y, (unsigned long long)(ns/1000));
- return !bars;
+ return !bars && !corners;
 }
 static int fg_scanout_verify(void)
 {

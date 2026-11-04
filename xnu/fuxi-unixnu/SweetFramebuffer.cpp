@@ -688,7 +688,11 @@ AppleCLCD::start(IOService *provider)
   else if (fLogicalW != FUXI_FIT_SRC_W || fLogicalH != FUXI_FIT_SRC_H || fWidth != FUXI_FIT_W || fHeight != 2400 || fRowBytes != 4320)
    IOLog("SWEET FB: fit refused: needs the %ux%u frame on the 1080x2400 stride 4320 panel (sweetfb_native off); centred crop kept\n",
        FUXI_FIT_SRC_W, FUXI_FIT_SRC_H);
-  else if (fuxi_gpu_scanout_fit(fit) == 1) fFit = (uint8_t)fit;
+  else {
+   uint32_t corner = 1; /* sweetfbcorner=0: no corner mask */
+   PE_parse_boot_argn("sweetfbcorner", &corner, sizeof(corner));
+   if (fuxi_gpu_scanout_fit(fit, corner != 0) == 1) fFit = (uint8_t)fit;
+  }
  }
  sweet_fb_fit = fFit;
  if (fFit == FUXI_FIT_STRETCH) IOLog("SWEET FB: fit %ux%u -> %ux%u at y=%u (stretch, bilinear; CPU fallback nearest)\n",
@@ -1003,6 +1007,34 @@ sweet_fb_fit_copy(uintptr_t pixels, uint32_t pitch, uint64_t mapped, uintptr_t t
 		}
 	}
 	return bytes;
+}
+
+/*
+ * The corner mask on a CPU frame (fuxi_gpu_scanout_fit_corner): black
+ * spans[j] pixels at both ends of image rows j and height-1-j, through the
+ * panel mapping below `mapped` and the tail window past it. GPU frames get
+ * the same pixels from solid fills in their copy.
+ */
+static void
+sweet_fb_fit_corners(uintptr_t pixels, uint32_t pitch, uint64_t mapped, uintptr_t tail, uint64_t tailBytes, uint32_t top,
+    uint32_t height, const uint8_t *spans, unsigned rows)
+{
+	for (unsigned j = 0; j < rows && 2 * j < height; j++) {
+		for (unsigned edge = 0; edge < 2; edge++) {
+			uint64_t row = (uint64_t)(top + (edge ? height - 1 - j : j)) * pitch;
+			for (uint32_t i = 0; i < spans[j]; i++) {
+				uint64_t at[2] = { row + (uint64_t)i * 4, row + (uint64_t)(FUXI_FIT_W - 1 - i) * 4 };
+				for (unsigned k = 0; k < 2; k++) {
+					uint64_t o = at[k];
+					if (o + 4 <= mapped) {
+						*(volatile uint32_t *)(pixels + o) = FUXI_FIT_BLACK;
+					} else if (tail && o - mapped + 4 <= tailBytes) {
+						*(volatile uint32_t *)(tail + (o - mapped)) = FUXI_FIT_BLACK;
+					}
+				}
+			}
+		}
+	}
 }
 
 /* The bars of the boot (4320-pitch) layout, the rows outside top..top+height, before the takeover sets up the 4352 one. */
@@ -1563,6 +1595,9 @@ AppleCLCD::present(const SwapRecord &record)
 					if (tail) mapped = split;
 					written = sweet_fb_fit_copy(fPixels, pitch, mapped, tail, tailBytes, top, height, src + s->offset,
 					    s->memory->getLength() - s->offset, s->bytesPerRow, sx, sy, dx, dy, w, h);
+					unsigned rows = 0;
+					const uint8_t *spans = fuxi_gpu_scanout_fit_corner(&rows);
+					if (spans) sweet_fb_fit_corners(fPixels, pitch, mapped, tail, tailBytes, top, height, spans, rows);
 				} else
 				if (fUnixnuDiff) {
 					uint64_t offset = (uint64_t)s->offset + (uint64_t)sy * s->bytesPerRow + (uint64_t)sx * 4;

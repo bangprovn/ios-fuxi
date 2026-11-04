@@ -1078,7 +1078,7 @@ static int fg_pk_want(unsigned n, uint32_t *wfence)
  const uint32_t gen=FG_CF_LD(fg_cf_gen);
  if (gen==fg_cf_expired_gen || !fg_cf_due_writer(0,wfence,1)) return 0;
  uint32_t used=(g3_wptr-g3_gr(0x806))&8191;
- if (fg_access_failed || used+n+1024+64>8191) { fg_pk_stats[FG_PK_REASONS+1]++; return 0; } /* room for this frame and one copy (fuxi_gpu_copy wants 1024) */
+ if (fg_access_failed || used+n+1024+fg_fit_mask_words+64>8191) { fg_pk_stats[FG_PK_REASONS+1]++; return 0; } /* room for this frame and one copy (fuxi_gpu_copy wants 1024, plus the sweetfbfit corner mask) */
  return 1;
 }
 static void fg_pk_park(const uint32_t *words, unsigned n, uint32_t wfence)

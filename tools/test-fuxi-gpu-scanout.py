@@ -114,6 +114,7 @@ static uint8_t modelB[4320u*2400],modelC[4320u*2400];
 static unsigned failBMap,failCMap;
 /* sweetfbfit: B/C windows at their full 0x9e4000 and the three tail windows (fuxi_adreno.c fg_windows); failTail=b+1 drops b's. */
 static unsigned fg_fit_requested,fg_fit_active,fitModel,failTail;
+static uint8_t fg_fit_span[128];static unsigned fg_fit_spans,fg_fit_runs,fg_fit_mask_words; /* corner mask table (defined in fuxi_adreno.c) */
 static uint8_t fitB[0x9e4000],fitC[0x9e4000],fitTail[3][0x14000];
 static uintptr_t fuxi_gpu_nc_pointer(uint64_t pa,uint64_t size) {
  if(fitModel) {
@@ -1409,22 +1410,24 @@ static unsigned fit_bars_black(const uint8_t *base,const uint8_t *tail) {
  return 1;
 }
 static unsigned stride_writes(void) {unsigned n=0;for(unsigned i=0;i<traceCount;i++)n+=trace[i].pa==0xae05024;return n;}
+static unsigned fitCorner; /* the corner mask for fit_owned: off in the geometry tests, on in the mask tests */
 static void fit_owned_mode(uint8_t *a,unsigned m,unsigned mode) {
  reset();fitModel=1;modelDouble=m>0;modelTriple=m==2;modelTe=1;
  intf[0x294/4]=2400;intf[0x298/4]=(1u<<16)|2500;intf[0x2b0/4]=2400;sspp[0x24/4]=0x10e0u|(7u<<16);ctl[0x18/4]=0x40;
  memset(a,0x5a,0x9e4000);memset(fitB,0xcc,sizeof(fitB));memset(fitC,0xcc,sizeof(fitC));memset(fitTail,0x77,sizeof(fitTail));
- fuxi_gpu_scanout_configure((uintptr_t)a,1,0);assert(fuxi_gpu_scanout_fit(mode)==1 && fg_fit_requested==mode);
+ fuxi_gpu_scanout_configure((uintptr_t)a,1,0);assert(fuxi_gpu_scanout_fit(mode,fitCorner)==1 && fg_fit_requested==mode && !!fg_fit_spans==!!fitCorner);
  assert(!fuxi_gpu_scanout_acquire() && fuxi_gpu_scanout_owned() && !fuxi_gpu_scanout_fit_pitch() && !stride_writes());
  intf[0x298/4]=(2u<<16)|2500;
 }
 static void fit_owned(uint8_t *a,unsigned m) {fit_owned_mode(a,m,1);}
 static void fit_tests(void) {
  uint8_t *a=malloc(0x9e4000),*src=malloc(4608u*2436);assert(a && src);
- reset();fuxi_gpu_scanout_configure((uintptr_t)a,0,0);assert(!fuxi_gpu_scanout_fit(1) && !fg_fit_requested && strstr(fitLog,"fit refused: needs fuxigpuscanout=1"));
- reset();fuxi_gpu_scanout_configure((uintptr_t)a,1,0);assert(!fuxi_gpu_scanout_fit(3) && !fuxi_gpu_scanout_fit(0) && !fg_fit_requested && strstr(fitLog,"fit refused: unknown mode"));
+ reset();fuxi_gpu_scanout_configure((uintptr_t)a,0,0);assert(!fuxi_gpu_scanout_fit(1,1) && !fg_fit_requested && strstr(fitLog,"fit refused: needs fuxigpuscanout=1"));
+ reset();fuxi_gpu_scanout_configure((uintptr_t)a,1,0);assert(!fuxi_gpu_scanout_fit(3,1) && !fuxi_gpu_scanout_fit(0,1) && !fg_fit_requested && strstr(fitLog,"fit refused: unknown mode"));
  reset();modelNc=0x1c00000u;fuxi_gpu_scanout_configure((uintptr_t)a,1,0);
- assert(fg_scanout_dpu_stage3 && !fuxi_gpu_scanout_fit(1) && !fuxi_gpu_scanout_fit(2) && !fg_fit_requested && strstr(fitLog,"direct scanout"));
- reset();modelNc=0x1000000u;fuxi_gpu_scanout_configure((uintptr_t)a,1,0);assert(fuxi_gpu_scanout_fit(1)==1 && !fuxi_gpu_scanout_fit_pitch());
+ assert(fg_scanout_dpu_stage3 && !fuxi_gpu_scanout_fit(1,1) && !fuxi_gpu_scanout_fit(2,1) && !fg_fit_requested && strstr(fitLog,"direct scanout"));
+ reset();modelNc=0x1000000u;fuxi_gpu_scanout_configure((uintptr_t)a,1,0);assert(fuxi_gpu_scanout_fit(1,0)==1 && !fuxi_gpu_scanout_fit_pitch());
+ assert(strstr(fitLog,"fit corner mask off (sweetfbcorner=0)"));{unsigned rows=7;assert(!fuxi_gpu_scanout_fit_corner(&rows) && !rows);}
  for(unsigned m=0;m<3;m++) {
   fit_owned(a,m);
   assert(fuxi_gpu_scanout_acquire()==1 && fuxi_gpu_scanout_fit_pitch()==4352 && fg_fit_active && !starts);
@@ -1508,8 +1511,50 @@ static void fit_tests(void) {
  assert(fg_scanout_verify() && strstr(fitLog,"fit pixel frame=1 buffer=0 pixels=2592000 bars_nonblack=0 max_err=0 over2=0 "));
  fitTail[0][(2399*4352-0x9e4000)+5*4+2]+=7;assert(fg_scanout_verify() && strstr(fitLog,"bars_nonblack=0 max_err=7 over2=1 first=5,2399 "));
  a[0]^=0xff;assert(fg_scanout_verify() && strstr(fitLog,"bars_nonblack=0 ")); // row 0 is image in mode 2: measured, never a bar
+
+ // Corner mask: the kernel's integer table equals a floating-point reference of the same rule for both modes (iPhone X 39 pt = 117 px,
+ // scaled; a pixel is black when its centre lies outside the quarter ellipse); its log line; the oracle checks the mask.
+ for(unsigned mode=1;mode<=2;mode++) {
+  reset();fuxi_gpu_scanout_configure((uintptr_t)a,1,0);assert(fuxi_gpu_scanout_fit(mode,1)==1);
+  unsigned H=mode==2?2400:2338,rows=0,runs=0,area=0;double rx=117*1080/1125.0,ry=117.0*H/2436;
+  const uint8_t *s=fuxi_gpu_scanout_fit_corner(&rows);assert(s==fg_fit_span && rows==(mode==2?104u:102u));
+  for(unsigned j=0;j<128;j++) {
+   double v=ry-(j+0.5);unsigned b=0;
+   if(v>0)while(rx-(b+0.5)>0 && ((rx-(b+0.5))/rx)*((rx-(b+0.5))/rx)+(v/ry)*(v/ry)>1)b++;
+   assert(fg_fit_span[j]==b && (j<rows || !b));area+=b;
+   if(j<rows)runs+=!j || s[j]!=s[j-1];
+   if(b && j<rows-1)assert(s[j]>=s[j+1]); // a staircase
+  }
+  assert(runs==fg_fit_runs && runs==(mode==2?66u:65u) && area==(mode==2?2772u:2707u) && fg_fit_mask_words==19+runs*28);
+  char want[200];snprintf(want,sizeof want,"fit corner mask 117 px (39 pt) -> 112.32 x %s px circular arc, %u rows, %u runs, %u fills and %u ring words per copy",
+      mode==2?"115.27":"112.29",rows,runs,runs*4,fg_fit_mask_words);
+  assert(strstr(fitLog,want));
+  // A pixel 1 px outside the arc on the 45-degree line is black, 1 px inside is not.
+  double d=1-0.70710678118654752; /* 1 - cos 45 */unsigned i=(unsigned)(rx*d),j=(unsigned)(ry*d);assert(i>=1 && j>=1 && s[j-1]>i-1 && s[j+1]<=i+1);
+ }
+ // Oracle with the mask (mode 1): the reference image with black corners passes; a non-black pixel outside the arc fails like a bar;
+ // a pixel just inside is measured only. Mask off: the line keeps its old form (no corners field).
+ fitCorner=1;fit_owned_mode(a,0,1);assert(fuxi_gpu_scanout_acquire()==1);fitCorner=0;
+ fg_scanout_checks=4;fg_scanout_checked=0;fg_scanout_source=(uintptr_t)src;fg_scanout_pitch=4608;
+ fg_scanout_sx=fg_scanout_sy=fg_scanout_dx=fg_scanout_dy=0;fg_scanout_w=1125;fg_scanout_h=2436;
+ for(unsigned y=0;y<2338;y++) {
+  double v=(y+0.5)*2436.0/2338.0-0.5;unsigned y0=(unsigned)v,fy=(unsigned)((v-y0)*256),y1=y0+1<2436?y0+1:y0;
+  unsigned e=y<fg_fit_spans?y:2337-y<fg_fit_spans?2337-y:~0u,cb=e!=~0u?fg_fit_span[e]:0;
+  for(unsigned x=0;x<1080;x++) {
+   if(x<cb || x>=1080-cb){uint32_t k=0xff000000u;memcpy(a+(31+y)*4352+x*4,&k,4);continue;}
+   double u=(x+0.5)*1125.0/1080.0-0.5;unsigned x0=(unsigned)u,fx=(unsigned)((u-x0)*256),x1=x0+1<1125?x0+1:x0;
+   for(unsigned c=0;c<4;c++)
+    a[(31+y)*4352+x*4+c]=(uint8_t)(((256-fx)*(256-fy)*src[y0*4608+x0*4+c]+fx*(256-fy)*src[y0*4608+x1*4+c]+
+     (256-fx)*fy*src[y1*4608+x0*4+c]+fx*fy*src[y1*4608+x1*4+c]+32768)>>16);
+  }
+ }
+ assert(fg_scanout_verify() && strstr(fitLog,"fit pixel frame=1 buffer=0 pixels=2525040 bars_nonblack=0 corners_nonblack=0 max_err=0 over2=0 "));
+ unsigned cb0=fg_fit_span[0];a[(31+0)*4352+(cb0-1)*4]=9;          // the last black pixel of the first image row
+ assert(!fg_scanout_verify() && strstr(fitLog,"bars_nonblack=0 corners_nonblack=1 "));a[(31+0)*4352+(cb0-1)*4]=0;
+ a[(31+0)*4352+cb0*4]^=0x40;                                          // the first image pixel after it: measured, not a failure
+ assert(fg_scanout_verify() && strstr(fitLog,"corners_nonblack=0 max_err=64 over2=1 first="));
  free(a);free(src);reset();
- puts("PASS: sweetfbfit modes 1 and 2 scanout: mode 2 without bars, drain of its tail; refused without the lane or with direct scanout; bars black in A/B/C incl. tails, then YSTRIDE0 4352 + flush once before START; kept through flips and stop; window failure stops first; fit oracle");
+ puts("PASS: sweetfbfit corner mask table (integer = float reference, 65/66 runs), log, oracle with mask; modes 1 and 2 scanout: mode 2 without bars, drain of its tail; refused without the lane or with direct scanout; bars black in A/B/C incl. tails, then YSTRIDE0 4352 + flush once before START; kept through flips and stop; window failure stops first; fit oracle");
 }
 int main(void) {
  te_estimator_tests();
@@ -2115,7 +2160,7 @@ static int IOLog(const char *format,...) {va_list args;va_start(args,format);vsn
             'sweet_fb_swap_bin', 'sweet_fb_te_configure', 'AppleCLCD::teVsyncTick', 'AppleCLCD::teVsyncLog',
             'AppleCLCD::presentWantedLocked', 'AppleCLCD::wakePresentLocked', 'sweet_fb_rearm',
             'AppleCLCD::vsyncFired', 'AppleCLCD::scanoutLog', 'get32', 'sweet_fb_fit_col', 'sweet_fb_fit_row', 'sweet_fb_fit_copy',
-            'sweet_fb_fit_bars', 'AppleCLCD::observeRecord', 'AppleCLCD::recordDone', 'AppleCLCD::consumeRecord', 'AppleCLCD::retireEarly', 'AppleCLCD::releaseRecord',
+            'sweet_fb_fit_corners', 'sweet_fb_fit_bars', 'AppleCLCD::observeRecord', 'AppleCLCD::recordDone', 'AppleCLCD::consumeRecord', 'AppleCLCD::retireEarly', 'AppleCLCD::releaseRecord',
             'AppleCLCD::swapWait', 'AppleCLCD::stopRecords',
             'AppleCLCD::writerRetired', 'AppleCLCD::writerWake', 'AppleCLCD::writerWakeAction',
             'AppleCLCD::presentStep', 'AppleCLCD::fifoDrop', 'AppleCLCD::stageStats', 'AppleCLCD::completePresent', 'AppleCLCD::presentStats', 'AppleCLCD::presentNext', 'AppleCLCD::swap', 'AppleCLCD::present'))

@@ -44,6 +44,10 @@ static void fg_delay(unsigned us) { delay_for_interval(us, NSEC_PER_USEC); }
 static unsigned fg_scanout_requested, fg_scanout_panel120_requested, fg_scanout_double_requested, fg_scanout_triple_requested;
 static unsigned fg_scanout_paneldcs_requested; /* fuxipaneldcs=1..4 accepted by fuxi_gpu_scanout_configure: DSI0 is mapped */
 static unsigned fg_fit_requested, fg_fit_active; /* sweetfbfit mode accepted, 1 or 2 (tail windows mapped); the 4352-pitch layout is live (fuxi_gpu_scanout.inc) */
+/* sweetfbfit corner mask (fuxi_gpu_scanout_fit): black width per image row from the edge, rows with any, runs of equal widths, and the ring
+ * words the mask adds to a copy; all 0 when off. */
+static uint8_t fg_fit_span[128];
+static unsigned fg_fit_spans, fg_fit_runs, fg_fit_mask_words;
 struct fg_window { uint64_t pa, size; uintptr_t va; };
 /* Disjoint apertures; framebuffer A is mapped by SweetFramebuffer.
  * Stage14 uses scratch, never stage15's panel readback/CPU comparator. */
@@ -803,6 +807,29 @@ static void fg_fit_rect(unsigned src, unsigned dst, unsigned pitch, unsigned hei
  g3_emit(0); g3_emit((FUXI_FIT_W-1) | (height-1)<<16);
  g4_event(63); g3_emit(g3_pkt7(0x2c, 1)); g3_emit(3); g4_wfi();
 }
+/* sweetfbfit corner mask: after the scaled blit, solid black fills (SOLID_COLOR as g4_clear, which the self-test proved) of the
+ * pixels outside the corner arc: one rect per run of image rows with the same black width, mirrored to the four corners (about 65
+ * runs, 260 fills, 7 ring words each). The fills land in the same submission, before the fence and so before any START: every
+ * buffer is shown masked, in double and triple rotation too. dst: the buffer's base; top/height: the image rows. */
+static void fg_fit_box(unsigned x0, unsigned y0, unsigned x1, unsigned y1)
+{
+ g3_emit(g4_pkt4(G4_GRAS_SRC_X+4, 2)); g3_emit(x0 | y0<<16); g3_emit(x1 | y1<<16);
+ g4_event(63); g3_emit(g3_pkt7(0x2c, 1)); g3_emit(3);
+}
+static void fg_fit_mask(unsigned dst, unsigned top, unsigned height)
+{
+ g4_reg(G4_RB_BLIT, 0x10f03080); g4_reg(G4_GRAS_BLIT, 0x10f03080);
+ g3_emit(g4_pkt4(G4_RB_SOLID, 4)); g3_emit(0); g3_emit(0); g3_emit(0); g3_emit(0xff); /* R G B A: FUXI_FIT_BLACK */
+ g3_emit(g4_pkt4(G4_RB_DST_INFO, 4)); g3_emit(0x430); g3_emit(dst & ~63u); g3_emit(0); g3_emit(FUXI_FIT_PITCH/64);
+ for (unsigned j = 0, k; j < fg_fit_spans; j = k) {
+  unsigned b = fg_fit_span[j];
+  for (k = j+1; k < fg_fit_spans && fg_fit_span[k] == b; k++) {}
+  if (!b) continue;
+  fg_fit_box(0, top+j, b-1, top+k-1); fg_fit_box(FUXI_FIT_W-b, top+j, FUXI_FIT_W-1, top+k-1);
+  fg_fit_box(0, top+height-k, b-1, top+height-1-j); fg_fit_box(FUXI_FIT_W-b, top+height-k, FUXI_FIT_W-1, top+height-1-j);
+ }
+ g4_wfi();
+}
 _Static_assert(!(FUXI_FIT_PITCH & 63) && !(FUXI_FIT_Y*FUXI_FIT_PITCH & 63) && FUXI_FIT_PITCH*2400u <= 0xa00000u &&
     (FUXI_FIT_Y+FUXI_FIT_H-1)*FUXI_FIT_PITCH+FUXI_FIT_W*4 <= FG_FIT_MAIN, "fit image rows stay inside the mapped part of each 10 MiB buffer");
 _Static_assert(FUXI_FIT_STRETCH_MAP <= 0xa00000u && FUXI_FIT_STRETCH_MAP >= 2400u*FUXI_FIT_PITCH && FG_FIT_MAIN+FG_FIT_TAIL_BYTES >= 2400u*FUXI_FIT_PITCH,
@@ -860,6 +887,8 @@ static int fg_ring_doorbell(void)
 #define FG_CP_STAMP 192u
 static uint32_t fg_cp_submit_lo, fg_cp_n, fg_cp_bad, fg_cp_pitch, fg_cp_rects;
 static uint64_t fg_cp_sum[4], fg_cp_max[4]; /* submit_to_start, blit, flush, poll_late */
+static unsigned fg_cp_masked; /* the last copy had the sweetfbfit corner mask: stamp +216 splits its fills from the blit */
+static uint64_t fg_cp_mask_sum, fg_cp_mask_max;
 static void fg_cp_stamp(unsigned off)
 {
  g3_emit(g3_pkt7(0x3e, 3)); g3_emit(0x980 | (2u<<18) | (1u<<30)); g3_emit(G3_FENCE_VA+off); g3_emit(0);
@@ -867,10 +896,12 @@ static void fg_cp_stamp(unsigned off)
 static void fg_cp_retire(void)
 {
  uint32_t s0 = g3_read(G3_FENCE_PA+FG_CP_STAMP), s1 = g3_read(G3_FENCE_PA+FG_CP_STAMP+8), s2 = g3_read(G3_FENCE_PA+FG_CP_STAMP+16), now = g3_gr(0x980);
+ uint32_t sm = fg_cp_masked ? g3_read(G3_FENCE_PA+FG_CP_STAMP+24) : 0;
  fg_cp_n++; fg_copy_log.s2s_us = fg_copy_log.blit_us = UINT32_MAX;
- if (fg_access_failed || !s0 || !s1 || !s2) fg_cp_bad++;
+ if (fg_access_failed || !s0 || !s1 || !s2 || (fg_cp_masked && !sm)) fg_cp_bad++;
  else {
-  uint32_t v[4] = {s0-fg_cp_submit_lo, s1-s0, s2-s1, now-s2};
+  uint32_t v[4] = {s0-fg_cp_submit_lo, fg_cp_masked ? sm-s0 : s1-s0, s2-s1, now-s2};
+  if (fg_cp_masked) { uint32_t m = s1-sm; fg_cp_mask_sum += m; if (m > fg_cp_mask_max) fg_cp_mask_max = m; }
   for (unsigned i = 0; i < 4; i++) { fg_cp_sum[i] += v[i]; if (v[i] > fg_cp_max[i]) fg_cp_max[i] = v[i]; }
   fg_copy_log.s2s_us = (uint32_t)((uint64_t)v[0]*10/192); fg_copy_log.blit_us = (uint32_t)((uint64_t)v[1]*10/192);
  }
@@ -880,8 +911,11 @@ static void fg_cp_retire(void)
       FG_US(fg_cp_sum[1]/600), FG_US(fg_cp_max[1]), FG_US(fg_cp_sum[2]/600), FG_US(fg_cp_max[2]), FG_US(fg_cp_sum[0]/600), FG_US(fg_cp_max[0]),
       FG_US(fg_cp_sum[3]/600), FG_US(fg_cp_max[3]), fg_cp_n, fg_cp_bad, fg_cp_pitch, fg_cp_rects,
       !fg_fit_active ? "" : fg_fit_requested == FUXI_FIT_STRETCH ? " fit=2" : " fit=1"); /* fit: one scaled bilinear blit, so blit avg is its GPU time */
+  if (fg_cp_masked) /* sweetfbfit corner mask: blit avg above is the scaled blit alone, this its fills */
+   printf("FUXI GPU: fit corner mask avg %llu max %llu us, %u fills per copy (%u runs x 4)\n", FG_US(fg_cp_mask_sum/600), FG_US(fg_cp_mask_max),
+       fg_fit_runs*4, fg_fit_runs);
   #undef FG_US
-  memset(fg_cp_sum, 0, sizeof fg_cp_sum); memset(fg_cp_max, 0, sizeof fg_cp_max);
+  memset(fg_cp_sum, 0, sizeof fg_cp_sum); memset(fg_cp_max, 0, sizeof fg_cp_max); fg_cp_mask_sum = fg_cp_mask_max = 0;
  }
 }
 /* Called once per display tick; never sleeps, spins for completion or submits.
@@ -946,7 +980,7 @@ int fuxi_gpu_copy(unsigned slot, uint64_t generation, uintptr_t source, uint64_t
  if (inl) {
   /* Never refused for a client job: it lands in the same in-order ring. Room for the whole copy (at most about 450 words), else fall back. */
   unsigned used = (g3_wptr-g3_gr(0x806)) & 8191, want = 1u | (fg_scanout_double_requested ? 2u : 0) | (fg_scanout_triple_requested ? 4u : 0);
-  unsigned why = fg_access_failed ? FG_INL_RING : used > 8191-1024 ? FG_INL_RING : (fg_inl_fbmask & want) != want ? FG_INL_BUFFERS : FG_INL_REASONS;
+  unsigned why = fg_access_failed ? FG_INL_RING : used > 8191-1024-(fit ? fg_fit_mask_words : 0) ? FG_INL_RING : (fg_inl_fbmask & want) != want ? FG_INL_BUFFERS : FG_INL_REASONS;
   if (why != FG_INL_REASONS) { fg_inl_fb[why]++; inl = 0; }
  } else if (fg_abi_inline) fg_inl_fb[fg_root_client ? FG_INL_WINDOW : fg_inl_ready == 2 ? FG_INL_WINDOW : FG_INL_NOROOT]++;
  if (!inl && fg_root_client && !fg_inl_to_present()) { fg_inl_fb[fg_client_busy ? FG_INL_CLIENT : FG_INL_SWITCH]++; return 0; }
@@ -978,13 +1012,16 @@ int fuxi_gpu_copy(unsigned slot, uint64_t generation, uintptr_t source, uint64_t
   fg_scanout_copy = fg_scanout_target();
  }
  g_wr(G3_FENCE_PA, FG_CP_STAMP, 0); g_wr(G3_FENCE_PA, FG_CP_STAMP+8, 0); g_wr(G3_FENCE_PA, FG_CP_STAMP+16, 0);
+ fg_cp_masked = fit && fg_fit_spans;
+ if (fg_cp_masked) g_wr(G3_FENCE_PA, FG_CP_STAMP+24, 0);
  fg_cp_pitch = pitch; fg_cp_rects = fit ? 1 : stride < height ? stride : height;
  g4_wfi(); fg_cp_stamp(FG_CP_STAMP);
  g4_setup();
- if (fit)
-  fg_fit_rect((inl ? FG_INL_SRC_VA : FG_SOURCE_VA)+slot*FG_SOURCE_BYTES+(source&4095)+sy*pitch+sx*4,
-      (inl ? FG_INL_FB_VA : G4_FB_VA)+(fg_scanout_double_active ? fg_scanout_copy*0xa00000u : 0)+fit_y*FUXI_FIT_PITCH, pitch, fit_h);
- else
+ if (fit) {
+  unsigned fb = (inl ? FG_INL_FB_VA : G4_FB_VA)+(fg_scanout_double_active ? fg_scanout_copy*0xa00000u : 0);
+  fg_fit_rect((inl ? FG_INL_SRC_VA : FG_SOURCE_VA)+slot*FG_SOURCE_BYTES+(source&4095)+sy*pitch+sx*4, fb+fit_y*FUXI_FIT_PITCH, pitch, fit_h);
+  if (fg_cp_masked) { fg_cp_stamp(FG_CP_STAMP+24); fg_fit_mask(fb, fit_y, fit_h); } /* the corner mask, after the image */
+ } else
  for (unsigned y = 0; y < stride && y < height; y++)
   fg_rect((inl ? FG_INL_SRC_VA : FG_SOURCE_VA)+slot*FG_SOURCE_BYTES+(source&4095)+(sy+y)*pitch+sx*4,
       (inl ? FG_INL_FB_VA : G4_FB_VA)+(fg_scanout_double_active ? fg_scanout_copy*0xa00000u : 0)+(dy+y)*4320+dx*4, pitch, width, (height-1-y)/stride+1, stride);
