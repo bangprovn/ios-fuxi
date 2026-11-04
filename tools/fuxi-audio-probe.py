@@ -3,7 +3,8 @@
 
   snapshot [--groups 0,1,2,3]  read-only snapshot pages (group 4 = SCM queries)
   squash DIR NAME OUT          merge NAME.mdt + NAME.bNN into one MBN (no device)
-  upload --dtb F --fw F        stage squashed adsp_dtb/adsp MBNs over control OUT
+  upload --dtb F --fw F        stage squashed adsp_dtb/adsp MBNs over control OUT; --chunk 4096 sends 4 KiB a transfer
+                               (loaders from fuxi-audio2 on; an older loader refuses it, and the image restarts at 512)
   boot                         stage 2: PAS-boot the ADSP once, then decode
   report                       re-read the frozen stage-2 report
   glink [--seconds N] [--answer] [--gpr] [--prm]  after a boot that reached ready: GLINK with the DSP, polled; no data is sent unless --gpr asks the APM its state; --prm then votes LPASS on and off; --graph between them opens, configures and closes the TDM graph, never starting it; --play also starts it and gives it a second of zeros, no pin muxed
@@ -15,6 +16,7 @@ import argparse
 import math
 import struct
 import sys
+import time
 from pathlib import Path
 
 VID, PID, PRODUCT = 0x1209, 0x0001, 'Fuxi hardware probe'
@@ -408,6 +410,7 @@ def main():
     ap.add_argument('--groups', default='0,1,2,3')
     ap.add_argument('--dtb', type=Path)
     ap.add_argument('--fw', type=Path)
+    ap.add_argument('--chunk', type=int, default=512, help='upload: bytes a control OUT, a multiple of 512 up to 4096')
     ap.add_argument('--timeout', type=int, default=60000, help='control timeout ms')
     ap.add_argument('--save', type=Path, help='append raw 512-byte pages here')
     ap.add_argument('--raw', action='store_true')
@@ -449,18 +452,32 @@ def main():
     elif a.cmd == 'upload':
         if not a.dtb or not a.fw:
             ap.error('upload needs --dtb and --fw (squashed MBNs)')
+        if a.chunk % 512 or not 512 <= a.chunk <= 4096:
+            ap.error('--chunk is a multiple of 512, from 512 to 4096')
         dev.ctrl_transfer(0xc0, 0x54, 30, 0, 8, timeout=a.timeout)  # reset deadline: +30 min
         for img, path in ((0, a.dtb), (1, a.fw)):
             data = path.read_bytes()
             if len(data) % 512 == 0:
-                data += b'\0'  # the device closes an image on a short chunk; trailing pad is harmless
-            for c in range((len(data) + 511) // 512):
-                part = data[c * 512:(c + 1) * 512]
-                idx = (img << 15) | (0x4000 if c == 0 else 0) | (c >> 16)
-                n = dev.ctrl_transfer(0x40, 0x5b, c & 0xffff, idx, part, timeout=a.timeout)
-                assert n == len(part), f'short OUT at chunk {c}'
-                if c % 4096 == 0:
-                    print(f'  image {img}: {c * 512}/{len(data)}', flush=True)
+                data += b'\0'  # the device closes an image on a chunk that is not a multiple of 512; trailing pad is harmless
+            size, start = a.chunk, time.monotonic()
+            off = 0
+            while off < len(data):
+                part = data[off:off + size]
+                c = off // 512  # chunks are numbered by their offset in 512-byte units, whatever their size
+                idx = (img << 15) | (0x4000 if off == 0 else 0) | (c >> 16)
+                try:
+                    n = dev.ctrl_transfer(0x40, 0x5b, c & 0xffff, idx, part, timeout=a.timeout)
+                except usb.core.USBError as e:
+                    if off != 0 or size == 512:
+                        raise
+                    print(f'  image {img}: {size}-byte chunks refused ({e}): an older loader; 512 from the start', flush=True)
+                    size = 512
+                    continue
+                assert n == len(part), f'short OUT at offset {off}'
+                if off % (4096 * 512) == 0:
+                    print(f'  image {img}: {off}/{len(data)}', flush=True)
+                off += len(part)
+            print(f'  image {img}: {len(data)} bytes in {time.monotonic() - start:.1f} s, {size}-byte chunks', flush=True)
             st = struct.unpack('<12I', req(0x4155, 0, 48))
             want = fnv(data)
             got_len, got_hash, done = st[1 + 3 * img:4 + 3 * img]

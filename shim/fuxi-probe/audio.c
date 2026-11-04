@@ -34,8 +34,11 @@
  *  IN  0x5a 'AH' (0x4148) wIndex=page: its log, 128 words a page.
  *  OUT 0x5b wValue=chunk[15:0], wIndex[11:0]=chunk[27:16], wIndex bit15 =
  *      image (0 adsp_dtb, 1 adsp), bit14 = restart that image at chunk 0.
- *      Sequential 512-byte chunks of a squashed (single-file) MBN; a short
- *      chunk ends the image.
+ *      Sequential chunks of a squashed (single-file) MBN, numbered by their
+ *      offset in 512-byte units; each a multiple of 512 bytes, up to
+ *      AU_CHUNK_MAX, but the last, whose length is not (the host pads the
+ *      image so), and which ends the image. 512 was the only size until
+ *      fuxi-audio2: 77,581 transfers and about 53 s for the ADSP's image.
  * Nothing runs unless the host asks; stage 2 refuses to run after a launch,
  * twice, or when the ADSP already reports ready. All new MMIO/RAM reads use
  * probe_safe_rd32 (synchronous aborts are contained; an SError still resets).
@@ -269,6 +272,9 @@ static uint32_t au_fnv(uint32_t h, const uint8_t *p, unsigned n)
  for (unsigned i = 0; i < n; i++) h = (h ^ p[i]) * 16777619u;
  return h;
 }
+/* A control OUT's data stage lands at UD_DATA (probe.c), 0x2f00 bytes before the end of the 16 KiB DMA area; WinUSB takes
+ * control transfers of up to 4 KiB. */
+#define AU_CHUNK_MAX 4096u
 static bool au_out_ok(uint16_t value, uint16_t index, uint16_t length)
 {
  unsigned img = index >> 15;
@@ -276,13 +282,13 @@ static bool au_out_ok(uint16_t value, uint16_t index, uint16_t length)
  uint32_t cap = img ? AU_CAP1 : AU_CAP0;
  extern char _head[], _end[];
  uint64_t lo = AU_STAGE, hi = AU_STAGE + AU_CAP0 + AU_CAP1;
- if (monitor_report[MON_LAUNCH] || au_boot[0] || !length || length > 512 ||
+ if (monitor_report[MON_LAUNCH] || au_boot[0] || !length || length > AU_CHUNK_MAX ||
      (index & 0x3000)) return false;
  /* The loader image and the FDT must not sit in the staging window. */
  if ((uintptr_t)_head < hi && lo < (uintptr_t)_end) return false;
  if (probe_fdt_address() < hi && lo < probe_fdt_address() + probe_fdt_bytes()) return false;
  if (index & 0x4000) { if (chunk) return false; au_len[img] = au_hash[img] = au_done[img] = 0; }
- if (au_done[img] || chunk != au_len[img] / 512 || length > cap - au_len[img]) return false;
+ if (au_done[img] || (au_len[img] & 511u) || chunk != au_len[img] / 512 || length > cap - au_len[img]) return false;
  return true;
 }
 static void au_out_data(uint16_t index, const volatile uint8_t *src, uint16_t length)
@@ -291,11 +297,14 @@ static void au_out_data(uint16_t index, const volatile uint8_t *src, uint16_t le
  uint64_t dst = AU_STAGE + (img ? AU_CAP0 : 0) + au_len[img];
  uint8_t tmp[512];
  if (!au_len[img]) au_hash[img] = 2166136261u;
- for (unsigned i = 0; i < length; i++) tmp[i] = src[i];
- for (unsigned i = 0; i < length; i++) *(volatile uint8_t *)(uintptr_t)(dst + i) = tmp[i];
- au_hash[img] = au_fnv(au_hash[img], tmp, length);
+ for (unsigned at = 0; at < length; at += 512) {
+  unsigned n = length - at < 512u ? length - at : 512u;
+  for (unsigned i = 0; i < n; i++) tmp[i] = src[at + i];
+  for (unsigned i = 0; i < n; i++) *(volatile uint8_t *)(uintptr_t)(dst + at + i) = tmp[i];
+  au_hash[img] = au_fnv(au_hash[img], tmp, n);
+ }
  au_len[img] += length;
- if (length < 512) au_done[img] = 1;
+ if (length & 511u) au_done[img] = 1;
  __asm__ volatile("dsb sy" ::: "memory");
 }
 static uint32_t au_status(uint32_t *r)

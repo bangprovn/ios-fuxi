@@ -866,7 +866,7 @@ static void core_probe(void)
 #define UD_TRB_OUT      0x1000          /* ep0 OUT TRB */
 #define UD_TRB_IN       0x1010          /* ep0 IN TRB */
 #define UD_SETUP        0x1040          /* 8-byte setup packet */
-#define UD_DATA         0x1100          /* ep0 data stage, 512 bytes */
+#define UD_DATA         0x1100          /* ep0 data stage: 512 bytes, up to AU_CHUNK_MAX (4 KiB) for audio staging */
 #define UD_SIZE         0x4000
 
 static struct {
