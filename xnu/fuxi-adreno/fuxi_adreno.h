@@ -24,6 +24,13 @@ void fuxi_gpu_import_stats(uint64_t *cleaned, uint64_t *skipped, uint64_t *inval
  */
 void fuxi_gpu_scanout_configure(uintptr_t pixels, unsigned enabled, unsigned check);
 int fuxi_gpu_scanout_owned(void);
+/* fuxipaneldcs (default off, fuxi_gpu_scanout.inc): dcs_max is the DBV cap while FuxiBacklight may set the panel's DCS 0x51
+ * (fuxipaneldcs=3/4), else 0; panel_dbv hands it a wanted DBV (clamped, coalesced, sent between transfers); panel_power is selector
+ * 12's state, which with fuxipaneldcs=4 puts the panel to sleep after the black frame and wakes it. dcs_max and panel_dbv never
+ * block; panel_power takes the GPU ring lock, so call it without the framebuffer lock. */
+unsigned fuxi_gpu_panel_dcs_max(void);
+void fuxi_gpu_panel_dbv(unsigned dbv);
+void fuxi_gpu_panel_power(int on);
 /* One copy/ready frame at a time; timestamps are mach absolute units. */
 struct fg_present_times { uint64_t submitted, fence, start, previous_start; };
 void fuxi_gpu_scanout_stamps(struct fg_present_times *times);

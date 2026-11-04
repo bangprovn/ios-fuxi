@@ -1938,7 +1938,7 @@
  	IOLockUnlock(fFB->fLock);
  	if (old != MACH_PORT_NULL) {
  		releaseNotificationPort(old);
-@@ -643,6 +1763,40 @@
+@@ -643,6 +1763,45 @@
  }
  
  static uint64_t sweet_fb_logged;        /* selectors already logged (< 64) */
@@ -1961,6 +1961,11 @@
 +{
 +	AppleCLCD *fb = (AppleCLCD *)owner;
 +	bool off = state == NULL;
++#if defined(FUXI)
++	/* fuxipaneldcs=4: the panel sleeps after the black frame drawn below and wakes before the redraw. Called before the framebuffer
++	 * lock (the scanout side takes the GPU ring lock) and before fPowerOff, so the black frame's CPU acquire sees the request. */
++	if (fb->fScanout) fuxi_gpu_panel_power(!off);
++#endif
 +	IOLockLock(fb->fLock);
 +	if (off != fb->fPowerOff) {
 +		fb->fPowerOff = off;
@@ -1979,7 +1984,7 @@
  
  IOReturn
  IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
-@@ -660,7 +1814,7 @@
+@@ -660,7 +1819,7 @@
  		break;
  	case kSweetFBSwapBegin:
  		IOLockLock(fFB->fLock);
@@ -1988,7 +1993,7 @@
  		IOLockUnlock(fFB->fLock);
  		outCount = 1;
  		break;
-@@ -672,7 +1826,7 @@
+@@ -672,7 +1831,7 @@
  			break;
  		}
  		memcpy(rec, args->structureInput, sizeof(rec));
@@ -1997,7 +2002,7 @@
  		break;
  	}
  	case kSweetFBGetID:
-@@ -698,6 +1852,7 @@
+@@ -698,6 +1857,7 @@
  			IOLockLock(fFB->fLock);
  			fFunc[type] = args->scalarInput[0];
  			fRefcon[type] = args->scalarInput[1];
@@ -2005,7 +2010,7 @@
  			IOLockUnlock(fFB->fLock);
  			char name[32];
  			proc_selfname(name, sizeof(name));
-@@ -707,19 +1862,13 @@
+@@ -707,19 +1867,13 @@
  		break;
  	case kSweetFBRequestPowerChange:
  		if (args->scalarInputCount >= 1) {

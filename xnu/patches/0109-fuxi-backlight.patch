@@ -10,7 +10,7 @@
  iokit/Kernel/arm/FuxiNetworkStack.cpp                            optional iokitcpp
 --- /dev/null
 +++ b/iokit/Kernel/arm/FuxiBacklight.cpp
-@@ -0,0 +1,376 @@
+@@ -0,0 +1,387 @@
 +/*
 + * FUXI backlight-control observer and opt-in logical power notifications.
 + * Published by AppleCLCD before its first registerService(), only on opt-in.
@@ -50,6 +50,9 @@
 +#include <kern/clock.h>
 +#include <mach/mach_time.h>
 +#include "fuxi_backlight_logic.h"
++/* bsd/dev/fuxi_gpu_scanout.inc (fuxipaneldcs): the DBV cap while brightness may reach the panel (else 0), and the hand-off. */
++extern "C" unsigned fuxi_gpu_panel_dcs_max(void);
++extern "C" void fuxi_gpu_panel_dbv(unsigned dbv);
 +
 +enum { BL_READ, BL_SET, BL_PROPERTIES, BL_OPEN, BL_METHOD, BL_BRIGHTNESS, BL_POWER, BL_COUNT };
 +static volatile SInt32 bl_events[BL_COUNT];
@@ -256,15 +259,23 @@
 +	OSNumber *number = OSDynamicCast(OSNumber, value);
 +	uint64_t requested = number ? number->unsigned64BitValue() : 0;
 +	bool valid = number && fbl_valid(requested);
-+	if (bl_log(BL_BRIGHTNESS, &event))
-+		IOLog("FUXI BACKLIGHT: brightness #%u requested=%llu valid=%u hardware=untouched\n",
-+		    event, requested, valid);
++	/* fuxipaneldcs>=3 (scanout side): the request becomes the panel's DBV; otherwise nothing touches hardware. */
++	uint32_t cap = valid ? fuxi_gpu_panel_dcs_max() : 0, dbv = cap ? fbl_dbv(requested, cap) : 0;
++	if (bl_log(BL_BRIGHTNESS, &event)) {
++		if (cap)
++			IOLog("FUXI BACKLIGHT: brightness #%u requested=%llu valid=%u sent dbv=%#x max=%#x\n",
++			    event, requested, valid, dbv, cap);
++		else
++			IOLog("FUXI BACKLIGHT: brightness #%u requested=%llu valid=%u hardware=untouched\n",
++			    event, requested, valid);
++	}
 +	if (!valid) return kIOReturnBadArgument;
 +	IOLockLock(fLock);
 +	/* Replace the immutable registry dictionary; never mutate a reader's snapshot. */
 +	bool ok = publishBrightness((uint32_t)requested);
 +	if (ok) fRequested = (uint32_t)requested;
 +	IOLockUnlock(fLock);
++	if (ok && cap) fuxi_gpu_panel_dbv(dbv); /* never blocks: coalesced and sent between two transfers */
 +	return ok ? kIOReturnSuccess : kIOReturnNoMemory;
 +}
 +
@@ -389,8 +400,8 @@
 +#endif /* FUXI */
 --- /dev/null
 +++ b/iokit/Kernel/arm/fuxi_backlight_logic.h
-@@ -0,0 +1,36 @@
-+/* Observation-only backlight policy; no panel units or hardware access. */
+@@ -0,0 +1,44 @@
++/* Backlight policy helpers; no hardware access (fuxipaneldcs>=3 hands the DBV to the scanout side). */
 +#ifndef FUXI_BACKLIGHT_LOGIC_H
 +#define FUXI_BACKLIGHT_LOGIC_H
 +#include <stdint.h>
@@ -424,5 +435,13 @@
 +static inline int fbl_valid(uint64_t value)
 +{
 +	return value <= FUXI_BACKLIGHT_MAX;
++}
++/* fuxipaneldcs>=3: a brightness of 0..65536 as a panel DBV, 4 + v*(cap-4)/65536, so 0 is still 4 (bl-min-level). The scanout
++ * side clamps it again to [4, fuxipanelmaxdbv]. */
++static inline uint32_t fbl_dbv(uint64_t value, uint32_t cap)
++{
++	if (cap < 4) cap = 4;
++	if (value > FUXI_BACKLIGHT_MAX) value = FUXI_BACKLIGHT_MAX;
++	return 4 + (uint32_t)(value * (cap - 4) / FUXI_BACKLIGHT_MAX);
 +}
 +#endif

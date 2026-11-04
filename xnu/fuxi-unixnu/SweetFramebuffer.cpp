@@ -1782,6 +1782,11 @@ AppleCLCD::powerChangeAction(OSObject *owner, void *state, void *, void *, void 
 {
 	AppleCLCD *fb = (AppleCLCD *)owner;
 	bool off = state == NULL;
+#if defined(FUXI)
+	/* fuxipaneldcs=4: the panel sleeps after the black frame drawn below and wakes before the redraw. Called before the framebuffer
+	 * lock (the scanout side takes the GPU ring lock) and before fPowerOff, so the black frame's CPU acquire sees the request. */
+	if (fb->fScanout) fuxi_gpu_panel_power(!off);
+#endif
 	IOLockLock(fb->fLock);
 	if (off != fb->fPowerOff) {
 		fb->fPowerOff = off;

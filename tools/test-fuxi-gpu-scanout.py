@@ -49,6 +49,7 @@ typedef int boolean_t;
 static int interruptsOn=1;
 static boolean_t ml_set_interrupts_enabled(boolean_t value) {int old=interruptsOn;interruptsOn=value;return old;}
 static unsigned fg_scanout_requested, fg_scanout_panel120_requested, fg_scanout_double_requested, fg_scanout_triple_requested, fg_busy, fg_client_busy, fg_abi_present_wait;
+static unsigned fg_scanout_paneldcs_requested;
 static unsigned ready=1,abiLive=1,abiResult,observations,reads,writes,starts,failAddress;
 static uint64_t ticks=1000,machScale=1;
 static uint64_t mach_absolute_time(void) {return ticks*machScale;}

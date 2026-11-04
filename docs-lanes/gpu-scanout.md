@@ -461,6 +461,65 @@ one attempt, stale completion, frozen-clock and busy/done timeouts, MMIO
 failure, tear-counter disable/update/enable and readback, 60/120 Hz timing,
 and DSI mapping only with opt-in. They cannot qualify actual hardware.
 
+## Panel brightness and sleep over DCS (`fuxipaneldcs=1..4`, default off)
+
+Design: `research_notes/panel-off-brightness-amp-level.md` 1.7 (outside the
+repo). Needs `fuxigpuscanout=1 sweetfb_noconsole=1`; DSI0 is mapped only with
+`fuxipanel120=1` or an accepted `fuxipaneldcs`. Exact values only:
+
+| Boot-arg | Effect |
+| --- | --- |
+| `fuxipaneldcs=1` | E1: 60 s after ownership `0x133` 10 s, `0x400` 10 s, `0x0a0` 10 s, then `0x133` |
+| `fuxipaneldcs=2` | E1, then `4` 5 s, `0` 5 s, then `0x133` (E2) |
+| `fuxipaneldcs=3` | FuxiBacklight's `brightness` (0..65536) → DBV `4 + v*(max-4)/65536` (needs `fuxibacklight=1`) |
+| `fuxipaneldcs=4` | As 3, and selector 12 puts the panel to sleep after the black frame and wakes it |
+| `fuxipanelmaxdbv=N` | DBV cap, default `0x400`, clamped in code to [4, `0x7ff`] |
+| `fuxipanelwake=1` / `=2` | Soft wake (default) / full on-command: **=2 is refused** (see below), so the panel never sleeps |
+
+One clamp (`fg_pd_clamp`) for every DBV: [4, cap]; 0 only in E2 and in the
+wake's DTB packet. Brightness is `39 51 MM LL`, HS, MSB first, at most one per
+16 ms, coalesced to the newest value, sent only between transfers (from
+acquire after its gates, or a thread call when no frame comes; both require
+the TE count past the last START and the write line idle), then the gates wait
+for a fresh TE. Every other packet is byte for byte from the phone's live DTB
+(`boot-logs/a-spk2-probe/live.dtb`, timing@1; extracted to
+`tools/fixtures/fuxi-panel-m3-dcs.json`), in LP like the DTB command state:
+
+| Step | Packets (DTB source) | Wait |
+| --- | --- | --- |
+| sleep 1 | `39 F0 5A 5A`, `05 28 00` (off-command 1-2) | 20 ms |
+| sleep 2 | `39 B0 00 4E 98`, `39 98 01 09 80`, `39 B0 00 0F F6`, `15 F6 02`, `15 F7 0F`, `39 F0 A5 A5` (off 3-8) | 100 ms |
+| sleep 3 | `05 10 00` (off 9) | 120 ms |
+| wake 1 | `39 51 00 00` (on-command 27) | 0 |
+| wake 2 | `05 11 00` (on 3) | 120 ms |
+| wake 3 | `39 F0 5A 5A`, `39 B0 00 4E 98`, `39 98 00 09 80`, `39 B0 00 0F F6`, `15 F6 10`, `39 F7 0F` (on 56-61) | 20 ms |
+| wake 4 | `05 29 00`, `39 F0 A5 A5` (on 62-63) | 0 |
+| restore | one frame STARTed and transferred, then `39 51 MM LL` (HS) | |
+
+States `AWAKE → OFF_SEND → ASLEEP → WAKE_SEND → AWAKE`. Selector 12 only sets
+the wanted state; a started sequence always finishes, so 11 never follows 10
+by less than 120 ms (also checked right before 11). While a sequence runs or
+the panel sleeps, acquire grants nothing and skips the TE gate (TE may stop),
+and publish starts nothing. DT waits are thread-call deadlines; nothing waits
+under the ring lock except the bounded DMA polls panel120 already uses. No
+regulator, GPIO or reset. A DMA error or timeout stops scanout like panel120.
+
+`fuxipanelwake=2` cannot be done with the proven path: the embedded command
+FIFO holds 64 bytes (`DSI_CTRL_MAX_CMD_FIFO_STORE_SIZE`), and on-command packet
+1 (`9E` PPS) carries 90 bytes. Sending the on-command needs the memory-fetch
+DMA path, which is not implemented.
+
+Log lines: `FUXI SCANOUT: dcs mode=`, `dcs armed`, `dcs script mode=... step=`,
+`dcs #N 51 MMLL lp=0 elapsed_us=... int=... line=... te=... why=...` (first 32,
+then every 64th, always for scripts and wake), `dcs sleep begin/step=k/3`,
+`dcs asleep`, `dcs wake begin/step=k/4/commands done/done`, `dcs wake te_hz=`,
+and any `dcs ... refused`, `aborted`, `stopped reason=dcs ...`. FuxiBacklight:
+`FUXI BACKLIGHT: brightness #... sent dbv=0x... max=0x...`.
+
+Host check: `python3 tools/test-fuxi-panel-dcs.py [--dtb live.dtb]` runs the
+production code under a DSI/MDP/TE model and decodes every FIFO word against
+the DTB. Not yet run on the device.
+
 ## TE-locked compositor heartbeat (`fuxivsyncte=1`, default off)
 
 The supplied 60 Hz device observation is `te_hz=60.4`, while CLCD's existing

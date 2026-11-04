@@ -37,6 +37,9 @@
 #include <kern/clock.h>
 #include <mach/mach_time.h>
 #include "fuxi_backlight_logic.h"
+/* bsd/dev/fuxi_gpu_scanout.inc (fuxipaneldcs): the DBV cap while brightness may reach the panel (else 0), and the hand-off. */
+extern "C" unsigned fuxi_gpu_panel_dcs_max(void);
+extern "C" void fuxi_gpu_panel_dbv(unsigned dbv);
 
 enum { BL_READ, BL_SET, BL_PROPERTIES, BL_OPEN, BL_METHOD, BL_BRIGHTNESS, BL_POWER, BL_COUNT };
 static volatile SInt32 bl_events[BL_COUNT];
@@ -243,15 +246,23 @@ IOReturn FuxiBacklight::setProperties(OSObject *properties)
 	OSNumber *number = OSDynamicCast(OSNumber, value);
 	uint64_t requested = number ? number->unsigned64BitValue() : 0;
 	bool valid = number && fbl_valid(requested);
-	if (bl_log(BL_BRIGHTNESS, &event))
-		IOLog("FUXI BACKLIGHT: brightness #%u requested=%llu valid=%u hardware=untouched\n",
-		    event, requested, valid);
+	/* fuxipaneldcs>=3 (scanout side): the request becomes the panel's DBV; otherwise nothing touches hardware. */
+	uint32_t cap = valid ? fuxi_gpu_panel_dcs_max() : 0, dbv = cap ? fbl_dbv(requested, cap) : 0;
+	if (bl_log(BL_BRIGHTNESS, &event)) {
+		if (cap)
+			IOLog("FUXI BACKLIGHT: brightness #%u requested=%llu valid=%u sent dbv=%#x max=%#x\n",
+			    event, requested, valid, dbv, cap);
+		else
+			IOLog("FUXI BACKLIGHT: brightness #%u requested=%llu valid=%u hardware=untouched\n",
+			    event, requested, valid);
+	}
 	if (!valid) return kIOReturnBadArgument;
 	IOLockLock(fLock);
 	/* Replace the immutable registry dictionary; never mutate a reader's snapshot. */
 	bool ok = publishBrightness((uint32_t)requested);
 	if (ok) fRequested = (uint32_t)requested;
 	IOLockUnlock(fLock);
+	if (ok && cap) fuxi_gpu_panel_dbv(dbv); /* never blocks: coalesced and sent between two transfers */
 	return ok ? kIOReturnSuccess : kIOReturnNoMemory;
 }
 

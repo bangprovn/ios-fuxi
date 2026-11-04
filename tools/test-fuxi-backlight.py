@@ -37,6 +37,11 @@ assert 'fBacklightPowerNotifications = backlight == 2 || backlight == 3;' in fb
 assert 'runAction(&AppleCLCD::powerChangeAction, this, argument)' in fb
 power = function('AppleCLCD::powerChangeAction', fb)
 assert power.index('IOLockUnlock(fb->fLock);') < power.index('fuxi_backlight_display_state(fb, !off)')
+# fuxipaneldcs=4: selector 12 reaches the scanout side before the framebuffer lock and before fPowerOff changes.
+assert power.index('if (fb->fScanout) fuxi_gpu_panel_power(!off);') < power.index('IOLockLock(fb->fLock);') < power.index('fb->fPowerOff = off;')
+# The brightness hand-off happens after the registry update, outside the service lock, and only for a valid request.
+props = function('FuxiBacklight::setProperties')
+assert props.index('if (!valid) return kIOReturnBadArgument;') < props.index('IOLockUnlock(fLock);') < props.index('if (ok && cap) fuxi_gpu_panel_dbv(dbv);')
 notify = function('fuxi_backlight_display_state')
 assert notify.index('if (!fbl_power_notifications(present, enable)) return;') < notify.index('getClientIterator()')
 assert notify.index('fbl_withhold_on(present, enable, on)') < notify.index('getClientIterator()')
@@ -200,6 +205,13 @@ struct FuxiBacklight : IOService {
     IOReturn setProperties(OSObject *properties);
 };
 static int sweet_fb_display_off;
+// fuxipaneldcs scanout side: the DBV cap (0 = off) and the hand-offs it received; panel power calls must not hold the fb lock.
+static uint32_t dcs_max;
+static std::vector<unsigned> dcs_sent;
+static std::vector<int> panel_power;
+static unsigned fuxi_gpu_panel_dcs_max() { return dcs_max; }
+static void fuxi_gpu_panel_dbv(unsigned dbv) { assert(!locked); dcs_sent.push_back(dbv); }
+static void fuxi_gpu_panel_power(int on) { assert(!locked); panel_power.push_back(on); }
 struct IOWorkLoop {
     unsigned calls = 0, depth = 0;
     using Action = IOReturn (*)(OSObject *, void *, void *, void *, void *);
@@ -214,7 +226,7 @@ struct AppleCLCD : IOService {
     void *fLock = nullptr;
     IOWorkLoop workloop;
     IOWorkLoop *fWorkLoop = &workloop;
-    bool fPowerOff = false, fDirty = false, fBacklightPowerNotifications = false;
+    bool fPowerOff = false, fDirty = false, fBacklightPowerNotifications = false, fScanout = false;
     unsigned fFadeStep = 7, wakes = 0;
     void wakePresentLocked() { assert(locked == 1); ++wakes; }
     IOReturn requestPowerChange(uint64_t);
@@ -326,6 +338,34 @@ int main() {
     service.fail = true;
     assert(service.setProperties(&flat) == kIOReturnNoMemory);
     assert(service.fRequested == 65536 && service.published == 65536 && !locked);
+    service.fail = false;
+
+    // fuxipaneldcs>=3: DBV = 4 + v*(max-4)/65536, 0 still 4, never above the scanout side's cap; off (cap 0): hardware untouched.
+    for (uint32_t max : {0u, 3u, 4u, 0x0a0u, 0x400u, 0x7ffu})
+        for (uint64_t v : std::initializer_list<uint64_t>{0, 1, 16384, 32768, 65535, 65536, 70000, UINT64_MAX}) {
+            uint32_t d = fbl_dbv(v, max), cap = max < 4 ? 4 : max;
+            assert(d >= 4 && d <= cap);
+            assert(d == 4 + (uint32_t)((v > 65536 ? 65536 : v) * (cap - 4) / 65536));
+        }
+    assert(fbl_dbv(0, 0x400) == 4 && fbl_dbv(65536, 0x400) == 0x400 && fbl_dbv(32768, 0x400) == 0x202 && fbl_dbv(65536, 0x7ff) == 0x7ff);
+    for (uint32_t v = 0; v < 65536; v += 97) assert(fbl_dbv(v, 0x400) <= fbl_dbv(v + 97, 0x400)); // monotonic
+    logs.clear(); bl_events[BL_BRIGHTNESS] = 0; dcs_sent.clear();
+    flat.values["brightness"] = &half;
+    assert(service.setProperties(&flat) == kIOReturnSuccess && dcs_sent.empty());
+    assert(logs.size() == 1 && logs[0].find("valid=1 hardware=untouched") != std::string::npos);
+    dcs_max = 0x400;
+    assert(service.setProperties(&flat) == kIOReturnSuccess && (dcs_sent == std::vector<unsigned>{0x202}));
+    assert(logs.size() == 2 && logs[1].find("requested=32768 valid=1 sent dbv=0x202 max=0x400") != std::string::npos);
+    flat.values["brightness"] = &zero;
+    assert(service.setProperties(&flat) == kIOReturnSuccess && dcs_sent.back() == 4 && service.fRequested == 0);
+    flat.values["brightness"] = &high;  // invalid: nothing handed over, previous request kept
+    assert(service.setProperties(&flat) == kIOReturnBadArgument && dcs_sent.size() == 2 && service.fRequested == 0);
+    assert(logs.back().find("valid=0 hardware=untouched") != std::string::npos);
+    flat.values["brightness"] = &maximum; service.fail = true; // failed publication: nothing handed over
+    assert(service.setProperties(&flat) == kIOReturnNoMemory && dcs_sent.size() == 2);
+    service.fail = false;
+    assert(service.setProperties(&flat) == kIOReturnSuccess && dcs_sent.back() == 0x400);
+    dcs_max = 0; dcs_sent.clear();
 
     // Execute the production notification fanout and framebuffer power action.
     AppleCLCD fb;
@@ -421,6 +461,11 @@ int main() {
     assert(fb.requestPowerChange(1) == kIOReturnSuccess && !fb.fPowerOff);
     assert(fb.requestPowerChange(0) == kIOReturnSuccess && fb.fPowerOff);
     assert(backlight.messages.size() == 3 && !locked);
+    // Selector 12 reaches the scanout side (fuxipaneldcs=4 decides there) only with scanout, before the fb lock and before fPowerOff.
+    assert(panel_power.empty());
+    fb.fScanout = true;
+    for (uintptr_t state : {1u, 0u, 0u, 1u}) assert(fb.requestPowerChange(state) == kIOReturnSuccess);
+    assert((panel_power == std::vector<int>{1, 0, 0, 1}) && !locked && !fb.fPowerOff);
 }
 '''
 with tempfile.TemporaryDirectory(prefix='fuxi-backlight-test-') as tmp:

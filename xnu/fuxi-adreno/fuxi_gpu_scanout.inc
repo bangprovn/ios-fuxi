@@ -113,6 +113,7 @@ static unsigned fg_scanout_pa(unsigned buffer) { return buffer >= 3 ? FG_DPU_IOV
 static uintptr_t fg_scanout_pixels_at(unsigned buffer) { return buffer == 2 ? fg_scanout_pixels_c : buffer ? fg_scanout_pixels_b : fg_scanout_pixels; }
 static int fg_scanout_acquire(unsigned publication);
 static int fg_scanout_stop(const char *reason);
+static void fg_pd_configure(void); /* fuxipaneldcs: panel DCS brightness and sleep, below fg_panel120_switch */
 
 void fuxi_gpu_scanout_configure(uintptr_t pixels, unsigned enabled, unsigned check)
 {
@@ -154,6 +155,11 @@ void fuxi_gpu_scanout_configure(uintptr_t pixels, unsigned enabled, unsigned che
   else if (nc & 0x800000u) printf("FUXI SCANOUT: dpu stage2 ignored: bit 23 needs bit 22\n");
   if (fg_scanout_dpu_stage3) printf("FUXI SCANOUT: dpu stage3 requested: stage2 keeps the translation, CA surfaces scan out through %u IOVA slots\n", FG_DD_SLOTS_N);
   else if (nc & 0x1000000u) printf("FUXI SCANOUT: dpu stage3 ignored: bit 24 needs bits 22+23\n");
+  fg_pd_configure();
+ } else {
+  unsigned dcs = 0;
+  if (PE_parse_boot_argn("fuxipaneldcs", &dcs, sizeof(dcs)))
+   printf("FUXI SCANOUT: dcs refused fuxipaneldcs=%u: needs fuxigpuscanout=1 sweetfb_noconsole=1; nothing sent\n", dcs);
  }
 }
 int fuxi_gpu_scanout_preclean(void) { return fg_scanout_preclean; }
@@ -1624,22 +1630,70 @@ static int fg_scanout_stop(const char *reason)
  * 090, INT_CTRL 110 (DMA_DONE W1C bit0; enables at odd bits), TPG_CTRL 15c,
  * FIFO_DATA 17c, FIFO_RESET 1ec. 094 is MDP_SW_TRIGGER: never use it for DCS.
  */
-static int fg_panel120_poll(unsigned offset, unsigned mask, unsigned want, const char *phase)
+static int fg_dsi_poll(const char *who, unsigned offset, unsigned mask, unsigned want, const char *phase)
 {
  uint64_t deadline = rsr("cntpct_el0") + rsr("cntfrq_el0")*FG_SCAN_DSI_TIMEOUT_US/1000000;
  unsigned status = 0;
  /* Both a wall-clock deadline and a finite sample count, even if the clock stalls. */
  for (unsigned n = 0; n <= FG_SCAN_DSI_TIMEOUT_US/10; n++) {
   if (!fg_scanout_read(FG_SCAN_DSI+offset, &status)) {
-   printf("FUXI SCANOUT: panel120 MMIO phase=%s offset=%#x\n", phase, offset);
+   printf("FUXI SCANOUT: %s MMIO phase=%s offset=%#x\n", who, phase, offset);
    return 0;
   }
   if ((status & mask) == want) return 1;
   if (rsr("cntpct_el0") >= deadline) break;
   delay(10);
  }
- printf("FUXI SCANOUT: panel120 timeout phase=%s offset=%#x status=%#x\n", phase, offset, status);
+ printf("FUXI SCANOUT: %s timeout phase=%s offset=%#x status=%#x\n", who, phase, offset, status);
  return 0;
+}
+/* Inherited DSI command settings, restored after each send. */
+struct fg_dsi_regs { unsigned dma, trigger, irq, length; };
+/* Steps 3-13 of one embedded-FIFO DMA (research_notes/panel-off-brightness-amp-level.md 1.1, the panel120 send): software DMA trigger,
+ * stale done cleared, FIFO reset, TPG FIFO mode, words[0..used) plus a zero pad word when used is odd (outside DMA_CMD_LENGTH), embedded
+ * unicast, HS or LP (DMA_CTRL bit 26), trigger, done and idle polled (20 ms each), error bit 24 checked, then FIFO reset and s restored.
+ * Under FG_GUARD with AR off, CTL START idle, the write line drained and the DSI idle. No MDP trigger (+0x094) and no START.
+ * 1 sent; 0 uncertain (MMIO, timeout, DMA error): the caller logs and stops scanout, nothing is retried. *irq: INT_CTRL at done;
+ * *us: trigger write to done. */
+static int fg_dsi_send(const char *who, const struct fg_dsi_regs *s, const uint32_t *words, unsigned used, unsigned lp,
+    unsigned *irq, uint64_t *us)
+{
+ unsigned masks = s->irq & 0xaaaaaaaau, done;
+ /* Select software DMA trigger 4, preserving the MDP/TE trigger fields.
+  * Clear DMA_TRG_MUX bit16 and BLOCK_DMA_WITHIN_FRAME bit12 while idle. */
+ if (!fg_scanout_write(FG_SCAN_DSI+0x084, (s->trigger & ~0x1100fu) | 4) ||
+     !fg_scanout_write(FG_SCAN_DSI+0x110, (masks & ~2u) | 1u) ||
+     !fg_dsi_poll(who, 0x110, 1, 0, "clear stale done") ||
+     !fg_scanout_write(FG_SCAN_DSI+0x1ec, 1)) return 0;
+ __asm__ volatile("dsb sy" ::: "memory");
+ delay(1);
+ if (!fg_scanout_write(FG_SCAN_DSI+0x1ec, 0) ||
+     !fg_scanout_write(FG_SCAN_DSI+0x15c, 0x00030006)) return 0;
+ for (unsigned i = 0; i < used + (used & 1); i++)
+  if (!fg_scanout_write(FG_SCAN_DSI+0x17c, i < used ? words[i] : 0)) return 0;
+ /* Embedded register FIFO, unicast: broadcast/master clear; LP (bit 26) only when the DTB command state is dsi_lp_mode. */
+ if (!fg_scanout_write(FG_SCAN_DSI+0x03c, (s->dma & ~0xc4000000u) | 0x10000000u | (lp ? 0x04000000u : 0)) ||
+     !fg_scanout_write(FG_SCAN_DSI+0x04c, used*4)) return 0;
+ __asm__ volatile("dsb sy" ::: "memory");
+ uint64_t t0 = rsr("cntpct_el0");
+ if (!fg_scanout_write(FG_SCAN_DSI+0x090, 1) ||
+     !fg_dsi_poll(who, 0x110, 1, 1, "DMA done") ||
+     !fg_dsi_poll(who, 0x008, 0x1f, 0, "idle after commands")) return 0;
+ if (us) *us = (rsr("cntpct_el0") - t0)*1000000/rsr("cntfrq_el0");
+ if (!fg_scanout_read(FG_SCAN_DSI+0x110, &done) || (done & (1u << 24))) return 0;
+ if (irq) *irq = done;
+ /* Completion is certain: reset only the command FIFO and restore ABL's
+  * command settings before any MDP START. No MDP/frame trigger is issued. */
+ if (!fg_scanout_write(FG_SCAN_DSI+0x110, (masks & ~2u) | 1u) ||
+     !fg_scanout_write(FG_SCAN_DSI+0x15c, 0) ||
+     !fg_scanout_write(FG_SCAN_DSI+0x1ec, 1)) return 0;
+ __asm__ volatile("dsb sy" ::: "memory");
+ delay(1);
+ return fg_scanout_write(FG_SCAN_DSI+0x1ec, 0) &&
+     fg_scanout_write(FG_SCAN_DSI+0x03c, s->dma) &&
+     fg_scanout_write(FG_SCAN_DSI+0x04c, s->length) &&
+     fg_scanout_write(FG_SCAN_DSI+0x084, s->trigger) &&
+     fg_scanout_write(FG_SCAN_DSI+0x110, masks);
 }
 /* One embedded FIFO batch, VC0, HS, no BTA, no per-packet delays. Long
  * header: length, 0, data type, flags; short: DCS, parameter, type, flags.
@@ -1701,7 +1755,7 @@ static int fg_panel120_switch(void)
 {
  unsigned dma, trigger, irq, tpg, length, ctrl, vsync, height, init, enable;
  fg_scanout_panel120_attempted = 1; /* Never retry a partial sequence. */
- if (!fg_panel120_poll(0x008, 0x1f, 0, "idle before switch")) {
+ if (!fg_dsi_poll("panel120", 0x008, 0x1f, 0, "idle before switch")) {
   printf("FUXI SCANOUT: panel120 aborted before commands; keeping 60 Hz\n");
   return fg_scanout_stop("panel120 controller not idle");
  }
@@ -1728,42 +1782,11 @@ static int fg_panel120_switch(void)
  }
  uint32_t words[14];
  unsigned used = fg_panel120_packet_words(words);
- unsigned masks = irq & 0xaaaaaaaau;
+ const struct fg_dsi_regs regs = {dma, trigger, irq, length};
  printf("FUXI SCANOUT: panel120 begin dma=%#x trigger=%#x irq=%#x vsync=%#x height=%#x init=%#x\n",
      dma, trigger, irq, vsync, height, init);
- /* Select software DMA trigger 4, preserving the MDP/TE trigger fields.
-  * Clear DMA_TRG_MUX bit16 and BLOCK_DMA_WITHIN_FRAME bit12 while idle. */
- if (!fg_scanout_write(FG_SCAN_DSI+0x084, (trigger & ~0x1100fu) | 4) ||
-     !fg_scanout_write(FG_SCAN_DSI+0x110, (masks & ~2u) | 1u) ||
-     !fg_panel120_poll(0x110, 1, 0, "clear stale done") ||
-     !fg_scanout_write(FG_SCAN_DSI+0x1ec, 1)) goto uncertain;
- __asm__ volatile("dsb sy" ::: "memory");
- delay(1);
- if (!fg_scanout_write(FG_SCAN_DSI+0x1ec, 0) ||
-     !fg_scanout_write(FG_SCAN_DSI+0x15c, 0x00030006)) goto uncertain;
- for (unsigned i = 0; i < used + (used & 1); i++)
-  if (!fg_scanout_write(FG_SCAN_DSI+0x17c, words[i])) goto uncertain;
- /* Embedded register FIFO, unicast HS: broadcast/master/LP all clear. */
- if (!fg_scanout_write(FG_SCAN_DSI+0x03c, (dma & ~0xc4000000u) | 0x10000000u) ||
-     !fg_scanout_write(FG_SCAN_DSI+0x04c, used*4)) goto uncertain;
- __asm__ volatile("dsb sy" ::: "memory");
- if (!fg_scanout_write(FG_SCAN_DSI+0x090, 1) ||
-     !fg_panel120_poll(0x110, 1, 1, "DMA done") ||
-     !fg_panel120_poll(0x008, 0x1f, 0, "idle after commands")) goto uncertain;
- unsigned done;
- if (!fg_scanout_read(FG_SCAN_DSI+0x110, &done) || (done & (1u << 24))) goto uncertain;
- /* Completion is certain: reset only the command FIFO and restore ABL's
-  * command settings before any MDP START. No MDP/frame trigger is issued. */
- if (!fg_scanout_write(FG_SCAN_DSI+0x110, (masks & ~2u) | 1u) ||
-     !fg_scanout_write(FG_SCAN_DSI+0x15c, 0) ||
-     !fg_scanout_write(FG_SCAN_DSI+0x1ec, 1)) goto uncertain;
- __asm__ volatile("dsb sy" ::: "memory");
- delay(1);
- if (!fg_scanout_write(FG_SCAN_DSI+0x1ec, 0) ||
-     !fg_scanout_write(FG_SCAN_DSI+0x03c, dma) ||
-     !fg_scanout_write(FG_SCAN_DSI+0x04c, length) ||
-     !fg_scanout_write(FG_SCAN_DSI+0x084, trigger) ||
-     !fg_scanout_write(FG_SCAN_DSI+0x110, masks)) goto uncertain;
+ /* Unicast HS (the timing-switch command state is dsi_hs_mode). */
+ if (!fg_dsi_send("panel120", &regs, words, used, 0, NULL, NULL)) goto uncertain;
  /* Same vsync clock and line geometry: count120=floor(count60*60/120).
   * Observed 0x180085: count=133 -> 66, resulting config 0x180042.
   * Bit19 is VSYNC_COUNTER_EN, bit20 external TE; preserve other flags.
@@ -1787,6 +1810,418 @@ uncertain:
   * never claim success or send rollback/START into an uncertain transfer. */
  printf("FUXI SCANOUT: panel120 aborted; panel state uncertain, reboot required\n");
  return fg_scanout_stop("panel120 switch incomplete");
+}
+/* fuxipaneldcs (default off, exact values 1-4; scanout must be requested: fuxigpuscanout=1 sweetfb_noconsole=1): panel brightness
+ * (DCS 0x51) and, with 4, real panel sleep/wake for selector 12. Design: research_notes/panel-off-brightness-amp-level.md 1.7.
+ *  1  E1 script, 60 s after ownership: 0x133 10 s, 0x400 10 s, 0x0a0 10 s, then 0x133. Not connected to iOS.
+ *  2  as 1, then 4 for 5 s, 0 for 5 s, then 0x133 (E2).
+ *  3  FuxiBacklight's requests (fuxibacklight=1) set the DBV.
+ *  4  as 3, and selector 12 puts the panel to sleep after the black frame and wakes it.
+ * fuxipanelmaxdbv=N caps every DBV (default 0x400, never above 0x7ff = mi,mdss-dsi-fac-bl-max-level). fg_pd_clamp is the one path to a
+ * DBV: [4 = bl-min-level, cap]; 0 only in E2 and in the wake sequence. 0x51 is HS (no bl-dcs-cmd-state) with two bytes MSB first
+ * (bl-inverted-dbv): 39 51 MM LL, at most one per 16 ms, coalesced to the newest value, and only between two transfers: from acquire
+ * after its gates, or from a thread call when no frame comes; both require the TE count past the last START and the write line idle.
+ * Every other packet is byte for byte from the phone's live DTB (boot-logs/a-spk2-probe/live.dtb, qcom,mdss_dsi_m3_38_0c_0a_dsc_cmd,
+ * timing@1; tools/fixtures/fuxi-panel-m3-dcs.json) and goes in LP like its command state.
+ * Sleep (4): the black frame STARTed and its transfer done, then off-command packets 1-2 (F0 5A 5A, 28) wait 20 ms, 3-8 (recovery,
+ * F0 A5 A5) wait 100 ms, 9 (10) wait 120 ms. Soft wake (fuxipanelwake=1, default): on-command packet 27 (51 00 00), 3 (11) wait 120 ms,
+ * 56-61 (F0 5A 5A, recovery return, F7 0F) wait 20 ms, 62-63 (29, F0 A5 A5); one frame; then 51 MM LL. fuxipanelwake=2 (the whole
+ * on-command) is refused: its packet 1 (9E PPS, 90 bytes) does not fit the 64-byte embedded command FIFO (DSI_CTRL_MAX_CMD_FIFO_STORE_SIZE),
+ * so with =2 the panel is never put to sleep. States AWAKE -> OFF_SEND -> ASLEEP -> WAKE_SEND -> AWAKE: selector 12 only sets the wanted
+ * state and a started sequence always completes first, so 11 never follows 10 by less than 120 ms (also checked before 11 is sent).
+ * No START while a sequence runs or the panel sleeps; nothing waits under FG_GUARD (a DT wait is the thread call's next deadline). No
+ * regulator, GPIO or reset. A DMA error or timeout stops scanout like panel120, without retry. Not yet observed on device. */
+#define FG_PD_DBV_HARD 0x7ffu
+#define FG_PD_DBV_DEFAULT_MAX 0x400u
+#define FG_PD_DBV_MIN 4u
+#define FG_PD_DBV_INIT 0x133u                            /* brightness-init-level: the DBV after a wake when none was asked for */
+#define FG_PD_RATE_US 16000u
+#define FG_PD_POLL_US 2000u
+#define FG_PD_SLEEPIN_US 120000u
+enum { FG_PD_AWAKE, FG_PD_OFF_SEND, FG_PD_ASLEEP, FG_PD_WAKE_SEND };
+struct fg_pd_pkt { uint8_t type, len, data[4]; };
+struct fg_pd_batch { const struct fg_pd_pkt *p; unsigned n, wait_ms; const char *src; };
+/* qcom,mdss-dsi-off-command (identical in timing@0 and @1, dsi_lp_mode), packets as numbered there. */
+static const struct fg_pd_pkt fg_pd_off1[] = {{0x39, 3, {0xf0, 0x5a, 0x5a}}, {0x05, 2, {0x28, 0x00}}};
+static const struct fg_pd_pkt fg_pd_off2[] = {{0x39, 4, {0xb0, 0x00, 0x4e, 0x98}}, {0x39, 4, {0x98, 0x01, 0x09, 0x80}},
+    {0x39, 4, {0xb0, 0x00, 0x0f, 0xf6}}, {0x15, 2, {0xf6, 0x02}}, {0x15, 2, {0xf7, 0x0f}}, {0x39, 3, {0xf0, 0xa5, 0xa5}}};
+static const struct fg_pd_pkt fg_pd_off3[] = {{0x05, 2, {0x10, 0x00}}};
+static const struct fg_pd_batch fg_pd_off[3] = {
+    {fg_pd_off1, 2, 20, "off 1-2"}, {fg_pd_off2, 6, 100, "off 3-8"}, {fg_pd_off3, 1, 120, "off 9"}};
+/* qcom,mdss-dsi-on-command of timing@1 (dsi_lp_mode), packets as numbered there. */
+static const struct fg_pd_pkt fg_pd_on27[] = {{0x39, 3, {0x51, 0x00, 0x00}}};
+static const struct fg_pd_pkt fg_pd_on3[] = {{0x05, 2, {0x11, 0x00}}};
+static const struct fg_pd_pkt fg_pd_on56[] = {{0x39, 3, {0xf0, 0x5a, 0x5a}}, {0x39, 4, {0xb0, 0x00, 0x4e, 0x98}},
+    {0x39, 4, {0x98, 0x00, 0x09, 0x80}}, {0x39, 4, {0xb0, 0x00, 0x0f, 0xf6}}, {0x15, 2, {0xf6, 0x10}}, {0x39, 2, {0xf7, 0x0f}}};
+static const struct fg_pd_pkt fg_pd_on62[] = {{0x05, 2, {0x29, 0x00}}, {0x39, 3, {0xf0, 0xa5, 0xa5}}};
+static const struct fg_pd_batch fg_pd_wake[4] = {
+    {fg_pd_on27, 1, 0, "on 27"}, {fg_pd_on3, 1, 120, "on 3"}, {fg_pd_on56, 6, 20, "on 56-61"}, {fg_pd_on62, 2, 0, "on 62-63"}};
+/* E1 (fuxipaneldcs=1) and E1 then E2 (=2): seconds after ownership, DBV, 0 allowed. */
+struct fg_pd_script_step { unsigned at_s, dbv, zero; };
+static const struct fg_pd_script_step fg_pd_e1[] = {{60, 0x133, 0}, {70, 0x400, 0}, {80, 0x0a0, 0}, {90, 0x133, 0}};
+static const struct fg_pd_script_step fg_pd_e2[] = {{60, 0x133, 0}, {70, 0x400, 0}, {80, 0x0a0, 0}, {90, 4, 0}, {95, 0, 1}, {100, 0x133, 0}};
+static unsigned fg_pd_mode, fg_pd_max = FG_PD_DBV_DEFAULT_MAX, fg_pd_wake_mode = 1, fg_pd_dead, fg_pd_state, fg_pd_step;
+static unsigned fg_pd_want = ~0u, fg_pd_want_zero, fg_pd_sent = ~0u, fg_pd_req, fg_pd_dirty, fg_pd_n51, fg_pd_wanted, fg_pd_refusals;
+static unsigned fg_pd_want_off, fg_pd_black, fg_pd_off_refused, fg_pd_wake_pending, fg_pd_wake_starts, fg_pd_script_i, fg_pd_holds;
+static unsigned fg_pd_te_pending, fg_pd_te_c0, fg_pd_sleep_te, fg_pd_owner_logged, fg_pd_always;
+static const char *fg_pd_why = "none";
+static uint64_t fg_pd_last51, fg_pd_t_step, fg_pd_t_seq, fg_pd_t_off, fg_pd_t_idle, fg_pd_t_sleepin, fg_pd_owned_t, fg_pd_te_t0, fg_pd_sleep_t;
+static thread_call_data_t fg_pd_call;
+static uint64_t fg_pd_us(uint64_t ticks) { return ticks*1000000/rsr("cntfrq_el0"); }
+/* The one path to a DBV: [4, fuxipanelmaxdbv] with the cap itself never above 0x7ff; 0 only when zero_ok (E2, wake sequence). */
+static unsigned fg_pd_clamp(unsigned dbv, unsigned zero_ok)
+{
+ unsigned cap = fg_pd_max < FG_PD_DBV_MIN ? FG_PD_DBV_MIN : fg_pd_max > FG_PD_DBV_HARD ? FG_PD_DBV_HARD : fg_pd_max;
+ if (!dbv && zero_ok) return 0;
+ return dbv < FG_PD_DBV_MIN ? FG_PD_DBV_MIN : dbv > cap ? cap : dbv;
+}
+/* FIFO words of one batch in panel120's layout: long (39) len | 39 << 16 | (40 | last) << 24, then the payload LSB first padded with
+ * ff; short (05, 15) d0 | d1 << 8 | type << 16 | last << 24; last (80) on the final packet only. 0 for a malformed batch or one that
+ * would not fit the 64-byte FIFO with its odd-word pad. */
+static unsigned fg_pd_words(const struct fg_pd_pkt *p, unsigned n, uint32_t words[16])
+{
+ unsigned used = 0;
+ for (unsigned i = 0; i < n; i++) {
+  unsigned last = i + 1 == n ? 0x80u : 0, lng = p[i].type == 0x39;
+  if ((!lng && p[i].type != 0x05 && p[i].type != 0x15) || (lng ? !p[i].len || p[i].len > 4 : p[i].len != 2) || used + 1 + lng > 16)
+   return 0;
+  if (lng) {
+   uint32_t payload = 0xffffffffu;
+   for (unsigned j = 0; j < p[i].len; j++) payload = (payload & ~(0xffu << (8*j))) | ((uint32_t)p[i].data[j] << (8*j));
+   words[used++] = p[i].len | (0x39u << 16) | ((0x40u | last) << 24);
+   words[used++] = payload;
+  } else words[used++] = p[i].data[0] | ((uint32_t)p[i].data[1] << 8) | ((uint32_t)p[i].type << 16) | (last << 24);
+ }
+ return used + (used & 1) <= 16 ? used : 0;
+}
+static void fg_pd_kick(void)
+{
+ __atomic_store_n(&fg_pd_dirty, 1, __ATOMIC_RELEASE);
+ (void)thread_call_enter(&fg_pd_call);
+}
+static void fg_pd_schedule(uint64_t us)
+{
+ uint64_t d;
+ nanoseconds_to_absolutetime(us*1000, &d);
+ (void)thread_call_enter_delayed(&fg_pd_call, mach_absolute_time() + d);
+}
+static void fg_pd_refuse(const char *what, const char *why, unsigned a, unsigned b)
+{
+ if (++fg_pd_refusals <= 8) printf("FUXI SCANOUT: dcs %s refused (%s %#x %#x); nothing sent, dcs off for the boot\n", what, why, a, b);
+ fg_pd_dead = 1;
+}
+/* Steps 1-2 of a send: autorefresh off (INTF+0x2b4 bit31), the DSI idle and its command engine as ABL left it (ctrl&7 == 5, TPG
+ * idle, no DMA error). 1 ready, 0 refused before any DSI write, -1 stopped. */
+static int fg_pd_prepare(const char *what, struct fg_dsi_regs *s)
+{
+ unsigned ar, ctrl, tpg;
+ if (!fg_scanout_read(FG_SCAN_INTF+0x2b4, &ar)) return fg_scanout_stop("dcs read autorefresh");
+ if ((ar & 0x80000000u) || fg_scanout_ar_on()) { fg_pd_refuse(what, "autorefresh", ar, fg_scanout_ar_state); return 0; }
+ if (!fg_dsi_poll("dcs", 0x008, 0x1f, 0, "idle before send")) return fg_scanout_stop("dcs controller not idle");
+ if (!fg_scanout_read(FG_SCAN_DSI+0x004, &ctrl) || !fg_scanout_read(FG_SCAN_DSI+0x03c, &s->dma) ||
+     !fg_scanout_read(FG_SCAN_DSI+0x084, &s->trigger) || !fg_scanout_read(FG_SCAN_DSI+0x110, &s->irq) ||
+     !fg_scanout_read(FG_SCAN_DSI+0x15c, &tpg) || !fg_scanout_read(FG_SCAN_DSI+0x04c, &s->length)) return fg_scanout_stop("dcs setup MMIO");
+ if ((ctrl & 7) != 5 || tpg || (s->irq & (1u << 24))) { fg_pd_refuse(what, "dsi ctrl/tpg|err", ctrl, tpg | (s->irq & (1u << 24))); return 0; }
+ return 1;
+}
+/* One batch: 1 sent, 0 refused before any DSI write, -1 stopped (logged, reboot required). */
+static int fg_pd_tx(const struct fg_pd_batch *b, unsigned lp, uint64_t *us, unsigned *irq)
+{
+ uint32_t words[16];
+ struct fg_dsi_regs s;
+ unsigned used = fg_pd_words(b->p, b->n, words);
+ if (!used) { fg_pd_refuse(b->src, "packing", b->n, 0); return 0; }
+ int r = fg_pd_prepare(b->src, &s);
+ if (r <= 0) return r;
+ if (!fg_dsi_send("dcs", &s, words, used, lp, irq, us)) {
+  printf("FUXI SCANOUT: dcs %s aborted; panel state uncertain, reboot required\n", b->src);
+  fg_pd_dead = 1;
+  return fg_scanout_stop("dcs send incomplete");
+ }
+ return 1;
+}
+/* The last START's transfer is over: CTL START clear, write line idle, and the TE count past that START with the margin acquire's TE
+ * gate uses (or two TEs, or 50 ms). START clears ~17 us after the write and the transfer begins at the next TE, so START and the line
+ * alone do not prove it. 1 idle, 0 not yet, -1 stopped. */
+static int fg_pd_idle(uint64_t now)
+{
+ unsigned count, line, start;
+ uint64_t hz = rsr("cntfrq_el0");
+ if (!fg_scanout_read(FG_SCAN_INTF+0x298, &count) || !fg_scanout_read(FG_SCAN_INTF+0x2b0, &line) ||
+     !fg_scanout_read(FG_SCAN_CTL+0x1c, &start)) return fg_scanout_stop("dcs read transfer status");
+ if ((start & 1) || ((line & 65535) != 0 && (line & 65535) < 2400)) return 0;
+ if (!fg_scanout_last_start) return now - fg_scanout_started >= hz/20;
+ unsigned since = ((count >> 16) - fg_scanout_last_count) & 0xffffu, lines = count & 0xffffu;
+ if (since >= 2 || (since == 1 && (lines < fg_scanout_te_init || lines - fg_scanout_te_init >= FG_SCAN_TE_MARGIN))) return 1;
+ return now - fg_scanout_last_start >= hz/20;
+}
+/* After a send the next START waits for a fresh TE through acquire's gates, as after panel120; no transfer to measure. */
+static int fg_pd_rearm(void)
+{
+ unsigned count;
+ if (!fg_scanout_read(FG_SCAN_INTF+0x298, &count)) return fg_scanout_stop("dcs read te count");
+ fg_scanout_arm(count);
+ fg_scanout_xfer_open = 0;
+ return 0;
+}
+static void fg_pd_set_want(unsigned dbv, unsigned zero_ok, const char *why, unsigned always)
+{
+ fg_pd_want = fg_pd_clamp(dbv, zero_ok); fg_pd_want_zero = zero_ok && !dbv; fg_pd_why = why; fg_pd_always = always; fg_pd_wanted++;
+}
+static void fg_pd_take(void)
+{
+ unsigned r = __atomic_exchange_n(&fg_pd_req, 0, __ATOMIC_ACQ_REL);
+ if (r) fg_pd_set_want(r & 0xffffu, 0, "backlight", 0);
+}
+/* E1/E2 steps due by now; microseconds to the next one, 0 when done or not scripted. */
+static uint64_t fg_pd_script(uint64_t now)
+{
+ if ((fg_pd_mode != 1 && fg_pd_mode != 2) || !fg_pd_owned_t) return 0;
+ const struct fg_pd_script_step *s = fg_pd_mode == 1 ? fg_pd_e1 : fg_pd_e2;
+ unsigned n = fg_pd_mode == 1 ? sizeof(fg_pd_e1)/sizeof(fg_pd_e1[0]) : sizeof(fg_pd_e2)/sizeof(fg_pd_e2[0]);
+ uint64_t hz = rsr("cntfrq_el0");
+ while (fg_pd_script_i < n && now >= fg_pd_owned_t + (uint64_t)s[fg_pd_script_i].at_s*hz) {
+  const struct fg_pd_script_step *t = &s[fg_pd_script_i++];
+  fg_pd_set_want(t->dbv, t->zero, fg_pd_mode == 1 ? "E1" : "E2", 1);
+  printf("FUXI SCANOUT: dcs script mode=%u step=%u/%u at_s=%u dbv=%#x asked=%#x\n", fg_pd_mode, fg_pd_script_i, n, t->at_s, fg_pd_want, t->dbv);
+ }
+ return fg_pd_script_i < n ? fg_pd_us(fg_pd_owned_t + (uint64_t)s[fg_pd_script_i].at_s*hz - now) + 1 : 0;
+}
+/* Microseconds until the wanted DBV may go (0: now; ~0: nothing to send). After a wake one frame goes first, for at most 1 s. */
+static uint64_t fg_pd_due_in(uint64_t now)
+{
+ uint64_t hz = rsr("cntfrq_el0"), rate = hz*FG_PD_RATE_US/1000000;
+ if (fg_pd_state != FG_PD_AWAKE || fg_pd_want == ~0u || fg_pd_clamp(fg_pd_want, fg_pd_want_zero) == fg_pd_sent) return ~0ull;
+ if (fg_pd_wake_pending && fg_scanout_starts == fg_pd_wake_starts && now - fg_pd_t_step < hz) return FG_PD_POLL_US;
+ return fg_pd_last51 && now - fg_pd_last51 < rate ? fg_pd_us(fg_pd_last51 + rate - now) + 1 : 0;
+}
+/* 39 51 MM LL in HS with the wanted DBV, under FG_GUARD with the transfer idle. 1 sent, 0 refused, -1 stopped. */
+static int fg_pd_send51(uint64_t now)
+{
+ unsigned dbv = fg_pd_clamp(fg_pd_want, fg_pd_want_zero), line = 0, count = 0, irq = 0, restore = fg_pd_wake_pending;
+ const struct fg_pd_pkt p = {0x39, 3, {0x51, (uint8_t)(dbv >> 8), (uint8_t)dbv}};
+ const struct fg_pd_batch b = {&p, 1, 0, "51"};
+ uint64_t us = 0, hz = rsr("cntfrq_el0");
+ (void)fg_scanout_read(FG_SCAN_INTF+0x2b0, &line);
+ (void)fg_scanout_read(FG_SCAN_INTF+0x298, &count);
+ int r = fg_pd_tx(&b, 0, &us, &irq);
+ if (r <= 0) return r;
+ fg_pd_sent = dbv; fg_pd_last51 = now;
+ unsigned n = ++fg_pd_n51;
+ if (n <= 32 || !(n & 63) || restore || fg_pd_always)
+  printf("FUXI SCANOUT: dcs #%u 51 %04x lp=0 elapsed_us=%llu int=%#x line=%u te=%u why=%s wants=%u\n", n, dbv, (unsigned long long)us, irq,
+      line & 65535, count >> 16, restore ? "wake" : fg_pd_why, fg_pd_wanted);
+ fg_pd_wanted = 0; fg_pd_always = 0;
+ if (restore) {
+  fg_pd_wake_pending = 0;
+  printf("FUXI SCANOUT: dcs wake done 51 %04x total_ms=%llu after_frame=%u starts=%u\n", dbv, (unsigned long long)((now - fg_pd_t_seq)*1000/hz),
+      fg_scanout_starts != fg_pd_wake_starts, fg_scanout_starts - fg_pd_wake_starts);
+  fg_pd_te_pending = 1; fg_pd_te_c0 = count >> 16; fg_pd_te_t0 = now;
+ }
+ return fg_pd_rearm() < 0 ? -1 : 1;
+}
+/* acquire, after its gates passed: a due 0x51 goes instead of the START. 1 sent (the caller waits for a fresh TE), 0 nothing sent. */
+static int fg_pd_inline(void)
+{
+ uint64_t now = rsr("cntpct_el0");
+ fg_pd_take();
+ if (fg_pd_dead || fg_pd_due_in(now)) return 0;
+ int idle = fg_pd_idle(now);
+ return idle <= 0 ? idle : fg_pd_send51(now);
+}
+static uint64_t fg_pd_wake_begin(uint64_t now);
+/* Waits out the previous batch's DT delay; 0 when the next step may run now. */
+static uint64_t fg_pd_wait_left(const struct fg_pd_batch *prev, uint64_t now)
+{
+ uint64_t due = fg_pd_t_step + rsr("cntfrq_el0")*prev->wait_ms/1000;
+ return now < due ? fg_pd_us(due - now) + 1 : 0;
+}
+static uint64_t fg_pd_off_step(uint64_t now)
+{
+ uint64_t hz = rsr("cntfrq_el0"), us = 0, left;
+ unsigned irq = 0, count = 0;
+ if (fg_pd_step && (left = fg_pd_wait_left(&fg_pd_off[fg_pd_step - 1], now))) return left;
+ if (fg_pd_step == 3) {
+  (void)fg_scanout_read(FG_SCAN_INTF+0x298, &count);
+  fg_pd_state = FG_PD_ASLEEP; fg_pd_sleep_te = count >> 16; fg_pd_sleep_t = now;
+  printf("FUXI SCANOUT: dcs asleep total_ms=%llu since_10_ms=%llu holds=%u\n", (unsigned long long)((now - fg_pd_t_seq)*1000/hz),
+      (unsigned long long)((now - fg_pd_t_sleepin)*1000/hz), fg_pd_holds);
+  return fg_pd_want_off ? 0 : fg_pd_wake_begin(now);
+ }
+ const struct fg_pd_batch *b = &fg_pd_off[fg_pd_step];
+ int r = fg_pd_tx(b, 1, &us, &irq);
+ if (r < 0) {
+  if (fg_pd_step) printf("FUXI SCANOUT: dcs sleep stopped after %u of 3 batches; F0 5A 5A may be left open, reboot required\n", fg_pd_step);
+  return 0;
+ }
+ if (!r) {
+  if (fg_pd_step) {
+   printf("FUXI SCANOUT: dcs sleep stopped after %u of 3 batches; F0 5A 5A may be left open, reboot required\n", fg_pd_step);
+   (void)fg_scanout_stop("dcs sleep incomplete");
+  } else fg_pd_state = FG_PD_AWAKE;
+  return 0;
+ }
+ now = rsr("cntpct_el0");
+ if (fg_pd_step == 2) fg_pd_t_sleepin = now;
+ printf("FUXI SCANOUT: dcs sleep step=%u/3 %s pkts=%u lp=1 elapsed_us=%llu int=%#x t_ms=%llu wait_ms=%u\n", fg_pd_step + 1, b->src, b->n,
+     (unsigned long long)us, irq, (unsigned long long)((now - fg_pd_t_seq)*1000/hz), b->wait_ms);
+ fg_pd_t_step = now; fg_pd_step++;
+ return (uint64_t)b->wait_ms*1000 + 1;
+}
+static uint64_t fg_pd_wake_step(uint64_t now)
+{
+ uint64_t hz = rsr("cntfrq_el0"), us = 0, left, sleepin = hz*FG_PD_SLEEPIN_US/1000000;
+ unsigned irq = 0;
+ if (fg_pd_step && (left = fg_pd_wait_left(&fg_pd_wake[fg_pd_step - 1], now))) return left;
+ if (fg_pd_step == 4) {
+  fg_pd_state = FG_PD_AWAKE; fg_pd_wake_pending = 1; fg_pd_wake_starts = fg_scanout_starts; fg_pd_t_step = now;
+  if (fg_pd_want == ~0u) fg_pd_set_want(FG_PD_DBV_INIT, 0, "init", 1);
+  printf("FUXI SCANOUT: dcs wake commands done total_ms=%llu; one frame, then 51 %04x\n", (unsigned long long)((now - fg_pd_t_seq)*1000/hz),
+      fg_pd_clamp(fg_pd_want, fg_pd_want_zero));
+  return fg_pd_rearm() < 0 ? 0 : FG_PD_POLL_US;
+ }
+ if (fg_pd_step == 1 && now - fg_pd_t_sleepin < sleepin) return fg_pd_us(fg_pd_t_sleepin + sleepin - now) + 1; /* 11 >= 120 ms after 10 */
+ const struct fg_pd_batch *b = &fg_pd_wake[fg_pd_step];
+ int r = fg_pd_tx(b, 1, &us, &irq);
+ if (r < 0) return 0;
+ if (!r) {
+  printf("FUXI SCANOUT: dcs wake stopped at %s; panel left asleep, reboot required\n", b->src);
+  (void)fg_scanout_stop("dcs wake refused");
+  return 0;
+ }
+ now = rsr("cntpct_el0");
+ if (!fg_pd_step) { fg_pd_sent = 0; fg_pd_last51 = now; } /* on 27 is 51 00 00 */
+ printf("FUXI SCANOUT: dcs wake step=%u/4 %s pkts=%u lp=1 elapsed_us=%llu int=%#x t_ms=%llu since_10_ms=%llu wait_ms=%u\n", fg_pd_step + 1,
+     b->src, b->n, (unsigned long long)us, irq, (unsigned long long)((now - fg_pd_t_seq)*1000/hz),
+     (unsigned long long)((now - fg_pd_t_sleepin)*1000/hz), b->wait_ms);
+ fg_pd_t_step = now; fg_pd_step++;
+ return b->wait_ms ? (uint64_t)b->wait_ms*1000 + 1 : fg_pd_wake_step(now);
+}
+static uint64_t fg_pd_wake_begin(uint64_t now)
+{
+ uint64_t hz = rsr("cntfrq_el0"), sleepin = hz*FG_PD_SLEEPIN_US/1000000;
+ unsigned count = 0;
+ if (fg_pd_mode < 4 || fg_pd_wake_mode != 1) return 0;
+ if (now - fg_pd_t_sleepin < sleepin) return fg_pd_us(fg_pd_t_sleepin + sleepin - now) + 1;
+ int idle = fg_pd_idle(now);
+ if (idle <= 0) return idle < 0 ? 0 : FG_PD_POLL_US;
+ (void)fg_scanout_read(FG_SCAN_INTF+0x298, &count);
+ printf("FUXI SCANOUT: dcs wake begin mode=soft asleep_ms=%llu te_edges_asleep=%u\n", (unsigned long long)((now - fg_pd_sleep_t)*1000/hz),
+     ((count >> 16) - fg_pd_sleep_te) & 0xffffu);
+ fg_pd_state = FG_PD_WAKE_SEND; fg_pd_step = 0; fg_pd_t_seq = fg_pd_t_step = now;
+ return fg_pd_wake_step(now);
+}
+/* Selector 12 asked for off: the black frame first (1 s at most), then its transfer done (200 ms at most, else no sleep this time). */
+static uint64_t fg_pd_sleep_begin(uint64_t now)
+{
+ uint64_t hz = rsr("cntfrq_el0");
+ if (fg_pd_black < 2 && now - fg_pd_t_off < hz) return FG_PD_POLL_US;
+ if (!fg_pd_t_idle) fg_pd_t_idle = now;
+ int idle = fg_pd_idle(now);
+ if (idle < 0) return 0;
+ if (!idle) {
+  if (now - fg_pd_t_idle < hz/5) return FG_PD_POLL_US;
+  fg_pd_off_refused = 1;
+  printf("FUXI SCANOUT: dcs sleep refused: transfer not idle for 200 ms; panel stays on with the black frame\n");
+  return 0;
+ }
+ fg_pd_state = FG_PD_OFF_SEND; fg_pd_step = 0; fg_pd_t_seq = fg_pd_t_step = now;
+ printf("FUXI SCANOUT: dcs sleep begin black_frame=%u request_ms=%llu\n", fg_pd_black == 2, (unsigned long long)((now - fg_pd_t_off)*1000/hz));
+ return fg_pd_off_step(now);
+}
+static uint64_t fg_pd_min(uint64_t a, uint64_t b) { return !a ? b : !b ? a : a < b ? a : b; }
+/* AWAKE: the TE rate one second after a wake, a wanted sleep, else a due 0x51 when the transfer is idle. */
+static uint64_t fg_pd_awake_step(uint64_t now)
+{
+ uint64_t hz = rsr("cntfrq_el0"), wait = 0, due;
+ if (fg_pd_te_pending && now - fg_pd_te_t0 < hz) wait = fg_pd_us(fg_pd_te_t0 + hz - now) + 1;
+ else if (fg_pd_te_pending) {
+  unsigned count = 0, edges;
+  (void)fg_scanout_read(FG_SCAN_INTF+0x298, &count);
+  edges = ((count >> 16) - fg_pd_te_c0) & 0xffffu;
+  uint64_t dhz = (uint64_t)edges*hz*10/(now - fg_pd_te_t0);
+  printf("FUXI SCANOUT: dcs wake te_hz=%llu.%llu edges=%u window_ms=%llu\n", (unsigned long long)(dhz/10), (unsigned long long)(dhz%10), edges,
+      (unsigned long long)((now - fg_pd_te_t0)*1000/hz));
+  fg_pd_te_pending = 0;
+ }
+ if (fg_pd_mode >= 4 && fg_pd_wake_mode == 1 && fg_pd_want_off && !fg_pd_off_refused) return fg_pd_sleep_begin(now);
+ if ((due = fg_pd_due_in(now)) == ~0ull) return wait;
+ if (due) return fg_pd_min(wait, due);
+ int idle = fg_pd_idle(now);
+ if (idle < 0 || (idle && fg_pd_send51(now) < 0)) return 0;
+ if (!idle) return fg_pd_min(wait, FG_PD_POLL_US);
+ due = fg_pd_due_in(rsr("cntpct_el0"));
+ return due == ~0ull ? wait : fg_pd_min(wait, due ? due : 1);
+}
+/* The thread call's step under FG_GUARD. Microseconds to the next run, 0 for none (requests and ownership kick it). */
+static uint64_t fg_pd_run_locked(void)
+{
+ if (!fg_pd_mode || fg_pd_dead || fg_scanout_failed) return 0;
+ if (!fuxi_gpu_scanout_owned()) {
+  if (!fg_pd_owner_logged++) printf("FUXI SCANOUT: dcs waiting: scanout not owned; nothing sent\n");
+  return 0;
+ }
+ uint64_t now = rsr("cntpct_el0"), next = fg_pd_script(now), wait;
+ fg_pd_take();
+ switch (fg_pd_state) {
+ case FG_PD_AWAKE: wait = fg_pd_awake_step(now); break;
+ case FG_PD_OFF_SEND: wait = fg_pd_off_step(now); break;
+ case FG_PD_ASLEEP: wait = fg_pd_want_off ? 0 : fg_pd_wake_begin(now); break;
+ default: wait = fg_pd_wake_step(now); break;
+ }
+ if (fg_pd_dead || fg_scanout_failed) return 0;
+ return fg_pd_min(next, wait);
+}
+static void fg_pd_run(thread_call_param_t a, thread_call_param_t b)
+{
+ (void)a; (void)b;
+ uint64_t next;
+ __atomic_store_n(&fg_pd_dirty, 0, __ATOMIC_RELEASE);
+ {
+  FG_GUARD;
+  next = fg_pd_run_locked();
+ }
+ if (__atomic_load_n(&fg_pd_dirty, __ATOMIC_ACQUIRE)) next = 1;
+ if (next) fg_pd_schedule(next);
+}
+static void fg_pd_configure(void)
+{
+ unsigned mode = 0, n = 0, bl = 0;
+ if (!PE_parse_boot_argn("fuxipaneldcs", &mode, sizeof(mode))) return;
+ if (mode < 1 || mode > 4) { printf("FUXI SCANOUT: dcs refused fuxipaneldcs=%u (accepted 1-4); off\n", mode); return; }
+ if (PE_parse_boot_argn("fuxipanelmaxdbv", &n, sizeof(n))) fg_pd_max = n < FG_PD_DBV_MIN ? FG_PD_DBV_MIN : n > FG_PD_DBV_HARD ? FG_PD_DBV_HARD : n;
+ if (PE_parse_boot_argn("fuxipanelwake", &n, sizeof(n))) {
+  if (n == 1 || n == 2) fg_pd_wake_mode = n;
+  else printf("FUXI SCANOUT: dcs fuxipanelwake=%u refused (accepted 1, 2); soft wake\n", n);
+ }
+ thread_call_setup_with_options(&fg_pd_call, fg_pd_run, NULL, THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);
+ fg_pd_mode = mode;
+ fg_scanout_paneldcs_requested = 1; /* maps DSI0 */
+ printf("FUXI SCANOUT: dcs mode=%u (%s) maxdbv=%#x wake=%u rate_ms=16 lp=dtb-state\n", mode, mode == 1 ? "E1 script" : mode == 2 ? "E1+E2 script" :
+     mode == 3 ? "backlight 0x51" : "backlight 0x51 + selector 12 panel sleep", fg_pd_clamp(FG_PD_DBV_HARD, 0), fg_pd_wake_mode);
+ if (mode >= 3 && !(PE_parse_boot_argn("fuxibacklight", &bl, sizeof(bl)) && bl >= 1 && bl <= 3))
+  printf("FUXI SCANOUT: dcs mode=%u without fuxibacklight=1: no brightness request will come\n", mode);
+ if (mode == 4 && fg_pd_wake_mode == 2)
+  printf("FUXI SCANOUT: dcs fuxipanelwake=2 refused: on-command packet 1 (9E PPS, 90 bytes) exceeds the 64-byte DSI command FIFO; "
+      "selector 12 keeps the black frame, no panel sleep\n");
+}
+unsigned fuxi_gpu_panel_dcs_max(void)
+{
+ return fg_scanout_requested && fg_pd_mode >= 3 && !fg_pd_dead ? fg_pd_clamp(FG_PD_DBV_HARD, 0) : 0;
+}
+void fuxi_gpu_panel_dbv(unsigned dbv)
+{
+ if (!fg_scanout_requested || fg_pd_mode < 3 || fg_pd_dead) return;
+ __atomic_store_n(&fg_pd_req, (dbv & 0xffffu) | 0x10000u, __ATOMIC_RELEASE);
+ fg_pd_kick();
+}
+void fuxi_gpu_panel_power(int on)
+{
+ if (!fg_scanout_requested || fg_pd_mode < 4) return;
+ FG_GUARD;
+ if (!on && !fg_pd_want_off) { fg_pd_t_off = rsr("cntpct_el0"); fg_pd_black = 0; fg_pd_off_refused = 0; fg_pd_t_idle = 0; }
+ fg_pd_want_off = !on;
+ if (fg_pd_wake_mode == 1) fg_pd_kick();
 }
 /* 1 writable, 0 wait, -1 held after error. Normal gates do not spin or sleep;
  * the one-time panel120 switch uses bounded polling before granting writes.
@@ -1841,6 +2276,11 @@ static int fg_scanout_acquire(unsigned publication)
        sv[0], sv[1], sv[2], sv[3], sv[4], sv[5], sv[6], sv[7], sv[8], sv[9]);
   }
   if (fg_scanout_dpu_dump) { fg_scanout_dpu_dump = 0; fg_scanout_dpu_survey(); }
+  if (fg_pd_mode) {
+   fg_pd_owned_t = rsr("cntpct_el0");
+   printf("FUXI SCANOUT: dcs armed mode=%u%s\n", fg_pd_mode, fg_pd_mode <= 2 ? ", script starts in 60 s" : "");
+   fg_pd_kick();
+  }
   return 0;
  }
  unsigned ar, line, start;
@@ -1851,6 +2291,8 @@ static int fg_scanout_acquire(unsigned publication)
   if (!fg_scanout_read(0xae05014, &src) || src != fg_scanout_pa(fg_scanout_front))
    return fg_scanout_stop("double SRC0 changed");
  }
+ /* fuxipaneldcs: no copy grant or START, and no TE gate (TE may stop), while a panel sequence runs or the panel sleeps. */
+ if (fg_pd_state != FG_PD_AWAKE) { fg_pd_holds++; return 0; }
  if (fg_busy && !(fg_abi_hard && fg_scanout_overlap_ok())) { fg_scanout_wait_ring++; if (publication) fg_scanout_charge_to(FG_WHY_RING); return 0; }
  if (fg_scanout_double_active && fg_scanout_ar_on()) {
   unsigned t;
@@ -1918,6 +2360,11 @@ static int fg_scanout_acquire(unsigned publication)
    return 0;
   }
  }
+ if (fg_pd_mode) {
+  /* The gates passed: a due 0x51 goes between this transfer and the next START, then the gates wait for a fresh TE. */
+  int sent = fg_pd_inline();
+  if (sent) return sent < 0 ? -1 : 0;
+ }
  if (fg_scanout_dpu_stage2) {
   /* Bits 22+23: the inherited transfer has drained (and panel120 switched): run the one translated test, then wait with fresh gates. */
   unsigned count;
@@ -1973,9 +2420,17 @@ int fuxi_gpu_scanout_pending(void)
 }
 /* CPU writers retain fPixels=A. Drain first, preserve the newest image and
  * use the single-buffer guard until the next GPU frame re-enters double mode. */
+static int fg_scanout_cpu_acquire_locked(void);
 int fuxi_gpu_scanout_cpu_acquire(void)
 {
  FG_GUARD;
+ int writable = fg_scanout_cpu_acquire_locked();
+ /* fuxipaneldcs=4: after selector 12 asked for off, the CPU frame is the black frame; its START lets the panel sleep. */
+ if (writable == 1 && fg_pd_want_off && !fg_pd_black) fg_pd_black = 1;
+ return writable;
+}
+static int fg_scanout_cpu_acquire_locked(void)
+{
  if ((fg_scanout_ar_on() || fg_scanout_ar_state == 4) && fg_scanout_ar_disable(0, FG_AR_OFF_CPU, "cpu fallback") < 0) return -1;
  int writable = fg_scanout_acquire(1);
  if (writable != 1 || !fg_scanout_double_active) return writable;
@@ -2006,6 +2461,7 @@ static int fg_scanout_publish(void)
 {
  unsigned ov = fg_abi_hard && fg_scanout_overlap_ok(); /* a copy into another buffer is open: the token stays with it */
  if (fg_scanout_failed || (fg_busy && !ov) || !fg_scanout_writable) return -1;
+ if (fg_pd_state != FG_PD_AWAKE) { fg_pd_holds++; return 2; } /* fuxipaneldcs sequence or panel asleep: no START, the caller retries */
  if (fg_dd_on && fg_scanout_double_active) {
   /* Bit 24: no START after a bank fault (a dropped direct frame leaves nothing to start); a slot waits for its writer's fence. */
   if (!fg_dd_check("start") && !fg_scanout_back_ready) return 2;
@@ -2035,6 +2491,7 @@ static int fg_scanout_publish(void)
  if (fg_scanout_double_active && !fg_scanout_select(fg_scanout_triple_requested ? fg_scanout_ready : fg_scanout_front ^ 1u))
   return fg_scanout_stop("double SRC0 flush");
  if (!arm_on && !fg_scanout_write(FG_SCAN_CTL+0x1c, 1)) return fg_scanout_stop("start transfer");
+ if (fg_pd_black == 1) fg_pd_black = 2; /* fuxipaneldcs=4: the black frame is on its way */
  fg_scanout_probe_t0 = rsr("cntpct_el0");
  fg_scanout_stamps.previous_start = fg_scanout_stamps.start;
  fg_scanout_stamps.start = mach_absolute_time();

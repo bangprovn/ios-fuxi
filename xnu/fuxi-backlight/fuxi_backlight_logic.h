@@ -1,4 +1,4 @@
-/* Observation-only backlight policy; no panel units or hardware access. */
+/* Backlight policy helpers; no hardware access (fuxipaneldcs>=3 hands the DBV to the scanout side). */
 #ifndef FUXI_BACKLIGHT_LOGIC_H
 #define FUXI_BACKLIGHT_LOGIC_H
 #include <stdint.h>
@@ -32,5 +32,13 @@ static inline int fbl_log_this(uint32_t event)
 static inline int fbl_valid(uint64_t value)
 {
 	return value <= FUXI_BACKLIGHT_MAX;
+}
+/* fuxipaneldcs>=3: a brightness of 0..65536 as a panel DBV, 4 + v*(cap-4)/65536, so 0 is still 4 (bl-min-level). The scanout
+ * side clamps it again to [4, fuxipanelmaxdbv]. */
+static inline uint32_t fbl_dbv(uint64_t value, uint32_t cap)
+{
+	if (cap < 4) cap = 4;
+	if (value > FUXI_BACKLIGHT_MAX) value = FUXI_BACKLIGHT_MAX;
+	return 4 + (uint32_t)(value * (cap - 4) / FUXI_BACKLIGHT_MAX);
 }
 #endif
