@@ -136,8 +136,8 @@ int main(){@autoreleasepool {
  assert(drawn && !fuxi::Backend::importSampledOnly);[drawn release];luma.usage=MTLTextureUsageShaderRead;
  // A draw whose shader declares a texture slot left empty (CA got nil for a refused texture) is left out, not the submit.
  {FuxiPipeline *yuv=[FuxiPipeline new];yuv->_device=[device retain];yuv->_pipeline=new fuxi::Pipeline{};yuv->_pipeline->textureSlots=0x3;
-  auto target=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:8 height:8 mipmapped:NO];target.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead;
-  FuxiTexture *rt=(FuxiTexture *)[device newTextureWithDescriptor:target];auto yuvPass=ios16PassDefaults();yuvPass.colorAttachments[0].texture=(id)rt;
+  auto target=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:8 height:8 mipmapped:NO];target.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead;target.storageMode=MTLStorageModePrivate;
+  FuxiTexture *rt=(FuxiTexture *)[device newTextureWithDescriptor:target];assert(rt);auto yuvPass=ios16PassDefaults();yuvPass.colorAttachments[0].texture=(id)rt;
   yuvPass.colorAttachments[0].loadAction=MTLLoadActionClear;yuvPass.colorAttachments[0].storeAction=MTLStoreActionStore;
   auto dropped=fuxi::unboundTextureDraws.load();
   c=(FuxiCommandBuffer *)[q commandBuffer];r=(FuxiRender *)[c renderCommandEncoderWithDescriptor:yuvPass];[r setRenderPipelineState:yuv];
