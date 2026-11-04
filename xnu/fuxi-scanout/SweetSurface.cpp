@@ -1212,7 +1212,33 @@ put64(uint8_t *p, uint32_t off, uint64_t v)
 	memcpy(p + off, &v, 8);
 }
 
-/* IOSurface.framework's lock result (copied to IOSurfaceClient + 0x68). */
+/* sweetsurfplanerow: 1 (default) puts each plane's row where IOSurface.framework reads it (+0x10);
+ * 0 puts it back at +8, the layout before 4 Nov, where every plane's row read as 0 (A/B only). */
+static bool
+sweet_surface_plane_row_fixed(void)
+{
+	static int mode = -1;
+	if (mode < 0) {
+		uint32_t v = 1;
+		(void)PE_parse_boot_argn("sweetsurfplanerow", &v, sizeof(v));
+		mode = v != 0;
+	}
+	return mode != 0;
+}
+
+/*
+ * IOSurface.framework's lock result (copied to IOSurfaceClient + 0x68).
+ *
+ * Plane i is the 0x80 bytes at +0x68 + i * 0x80. IOSurfaceClientGet*OfPlane (iOS 16.7)
+ * read width +0, height +4, offset +0xc, bytes per row +0x10, size +0x14, element bytes
+ * +0x18, element width and height +0x1a/+0x1b; +0x54 == 1 (compressed) answers no base
+ * and no row. Nothing reads +8 (HakiOS's MiniIOSurface.h has it reserved). The row used
+ * to be written at +8, so IOSurfaceGetBytesPerRowOfPlane, and CoreVideo's
+ * CVPixelBufferGetBytesPerRowOfPlane above it, answered 0 for every plane of every
+ * surface: H264SW.videocodec copied decoded rows into mediaserverd's 420v buffer with a
+ * row of 0, and its 32-bit step (2 * row - width, zero-extended) moved the destination
+ * 4 GiB on per row pair into the shared cache (SIGBUS at +0x13914, 4 Nov).
+ */
 static void
 sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
 {
@@ -1240,7 +1266,7 @@ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
 		const struct sweet_surface_plane *pl = &s->planes[i];
 		put32(p, 0x00, pl->width);
 		put32(p, 0x04, pl->height);
-		put32(p, 0x08, pl->bytesPerRow);
+		put32(p, sweet_surface_plane_row_fixed() ? 0x10 : 0x08, pl->bytesPerRow);
 		put32(p, 0x0c, pl->offset);
 		put32(p, 0x14, pl->size);
 		memcpy(p + 0x18, &pl->bytesPerElement, 2);
@@ -1268,6 +1294,51 @@ sweet_struct_out(IOExternalMethodArguments *args, const void *buf, uint32_t len)
 	return kIOReturnSuccess;
 }
 
+/* The first 4 multi-plane lock results each of the first 16 processes gets (create or lookup), with each
+ * plane's row and offset read back where the framework reads them: shows a video decoder (mediaserverd)
+ * and whoever draws its frames getting real rows, beside SpringBoard's snapshots. */
+#define SWEET_SURFACE_PLANE_PROCS       16
+#define SWEET_SURFACE_PLANE_LINES       4
+static char    sweet_surface_plane_procs[SWEET_SURFACE_PLANE_PROCS][32];
+static uint8_t sweet_surface_plane_lines[SWEET_SURFACE_PLANE_PROCS];
+
+static void
+sweet_surface_plane_log(SweetSurface *s, const uint8_t *out, bool existing)
+{
+	char name[32] = "?", planes[96] = "";
+	bool print = false;
+	size_t used = 0;
+
+	proc_selfname(name, sizeof(name));
+	IOLockLock(sweet_surface_lock);
+	for (unsigned i = 0; i < SWEET_SURFACE_PLANE_PROCS; i++) {
+		if (sweet_surface_plane_procs[i][0] == '\0') {
+			strlcpy(sweet_surface_plane_procs[i], name, sizeof(sweet_surface_plane_procs[i]));
+		}
+		if (strncmp(sweet_surface_plane_procs[i], name, sizeof(name)) == 0) {
+			print = sweet_surface_plane_lines[i] < SWEET_SURFACE_PLANE_LINES;
+			sweet_surface_plane_lines[i] += print;
+			break;
+		}
+	}
+	IOLockUnlock(sweet_surface_lock);
+	if (!print) {
+		return;
+	}
+	for (uint32_t i = 0; i < s->planeCount && i < 3; i++) {
+		uint32_t row, off;
+		memcpy(&row, out + 0x68 + i * 0x80 + 0x10, sizeof(row));
+		memcpy(&off, out + 0x68 + i * 0x80 + 0x0c, sizeof(off));
+		int w = snprintf(planes + used, sizeof(planes) - used, " p%u row %u off %u", i, row, off);
+		if (w < 0 || (size_t)w >= sizeof(planes) - used) {
+			break;
+		}
+		used += (size_t)w;
+	}
+	IOLog("SWEET SURF: planes %s id %u fmt 0x%08x %ux%u n %u%s%s\n", name, s->id, s->pixelFormat,
+	    s->width, s->height, s->planeCount, planes, existing ? " cached" : "");
+}
+
 /* Map s for this client and answer with its lock result. Takes s's user count. */
 IOReturn
 IOSurfaceRootUserClient::returnSurface(SweetSurface *s, IOExternalMethodArguments *args)
@@ -1285,6 +1356,9 @@ IOSurfaceRootUserClient::returnSurface(SweetSurface *s, IOExternalMethodArgument
 		sweet_surface_fill_result(s, ref, out);
 		if (existing) {
 			put64(out, 0x00, ~0ULL);        /* "already yours": use the cached client */
+		}
+		if (s->planeCount > 1) {
+			sweet_surface_plane_log(s, out, existing);
 		}
 		ret = sweet_struct_out(args, out, SWEET_SURFACE_RESULT_SIZE);
 		IOFreeData(out, SWEET_SURFACE_RESULT_SIZE);

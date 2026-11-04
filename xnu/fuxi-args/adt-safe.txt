@@ -10,6 +10,7 @@ sweetlog          0047 sweet_ufs.c, the persistent console log
 sweetnoexec       0095 kern_exec.c
 sweetnull         0048 kern_exec.c
 sweetsurfrow      0108 IOSurface rows
+sweetsurfplanerow 0108 IOSurface plane rows (lock result layout)
 fuxigpu           0096 Adreno
 fuxigpuabi        0098 Adreno ABI
 fuxigpulevel      0098 Adreno
