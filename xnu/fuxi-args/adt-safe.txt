@@ -30,3 +30,4 @@ fxinj             0121
 fuxisbext         0107 TUNABLE
 fuxiaudio         0113
 fuxiaudioamp      0113
+sweetfbfit        0106 SweetFramebuffer fit (SweetHID follows its result)

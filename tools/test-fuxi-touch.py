@@ -43,6 +43,7 @@ using vm_offset_t = uintptr_t;
 #define TRUE 1
 #define SWEET_TOUCH_FINGERS 10
 #define SWEET_TOUCH_EDGE_PX 48
+int sweet_fb_fit; /* SweetFramebuffer: sweetfbfit accepted */
 #define FT_MAX 10u
 #define FT_EV_READY 0x03u
 #define FT_EV_ENTER 0x13u
@@ -325,8 +326,37 @@ static void randomized_sets() {
  ft_report(0);if(previous)check(0,previous);
  puts("PASS: 2,000 randomized full contact sets, ID uniqueness, masks, lifts and bounded coordinates");
 }
+
+// sweetfbfit: x/1080 and (y-31)/2338 of the frame (iOS x/0.96, (y-31)*2436/2338), bars clamp to the frame's first/last row,
+// edges count from the frame's top/bottom; both delivery paths. Off again: the centred crop mapping, unchanged.
+static void fit_mapping() {
+ for(int batch=0;batch<2;batch++) {
+  reset(batch);sweet_fb_fit=1;
+  struct {int x,y;} pts[]={{0,31},{1079,2368},{540,1200},{100,0},{100,30},{100,2369},{100,2399},{-5,3000},{777,1500}};
+  for(auto &q:pts) {
+   ft.x[3]=q.x;ft.y[3]=q.y;ft_report(1u<<3);
+   int x=q.x<0?0:q.x>1079?1079:q.x, y=q.y<31?31:q.y>2368?2368:q.y;
+   assert(field(child(3),kIOHIDEventFieldDigitizerX)==(int)(((int64_t)x<<16)/1080));
+   assert(field(child(3),kIOHIDEventFieldDigitizerY)==(int)(((int64_t)(y-31)<<16)/2338));
+   double ix=field(child(3),kIOHIDEventFieldDigitizerX)/65536.0*1125, iy=field(child(3),kIOHIDEventFieldDigitizerY)/65536.0*2436;
+   assert(ix>=x/0.96-0.02 && ix<=x/0.96+0.0001 && iy>=(y-31)*2436.0/2338-0.04 && iy<=(y-31)*2436.0/2338+0.0001);
+   ft_report(0);
+  }
+  // Edges: from the frame's top/bottom (and through the bars), not from the panel's alone.
+  struct {int y;bool edge;} rows[]={{0,true},{31+47,true},{31+48,false},{2368-48,false},{2368-47,true},{2399,true}};
+  for(auto &r:rows) {
+   ft.x[1]=540;ft.y[1]=r.y;ft_report(1u<<1);
+   assert(!!(field(child(1),kIOHIDEventFieldDigitizerEventMask)&kIOHIDDigitizerEventFromEdgeTip)==r.edge);
+   ft_report(0);
+  }
+ }
+ sweet_fb_fit=0;reset();ft.x[2]=410;ft.y[2]=700;ft_report(1u<<2);
+ assert(field(child(2),kIOHIDEventFieldDigitizerX)==((410+22)*65536/1125) && field(child(2),kIOHIDEventFieldDigitizerY)==((700+18)*65536/2436));
+ ft_report(0);
+ puts("PASS: sweetfbfit touch: x/1080, (y-31)/2338, bars clamp, frame edges, batched and per-finger paths; off path unchanged");
+}
 int main() {
- batching();coordinates_edges_and_legacy();allocation_failures();fifo_tests();randomized_sets();
+ batching();coordinates_edges_and_legacy();allocation_failures();fifo_tests();randomized_sets();fit_mapping();
  assert(!live && !lock_depth);
 }
 '''
@@ -380,7 +410,9 @@ def main():
     hid = (SRC / 'SweetHID.cpp').read_text()
     touch = (SRC / 'fuxi_touch.c').read_text()
     state = touch[touch.index('static struct {'):touch.index('} ft;') + len('} ft;')]
-    methods = ''.join(function(hid, name) for name in (
+    fit = '\n' + '\n'.join(re.findall(r'^#define SWEET_FIT_\w+ [^\n]*', hid, re.M)) + '\n'  # state ends without a newline
+    assert fit.count('#define') == 3
+    methods = fit + ''.join(function(hid, name) for name in (
         'SweetHIDTouch::touch', 'SweetHIDTouch::report',
         'sweet_hid_touch', 'sweet_hid_touch_report'))
     driver = ''.join(function(touch, name) for name in (

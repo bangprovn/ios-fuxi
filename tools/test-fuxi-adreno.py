@@ -33,6 +33,8 @@ PREFIX = r'''
 #define FG_ABI_WAKE() ((void)0)
 static unsigned fg_abi_present_wait, fg_client_busy, fg_scanout_owned, fg_scanout_writable, fg_scanout_requested, fg_scanout_preclean;
 static unsigned fg_scanout_double_active,fg_scanout_front,fg_scanout_back_ready,fg_scanout_ready_drops,fg_scanout_triple_requested,fg_scanout_double_requested,fg_scanout_ready,fg_scanout_copy;
+static unsigned fg_scanout_fifo_q,fg_scanout_fifo_buf; /* fuxiearly bit 4 (fuxi_gpu_scanout.inc): off here */
+static unsigned fg_fit_requested,fg_fit_active; /* sweetfbfit (fuxi_adreno.c / fuxi_gpu_scanout.inc) */
 static uintptr_t fg_scanout_source;
 static unsigned fg_scanout_pitch,fg_scanout_sx,fg_scanout_sy,fg_scanout_dx,fg_scanout_dy,fg_scanout_w,fg_scanout_h;
 static unsigned scanoutStops,verifyBad,dcvsKicks;
@@ -192,6 +194,37 @@ static uint32_t translated_pixel(unsigned va)
  assert(off<FG_SOURCE_BYTES);
  uint32_t got; memcpy(&got,source_buf+off,4); return got;
 }
+/* A scaled 2D blit (SP_PS_2D_SRC_INFO.FILTER set), modelled on Mesa's r2d semantics, not measured on the hardware: inclusive source
+ * rect in 24.8 (whole pixels here) and destination rect, scale = their extents' ratio, bilinear with 8-bit weights sampling at
+ * (d+0.5)*S/D-0.5, edges clamped to SP_PS_2D_SRC_SIZE. Every input comes from the registers the driver wrote. */
+static unsigned scaled_blits;
+static void scaled_blit(const uint32_t *regs)
+{
+ assert(!((regs[0x8401]|regs[0x8402]|regs[0x8403]|regs[0x8404])&255));
+ unsigned sx0=regs[0x8401]>>8, sx1=regs[0x8402]>>8, sy0=regs[0x8403]>>8, sy1=regs[0x8404]>>8;
+ unsigned dx0=regs[0x8405]&0x3fff, dy0=regs[0x8405]>>16, dx1=regs[0x8406]&0x3fff, dy1=regs[0x8406]>>16;
+ unsigned sw=sx1-sx0+1, sh=sy1-sy0+1, dw=dx1-dx0+1, dh=dy1-dy0+1, iw=regs[0xb2c1]&0x7fff, ih=(regs[0xb2c1]>>15)&0x7fff;
+ unsigned sp=(regs[0xb2c4]>>9)*64, dp=regs[0x8c1a]*64;
+ assert(sx1>=sx0 && sy1>=sy0 && dx1>=dx0 && dy1>=dy0 && sw>=dw && sh>=dh && sx1<iw && sy1<ih);
+ assert(!((regs[0xb2c2]|regs[0x8c18])&63) && sp>=iw*4 && dp>=(dx1+1)*4);
+ for(unsigned y=0;y<dh;y++) {
+  unsigned ny=(unsigned)(((uint64_t)(2*y+1)*sh-dh)*256/(2*dh)), fy=ny&255, y0=sy0+(ny>>8), y1=y0+1<ih?y0+1:y0;
+  for(unsigned x=0;x<dw;x++) {
+   unsigned nx=(unsigned)(((uint64_t)(2*x+1)*sw-dw)*256/(2*dw)), fx=nx&255, x0=sx0+(nx>>8), x1=x0+1<iw?x0+1:x0;
+   uint32_t p[4]={translated_pixel(regs[0xb2c2]+y0*sp+x0*4),translated_pixel(regs[0xb2c2]+y0*sp+x1*4),
+                  translated_pixel(regs[0xb2c2]+y1*sp+x0*4),translated_pixel(regs[0xb2c2]+y1*sp+x1*4)},v=0;
+   for(unsigned c=0;c<32;c+=8)
+    v|=(((256-fx)*(256-fy)*((p[0]>>c)&255)+fx*(256-fy)*((p[1]>>c)&255)+(256-fx)*fy*((p[2]>>c)&255)+fx*fy*((p[3]>>c)&255)+32768)>>16)<<c;
+   unsigned dst=regs[0x8c18]+(dy0+y)*dp+(dx0+x)*4-(regs[0x8c18]>=FG_INL_FB_VA ? FG_INL_FB_VA : G4_FB_VA);
+   unsigned buffer=dst/0xa00000u;
+   dst-=buffer*0xa00000u;
+   assert(buffer<3 && (!fg_scanout_triple_requested || !fg_scanout_back_ready || buffer!=fg_scanout_ready));
+   assert(dst<4320*2400 && (!fg_scanout_double_active || buffer!=fg_scanout_front) && pending<2400*1080);
+   pdst[pending]=dst+buffer*4320*2400; pdata[pending++]=v;
+  }
+ }
+ scaled_blits++;
+}
 static int g3_gw(unsigned reg,unsigned value)
 {
  assert(reg==0x807 && value<8192 && cache_clean);
@@ -218,6 +251,10 @@ static int g3_gw(unsigned reg,unsigned value)
    for(unsigned i=0;i<n;i++) a[i]=ring[pos++&8191];
    left-=n;
    if(op==0x17) { assert(n==1 && a[0]==((1u<<27)|1)); br=1; }
+   else if(op==0x2c && regs[G4_SP_SRC_INFO]==0x510430) {
+    assert(br && n==1 && a[0]==3 && regs[G4_RB_BLIT]==0x10f03000 && regs[G4_GRAS_BLIT]==0x10f03000);
+    scaled_blit(regs); blits++;
+   }
    else if(op==0x2c) {
     assert(br && n==1 && a[0]==3 && regs[G4_SP_SRC_INFO]==0x500430);
     assert(regs[G4_RB_BLIT]==0x10f03000 && regs[G4_GRAS_BLIT]==0x10f03000);
@@ -258,6 +295,7 @@ static void reset(void)
 {
  fg_scanout_owned=fg_scanout_writable=fg_scanout_requested=scanoutStops=verifyBad=0;
  fg_scanout_triple_requested=fg_scanout_ready=fg_scanout_copy=0;
+ fg_fit_requested=fg_fit_active=scaled_blits=0;
  fg_scanout_double_active=fg_scanout_front=fg_scanout_back_ready=fg_scanout_ready_drops=0;
  fg_faults=fg_suspends=fg_reset_held=0;
  fg_state=1; fg_force=fg_seq=fg_access_failed=mode=fail_tlb=tlbs=isolated=doorbells=0;
@@ -453,6 +491,57 @@ int main(void)
  assert(!fuxi_gpu_copy(0,1,(uintptr_t)source_buf,4544u*100,4544,22,18,0,0,17,3,&times));
  assert(doorbells==before && fg_scanout_ready_drops==drops && fg_scanout_back_ready);
  puts("PASS: actual PM4 double/triple targets, full crops from damage, front/ready exclusion, submit preserves triple ready, incomplete-source refusal");
+ /* sweetfbfit: the whole 1125x2436 frame (origin 3,2 in a stride-4608 surface whose base is 20 bytes past a 64-byte line) becomes ONE
+  * bilinear blit into 1080x2338 at y=31 of the target, pitch 4352. Expected pixels come from the constants, the model's from the
+  * registers. The bars, the rows past the image and the front/ready buffers keep the 0x6b fill. */
+ {
+  const unsigned P=4608, OX=3, OY=2, OFF=20, LEN=(OY+2436)*P;
+  for(unsigned m=0;m<3;m++) {
+   reset();fg_fit_requested=fg_fit_active=1;fg_scanout_owned=fg_scanout_requested=fg_scanout_writable=1;
+   fg_scanout_double_active=m>0;fg_scanout_triple_requested=m==2;fg_scanout_front=0;fg_scanout_back_ready=m==2;fg_scanout_ready=1;
+   assert(fuxi_gpu_map(0,1,(uintptr_t)source_buf+OFF,LEN,&times));
+   unsigned rung=doorbells;
+   assert(model_copy(0,1,(uintptr_t)source_buf+OFF,LEN,P,OX,OY,0,0,1125,2436,&times)==1);
+   assert(doorbells==rung+1 && scaled_blits==1 && fg_cp_rects==1 && fg_cp_pitch==P);
+   assert(fg_scanout_sx==OX && fg_scanout_sy==OY && fg_scanout_w==1125 && fg_scanout_h==2436 && !fg_scanout_dx && !fg_scanout_dy);
+   unsigned target=m==0?0:m==1?1:2;
+   uint8_t *t=panel+target*4320*2400;
+   for(unsigned y=0;y<2338;y++) {
+    unsigned ny=(unsigned)(((uint64_t)(2*y+1)*2436-2338)*256/4676), fy=ny&255, y0=ny>>8, y1=y0+1<2436?y0+1:y0;
+    for(unsigned x=0;x<1080;x++) {
+     unsigned nx=(unsigned)(((uint64_t)(2*x+1)*1125-1080)*256/2160), fx=nx&255, x0=nx>>8, x1=x0+1<1125?x0+1:x0;
+     const uint8_t *r0=source_buf+OFF+(OY+y0)*P+OX*4, *r1=source_buf+OFF+(OY+y1)*P+OX*4;
+     for(unsigned c=0;c<4;c++) {
+      unsigned v=((256-fx)*(256-fy)*r0[x0*4+c]+fx*(256-fy)*r0[x1*4+c]+(256-fx)*fy*r1[x0*4+c]+fx*fy*r1[x1*4+c]+32768)>>16;
+      assert(t[(31+y)*4352+x*4+c]==v);
+     }
+    }
+    for(unsigned b=1080*4;b<4352;b++) assert(t[(31+y)*4352+b]==0x6b); /* the row's pitch padding */
+   }
+   for(unsigned i=0;i<31*4352;i++) assert(t[i]==0x6b);
+   for(unsigned i=2369*4352;i<4320*2400;i++) assert(t[i]==0x6b);
+   for(unsigned b=0;b<3;b++) if(b!=target) for(unsigned i=0;i<4320*2400;i+=4099) assert(panel[b*4320*2400+i]==0x6b);
+   assert(fuxi_gpu_unmap(0,&times));
+  }
+  /* Refused (the CPU draws): fit requested but the layout not live yet, display not owned, any other rect, a source pitch that is
+   * not whole 64-byte units. Nothing is rung. */
+  reset();fg_fit_requested=1;fg_scanout_owned=fg_scanout_requested=fg_scanout_writable=1;
+  assert(fuxi_gpu_map(0,1,(uintptr_t)source_buf,2436u*4544,&times));
+  unsigned rung=doorbells;
+  assert(!fuxi_gpu_copy(0,1,(uintptr_t)source_buf,2436u*4544,4544,0,0,0,0,1125,2436,&times));
+  fg_fit_active=1;fg_scanout_owned=0;
+  assert(!fuxi_gpu_copy(0,1,(uintptr_t)source_buf,2436u*4544,4544,0,0,0,0,1125,2436,&times));
+  fg_scanout_owned=1;
+  assert(!fuxi_gpu_copy(0,1,(uintptr_t)source_buf,2436u*4544,4544,22,18,0,0,1080,2400,&times));
+  assert(!fuxi_gpu_copy(0,1,(uintptr_t)source_buf,2436u*4544,4544,0,0,0,0,1125,2435,&times));
+  assert(!fuxi_gpu_copy(0,1,(uintptr_t)source_buf,2436u*4544,4544,0,0,1,0,1125,2436,&times));
+  assert(!fuxi_gpu_copy(0,1,(uintptr_t)source_buf,2436u*4544,4520,0,0,0,0,1125,2436,&times));
+  assert(!fuxi_gpu_copy(0,1,(uintptr_t)source_buf,2435u*4544,4544,0,0,0,0,1125,2436,&times)); /* short source */
+  assert(doorbells==rung && !fg_busy);
+  assert(model_copy(0,1,(uintptr_t)source_buf,2436u*4544,4544,0,0,0,0,1125,2436,&times)==1 && scaled_blits==1);
+  assert(fuxi_gpu_unmap(0,&times));
+ }
+ puts("PASS: sweetfbfit one bilinear 1125x2436->1080x2338 blit at y=31, pitch 4352, single/double/triple targets, bars and other buffers untouched, refusals");
  /* Independent windows and generations; unmapping one preserves the others. */
  reset();
  for(unsigned slot=0;slot<4;slot++) {
@@ -495,9 +584,10 @@ def main():
             assert a + n <= b or b + m <= a, 'overlapping platform mappings'
     functions = ''.join(function(probe, n) for n in ('g3_parity', 'g3_pkt7', 'g4_pkt4', 'g4_reg', 'g4_event', 'g4_wfi', 'g4_setup', 'g4_end'))
     functions += function((ROOT / 'xnu/fuxi-adreno/fuxi_gpu_scanout.inc').read_text(), 'fg_scanout_target')
-    functions += ''.join(function(adapter, n) for n in ('fg_fail', 'fg_isolate', 'fuxi_gpu_unmap', 'fuxi_gpu_map', 'fg_rect', 'fg_clean', 'fg_ring_doorbell', 'fg_cp_stamp', 'fg_cp_retire', 'fuxi_gpu_poll', 'fuxi_gpu_copy'))
+    functions += ''.join(function(adapter, n) for n in ('fg_fail', 'fg_isolate', 'fuxi_gpu_unmap', 'fuxi_gpu_map', 'fg_rect', 'fg_fit_rect', 'fg_clean', 'fg_ring_doorbell', 'fg_cp_stamp', 'fg_cp_retire', 'fuxi_gpu_poll', 'fuxi_gpu_copy'))
     functions = re.sub(r'__asm__ volatile\([^;]*\);', ';', functions)
     constants = '\n'.join(line for line in sync.added_file('gpu-a740.h').splitlines() if line.startswith('#define G4_'))
+    constants += '\n' + '\n'.join(re.findall(r'^#define FUXI_FIT_\w+ [^\n]*', sync.added_file('fuxi_adreno.h'), re.M))
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / 'test.c'
         path.write_text(PREFIX + constants + '\n' + functions + MODEL)

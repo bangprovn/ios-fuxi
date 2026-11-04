@@ -68,6 +68,21 @@ int fuxi_gpu_scanout_pending(void);
 int fuxi_gpu_scanout_double(void);
 int fuxi_gpu_scanout_triple(void);
 int fuxi_gpu_scanout_cpu_acquire(void);
+/* sweetfbfit=1 (default off, read by SweetFramebuffer): the whole presented 1125x2436 frame is shown scaled into 1080x2338 at y=31
+ * with black bars of 31 rows above and below (x 0.96, y 2338/2436), as the iPhone 12/13 mini shows the 1125x2436 frame. The GPU copy
+ * is one bilinear 2D blit, which needs a destination pitch in 64-byte units: from the scanout takeover on, A/B/C use a 4352-byte
+ * pitch (VIG0 SRC_YSTRIDE0, written once after the bars of every buffer are black; the image rows never touch the bars). fit:
+ * call after configure, 1 accepted (needs fuxigpuscanout, refused with direct scanout). fit_pitch: FUXI_FIT_PITCH once the display
+ * fetches that layout, else 0 (CPU writers keep the boot pitch, the boot layout's bars are theirs to clear). */
+#define FUXI_FIT_SRC_W 1125u
+#define FUXI_FIT_SRC_H 2436u
+#define FUXI_FIT_W 1080u
+#define FUXI_FIT_H 2338u
+#define FUXI_FIT_Y 31u
+#define FUXI_FIT_PITCH 4352u
+#define FUXI_FIT_BLACK 0xff000000u
+int fuxi_gpu_scanout_fit(void);
+unsigned fuxi_gpu_scanout_fit_pitch(void);
 int fuxi_gpu_scanout_reserve(void);
 /* fuxigpuncimport bit 20 (1048576, default off): SweetSurface cleans the copy source to PoC
  * before the ring reservation, outside the GPU lock, and fuxi_gpu_copy then skips its own

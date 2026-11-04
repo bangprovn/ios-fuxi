@@ -2314,3 +2314,75 @@ inferred from imports already in use, not proven. If coherency fails, the GPU
 reads stale vertex/index/uniform bytes: visual corruption, not memory
 corruption. CPU write-back mappings of GPU-written buffers rely on the same
 snooping in the other direction.
+
+## Whole-frame fit (`sweetfbfit=1`, default off)
+
+2026-11-04. Host-tested only; **not yet observed on device**.
+
+iOS still sees the iPhone X: the same 1125x2436 surface, IOMFB size, ADT and
+MobileGestalt. Instead of the centred 1080x2400 crop (22/23 px cut left/right,
+18 top/bottom), the whole frame is shown scaled into 1080x2338 at y=31 with
+black bars of 31 rows above and below (x 1080/1125 = 0.96 exactly, y
+2338/2436 = 0.95977), as the iPhone 12/13 mini shows the 1125x2436 frame.
+Geometry constants are `FUXI_FIT_*` in `fuxi_adreno.h`.
+
+Needs `fuxigpuscanout=1 sweetfb_noconsole=1` (the display must be ours to
+re-lay out); refused, with the crop kept, without it, with `sweetfb_native=1`,
+or with direct scanout (bits 22+23+24). Logs at start:
+`SWEET FB: fit 1125x2436 -> 1080x2338 at y=31 (bilinear; CPU fallback nearest)`.
+
+**Pitch decision.** A scaled copy cannot use today's row classes: with the
+4320-byte destination pitch (not a 64-byte unit) every frame is split into
+even and odd rows, and a scaled odd-row class starts at source row
+(k-0.5)/0.96, a fraction. Bits 0-7 of `GRAS_2D_SRC_*` may be a fraction, but
+that is unproven and a wrong guess would comb every horizontal edge. Two
+passes (scale into a 4352-pitch scratch, then today's 1:1 copy) would double
+the GPU copy time. Instead the scanout buffers become ours to lay out: from the
+takeover on, A/B/C use a 4352-byte pitch (68 x 64), so the copy is one
+unsplit blit with integer rects, exactly as Mesa's r2d programs scaled blits
+(`SP_PS_2D_SRC_INFO` 0x510430 = today's value plus FILTER, bit 16). The source
+pitch must be 64-byte units too (CA's 4608 is); any other frame is drawn by
+the CPU. 4352 x 2400 = 0x9f6000 fits each 10 MiB slot; the GPU mappings
+(0x9e4000) already cover every image row.
+
+**Takeover.** Once owned, with no transfer running and before B/C copy A,
+`fg_fit_init` makes the bars of every buffer black (A through its surface
+mapping, B/C through their windows, the last ~17 rows through three new 80 KiB
+tail windows mapped only with the option), then writes VIG0 `SRC_YSTRIDE0`
+low half = 4352 and sets CTL0 flush bit 0; it latches at the next START, which
+is always a frame written in the new layout. The same write-then-flush path
+carried stage 2's stride-4608 flip on device (X232, flip latched); this
+stride itself is unproven there. Image rows never touch the bars, so every buffer
+keeps them in double and triple rotation; display-off fills write 0 (also
+black). `fg_scanout_stop` keeps the stride. Log:
+`FUXI SCANOUT: fit layout pitch=4352 ystride0=0x10e0->0x1100, bars black in N buffer(s)`.
+
+**CPU frames** (GPU not ready, refused, or a layer that is not the whole
+frame): nearest neighbour sampling the GPU filter's positions, at the pitch
+the display fetches (4320 before the takeover, whose bars SweetFramebuffer
+blacks once). **Touch** (SweetHID, both paths): x/1080 and (y-31)/2338 of the
+frame (iOS px x/0.96 and (y-31)x2436/2338; the y factor matches the image,
+0.6 iOS px from /0.96 at the bottom), bars clamp to the frame's first/last
+row, edge contacts count from the frame's top/bottom.
+
+**Cost.** `FUXI GPU: copy_exec blit avg` (GPU stamps) ends in ` fit=1` and is
+the scaled blit's GPU time; `FUXI SCANOUT: summary ... fit=1 gpu_copy_avg_us=
+cpu_copy_avg_us=` splits the per-path copy time. Estimate before any device
+run: about today's 626 us (10.96 MB read + 10.10 MB written against 10.37 +
+10.37 MB), one blit instead of two; the bilinear fetch cost is unmeasured.
+
+**Device checks.** `fuxigpuscanoutcheck=1` (first four GPU frames) prints
+`FUXI SCANOUT: fit pixel ... bars_nonblack= max_err= over2=`: bars must be 0
+(else the GPU is stopped, as a 1:1 mismatch does); `max_err` is the largest
+channel difference from a bilinear reference sampling at (d+0.5)xS/D-0.5 with
+8-bit weights. A small value (0-2) confirms the 2D engine's rect mapping;
+a large one, or a visible half-pixel shift, means the hardware samples
+differently. USB screenshots (req 0x4e) refuse while the stride is 4352.
+
+Host tests: `test-fuxi-adreno.py` (one blit per frame, registers through a
+Mesa-semantics bilinear model, single/double/triple targets, bars and other
+buffers untouched, refusals), `test-fuxi-adreno-mapping.py` (tail windows),
+`test-fuxi-gpu-scanout.py` (init order, stride once before START, failure
+paths, oracle), `test-fuxi-unixnu.py` (GPU request, CPU frames at both
+pitches, partial layer, summary), `test-fuxi-touch.py` (mapping, clamps,
+edges).

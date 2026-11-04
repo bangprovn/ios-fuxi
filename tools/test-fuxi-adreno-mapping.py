@@ -18,6 +18,7 @@ spec.loader.exec_module(submit)
 PREFIX = r'''
 static unsigned fg_scanout_requested, fg_scanout_panel120_requested, fg_scanout_double_requested, fg_scanout_triple_requested;
 static unsigned fg_scanout_paneldcs_requested;
+static unsigned fg_fit_requested; /* sweetfbfit: maps the three tail windows */
 #include <assert.h>
 #define FG_GUARD
 static unsigned fg_abi_enabled;
@@ -182,7 +183,7 @@ static void reset(void)
  fail_alloc=fail_enter=invalid_reservation=0;
  live=cursor=removed=0;
  fg_scanout_requested=fg_scanout_panel120_requested=fg_scanout_double_requested=fg_scanout_triple_requested=1;
- fg_scanout_paneldcs_requested=0;
+ fg_scanout_paneldcs_requested=0;fg_fit_requested=1;
  fg_limit=17; enable_arg=1; gPhysSize=FG_RAM_SIZE;
  valid_handoff=abi_inits=abi_publishes=abi_fail=fg_abi_enabled=fbMaps=failFbMap=0;
  level_arg=clock_logs=g_gpu_selected=fg_clock_measure=0;
@@ -193,14 +194,14 @@ int main(void)
  (void)g_gpu_bw_packet;(void)g_gpu_bw_index;(void)g_gpu_level;
  uint64_t total=0;
  for(unsigned i=0;i<COUNT;i++) total+=fg_windows[i].size;
- assert(total==0x3554000); /* Existing windows + optional DPU, DSI0 and buffers B/C windows. */
- reset();fg_scanout_requested=fg_scanout_panel120_requested=fg_scanout_double_requested=fg_scanout_triple_requested=0;assert(fg_map_windows()==KERN_SUCCESS);
- assert(live==total-49152-2*0x9e4000 && fg_mapped_bytes==total-49152-2*0x9e4000 && alloc_calls==COUNT-5);
+ assert(total==0x3590000); /* Existing windows + optional DPU, DSI0, buffers B/C and the three sweetfbfit tail windows. */
+ reset();fg_scanout_requested=fg_scanout_panel120_requested=fg_scanout_double_requested=fg_scanout_triple_requested=fg_fit_requested=0;assert(fg_map_windows()==KERN_SUCCESS);
+ assert(live==total-49152-2*0x9e4000-3*0x14000 && fg_mapped_bytes==total-49152-2*0x9e4000-3*0x14000 && alloc_calls==COUNT-8);
  assert(!fuxi_gpu_nc_pointer(0xb8a00000,4320u*2400));
  assert(!fuxi_gpu_nc_pointer(0xb9400000,4320u*2400));
  assert(!fg_pointer(0xae16000) && !fg_pointer(0xae36000) && !fg_pointer(0xae94000));
  reset();fg_scanout_double_requested=fg_scanout_triple_requested=0;assert(fg_map_windows()==KERN_SUCCESS);
- assert(!fuxi_gpu_nc_pointer(0xb8a00000,4320u*2400) && live==total-2*0x9e4000);
+ assert(!fuxi_gpu_nc_pointer(0xb8a00000,4320u*2400) && live==total-2*0x9e4000-2*0x14000); /* A's fit tail stays */
  reset();fg_scanout_panel120_requested=0;assert(fg_map_windows()==KERN_SUCCESS);
  assert(live==total-16384 && fg_mapped_bytes==total-16384 && alloc_calls==COUNT-1);
  assert(fg_pointer(0xae16000) && fg_pointer(0xae36000) && !fg_pointer(0xae94000));
@@ -289,7 +290,15 @@ int main(void)
   assert(fg_state==1 && fbMaps==doubleMode+1);
  }
  reset();fg_scanout_triple_requested=0;assert(fg_map_windows()==KERN_SUCCESS);
- assert(live==total-0x9e4000 && fuxi_gpu_nc_pointer(0xb8a00000,4320u*2400) && !fuxi_gpu_nc_pointer(0xb9400000,4320u*2400));
+ assert(live==total-0x9e4000-0x14000 && fuxi_gpu_nc_pointer(0xb8a00000,4320u*2400) && !fuxi_gpu_nc_pointer(0xb9400000,4320u*2400));
+ assert(fuxi_gpu_nc_pointer(0xb89e4000,0x12000) && fuxi_gpu_nc_pointer(0xb93e4000,0x12000) && !fuxi_gpu_nc_pointer(0xb9de4000,0x12000));
+ /* sweetfbfit's tails: only with it (B's with double, C's with triple), each the 4352-pitch rows past its buffer's 0x9e4000. */
+ reset();fg_fit_requested=0;assert(fg_map_windows()==KERN_SUCCESS);
+ assert(live==total-3*0x14000 && alloc_calls==COUNT-3);
+ for(unsigned b=0;b<3;b++) assert(!fuxi_gpu_nc_pointer(0xb89e4000u+b*0xa00000u,0x12000) && fuxi_gpu_nc_pointer(0xb8000000u+b*0xa00000u+4096,4096)==(b?fuxi_gpu_nc_pointer(0xb8000000u+b*0xa00000u,4096)+4096:0));
+ reset();assert(fg_map_windows()==KERN_SUCCESS && live==total);
+ for(unsigned b=0;b<3;b++) assert(fuxi_gpu_nc_pointer(0xb89e4000u+b*0xa00000u,0x12000) && !fuxi_gpu_nc_pointer(0xb89e4000u+b*0xa00000u-4,8));
+ assert(0x9e4000u+0x12000u==4352u*2400 && 0x9e4000u+0x14000u<=0xa00000u && 0xb9de4000u+0x14000u<=0xbab00000u);
  reset();valid_handoff=1;failFbMap=3;
  fuxi_gpu_start(G4_FB_PA,1080,2400,4320);fg_thread(NULL,NULL);
  assert(fg_state==2 && fbMaps==3 && !abi_publishes); // C mapping fails closed
