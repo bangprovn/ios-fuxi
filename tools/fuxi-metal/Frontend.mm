@@ -2017,12 +2017,15 @@ static NSString *surfaceDescriptorText(IOSurfaceRef surface,NSUInteger plane){
  // are printed, and the cache period line has the count.
  const uint64_t passes=++fuxi::surfacePassLogs;
  const char *name=wanted==MTLPixelFormatBGRA8Unorm?"BGRA8":wanted==MTLPixelFormatR8Unorm?"R8":wanted==MTLPixelFormatRG8Unorm?"RG8":"RGBA8";
- if(fuxi::logSampled(passes))fprintf(stderr,"FUXI MTL: IOSurface import PASS %s %lux%lu same-memory %s count=%llu\n",name,(unsigned long)d.width,(unsigned long)d.height,layout().UTF8String,(unsigned long long)passes);
+ // same-memory: the image samples the surface's own pages; shadow: an optimal copy refreshed from them through a buffer import;
+ // copy: the host import was refused and the CPU copies the rows (Backend::importHostCopy).
+ const char *path=t->_texture->hostSource?"copy":t->_texture->shadow?"shadow":"same-memory";
+ if(fuxi::logSampled(passes))fprintf(stderr,"FUXI MTL: IOSurface import PASS %s %lux%lu %s %s count=%llu\n",name,(unsigned long)d.width,(unsigned long)d.height,path,layout().UTF8String,(unsigned long long)passes);
  // Planes of multi-plane surfaces: the first eight and then powers of two (cache hits included), with the plane's own layout.
  static std::atomic<uint64_t> planePasses{0};
  if(planes>1){const uint64_t n=++planePasses;
   if(fuxi::logSampled(n))fprintf(stderr,"FUXI MTL: IOSurface plane import PASS fourcc=0x%08x plane=%lu/%lu %s %lux%lu row=%lu offset=%lu path=%s usage=0x%lx count=%llu\n",
-   fourcc,(unsigned long)plane,(unsigned long)planes,name,(unsigned long)width,(unsigned long)height,(unsigned long)row,(unsigned long)offset,t->_texture->shadow?"shadow":"same-memory",(unsigned long)d.usage,(unsigned long long)n);}
+   fourcc,(unsigned long)plane,(unsigned long)planes,name,(unsigned long)width,(unsigned long)height,(unsigned long)row,(unsigned long)offset,path,(unsigned long)d.usage,(unsigned long long)n);}
  return t;
 }
 // Repeat, mirror repeat, clamp-to-zero and clamp-to-border map to core Vulkan; mirror clamp-to-edge stays refused.

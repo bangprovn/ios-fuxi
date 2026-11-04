@@ -110,6 +110,9 @@ struct Texture : TextureLevels {VkImage image{};VkDeviceMemory memory{};VkImageV
  VkImageTiling tiling=VK_IMAGE_TILING_OPTIMAL;VkImageLayout layout=VK_IMAGE_LAYOUT_UNDEFINED;std::array<VkImageLayout,32> levelLayouts{};void *mapped{};bool imported=false,borrowedMemory=false;
  MemoryKey recycleKey{};bool recyclable=false,slabbed=false;uint64_t memOffset{},memExtent{};SlabMemory<VkDeviceMemory>::Block slabBlock{};std::array<uint64_t,8> importKey{};bool importCached=false;
  Buffer *backingBuffer{};size_t backingOffset{},backingRow{};bool shadow=false;uint64_t shadowHash{};bool shadowHashed=false; // hash of the backing rows the last recorded refresh copied
+ // hostSource: a sampled IOSurface plane the host import refused, copied by the CPU from these rows (hostRow apart) into the backing
+ // buffer when their hash changes (Backend::importHostCopy). surfaceShared: the memory is one import shared by every image of the surface.
+ const void *hostSource{};size_t hostRow{};uint64_t hostHash{};bool hostHashed=false,surfaceShared=false;std::array<uint64_t,3> surfaceKey{};
  std::vector<VkImageView> attachmentViews;bool canGenerate=false,filterable=true,blendable=false;uint64_t planStamp=0;};
 struct Sampler {size_t references=1;VkSampler sampler{};uint32_t filters=1;float lodMin=0,lodMax=0;};
 struct VariantKey {
@@ -209,6 +212,11 @@ class Backend {
    (unsigned long long)objectHits,(unsigned long long)objectMisses,objects.count(),objects.evictions,objects.totalBytes(),blobShare.size(),(unsigned long long)blobSharedHits,mesaStatus[0]?mesaStatus:"off",
    (unsigned long long)linearOwnRows,(unsigned long long)linearTailUses,(unsigned long long)linearShadows,linearShadowKinds.size(),tailPadBytes>>10,
    (unsigned long long)surfacePassLogs.load(),(unsigned long long)renderTargetLogs.load(),(unsigned long long)(notes?notes():0));
+  // IOSurface memory: shared imports live, and the copies made because a host import was refused (cumulative), when there are any.
+  if(!surfaceMemory.empty() || hostCopyTextures || hostImportFailures)
+   fprintf(stderr,"FUXI MTL: cache period surfaces shared_imports=%zu shared_images=%zu host_import_failures=%llu backoff=%d copied_textures=%llu copies=%llu copied_kb=%llu\n",
+    surfaceMemory.size(),[&]{size_t n=0;for(auto &e:surfaceMemory)n+=e.second.references;return n;}(),(unsigned long long)hostImportFailures,int(importBackoff()),
+    (unsigned long long)hostCopyTextures,(unsigned long long)hostCopies,(unsigned long long)(hostCopyBytes>>10));
   {size_t variants=0,largest=0,largestVariants=0;objects.each([&](Pipeline *p,size_t n){variants+=p->variants.size();if(n>largest){largest=n;largestVariants=p->variants.size();}});
    fprintf(stderr,"FUXI MTL: cache period object bytes live=%zu variants=%zu avg_kb=%zu largest_kb=%zu largest_variants=%zu (entry bytes include runtime variants: each variant is a full pipeline, up to 8 per entry)\n",objects.count(),variants,objects.count()?objects.totalBytes()/objects.count()/1024:0,largest/1024,largestVariants);}
   driverHits=driverMisses=driverUnknown=objectHits=objectMisses=0;return checkpoint;
@@ -455,6 +463,20 @@ public:
  static inline std::atomic<uint64_t> splitWindow{0},splitSubmits{0},splitChunks{0},splitFirstNs{0},splitLastNs{0},splitGapNs{0},splitGapSamples{0},splitFewPasses{0},splitUnsplit{0},splitDrained{0};
  static inline std::atomic<uint64_t> flushCalls{0},invalidateCalls{0},emptySubmits{0},submitObjectCreates{0},submitPoolCreates{0},submitFrameCreates{0},submitViewCreates{0};
  std::map<std::array<uint64_t,8>,Texture *> imports;
+ // One host import per IOSurface allocation (identity, base, bytes), shared by every image bound into it (a video frame's two
+ // planes, re-wraps under other formats): FuxiAdreno maps at most 512 imports at once (FG_ABI_MAX_IMPORTS), and v-yuv1 filled
+ // them with Safari's surfaces while two imports per video frame were live. Under the mutex.
+ struct SurfaceMemory {VkDeviceMemory memory{};void *mapped{};size_t bytes{},references{};uint32_t type{};};
+ std::map<std::array<uint64_t,3>,SurfaceMemory> surfaceMemory;
+ // After a host import fails, sampled surfaces are copied instead of imported until this submit count (importBackoffUntil), and
+ // no-copy buffers take their copy at once: a full import table made every frame retry, and fail, for each surface (v-yuv1: 4096).
+ uint64_t importBackoffUntil=0,hostImportFailures=0,hostCopyTextures=0,hostCopies=0,hostCopyBytes=0;
+ static constexpr uint64_t importBackoffSubmits=300;
+ bool importBackoff() const {return importBackoffUntil && submits.load()<importBackoffUntil;}
+ void noteImportFailureUnlocked(const char *what,const std::string &why){
+  const uint64_t n=++hostImportFailures;importBackoffUntil=submits.load()+importBackoffSubmits;
+  if(logSampled(n))fprintf(stderr,"FUXI MTL: host import refused %s (%s); sampled surfaces are copied for the next %llu submits count=%llu\n",what,why.c_str(),(unsigned long long)importBackoffSubmits,(unsigned long long)n);
+ }
  // Linear textures over buffers (linearTexture): aliased at their own row, aliased only thanks to the tail pad or an import's
  // enclosing pages, shadowed, and the kinds of shadow logged; the live tail pad bytes of owned buffers. Under the mutex.
  uint64_t linearOwnRows=0,linearTailUses=0,linearShadows=0;std::set<std::string> linearShadowKinds;size_t tailPadBytes=0;
@@ -462,6 +484,7 @@ public:
 #ifdef FUXI_MTL_HOST_TEST
  // Test-only reference mode and deterministic recording failure; no production environment switches.
  bool reuseSubmitObjects=true,reuseDrawPlans=true,captureDrawPlans=false,failBeforeQueue=false,failQueueAttempt=false,failAfterChunk=false,failChunkAttempt=false,reuseForgetForTest=true;
+ unsigned failHostImportsForTest=0; // the next N surface host imports answer VK_ERROR_OUT_OF_DEVICE_MEMORY, as Turnip did when FuxiAdreno's import table was full
  std::vector<std::pair<Pipeline *,DrawOutput>> drawPlansForTest;
  void loseWhileInFlightForTest(){std::lock_guard<std::mutex> lock(mutex);check(VK_ERROR_DEVICE_LOST);}
  struct ImageTransition {Texture *texture;uint32_t level;VkImageLayout before,after;};
@@ -695,6 +718,7 @@ public:
  // page contract. Sample-only layouts may use a refreshed optimal shadow.
  Buffer *importBuffer(void *base,size_t bytes) {
   std::lock_guard<std::mutex> guard(mutex);requireLive();
+  if(importBackoff())throw std::runtime_error("host import backoff after a refused import");
   ++HostImportStats::attempts;
   if(!supportsHostImport())throw std::runtime_error("no-copy buffer host import unsupported");
   // Import the enclosing host pages and bind the buffer at the pointer's offset: CA's CGImage bytes are rarely page aligned.
@@ -720,9 +744,12 @@ public:
    VkImportMemoryHostPointerInfoEXT hi{};hi.sType=VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;hi.handleType=VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;hi.pHostPointer=(void *)plan.base;
    VkMemoryAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;ai.pNext=&hi;ai.allocationSize=plan.bytes;ai.memoryTypeIndex=type;
    reserveMemoryUnlocked(ai.allocationSize);b->charged=ai.allocationSize;
+#ifdef FUXI_MTL_HOST_TEST
+   if(failHostImportsForTest){--failHostImportsForTest;importCheck(VK_ERROR_OUT_OF_DEVICE_MEMORY);}
+#endif
    importCheck(frameKernelCall([&]{return AllocateMemory(device,&ai,nullptr,&b->memory);}));if(systemTranslationPolicy().frameTrace)++frameCounts.allocations;++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;b->memoryBytes=ai.allocationSize;b->allocated=bytes;b->memoryType=type;check(frameKernelCall([&]{return BindBufferMemory(device,b->buffer,b->memory,plan.offset);}));
    check(frameKernelCall([&]{return MapMemory(device,b->memory,0,VK_WHOLE_SIZE,0,&b->contents);}));b->contents=(uint8_t *)b->contents+plan.offset;return b;
-  }catch(...){++HostImportStats::refusedVulkan;destroyUnlocked(b);throw;}
+  }catch(const std::exception &e){++HostImportStats::refusedVulkan;destroyUnlocked(b);if(!poisoned && !backboardGate.blocked())noteImportFailureUnlocked("buffer",e.what());throw;}
  }
  static std::string linearAliasMismatch(const VkMemoryRequirements &req,const VkSubresourceLayout &layout,uint32_t memoryType,size_t allocated,size_t offset,size_t row,size_t memoryOffset=0) {
    std::string mismatch;
@@ -844,7 +871,9 @@ public:
    if(t->slabbed)slabMemory.release(t->slabBlock,memoryNow());
    else if(t->recyclable && textureMemory.put(t->recycleKey,t->memory,memoryNow()))t->charged=0;
    else {frameKernelCall([&]{return FreeMemory(device,t->memory,nullptr);});--liveMemoryObjects;liveMemoryBytes-=t->memoryBytes;}
-  }}limits.release(t->charged);destroyUnlocked(t->backingBuffer);if(!t->backingBuffer)rtForget(t);delete t;return !poisoned;
+  }
+   if(t->surfaceShared)releaseSurfaceMemoryUnlocked(t->surfaceKey); // after its image: the shared import outlives every image bound to it
+  }limits.release(t->charged);destroyUnlocked(t->backingBuffer);if(!t->backingBuffer)rtForget(t);delete t;return !poisoned;
  }
  bool supportsHostImport() const {return hostImport && hostAlignment && GetMemoryHostPointerPropertiesEXT && GetPhysicalDeviceImageFormatProperties2;}
  bool supportsExplicitPitch() const {return supportsHostImport() && explicitPitch;}
@@ -882,25 +911,32 @@ public:
  // Safari's 433x433 'LA08', whose refusal failed backboardd over to the CPU on 3 Nov). A format without linear colour-attachment
  // support is imported for sampling and transfers only.
  // A plane of a multi-plane surface is the same import at that plane's offset and row (420v/420f video frames and snapshots: luma as
- // R8 at plane 0, CbCr as RG8 at plane 1). sampledOnly: the client asked for a ShaderRead-only texture. Such a plane that Turnip cannot
- // alias at its offset and row (an explicit linear row must be a multiple of 64 bytes and the binding offset of 64: SpringBoard's
- // 788-wide 420f snapshots have 800-byte rows) is sampled through an optimal shadow instead, copied from the whole surface imported as a
- // buffer, as linearTexture does for a client buffer (refreshed when its rows' hash changes). Other refusals throw as before.
+ // R8 at plane 0, CbCr as RG8 at plane 1). With an identity, every image of one surface allocation binds into one shared import
+ // (surfaceMemory). sampledOnly: the client asked for a ShaderRead-only texture. Such a texture that Turnip cannot alias at its
+ // offset and row (an explicit linear row must be a multiple of 64 bytes and the binding offset of 64: SpringBoard's 788-wide 420f
+ // snapshots have 800-byte rows) is sampled through an optimal shadow copied from the whole surface imported as a buffer, as
+ // linearTexture does for a client buffer. One whose host import is refused (v-yuv1: FuxiAdreno's 512 imports all live, so BoMap
+ // failed and Turnip answered VK_ERROR_OUT_OF_DEVICE_MEMORY) is copied by the CPU instead (importHostCopy). Other refusals throw.
  Texture *importTexture(void *base,size_t bytes,size_t row,uint32_t width=256,uint32_t height=256,size_t offset=0,uint64_t identity=0,uint32_t format=80,bool sampledOnly=false) {
   std::unique_lock<std::mutex> guard(mutex);requireLive();
-  std::array<uint64_t,8> key{identity,uint64_t(uintptr_t(base)),bytes,row,offset,width,height,format},shadowKey=key;shadowKey[7]|=uint64_t(1)<<32;
-  if(identity){auto hit=imports.find(key);if(hit==imports.end() && sampledOnly)hit=imports.find(shadowKey);
+  std::array<uint64_t,8> key{identity,uint64_t(uintptr_t(base)),bytes,row,offset,width,height,format},shadowKey=key,copyKey=key;
+  shadowKey[7]|=uint64_t(1)<<32;copyKey[7]|=uint64_t(2)<<32;
+  if(identity){auto hit=imports.find(key);
+   if(hit==imports.end() && sampledOnly)hit=imports.find(shadowKey);
+   if(hit==imports.end() && sampledOnly)hit=imports.find(copyKey);
    if(hit!=imports.end()){++hit->second->references;++surfaceImportHits;return hit->second;}++surfaceImportMisses;}
   if(!supportsHostImport())throw std::runtime_error("IOSurface same-memory import requires VK_EXT_external_memory_host / NativeAdreno HostImport");
   const VkFormat vkFormat=pixelFormat(format);const size_t texel=texelBytes(format);
+  if(!base || !bytes || bytes>maxBufferLength || (uintptr_t(base)%hostAlignment) || bytes%hostAlignment || !limits.rows(width,height,texel,row,offset,bytes))
+   throw std::runtime_error("IOSurface host alignment/length/stride");
+  // While host imports are being refused, a sampled surface is copied without trying (each try maps and unmaps in the kernel).
+  if(sampledOnly && importBackoff()){guard.unlock();return importHostCopy(base,bytes,row,width,height,offset,identity,format,copyKey,"host import backoff");}
   VkFormatFeatureFlags have=linearFeatures;
   if(vkFormat!=VK_FORMAT_B8G8R8A8_UNORM){VkFormatProperties fp{};GetPhysicalDeviceFormatProperties(physical,vkFormat,&fp);have=fp.linearTilingFeatures;}
   constexpr VkFormatFeatureFlags required=VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT|
    VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT|VK_FORMAT_FEATURE_TRANSFER_SRC_BIT|VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
   const bool attachment=have&VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
   if((have&required)!=required || (vkFormat==VK_FORMAT_B8G8R8A8_UNORM && !attachment))throw std::runtime_error("IOSurface linear format features unavailable");
-  if(!base || !bytes || bytes>maxBufferLength || (uintptr_t(base)%hostAlignment) || bytes%hostAlignment || !limits.rows(width,height,texel,row,offset,bytes))
-   throw std::runtime_error("IOSurface host alignment/length/stride");
   VkPhysicalDeviceExternalImageFormatInfo external{};external.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO;
   external.handleType=VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
   VkPhysicalDeviceImageFormatInfo2 info{};info.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2;info.pNext=&external;
@@ -952,29 +988,63 @@ public:
     shadowWhy=why;
    }
   }catch(...) {guard.unlock();destroy(t);throw;}
-  if(!shadowWhy.empty()){destroyTextureUnlocked(t);guard.unlock();return importShadowed(base,bytes,row,width,height,offset,identity,format,shadowKey,shadowWhy);}
+  if(!shadowWhy.empty()){destroyTextureUnlocked(t);guard.unlock();return importShadowed(base,bytes,row,width,height,offset,identity,format,shadowKey,copyKey,shadowWhy);}
   try {
    VkMemoryRequirements req{};GetImageMemoryRequirements(device,t->image,&req);
-   VkMemoryHostPointerPropertiesEXT hp{};hp.sType=VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT;
-   // A host pointer the kernel will not import is a refusal of this texture (importCheck), as for a no-copy buffer.
-   importCheck(GetMemoryHostPointerPropertiesEXT(device,external.handleType,base,&hp));
-   uint32_t type=0;while(type<memory.memoryTypeCount && (!(req.memoryTypeBits&hp.memoryTypeBits&(1u<<type)) || !(memory.memoryTypes[type].propertyFlags&VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)))++type;
-   if(type==memory.memoryTypeCount)throw std::runtime_error("IOSurface host memory type mismatch");
-   VkImportMemoryHostPointerInfoEXT hi{};hi.sType=VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;hi.handleType=external.handleType;hi.pHostPointer=base;
-   VkMemoryAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;ai.pNext=&hi;ai.allocationSize=bytes;ai.memoryTypeIndex=type;t->memoryType=type;
-   reserveMemoryUnlocked(ai.allocationSize);t->charged=ai.allocationSize;
-   // Import/charge the whole surface, binding the image at its plane's offset. A host import the kernel refuses refuses this texture only.
-   importCheck(frameKernelCall([&]{return AllocateMemory(device,&ai,nullptr,&t->memory);}));if(systemTranslationPolicy().frameTrace)++frameCounts.allocations;++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;t->memoryBytes=ai.allocationSize;t->allocated=bytes;check(frameKernelCall([&]{return BindImageMemory(device,t->image,t->memory,offset);}));
-   check(frameKernelCall([&]{return MapMemory(device,t->memory,0,VK_WHOLE_SIZE,0,&t->mapped);}));
+   const std::array<uint64_t,3> surfaceKey{identity,uint64_t(uintptr_t(base)),bytes};
+   auto shared=identity?surfaceMemory.find(surfaceKey):surfaceMemory.end();
+   if(shared!=surfaceMemory.end() && !(req.memoryTypeBits&(1u<<shared->second.type)))shared=surfaceMemory.end();
+   if(shared==surfaceMemory.end()){
+    VkMemoryHostPointerPropertiesEXT hp{};hp.sType=VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT;
+    // A host pointer the kernel will not import is a refusal of this texture (importCheck), as for a no-copy buffer.
+    importCheck(GetMemoryHostPointerPropertiesEXT(device,external.handleType,base,&hp));
+    uint32_t type=0;while(type<memory.memoryTypeCount && (!(req.memoryTypeBits&hp.memoryTypeBits&(1u<<type)) || !(memory.memoryTypes[type].propertyFlags&VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)))++type;
+    if(type==memory.memoryTypeCount)throw std::runtime_error("IOSurface host memory type mismatch");
+    VkImportMemoryHostPointerInfoEXT hi{};hi.sType=VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;hi.handleType=external.handleType;hi.pHostPointer=base;
+    VkMemoryAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;ai.pNext=&hi;ai.allocationSize=bytes;ai.memoryTypeIndex=type;
+    // Import/charge the whole surface once, binding each image at its plane's offset. A host import the kernel refuses (FuxiAdreno
+    // BoImport or BoMap: Turnip answers VK_ERROR_OUT_OF_DEVICE_MEMORY or INVALID_EXTERNAL_HANDLE) refuses this import only.
+    reserveMemoryUnlocked(bytes);VkDeviceMemory imported{};void *mapped=nullptr;
+    auto result=frameKernelCall([&]{return AllocateMemory(device,&ai,nullptr,&imported);});
+#ifdef FUXI_MTL_HOST_TEST
+    if(result==VK_SUCCESS && failHostImportsForTest){--failHostImportsForTest;FreeMemory(device,imported,nullptr);imported=VK_NULL_HANDLE;result=VK_ERROR_OUT_OF_DEVICE_MEMORY;}
+#endif
+    if(result!=VK_SUCCESS){limits.release(bytes);importCheck(result);}
+    if(systemTranslationPolicy().frameTrace)++frameCounts.allocations;++liveMemoryObjects;liveMemoryBytes+=bytes;
+    auto mappedResult=frameKernelCall([&]{return MapMemory(device,imported,0,VK_WHOLE_SIZE,0,&mapped);});
+    if(mappedResult!=VK_SUCCESS){frameKernelCall([&]{FreeMemory(device,imported,nullptr);});--liveMemoryObjects;liveMemoryBytes-=bytes;limits.release(bytes);check(mappedResult);}
+    if(identity)shared=surfaceMemory.emplace(surfaceKey,SurfaceMemory{imported,mapped,bytes,0,type}).first;
+    else {t->memory=imported;t->mapped=mapped;t->memoryType=type;t->charged=bytes;t->memoryBytes=bytes;}
+   }
+   if(shared!=surfaceMemory.end()){auto &s=shared->second;++s.references;
+    t->memory=s.memory;t->mapped=s.mapped;t->memoryType=s.type;t->borrowedMemory=true;t->surfaceShared=true;t->surfaceKey=surfaceKey;}
+   t->allocated=bytes;
+   check(frameKernelCall([&]{return BindImageMemory(device,t->image,t->memory,offset);}));
    VkImageViewCreateInfo vi{};vi.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;vi.image=t->image;vi.viewType=VK_IMAGE_VIEW_TYPE_2D;vi.format=info.format;
    vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};check(CreateImageView(device,&vi,nullptr,&t->view));if(identity){t->importKey=key;t->importCached=true;imports.emplace(key,t);}return t;
-  }catch(...) {guard.unlock();destroy(t);throw;}
+  }catch(const std::exception &e) {
+   const bool fault=poisoned || backboardGate.blocked();
+   if(!fault)noteImportFailureUnlocked("surface",e.what());
+   guard.unlock();destroy(t);
+   if(fault || !sampledOnly)throw;
+   return importHostCopy(base,bytes,row,width,height,offset,identity,format,copyKey,e.what());
+  }
+ }
+ // A surface's shared import loses an image (destroyTextureUnlocked); the last one unmaps and frees it.
+ void releaseSurfaceMemoryUnlocked(const std::array<uint64_t,3> &surfaceKey){
+  auto it=surfaceMemory.find(surfaceKey);if(it==surfaceMemory.end() || --it->second.references)return;
+  auto s=it->second;surfaceMemory.erase(it);
+  frameKernelCall([&]{return UnmapMemory(device,s.memory);});frameKernelCall([&]{FreeMemory(device,s.memory,nullptr);});
+  --liveMemoryObjects;liveMemoryBytes-=s.bytes;limits.release(s.bytes);
  }
  // importTexture's sampled fallback (no lock held): the whole surface imported as a buffer and a linear texture over it at the plane's
  // offset and row, which linearTexture aliases when Turnip can and otherwise backs with an optimal shadow refreshed from those rows.
- // Shared like a direct import under shadowKey (a format with bit 32 set).
- Texture *importShadowed(void *base,size_t bytes,size_t row,uint32_t width,uint32_t height,size_t offset,uint64_t identity,uint32_t format,const std::array<uint64_t,8> &shadowKey,const std::string &why) {
-  Buffer *b=importBuffer(base,bytes);Texture *t=nullptr;
+ // Shared like a direct import under shadowKey (a format with bit 32 set). A refused buffer import goes to importHostCopy.
+ Texture *importShadowed(void *base,size_t bytes,size_t row,uint32_t width,uint32_t height,size_t offset,uint64_t identity,uint32_t format,const std::array<uint64_t,8> &shadowKey,const std::array<uint64_t,8> &copyKey,const std::string &why) {
+  Buffer *b=nullptr;
+  try {b=importBuffer(base,bytes);}
+  catch(const std::exception &e){if(poisoned || backboardGate.blocked())throw;return importHostCopy(base,bytes,row,width,height,offset,identity,format,copyKey,why+"; buffer import: "+e.what());}
+  Texture *t=nullptr;
   try {t=linearTexture(b,format,1,width,height,offset,row);}catch(...){destroy(b);throw;}
   destroy(b); // the texture holds its own reference to the buffer
   std::lock_guard<std::mutex> guard(mutex);
@@ -984,6 +1054,25 @@ public:
   const uint64_t n=++surfaceShadowImports;
   if(logSampled(n))fprintf(stderr,"FUXI MTL: IOSurface plane import via %s format=%u %ux%u offset=%zu row=%zu count=%llu reason=%s\n",
    t->shadow?"shadow":"buffer alias",format,width,height,offset,row,(unsigned long long)n,why.c_str());
+  return t;
+ }
+ // The last fallback for a sampled IOSurface texture (no lock held): an optimal shadow over an owned buffer. Before each submit
+ // that reads it, the CPU copies the surface's rows into the buffer when their hash changed (hostSource, Backend::submit), then the
+ // shadow refresh copies the buffer into the image. No host import: nothing in FuxiAdreno's import table. A 640x360 luma plane is
+ // 230 KB a frame. Shared like a direct import under copyKey (a format with bit 33 set); the surface stays retained by its wrappers.
+ Texture *importHostCopy(void *base,size_t bytes,size_t row,uint32_t width,uint32_t height,size_t offset,uint64_t identity,uint32_t format,const std::array<uint64_t,8> &copyKey,const std::string &why) {
+  std::unique_lock<std::mutex> guard(mutex);requireLive();
+  if(identity){auto hit=imports.find(copyKey);if(hit!=imports.end()){++hit->second->references;++surfaceImportHits;return hit->second;}}
+  const size_t texel=texelBytes(format),rowBytes=size_t(width)*texel,copyRow=(rowBytes+63)&~size_t(63);
+  if(!base || !limits.rows(width,height,texel,row,offset,bytes))throw std::runtime_error("IOSurface copy rows outside the surface");
+  Buffer *b=allocateUnlocked(copyRow*height);Texture *t=nullptr;
+  try {t=allocateTextureUnlocked(format,1,width,height);}catch(...){destroyUnlocked(b);throw;}
+  t->shadow=true;b->shadowBacking=true;t->backingBuffer=b;t->backingOffset=0;t->backingRow=copyRow;
+  t->hostSource=(const uint8_t *)base+offset;t->hostRow=row;
+  if(identity){t->importKey=copyKey;t->importCached=true;imports.emplace(copyKey,t);}
+  const uint64_t n=++hostCopyTextures;
+  if(logSampled(n))fprintf(stderr,"FUXI MTL: IOSurface copied, not imported: format=%u %ux%u offset=%zu row=%zu count=%llu reason=%s\n",
+   format,width,height,offset,row,(unsigned long long)n,why.c_str());
   return t;
  }
  static size_t texelBytes(uint32_t f){return metalTexelBytes(f);}
@@ -2491,6 +2580,16 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
    };
    auto refresh=[&](Texture *t){if(!t || !t->shadow)return;transition(t,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);flushImages();copyShadow(t);};
    std::vector<Texture *> refreshed,refreshedSubmit,collected;
+   // A copied IOSurface (hostSource): once per submit, before its shadow refresh, the CPU copies the surface's rows into the backing
+   // buffer when their hash changed since the last copy; the refresh's own hash then sees new rows and copies them into the image.
+   std::vector<Texture *> hostPulled;
+   auto pullHost=[&](Texture *t){
+    if(!t->hostSource || !t->backingBuffer || std::find(hostPulled.begin(),hostPulled.end(),t)!=hostPulled.end())return;hostPulled.push_back(t);
+    const size_t rowBytes=size_t(t->width)*texelBytes(t->format);const auto *src=(const uint8_t *)t->hostSource;
+    const uint64_t h=hashRows(src,t->height,t->hostRow,rowBytes);if(t->hostHashed && t->hostHash==h)return;
+    auto *dst=(uint8_t *)t->backingBuffer->contents+t->backingOffset;for(size_t y=0;y<t->height;++y)memcpy(dst+y*t->backingRow,src+y*t->hostRow,rowBytes);
+    t->hostHash=h;t->hostHashed=true;++hostCopies;hostCopyBytes+=uint64_t(rowBytes)*t->height;
+   };
    // Perf bit 4: a shadow is copied from its backing buffer once per submit when nothing in the submit can change that backing
    // (no buffer destination, no storage-buffer/image shader, no written texture overlapping it). The CPU snapshot is applied before submit.
    bool shadowStable=boundaryPerf;
@@ -2535,6 +2634,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
     // Once per run, after preceding writes and before any sample transitions.
     // Never deduplicate the transfer-destination transition with a read layout.
     auto readShadow=[&](Texture *t){if(!t || !t->shadow || std::find(refreshed.begin(),refreshed.end(),t)!=refreshed.end())return;
+     pullHost(t);
      if(shadowUnchanged(t)){refreshed.push_back(t);return;}
      if(boundaryPerf){refreshed.push_back(t);
       if(std::find(refreshedSubmit.begin(),refreshedSubmit.end(),t)!=refreshedSubmit.end() && backingStable(t)){if(currentFrame)++currentFrame->shadowRefreshSkipped;return;}

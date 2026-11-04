@@ -23,7 +23,7 @@
 namespace fuxi {
 struct Buffer {void *contents;size_t length,allocated;bool upload=false;void *shadowKey() const{return contents;}};
 struct PrepareWrite {Buffer *buffer;uint64_t offset,bytes;};
-struct Texture : TextureLevels {size_t allocated{},charged{};uint32_t format=80;Buffer *backingBuffer{};size_t backingOffset{},backingRow{};bool shadow=false;std::vector<uint8_t> pixels{};
+struct Texture : TextureLevels {size_t allocated{},charged{};uint32_t format=80;Buffer *backingBuffer{};size_t backingOffset{},backingRow{};bool shadow=false;const void *hostSource{};std::vector<uint8_t> pixels{};
  size_t offset(uint32_t level) const {size_t o=0;for(uint32_t l=0;l<level;++l)o+=levelWidth(l)*levelHeight(l)*levelDepth(l)*metalTexelBytes(format);return o;}
 };
 struct Pipeline {ShadowWindow shadowWindows[2][resourceSlots]{};CompileOptions options{};bool sampled=false;size_t references=1;uint32_t textureSlots=0;};
@@ -83,8 +83,13 @@ public:
  Texture *importTexture(void *base,size_t bytes,size_t row,uint32_t width=256,uint32_t height=256,size_t offset=0,uint64_t=0,uint32_t format=80,bool sampledOnly=false) {
   if(!modelHostImport || !base || !limits.rows(width,height,metalTexelBytes(format),row,offset,bytes))throw std::runtime_error("modeled host import bounds");
   importBase=base;importBytes=bytes;importRow=row;importOffset=offset;importFormat=format;importSampledOnly=sampledOnly;
-  limits.reserve(bytes);auto *t=new Texture{};t->format=format;t->width=width;t->height=height;t->allocated=t->charged=bytes;t->defined=true;t->shadow=sampledOnly && (row%64 || offset%64);return t;
+  // modelImportRefused: the host import is refused (v-yuv1: FuxiAdreno's import table full). A sampled texture is then copied by the
+  // CPU (production Backend::importHostCopy); any other use is refused.
+  if(modelImportRefused && !sampledOnly)throw std::runtime_error("modeled host import refused");
+  limits.reserve(bytes);auto *t=new Texture{};t->format=format;t->width=width;t->height=height;t->allocated=t->charged=bytes;t->defined=true;t->shadow=sampledOnly && (row%64 || offset%64 || modelImportRefused);
+  if(modelImportRefused)t->hostSource=(const uint8_t *)base+offset;return t;
  }
+ static inline bool modelImportRefused=false;
  uint32_t declaredTextures(const Pipeline *p) const {return p?p->textureSlots:0;}
  Buffer *importBuffer(void *,size_t) {throw std::runtime_error("no modeled host buffer import");}
  Texture *linearTexture(Buffer *b,uint32_t format,uint32_t usage,uint32_t width,uint32_t height,size_t offset,size_t row,bool=false) {

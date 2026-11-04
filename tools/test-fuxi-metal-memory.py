@@ -41,6 +41,7 @@ def main():
             assert p.returncode==0,p.stderr
             assert 'AddressSanitizer' not in p.stderr and 'runtime error:' not in p.stderr,p.stderr
             assert 'FUXI MTL: IOSurface plane import via shadow format=10 20x9 offset=0 row=40' in p.stderr,p.stderr
+            assert 'FUXI MTL: host import refused surface (Vulkan rc -2' in p.stderr and 'FUXI MTL: IOSurface copied, not imported: format=10 640x360 offset=64 row=640' in p.stderr,p.stderr
             assert 'backboardd gate' not in p.stderr,p.stderr
             print(p.stdout,end='')
 

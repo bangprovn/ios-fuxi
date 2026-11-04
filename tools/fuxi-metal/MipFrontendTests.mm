@@ -157,6 +157,24 @@ int main(){@autoreleasepool {
  y=(FuxiTexture *)[device newTextureWithDescriptor:luma iosurface:surface plane:0];assert(y && y->_texture->shadow && fuxi::Backend::importRow==800 && fuxi::Backend::importOffset==0);
  cbcr=(FuxiTexture *)[device newTextureWithDescriptor:chroma iosurface:surface plane:1];assert(cbcr && cbcr->_texture->shadow && fuxi::Backend::importOffset==1364800);
  [y release];[cbcr release];CFRelease(surface);assert(failureCount==hardFailures);
+ // v-yuv1 (YouTube in Safari): the host import refused (FuxiAdreno's import table full). A sampled plane or BGRA layer is copied by
+ // the CPU (modeled: hostSource set); a render target cannot be, and is refused softly.
+ fuxi::Backend::modelImportRefused=true;soft=softRefusalCount.load();
+ surface=IOSurfaceCreate((CFDictionaryRef)@{(id)kIOSurfaceWidth:@640,(id)kIOSurfaceHeight:@360,(id)kIOSurfacePixelFormat:@0x34323076,(id)kIOSurfaceAllocSize:@360448,
+  (id)kIOSurfacePlaneInfo:@[@{(id)kIOSurfacePlaneWidth:@640,(id)kIOSurfacePlaneHeight:@360,(id)kIOSurfacePlaneBytesPerElement:@1,(id)kIOSurfacePlaneBytesPerRow:@640,(id)kIOSurfacePlaneOffset:@64,(id)kIOSurfacePlaneSize:@235520},
+   @{(id)kIOSurfacePlaneWidth:@320,(id)kIOSurfacePlaneHeight:@180,(id)kIOSurfacePlaneBytesPerElement:@2,(id)kIOSurfacePlaneBytesPerRow:@640,(id)kIOSurfacePlaneOffset:@235584,(id)kIOSurfacePlaneSize:@115200}]});
+ assert(surface);luma.width=640;luma.height=360;chroma.width=320;chroma.height=180;
+ y=(FuxiTexture *)[device newTextureWithDescriptor:luma iosurface:surface plane:0];assert(y && y->_texture->hostSource==(uint8_t *)IOSurfaceGetBaseAddress(surface)+64 && y->_texture->shadow);
+ cbcr=(FuxiTexture *)[device newTextureWithDescriptor:chroma iosurface:surface plane:1];assert(cbcr && cbcr->_texture->hostSource==(uint8_t *)IOSurfaceGetBaseAddress(surface)+235584);
+ [y release];[cbcr release];CFRelease(surface);
+ surface=IOSurfaceCreate((CFDictionaryRef)@{(id)kIOSurfaceWidth:@66,(id)kIOSurfaceHeight:@45,(id)kIOSurfaceBytesPerElement:@4,(id)kIOSurfaceBytesPerRow:@320,(id)kIOSurfacePixelFormat:@0x42475241});
+ MTLTextureDescriptor *layer=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:66 height:45 mipmapped:NO];
+ layer.usage=MTLTextureUsageShaderRead;layer.storageMode=MTLStorageModeShared;
+ FuxiTexture *tile=(FuxiTexture *)[device newTextureWithDescriptor:layer iosurface:surface plane:0];
+ assert(surface && tile && tile->_texture->hostSource==IOSurfaceGetBaseAddress(surface) && fuxi::Backend::importRow==IOSurfaceGetBytesPerRow(surface));[tile release];
+ layer.usage=MTLTextureUsageShaderRead|MTLTextureUsageRenderTarget;assert(![device newTextureWithDescriptor:layer iosurface:surface plane:0]);
+ CFRelease(surface);fuxi::Backend::modelImportRefused=false;
+ assert(failureCount==hardFailures && softRefusalCount==soft+1);
  [modelPipeline release];[buffer release];[copy release];[nested release];[t release];assert(view.width==6);[view release];[q release];[device release];
  puts("PASS: native M9k descriptor/level transfers/views/blits/generation encoding/render attachment/private heap/purge/sampler/refusal controls");
 }}
