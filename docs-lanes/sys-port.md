@@ -13,6 +13,7 @@ boot-arg, ADT option or root-edit option, the kernel, ADT and root are unchanged
 | Sandbox extensions issued and consumed | same | boot-arg `fuxisbext=1` | Fuxi; HackiOS only returns success |
 | SpringBoard's frame rates: its in-process animations' display link, its animations through the window server | `tools/fuxi-sb/FuxiRates.c`, in `libfuxi-sb.dylib` | on where the library is installed; boot-arg `fxrate=0` turns it off, `1` and `2` one at a time | `hakios-xnu-kernel userland/src/inject_sb.c` (MIT) |
 | Every application above 60 a second (`CADisableMinimumFrameDurationOnPhone`), its Info.plist untouched | `tools/fuxi-sb/FuxiAppRate.c`, `libfuxi-app.dylib` | `fuxi-sys-root.py --app-rate` installs it; boot-arg `fxinj=1` (patch 0121) inserts it | Fuxi; the key from `hakios-xnu-kernel userland/mkhighrate.py`, kernel insertion as `xnu/hakios.patch` `kern.exec_inject` (MIT) |
+| CoreImage in applications with no OpenGL ES: a nil `CIContext` instead of the GL fallback's call to address 0 (Settings → Notifications crashed) | `tools/fuxi-sb/FuxiNoGL.c`, in `libfuxi-app.dylib` | as the row above | Fuxi |
 | HAL devices Speaker/Hawking/Actuator/Codec | `tools/fuxi-audio/` | `fuxi-sys-root.py --audio-plugin` (+ `--restore-virtualaudio`) | `hackios-xnu-userland userland/src/audio_plugin.c`, `audio_plugin.plist` (MIT) |
 | `/product/haptics`, `/product/camera` | `tools/mkadt-fuxi.py` | `--product-haptics`, `--product-camera` | `hackios-xnu-userland` loader/identity notes (MIT); values from the local D22AP tree |
 | App snapshots as JPEG/PNG, not ATX | `tools/fuxi-sb/` | `fuxi-sys-root.py --sb-snapshots`; boot-arg `fuxisbjpeg=0` turns it off again | `hackios-xnu-userland userland/src/inject_sb.c` (MIT) |
@@ -159,6 +160,15 @@ runningboardd's launchd job instead (the library hooking `-[RBLaunchdJobManager
 _generateDataWithIdentity:context:error:]`); launchd dropped the variable (above), so nothing loaded (r-v26: no
 line from runningboardd or any application, Settings' double-vsync share unchanged against `fxapp=0`).
 
+The same library carries `FuxiNoGL.c`. Applications get no Metal device (FuxiMetal's client gate), so
+`-[CIContext initWithOptions:]` falls back to `+[CIContext internalGLContextWithOptions:]`; CI::GLContext then
+calls the GL dispatch table of an EAGLContext that this phone cannot make (no OpenGL ES driver), at address 0.
+MobileIcons' icon scaler did so on every opening of Settings → Notifications (`CRASH Preferences sig 11 pc 0x0`,
+lr CoreImage+0x19c58c). The library replaces that one class method: when no EAGLContext for API 3 or 2 has a GL
+context behind it, it returns NULL, which `-initWithOptions:` already turns into a nil context, and MobileIcons
+draws the unscaled icon with CoreGraphics instead. It says
+`fuxi: NAME: CIContext asked for OpenGL ES, none on this phone: nil context, not a crash` once per process.
+
 ### Respawn-storm jobs (`--quiet-jobs`)
 
 - `observed`: `com.apple.nanotimekitcompaniond`. Observed: exec'd 55 times per boot on the m9j log. It
@@ -267,7 +277,10 @@ console with `tools/fuxi-xnu-monitor.py` and compare against the m9j baseline.
   and pre-disabled jobs, and `--app-rate` (the file, and v26's runningboardd entry taken out) and back.
 
 `tools/test-fuxi-apprate.py` compiles `FuxiAppRate.c` against a stub CF: the key set (also over NO), the
-library leaving `DYLD_INSERT_LIBRARIES`, no bundle. `tools/test-fuxi-inject.py` compiles `fuxi_exec_inject.h`:
+library leaving `DYLD_INSERT_LIBRARIES`, no bundle. `tools/test-fuxi-nogl.py` compiles `FuxiNoGL.c` against a
+stub runtime: the method replaced once CoreImage is loaded, NULL without OpenGL ES (no EAGLContext, or one with no
+GL context; asked once, said once), the original when OpenGL ES works, left alone when the method is missing.
+`tools/test-fuxi-inject.py` compiles `fuxi_exec_inject.h`:
 which paths count as applications (not `.appex`, helpers, daemons), the `fxinj` bits, SpringBoard, the
 environment string, and that 0121, the libraries and `fuxi-sys-root.py` use the same paths.
 

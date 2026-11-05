@@ -240,6 +240,7 @@ kernel() {
     python3 tools/test-fuxi-audio-dsp.py
     python3 tools/test-fuxi-rates.py
     python3 tools/test-fuxi-apprate.py
+    python3 tools/test-fuxi-nogl.py
     python3 tools/test-fuxi-inject.py
     python3 tools/sync-fuxi-inject.py --check
     python3 tools/test-fuxi-args.py

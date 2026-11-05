@@ -3,7 +3,8 @@
 #   OUT/FuxiAudio.driver   AudioServerPlugIn bundle for mediaserverd's HAL
 #   OUT/libfuxi-sb.dylib   SpringBoard (inserted by the kernel, fxinj bit 1): snapshot format, frame rates, no CoreTelephony
 #                          reconnect loop without CommCenter
-#   OUT/libfuxi-app.dylib  every application (inserted by the kernel, fxinj=1): CADisableMinimumFrameDurationOnPhone = YES
+#   OUT/libfuxi-app.dylib  every application (inserted by the kernel, fxinj=1): CADisableMinimumFrameDurationOnPhone = YES,
+#                          and a nil CIContext instead of CoreImage's OpenGL ES fallback when there is no OpenGL ES
 # Install them with tools/fuxi-sys-root.py (see docs-lanes/sys-port.md).
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -19,7 +20,7 @@ cp tools/fuxi-audio/Info.plist "$bundle/Info.plist"
 "$cc" "${flags[@]}" -bundle tools/fuxi-audio/FuxiAudio.c -framework CoreFoundation -o "$bundle/FuxiAudio"
 "$cc" "${flags[@]}" -dynamiclib tools/fuxi-sb/FuxiSnapshots.c tools/fuxi-sb/FuxiRates.c tools/fuxi-sb/FuxiTelephony.c -lobjc \
  -install_name /usr/local/lib/fuxi/libfuxi-sb.dylib -o "$out/libfuxi-sb.dylib"
-"$cc" "${flags[@]}" -dynamiclib tools/fuxi-sb/FuxiAppRate.c -framework CoreFoundation \
+"$cc" "${flags[@]}" -dynamiclib tools/fuxi-sb/FuxiAppRate.c tools/fuxi-sb/FuxiNoGL.c -framework CoreFoundation -lobjc \
  -install_name /usr/local/lib/fuxi/libfuxi-app.dylib -o "$out/libfuxi-app.dylib"
 for binary in "$bundle" "$out/libfuxi-sb.dylib" "$out/libfuxi-app.dylib"; do
  codesign -f -s - "$binary"
