@@ -18,6 +18,14 @@ int main(){
  limits.reserve(limits.single);limits.reserve(limits.single);bool refused=false;
  try{limits.reserve(1);}catch(const std::runtime_error&){refused=true;}assert(refused);
  limits.release(limits.single);limits.release(limits.single);assert(!limits.used);
+ // Imported client memory is its own account (v-imp2c): it leaves the own target whole; own past the target is an overdraft,
+ // bounded with the imports by the wired ceiling, and every refusal is a BudgetRefusal (nothing latched).
+ {fuxi::ResourceLimits split;split.reserveImport(213u<<20);assert(split.left()==split.target && split.used==0);
+  split.reserve(split.single);split.reserve(split.single);bool budget=false;try{split.reserve(1);}catch(const fuxi::BudgetRefusal&){budget=true;}assert(budget);
+  assert(split.overdraftFits(64u<<20) && !split.overdraftFits(split.single+1));
+  split.overdraft(64u<<20);assert(!split.left() && split.wiredLeft()==split.ceiling-split.used-split.imported);
+  budget=false;try{split.reserveImport(split.wiredLeft()+1);}catch(const fuxi::BudgetRefusal&){budget=true;}assert(budget);
+  split.release(split.used);split.releaseImport(split.imported);assert(!split.used && !split.imported);}
  assert(fuxi::scissorFits(1000,2300,80,100,1080,2400));
  assert(!fuxi::scissorFits(1000,2300,81,100,1080,2400) && !fuxi::scissorFits(huge,0,1,1,1080,2400));
  assert(fuxi::viewportFits(0,0,1080,2400,0,1,1080,2400));

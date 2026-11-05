@@ -9,6 +9,8 @@
 #include <unistd.h>
 template<class F> static std::string refuses(F f){try{f();}catch(const std::runtime_error &e){return e.what();}assert(false);return {};}
 static void transfers(fuxi::Backend &b){
+ // Exact byte accounting below: no slab sub-allocation (charged 0) and no pooled buffers (charged after destroy).
+ b.slabsEnabled=false;b.buffersPooled=false;
  auto baseline=b.resourceBytes();auto memory=fuxi::liveMemoryObjects.load();
  VkMemoryRequirements req{};req.alignment=64;req.memoryTypeBits=2;req.size=1024;
  VkSubresourceLayout layout{};layout.offset=8;layout.rowPitch=256;
@@ -77,7 +79,9 @@ static void transfers(fuxi::Backend &b){
  assert(!alias->shadow && alias->borrowedMemory && !alias->charged);b.destroy(buffer);b.destroy(alias);
  b.trimMemory();assert(b.resourceBytes()==baseline && fuxi::liveMemoryObjects==memory);
  // Force budget exhaustion only for the shadow, then prove rollback of the
- // attempted image and that the caller's existing buffer remains usable.
+ // attempted image and that the caller's existing buffer remains usable. The wired ceiling is set to the own target, so the
+ // shadow (a required allocation) has no overdraft to fall back on either.
+ b.setLimitsForTest(fuxi::ResourceLimits::budget,fuxi::ResourceLimits::importBudget,fuxi::ResourceLimits::budget);
  auto *small=b.allocate(128);std::vector<fuxi::Buffer *> ballast;
  while(b.resourceBytes()<fuxi::ResourceLimits::budget){size_t left=fuxi::ResourceLimits::budget-b.resourceBytes();ballast.push_back(b.allocate(std::min(left,fuxi::ResourceLimits::single)));}
  auto charged=b.resourceBytes();auto objects=fuxi::liveMemoryObjects.load();

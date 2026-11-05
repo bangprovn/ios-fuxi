@@ -23,7 +23,7 @@
 namespace fuxi {
 struct Buffer {void *contents;size_t length,allocated;bool upload=false;void *shadowKey() const{return contents;}};
 struct PrepareWrite {Buffer *buffer;uint64_t offset,bytes;};
-struct Texture : TextureLevels {size_t allocated{},charged{};uint32_t format=80;Buffer *backingBuffer{};size_t backingOffset{},backingRow{};bool shadow=false;const void *hostSource{};std::vector<uint8_t> pixels{};
+struct Texture : TextureLevels {size_t allocated{},charged{};bool imported=false;uint32_t format=80;Buffer *backingBuffer{};size_t backingOffset{},backingRow{};bool shadow=false;const void *hostSource{};std::vector<uint8_t> pixels{};
  size_t offset(uint32_t level) const {size_t o=0;for(uint32_t l=0;l<level;++l)o+=levelWidth(l)*levelHeight(l)*levelDepth(l)*metalTexelBytes(format);return o;}
 };
 struct Pipeline {ShadowWindow shadowWindows[2][resourceSlots]{};CompileOptions options{};bool sampled=false;size_t references=1;uint32_t textureSlots=0;};
@@ -63,6 +63,7 @@ public:
  void requireLive(){if(poisoned || backboardGate.refusesResources())throw std::runtime_error("device poisoned or backboardd failure latched");}
  uint32_t maxTextureDimension() const{return limits.dimension;}
  size_t resourceBytes() const{return limits.used;}
+ size_t importedBytes() const{return limits.imported;}
  ~Backend(){objects.clear([&](Pipeline *p){destroy(p);});}
  static inline bool modelTextures=false;
  static inline int live=0,submissions=0,constructed=0;std::atomic<bool> poisoned{false};
@@ -86,7 +87,9 @@ public:
   // modelImportRefused: the host import is refused (v-yuv1: FuxiAdreno's import table full). A sampled texture is then copied by the
   // CPU (production Backend::importHostCopy); any other use is refused.
   if(modelImportRefused && !sampledOnly)throw std::runtime_error("modeled host import refused");
-  limits.reserve(bytes);auto *t=new Texture{};t->format=format;t->width=width;t->height=height;t->allocated=t->charged=bytes;t->defined=true;t->shadow=sampledOnly && (row%64 || offset%64 || modelImportRefused);
+  // As production: an import charges the import account (client memory), a copy of a refused one the own budget.
+  if(modelImportRefused)limits.reserve(bytes);else limits.reserveImport(bytes);
+  auto *t=new Texture{};t->imported=!modelImportRefused;t->format=format;t->width=width;t->height=height;t->allocated=t->charged=bytes;t->defined=true;t->shadow=sampledOnly && (row%64 || offset%64 || modelImportRefused);
   if(modelImportRefused)t->hostSource=(const uint8_t *)base+offset;return t;
  }
  static inline bool modelImportRefused=false;
@@ -103,7 +106,7 @@ public:
   if(!modelTextures)throw std::runtime_error("M4 CPU model has no rendering");
   if(!textureShapeAccepted(type,height,usage,depth,levels))throw std::runtime_error("texture dimension/usage");
   if(!limits.extent(width,height,texelBytes(format)) || !limits.volume(width,height,depth,texelBytes(format)))throw std::runtime_error("extent");
-  auto *t=new Texture{};t->format=format;t->width=width;t->height=height;t->depth=depth;t->levels=levels;t->textureType=type;t->allocated=t->offset(levels);limits.reserve(t->allocated);t->charged=t->allocated;t->pixels.resize(t->allocated);return t;
+  auto *t=new Texture{};t->format=format;t->width=width;t->height=height;t->depth=depth;t->levels=levels;t->textureType=type;t->allocated=t->offset(levels);try{limits.reserve(t->allocated);}catch(...){delete t;throw;}t->charged=t->allocated;t->pixels.resize(t->allocated);return t;
  }
  Pipeline *compilePipeline(void *,const char *v,void *,const char *f,const CompileOptions &options=CompileOptions{}) {
   if(!modelPipelines)throw std::runtime_error("M4 CPU model has no translation");
@@ -113,7 +116,7 @@ public:
   if(auto *p=objects.acquire(key)){++pipelineHits;return p;}
   ++pipelineMisses;auto *p=new Pipeline{};p->options=options;objects.insert(key,key,p,sizeof(Pipeline),[&](Pipeline *old){destroy(old);});return p;
  }
- bool destroy(Texture *t) {if(t){limits.release(t->charged);delete t;}return !poisoned;}
+ bool destroy(Texture *t) {if(t){if(t->imported)limits.releaseImport(t->charged);else limits.release(t->charged);delete t;}return !poisoned;}
  void destroy(Pipeline *p) {if(p && !--p->references)delete p;}
  bool requiresSampling(const Pipeline *p) const {return p->sampled;}
  void submit(const std::vector<Operation>& ops,const std::function<void()> &scheduled={},std::function<void()> *retirement=nullptr,const std::function<void()> &prepare={},const std::vector<PrepareWrite> * =nullptr,const std::function<void()> & ={}) {

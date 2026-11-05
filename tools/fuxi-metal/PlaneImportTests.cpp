@@ -24,7 +24,7 @@ static void sentinels(const uint8_t *host,size_t bytes,const std::vector<Plane> 
  for(size_t i=0;i<bytes;++i)if(!used[i])assert(host[i]==0xa7);
 }
 int main(){
- Backend b;b.slabsEnabled=false;auto baseline=b.resourceBytes();
+ Backend b;b.slabsEnabled=false;auto baseline=b.resourceBytes(),importBaseline=b.importedBytes();
  if(!b.supportsHostImport()){puts("SKIP: plane imports require VK_EXT_external_memory_host");return 0;}
  // h-daily2's mediaserverd H.264 frame, 'v024' 332x198: plane 0 luma R8 at 64 with 384-byte rows, plane 1 CbCr RG8 166x99 at
  // 79936 with 384-byte rows, in a 131072-byte allocation. Both planes import the whole allocation and bind at their offset.
@@ -37,8 +37,9 @@ int main(){
   auto *c=b.importTexture(host,bytes,chroma.row,chroma.width,chroma.height,chroma.offset,24,chroma.format,true);
   assert(y!=c && y->imported && c->imported && !y->shadow && !c->shadow && y->tiling==VK_IMAGE_TILING_LINEAR && c->tiling==VK_IMAGE_TILING_LINEAR);
   assert(y->vkFormat==VK_FORMAT_R8_UNORM && c->vkFormat==VK_FORMAT_R8G8_UNORM && y->format==10 && c->format==30 && y->mapped==host && c->mapped==host);
-  // One import for the surface, shared by both planes (FuxiAdreno maps at most 512 imports at once).
-  assert(y->allocated==bytes && c->allocated==bytes && y->memory==c->memory && y->surfaceShared && c->surfaceShared && b.surfaceMemory.size()==1 && b.resourceBytes()==baseline+bytes);
+  // One import for the surface, shared by both planes (FuxiAdreno maps at most 512 imports at once), charged once to the import
+  // account (the client's pages), not to the own budget.
+  assert(y->allocated==bytes && c->allocated==bytes && y->memory==c->memory && y->surfaceShared && c->surfaceShared && b.surfaceMemory.size()==1 && b.resourceBytes()==baseline && b.importedBytes()==importBaseline+bytes);
   // Core Animation wraps the same planes every frame: one live import per plane.
   auto *again=b.importTexture(host,bytes,chroma.row,chroma.width,chroma.height,chroma.offset,24,chroma.format,true);
   assert(again==c && c->references==2 && surfaceImportHits==hits+1);b.destroy(again);
@@ -49,7 +50,7 @@ int main(){
   // A plane's own rows end inside the allocation; one that would run past it is refused before Vulkan.
   refuses([&]{b.importTexture(host,bytes,384,166,99,bytes-384*98,24,30,true);});
   assert(!b.poisoned && !backboardGate.blocked());
-  b.destroy(y);assert(b.surfaceMemory.size()==1);b.destroy(c);assert(b.surfaceMemory.empty());b.trimMemory();assert(b.resourceBytes()==baseline);free(host);
+  b.destroy(y);assert(b.surfaceMemory.size()==1 && b.importedBytes()==importBaseline+bytes);b.destroy(c);assert(b.surfaceMemory.empty() && b.importedBytes()==importBaseline);b.trimMemory();assert(b.resourceBytes()==baseline);free(host);
   puts("PASS: 420v planes R8 332x198 at 64 and RG8 166x99 at 79936 (rows 384) import in place into one shared surface import, share per plane, read both frames");
  }
  // SpringBoard's 420f snapshots have 800-byte rows (788x1706, plane 1 at 1364800), which no linear image can alias in place (Turnip
@@ -71,7 +72,7 @@ int main(){
   sentinels((const uint8_t *)host,bytes,{luma,chroma});
   // A shadow is read only: a GPU write to it is refused (and the submit with it), as for any linear texture shadow.
   auto *up=b.allocate(256);Operation write{};write.texture=y;write.src=up;write.upload=true;refuses([&]{b.submit({write});});b.destroy(up);
-  b.destroy(y);b.destroy(c);b.trimMemory();assert(b.resourceBytes()==baseline);free(host);
+  b.destroy(y);b.destroy(c);b.trimMemory();assert(b.resourceBytes()==baseline && b.importedBytes()==importBaseline);free(host);
   puts("PASS: 420f-shaped planes with 40-byte rows: refused for rendering, sampled through a refreshed shadow, shared, both frames");
  }
  // v-yuv1 (YouTube in Safari): FuxiAdreno's 512 imports were all live, so BoMap failed and Turnip answered VK_ERROR_OUT_OF_DEVICE_MEMORY
@@ -116,9 +117,9 @@ int main(){
   b.importBackoffUntil=0;auto objects=liveMemoryObjects.load();
   y=b.importTexture(host,bytes,luma.row,luma.width,luma.height,luma.offset,53,luma.format,true);
   c=b.importTexture(host,bytes,chroma.row,chroma.width,chroma.height,chroma.offset,53,chroma.format,true);
-  assert(y->imported && c->imported && !y->hostSource && y->memory==c->memory && b.surfaceMemory.size()==1 && liveMemoryObjects==objects+1 && b.resourceBytes()==baseline+bytes);
+  assert(y->imported && c->imported && !y->hostSource && y->memory==c->memory && b.surfaceMemory.size()==1 && liveMemoryObjects==objects+1 && b.resourceBytes()==baseline && b.importedBytes()==importBaseline+bytes);
   readBack(b,y,luma,3);readBack(b,c,chroma,3);
-  b.destroy(y);b.destroy(c);assert(b.surfaceMemory.empty());b.trimMemory();assert(b.resourceBytes()==baseline && liveMemoryObjects==objects);
+  b.destroy(y);b.destroy(c);assert(b.surfaceMemory.empty());b.trimMemory();assert(b.resourceBytes()==baseline && b.importedBytes()==importBaseline && liveMemoryObjects==objects);
   free(host);free(tile);
   puts("PASS: refused host imports: 640x360 420v planes and a 66x45 BGRA layer copied and refreshed per changed frame, render targets still imported, backoff, shared import after it");
  }

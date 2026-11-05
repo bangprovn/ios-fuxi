@@ -217,6 +217,13 @@ class Backend {
    fprintf(stderr,"FUXI MTL: cache period surfaces shared_imports=%zu shared_images=%zu host_import_failures=%llu backoff=%d copied_textures=%llu copies=%llu copied_kb=%llu\n",
     surfaceMemory.size(),[&]{size_t n=0;for(auto &e:surfaceMemory)n+=e.second.references;return n;}(),(unsigned long long)hostImportFailures,int(importBackoff()),
     (unsigned long long)hostCopyTextures,(unsigned long long)hostCopies,(unsigned long long)(hostCopyBytes>>10));
+  // The two byte accounts (ResourceLimits): own now/peak this period against its target, imported client memory now/peak against its
+  // cap, both under the wired ceiling; cumulative overdrafts (own past the target), refusals at the ceiling, import account refusals,
+  // optional refusals and sheds. A gate runtime-failure from the budget needs refused>0 here first.
+  fprintf(stderr,"FUXI MTL: cache period budget own_mb=%zu own_peak_mb=%zu target_mb=%zu imported_mb=%zu imported_peak_mb=%zu import_cap_mb=%zu ceiling_mb=%zu overdrafts=%llu overdraft_peak_mb=%zu refused=%llu import_refused=%llu optional_refused=%llu sheds=%llu submit_sheds=%llu\n",
+   limits.used>>20,limits.usedPeak>>20,limits.target>>20,limits.imported>>20,limits.importedPeak>>20,limits.importCap>>20,limits.ceiling>>20,
+   (unsigned long long)budgetOverdrafts,overdraftPeak>>20,(unsigned long long)budgetRefusals,(unsigned long long)importBudgetRefusals,(unsigned long long)optionalRefusals,(unsigned long long)optionalSheds,(unsigned long long)submitSheds);
+  limits.resetPeaks();
   {size_t variants=0,largest=0,largestVariants=0;objects.each([&](Pipeline *p,size_t n){variants+=p->variants.size();if(n>largest){largest=n;largestVariants=p->variants.size();}});
    fprintf(stderr,"FUXI MTL: cache period object bytes live=%zu variants=%zu avg_kb=%zu largest_kb=%zu largest_variants=%zu (entry bytes include runtime variants: each variant is a full pipeline, up to 8 per entry)\n",objects.count(),variants,objects.count()?objects.totalBytes()/objects.count()/1024:0,largest/1024,largestVariants);}
   driverHits=driverMisses=driverUnknown=objectHits=objectMisses=0;return checkpoint;
@@ -248,12 +255,15 @@ private:
   slabMemory.trim(now,all,[&](VkDeviceMemory h,size_t bytes){freePooledUnlocked(h,bytes);});
  }
  void freePooledUnlocked(VkDeviceMemory h,size_t bytes){frameKernelCall([&]{FreeMemory(device,h,nullptr);});--liveMemoryObjects;liveMemoryBytes-=bytes;limits.release(bytes);}
- // Optional features (rename pool, render target shadows) allocate with optionalAlloc set: they may only use budget minus optionalHeadroom, so CA's own textures always keep room.
- // A CA allocation that would be rejected first sheds the pool, then the shadows (never while a submit is rewriting ops that point at them), and only then fails.
+ // Optional features (rename pool, render target shadows, sample shadows, copies of refused imports) allocate with optionalAlloc set:
+ // they may only use the own target minus optionalHeadroom, so CA's own textures always keep room.
+ // A CA allocation that would be rejected first sheds the pool, then the shadows (never while a submit is rewriting ops that point at
+ // them). Still short, it goes past the target (an overdraft) as long as FuxiAdreno can wire it (ResourceLimits::ceiling, own +
+ // imported); only past that is it refused, with a BudgetRefusal (newTextureWithDescriptor: then fails that texture only).
  static constexpr size_t optionalHeadroom=64u<<20;
- bool optionalAlloc=false,inSubmit=false;uint64_t optionalRefusals=0,optionalSheds=0;
+ bool optionalAlloc=false,inSubmit=false;uint64_t optionalRefusals=0,optionalSheds=0,budgetOverdrafts=0,budgetRefusals=0;size_t overdraftPeak=0;
  void reserveMemoryUnlocked(size_t bytes){
-  const size_t cap=optionalAlloc?ResourceLimits::budget-optionalHeadroom:ResourceLimits::budget;
+  const size_t cap=optionalAlloc?(limits.target>optionalHeadroom?limits.target-optionalHeadroom:0):limits.target;
   auto shortBy=[&]()->size_t{return limits.used+bytes>cap?limits.used+bytes-cap:0;};
   auto reclaim=[&](){
    if(shortBy() && !poisoned)trimBuffers(0,false,shortBy());
@@ -264,11 +274,33 @@ private:
    if(!sampleShadows.empty()){releaseSampleShadows();++optionalSheds;reclaim();}
    if(!renamePool.empty()){releaseRenamePool();++optionalSheds;reclaim();}
    if(shortBy() && !rtShadows.empty()){releaseRtShadows();++optionalSheds;reclaim();}
-   if(optionalSheds)fprintf(stderr,"FUXI MTL: budget pressure shed optional memory (sheds=%llu used=%zu need=%zu)\n",(unsigned long long)optionalSheds,limits.used,bytes);
+   if(optionalSheds)fprintf(stderr,"FUXI MTL: budget pressure shed optional memory (sheds=%llu used=%zu imported=%zu need=%zu)\n",(unsigned long long)optionalSheds,limits.used,limits.imported,bytes);
   }
-  if(optionalAlloc && shortBy()){++optionalRefusals;throw std::runtime_error("optional feature headroom");}
+  if(optionalAlloc && shortBy()){++optionalRefusals;throw BudgetRefusal("optional feature headroom");}
+  if(shortBy()){
+   if(!limits.overdraftFits(bytes)){
+    const uint64_t n=++budgetRefusals;
+    if(logSampled(n))fprintf(stderr,"FUXI MTL: budget refused need=%zu used=%zu imported=%zu ceiling=%zu in_submit=%d count=%llu (FuxiAdreno could not wire it)\n",bytes,limits.used,limits.imported,limits.ceiling,int(inSubmit),(unsigned long long)n);
+    throw BudgetRefusal("resource byte budget");
+   }
+   const size_t before=limits.used;limits.overdraft(bytes);overdraftPeak=std::max(overdraftPeak,limits.used-std::min(limits.used,limits.target));
+   const uint64_t n=++budgetOverdrafts;
+   if(logSampled(n))fprintf(stderr,"FUXI MTL: budget overdraft need=%zu used=%zu->%zu target=%zu imported=%zu ceiling=%zu in_submit=%d count=%llu (a client allocation past the own target, nothing optional left)\n",bytes,before,limits.used,limits.target,limits.imported,limits.ceiling,int(inSubmit),(unsigned long long)n);
+   return;
+  }
   limits.reserve(bytes);
  }
+ // Client memory a host import pins (an IOSurface, a no-copy buffer): its own account (ResourceLimits::importCap), never the own
+ // target, so a page full of Safari surfaces cannot starve CA's own textures. A refusal here is this accounting, not the kernel's,
+ // so it starts no host import backoff: a sampled surface is copied (as optional memory), anything else fails alone.
+ uint64_t importBudgetRefusals=0;
+ void reserveImportUnlocked(size_t bytes,const char *what){
+  if(limits.importFits(bytes)){limits.reserveImport(bytes);return;}
+  const uint64_t n=++importBudgetRefusals;
+  if(logSampled(n))fprintf(stderr,"FUXI MTL: import byte budget full %s need=%zu imported=%zu import_cap=%zu used=%zu ceiling=%zu count=%llu (this import only, no backoff)\n",what,bytes,limits.imported,limits.importCap,limits.used,limits.ceiling,(unsigned long long)n);
+  throw BudgetRefusal("import byte budget");
+ }
+ static bool budgetRefusal(const std::exception &e){return dynamic_cast<const BudgetRefusal *>(&e)!=nullptr;}
  // A submit may not shed (its rewritten ops point at the shadows), so an IOSurface import inside one that finds the budget full
  // fails backboardd over to the CPU (d-v12-rtb: 1125x2436 import, no shed). Before the rewrite nothing points at them yet: with
  // under submitHeadroom left, the optional memory goes here instead.
@@ -277,9 +309,9 @@ private:
  static constexpr size_t submitHeadroom=16u<<20;
  uint64_t submitSheds=0;
  void shedBeforeSubmit() {
-  if(poisoned || ResourceLimits::budget-limits.used>=submitHeadroom)return;
+  if(poisoned || limits.left()>=submitHeadroom)return;
   const size_t before=limits.used;
-  auto shortBy=[&]()->size_t{size_t left=ResourceLimits::budget-limits.used;return left<submitHeadroom?submitHeadroom-left:0;};
+  auto shortBy=[&]()->size_t{size_t left=limits.left();return left<submitHeadroom?submitHeadroom-left:0;};
   // Released textures may sit in the recycling pools still charged; hand back what the headroom needs.
   auto reclaim=[&](){
    if(shortBy())textureMemory.reclaim(shortBy(),[&](VkDeviceMemory h,size_t n){freePooledUnlocked(h,n);});
@@ -298,7 +330,7 @@ private:
   }
   if(before==limits.used)return;
   ++submitSheds;
-  fprintf(stderr,"FUXI MTL: budget pressure shed optional memory before submit (sheds=%llu evicted=%u used=%zu->%zu)\n",(unsigned long long)submitSheds,evicted,before,limits.used);
+  fprintf(stderr,"FUXI MTL: budget pressure shed optional memory before submit (sheds=%llu evicted=%u used=%zu->%zu imported=%zu)\n",(unsigned long long)submitSheds,evicted,before,limits.used,limits.imported);
  }
  struct OptionalScope {Backend &b;bool old;explicit OptionalScope(Backend &x):b(x),old(x.optionalAlloc){b.optionalAlloc=true;}~OptionalScope(){b.optionalAlloc=old;}};
  // Two independently resettable lanes. A busy lane belongs to its retirement.
@@ -502,6 +534,14 @@ public:
  uint32_t maxTextureDimension() const{return limits.dimension;}
  uint64_t optionalShedCount() const{return optionalSheds;}
  size_t resourceBytes() const{std::lock_guard<std::mutex> guard(mutex);return limits.used;}
+ // Client memory pinned by host imports (IOSurfaces, no-copy buffers): not in resourceBytes().
+ size_t importedBytes() const{std::lock_guard<std::mutex> guard(mutex);return limits.imported;}
+ struct BudgetCounts {uint64_t overdrafts,refused,importRefused,optionalRefused;};
+ BudgetCounts budgetCounts() const{std::lock_guard<std::mutex> guard(mutex);return {budgetOverdrafts,budgetRefusals,importBudgetRefusals,optionalRefusals};}
+#ifdef FUXI_MTL_HOST_TEST
+ // Shrinks the own target, the import cap and the ceiling (ResourceLimits) so a host test reaches them with little memory.
+ void setLimitsForTest(size_t target,size_t importCap,size_t ceiling){std::lock_guard<std::mutex> guard(mutex);limits.target=target;limits.importCap=importCap;limits.ceiling=ceiling;}
+#endif
  bool supportsTimestamps() const{return timestampBits && timestampPeriod>0;}
  explicit Backend(const char *client="unknown") {
   setenv("TU_DARWIN_SERVICE","NativeAdrenoGpuPublished",1);
@@ -543,7 +583,8 @@ public:
    if(props.deviceType!=VK_PHYSICAL_DEVICE_TYPE_CPU || strncmp(props.deviceName,"llvmpipe",8))throw std::runtime_error("offline qualifier requires lavapipe CPU device");
 #endif
    limits=ResourceLimits(props.limits.maxImageDimension2D);timestampPeriod=props.limits.timestampPeriod;
-   fprintf(stderr,"FUXI MTL: texture limits dimension=%u budget=%zu MiB\n",limits.dimension,ResourceLimits::budget/(1024*1024));
+   fprintf(stderr,"FUXI MTL: texture limits dimension=%u budget=%zu MiB import_budget=%zu MiB wired_ceiling=%zu MiB (FuxiAdreno quota %zu MiB; imported client memory is not in the budget)\n",
+    limits.dimension,limits.target>>20,limits.importCap>>20,limits.ceiling>>20,ResourceLimits::kernelWired>>20);
    GetPhysicalDeviceMemoryProperties(physical,&memory);
    VkFormatProperties format{};GetPhysicalDeviceFormatProperties(physical,VK_FORMAT_B8G8R8A8_UNORM,&format);
    linearFeatures=format.linearTilingFeatures;optimalFeatures=format.optimalTilingFeatures;
@@ -743,13 +784,14 @@ public:
    if(type==memory.memoryTypeCount)throw std::runtime_error("no-copy buffer memory type");
    VkImportMemoryHostPointerInfoEXT hi{};hi.sType=VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;hi.handleType=VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;hi.pHostPointer=(void *)plan.base;
    VkMemoryAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;ai.pNext=&hi;ai.allocationSize=plan.bytes;ai.memoryTypeIndex=type;
-   reserveMemoryUnlocked(ai.allocationSize);b->charged=ai.allocationSize;
+   // Client pages (destroyUnlocked releases an imported buffer's charge from the import account).
+   reserveImportUnlocked(ai.allocationSize,"buffer");b->charged=ai.allocationSize;
 #ifdef FUXI_MTL_HOST_TEST
    if(failHostImportsForTest){--failHostImportsForTest;importCheck(VK_ERROR_OUT_OF_DEVICE_MEMORY);}
 #endif
    importCheck(frameKernelCall([&]{return AllocateMemory(device,&ai,nullptr,&b->memory);}));if(systemTranslationPolicy().frameTrace)++frameCounts.allocations;++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;b->memoryBytes=ai.allocationSize;b->allocated=bytes;b->memoryType=type;check(frameKernelCall([&]{return BindBufferMemory(device,b->buffer,b->memory,plan.offset);}));
    check(frameKernelCall([&]{return MapMemory(device,b->memory,0,VK_WHOLE_SIZE,0,&b->contents);}));b->contents=(uint8_t *)b->contents+plan.offset;return b;
-  }catch(const std::exception &e){++HostImportStats::refusedVulkan;destroyUnlocked(b);if(!poisoned && !backboardGate.blocked())noteImportFailureUnlocked("buffer",e.what());throw;}
+  }catch(const std::exception &e){const bool budget=budgetRefusal(e);if(!budget)++HostImportStats::refusedVulkan;destroyUnlocked(b);if(!poisoned && !backboardGate.blocked() && !budget)noteImportFailureUnlocked("buffer",e.what());throw;}
  }
  static std::string linearAliasMismatch(const VkMemoryRequirements &req,const VkSubresourceLayout &layout,uint32_t memoryType,size_t allocated,size_t offset,size_t row,size_t memoryOffset=0) {
    std::string mismatch;
@@ -858,7 +900,7 @@ public:
    if(b->buffer){reuseForget(handleKey(b->buffer));DestroyBuffer(device,b->buffer,nullptr);}
    if(b->memory) {frameKernelCall([&]{return FreeMemory(device,b->memory,nullptr);});--liveMemoryObjects;liveMemoryBytes-=b->memoryBytes;if(!b->imported)tailPadBytes-=b->memoryBytes-b->allocated;}
   }
-  limits.release(b->charged);delete b;
+  if(b->imported)limits.releaseImport(b->charged);else limits.release(b->charged);delete b;
  }
  void destroy(Buffer *b) {std::lock_guard<std::mutex> guard(mutex);destroyUnlocked(b);}
  bool destroy(Texture *t) {
@@ -873,7 +915,7 @@ public:
    else {frameKernelCall([&]{return FreeMemory(device,t->memory,nullptr);});--liveMemoryObjects;liveMemoryBytes-=t->memoryBytes;}
   }
    if(t->surfaceShared)releaseSurfaceMemoryUnlocked(t->surfaceKey); // after its image: the shared import outlives every image bound to it
-  }limits.release(t->charged);destroyUnlocked(t->backingBuffer);if(!t->backingBuffer)rtForget(t);delete t;return !poisoned;
+  }if(t->imported)limits.releaseImport(t->charged);else limits.release(t->charged);destroyUnlocked(t->backingBuffer);if(!t->backingBuffer)rtForget(t);delete t;return !poisoned;
  }
  bool supportsHostImport() const {return hostImport && hostAlignment && GetMemoryHostPointerPropertiesEXT && GetPhysicalDeviceImageFormatProperties2;}
  bool supportsExplicitPitch() const {return supportsHostImport() && explicitPitch;}
@@ -1004,15 +1046,16 @@ public:
     VkMemoryAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;ai.pNext=&hi;ai.allocationSize=bytes;ai.memoryTypeIndex=type;
     // Import/charge the whole surface once, binding each image at its plane's offset. A host import the kernel refuses (FuxiAdreno
     // BoImport or BoMap: Turnip answers VK_ERROR_OUT_OF_DEVICE_MEMORY or INVALID_EXTERNAL_HANDLE) refuses this import only.
-    reserveMemoryUnlocked(bytes);VkDeviceMemory imported{};void *mapped=nullptr;
+    // The surface's pages are the client's: charged to the import account (once per surface), never to the own budget.
+    reserveImportUnlocked(bytes,"surface");VkDeviceMemory imported{};void *mapped=nullptr;
     auto result=frameKernelCall([&]{return AllocateMemory(device,&ai,nullptr,&imported);});
 #ifdef FUXI_MTL_HOST_TEST
     if(result==VK_SUCCESS && failHostImportsForTest){--failHostImportsForTest;FreeMemory(device,imported,nullptr);imported=VK_NULL_HANDLE;result=VK_ERROR_OUT_OF_DEVICE_MEMORY;}
 #endif
-    if(result!=VK_SUCCESS){limits.release(bytes);importCheck(result);}
+    if(result!=VK_SUCCESS){limits.releaseImport(bytes);importCheck(result);}
     if(systemTranslationPolicy().frameTrace)++frameCounts.allocations;++liveMemoryObjects;liveMemoryBytes+=bytes;
     auto mappedResult=frameKernelCall([&]{return MapMemory(device,imported,0,VK_WHOLE_SIZE,0,&mapped);});
-    if(mappedResult!=VK_SUCCESS){frameKernelCall([&]{FreeMemory(device,imported,nullptr);});--liveMemoryObjects;liveMemoryBytes-=bytes;limits.release(bytes);check(mappedResult);}
+    if(mappedResult!=VK_SUCCESS){frameKernelCall([&]{FreeMemory(device,imported,nullptr);});--liveMemoryObjects;liveMemoryBytes-=bytes;limits.releaseImport(bytes);check(mappedResult);}
     if(identity)shared=surfaceMemory.emplace(surfaceKey,SurfaceMemory{imported,mapped,bytes,0,type}).first;
     else {t->memory=imported;t->mapped=mapped;t->memoryType=type;t->charged=bytes;t->memoryBytes=bytes;}
    }
@@ -1024,7 +1067,8 @@ public:
    vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};check(CreateImageView(device,&vi,nullptr,&t->view));if(identity){t->importKey=key;t->importCached=true;imports.emplace(key,t);}return t;
   }catch(const std::exception &e) {
    const bool fault=poisoned || backboardGate.blocked();
-   if(!fault)noteImportFailureUnlocked("surface",e.what());
+   // The import account being full is no kernel refusal: no backoff (the next surface may fit, and trying costs no kernel call).
+   if(!fault && !budgetRefusal(e))noteImportFailureUnlocked("surface",e.what());
    guard.unlock();destroy(t);
    if(fault || !sampledOnly)throw;
    return importHostCopy(base,bytes,row,width,height,offset,identity,format,copyKey,e.what());
@@ -1035,7 +1079,7 @@ public:
   auto it=surfaceMemory.find(surfaceKey);if(it==surfaceMemory.end() || --it->second.references)return;
   auto s=it->second;surfaceMemory.erase(it);
   frameKernelCall([&]{return UnmapMemory(device,s.memory);});frameKernelCall([&]{FreeMemory(device,s.memory,nullptr);});
-  --liveMemoryObjects;liveMemoryBytes-=s.bytes;limits.release(s.bytes);
+  --liveMemoryObjects;liveMemoryBytes-=s.bytes;limits.releaseImport(s.bytes);
  }
  // importTexture's sampled fallback (no lock held): the whole surface imported as a buffer and a linear texture over it at the plane's
  // offset and row, which linearTexture aliases when Turnip can and otherwise backs with an optimal shadow refreshed from those rows.
@@ -1065,6 +1109,9 @@ public:
   if(identity){auto hit=imports.find(copyKey);if(hit!=imports.end()){++hit->second->references;++surfaceImportHits;return hit->second;}}
   const size_t texel=texelBytes(format),rowBytes=size_t(width)*texel,copyRow=(rowBytes+63)&~size_t(63);
   if(!base || !limits.rows(width,height,texel,row,offset,bytes))throw std::runtime_error("IOSurface copy rows outside the surface");
+  // The copy is owned memory standing in for the client's: optional, below the headroom CA's own textures keep (v-imp2c: copies made
+  // under a full budget took the last of it). Refused, this texture fails alone (BudgetRefusal "optional feature headroom").
+  OptionalScope optional(*this);
   Buffer *b=allocateUnlocked(copyRow*height);Texture *t=nullptr;
   try {t=allocateTextureUnlocked(format,1,width,height);}catch(...){destroyUnlocked(b);throw;}
   t->shadow=true;b->shadowBacking=true;t->backingBuffer=b;t->backingOffset=0;t->backingRow=copyRow;
@@ -1094,9 +1141,10 @@ public:
   if(r==SlabMemory<VkDeviceMemory>::grow){
    constexpr uint64_t slab=SlabMemory<VkDeviceMemory>::slabSize;
    if(!slabMemory.canGrow())return false;
-   if(slab>ResourceLimits::budget-limits.used){textureMemory.reclaim(slab-(ResourceLimits::budget-limits.used),[&](VkDeviceMemory h,size_t n){freePooledUnlocked(h,n);});}
-   if(slab>ResourceLimits::budget-limits.used)slabMemory.reclaim(slab-(ResourceLimits::budget-limits.used),[&](VkDeviceMemory h,size_t n){freePooledUnlocked(h,n);});
-   if(slab>ResourceLimits::budget-limits.used)return false;
+   // A new slab only fits under the own target (left() is 0 while over it: no slab grows in an overdraft).
+   if(slab>limits.left()){textureMemory.reclaim(slab-limits.left(),[&](VkDeviceMemory h,size_t n){freePooledUnlocked(h,n);});}
+   if(slab>limits.left())slabMemory.reclaim(slab-limits.left(),[&](VkDeviceMemory h,size_t n){freePooledUnlocked(h,n);});
+   if(slab>limits.left() || slab>limits.wiredLeft())return false;
    VkMemoryAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;ai.allocationSize=slab;ai.memoryTypeIndex=memoryType;VkDeviceMemory m{};
    auto result=frameKernelCall([&]{return AllocateMemory(device,&ai,nullptr,&m);});
    if(result!=VK_SUCCESS)return false;

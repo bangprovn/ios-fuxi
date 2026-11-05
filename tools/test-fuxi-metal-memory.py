@@ -44,6 +44,20 @@ def main():
             assert 'FUXI MTL: host import refused surface (Vulkan rc -2' in p.stderr and 'FUXI MTL: IOSurface copied, not imported: format=10 640x360 offset=64 row=640' in p.stderr,p.stderr
             assert 'backboardd gate' not in p.stderr,p.stderr
             print(p.stdout,end='')
+        # The two byte accounts (v-imp2c, 5 Nov): imports apart from the own target, copies as optional memory, overdraft, ceiling.
+        subprocess.run(common+['-fsanitize=address,undefined','-DFUXI_MTL_HOST_TEST',
+            '-DFUXI_MTL_ICD="'+str(d/'proxy.so')+'"',str(ROOT/'tools/fuxi-metal/BudgetTests.cpp'),
+            '-ldl','-pthread','-o',str(d/'budget')],check=True)
+        env=dict(os.environ,ASAN_OPTIONS='detect_leaks=0',LP_NUM_THREADS='2',SOFTWARE_ICD=str(args.icd))
+        p=subprocess.run([str(d/'budget')],env=env,text=True,capture_output=True,timeout=120)
+        assert p.returncode==0,p.stderr
+        assert 'AddressSanitizer' not in p.stderr and 'runtime error:' not in p.stderr,p.stderr
+        for line in ('FUXI MTL: import byte budget full surface need=4194304','FUXI MTL: import byte budget full buffer need=4194304',
+                     'FUXI MTL: IOSurface copied, not imported: format=80 512x2048 offset=0 row=2048 count=1 reason=import byte budget',
+                     'FUXI MTL: budget overdraft need=','FUXI MTL: budget refused need='):
+            assert line in p.stderr,(line,p.stderr)
+        assert 'backboardd gate' not in p.stderr and 'host import refused' not in p.stderr,p.stderr
+        print(p.stdout,end='')
 
 
 if __name__=='__main__':main()

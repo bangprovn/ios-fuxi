@@ -1951,7 +1951,17 @@ static NSString *surfaceDescriptorText(IOSurfaceRef surface,NSUInteger plane){
  if(clientMode==fuxi::ClientMode::census)return nil;
  if(!textureDescriptorAccepted(d,owner(self)->backend->maxTextureDimension()))return nil;
  FuxiTexture *t=[FuxiTexture new];t->_descriptorText=[textureDescriptorText(d) copy];t->_cacheMode=d.cpuCacheMode;t->_device=[self retain];t->_usage=d.usage;t->_shared=d.storageMode==MTLStorageModeShared;t->_memoryless=d.storageMode==MTLStorageModeMemoryless;
- try {t->_texture=owner(self)->backend->allocateTexture((uint32_t)d.pixelFormat,(uint32_t)d.usage,(uint32_t)d.width,(uint32_t)d.height,(uint32_t)d.mipmapLevelCount,(uint32_t)d.textureType,(uint32_t)d.depth);}catch(const std::exception &e) {failureLog("FUXI MTL: texture reject allocation 0 desc=%s reason=%s\n",textureDescriptorText(d).UTF8String,e.what());[t release];return nil;}return t;
+ try {t->_texture=owner(self)->backend->allocateTexture((uint32_t)d.pixelFormat,(uint32_t)d.usage,(uint32_t)d.width,(uint32_t)d.height,(uint32_t)d.mipmapLevelCount,(uint32_t)d.textureType,(uint32_t)d.depth);}
+ catch(const fuxi::BudgetRefusal &e) {
+  // FuxiMetal's own byte accounting refused it after shedding everything optional and past the overdraft FuxiAdreno could still wire
+  // (Backend::reserveMemoryUnlocked): no Vulkan call failed, so this texture fails alone, as a real device answers nil when out of
+  // memory. v-imp2c (5 Nov): CA's 284x93 texture refused this way latched backboardd onto the CPU for the rest of the boot.
+  if(fuxi::backboardGate.blocked() || owner(self)->backend->poisoned)failureLog("FUXI MTL: texture reject allocation 0 desc=%s reason=%s\n",textureDescriptorText(d).UTF8String,e.what());
+  else {char kind[128];snprintf(kind,sizeof kind,"allocation format=%lu %.48s",(unsigned long)d.pixelFormat,e.what());
+   softRefusal(kind,"FUXI MTL: texture reject allocation 0 desc=%s reason=%s",textureDescriptorText(d).UTF8String,e.what());}
+  [t release];return nil;
+ }
+ catch(const std::exception &e) {failureLog("FUXI MTL: texture reject allocation 0 desc=%s reason=%s\n",textureDescriptorText(d).UTF8String,e.what());[t release];return nil;}return t;
 }
 - (id)newTextureWithBytesNoCopy:(void *)bytes length:(NSUInteger)length descriptor:(MTLTextureDescriptor *)d deallocator:(void (^)(void *,NSUInteger))deallocator {CENSUS();FUXI_PHASE(newTexture);
  (void)bytes;(void)deallocator;

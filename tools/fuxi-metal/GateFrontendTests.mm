@@ -152,6 +152,21 @@ int main() {
     assert(luma && luma.iosurfacePlane==0 && fuxi::Backend::importOffset==64);
     assert(!fuxi::backboardGate.blocked() && backboardExits==0 && failureCount==failures && good());
     [luma release];CFRelease(video);[surfaceDevice release];}
+   // A texture FuxiMetal's own byte accounting refuses (BudgetRefusal: no Vulkan call failed) fails alone too. v-imp2c (5 Nov): CA's
+   // 284x93 texture, refused by a budget full of Safari's surfaces, latched backboardd onto the CPU for the rest of the boot.
+   {id budgetDevice=[cls alloc];FuxiOwner *budgetState=[FuxiOwner new];budgetState->backend=new fuxi::Backend;
+    objc_setAssociatedObject(budgetDevice,&ownerKey,budgetState,OBJC_ASSOCIATION_RETAIN_NONATOMIC);[budgetState release];
+    budgetState->backend->limits.target=1u<<20; // the model's own target: 1 MiB
+    auto failures=failureCount.load();auto soft=softRefusalCount.load();
+    MTLTextureDescriptor *small=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:284 height:93 mipmapped:NO];
+    small.usage=MTLTextureUsageShaderRead|MTLTextureUsageRenderTarget;small.storageMode=MTLStorageModePrivate;
+    MTLTextureDescriptor *large=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:1024 height:1024 mipmapped:NO];
+    large.usage=MTLTextureUsageShaderRead|MTLTextureUsageRenderTarget;large.storageMode=MTLStorageModePrivate;
+    id first=[budgetDevice newTextureWithDescriptor:small];assert(first);
+    assert(![budgetDevice newTextureWithDescriptor:large] && ![budgetDevice newTextureWithDescriptor:large]);
+    assert(!fuxi::backboardGate.blocked() && backboardExits==0 && failureCount==failures && softRefusalCount==soft+2 && good());
+    id second=[budgetDevice newTextureWithDescriptor:small];assert(second);
+    [first release];[second release];[budgetDevice release];}
    // Even a failure after qualification and beyond the ordinary log cap latches.
    failureCount=64;failureLog("test failure after good\n");assert(fuxi::backboardGate.blocked());
    // A latched render server exits so launchd respawns it on the CPU path.

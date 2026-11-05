@@ -4,9 +4,10 @@
 #include <cstdio>
 template<class F> static void refuses(F body){bool failed=false;try{body();}catch(const std::runtime_error&){failed=true;}assert(failed);}
 int main(int argc,char **argv){
- fuxi::Backend backend;assert(!strcmp(getenv("TU_DEBUG"),argc==2?argv[1]:"sysmem,nocb"));
+ fuxi::Backend backend;backend.slabsEnabled=false;backend.buffersPooled=false; // exact byte accounting: no slabs, no pooled buffers
+ assert(!strcmp(getenv("TU_DEBUG"),argc==2?argv[1]:"sysmem,nocb"));
  if(argc==2){puts("PASS: Backend preserves the TU_DEBUG override");return 0;}
- auto baseline=backend.resourceBytes();
+ auto baseline=backend.resourceBytes(),importBaseline=backend.importedBytes();
  // Even corrupt internal render records cannot load the translator or bind a
  // null Vulkan pipeline. A marked draw is distinct from a valid image transfer.
  fuxi::Operation missing{};missing.renderDraw=true;
@@ -24,7 +25,7 @@ int main(int argc,char **argv){
  refuses([&]{backend.importTexture(host,bytes,2048,width,height,offset);});assert(backend.resourceBytes()==baseline);
  auto *texture=backend.importTexture(host,bytes,row,width,height,offset);
  assert(texture->imported && texture->mapped==host && texture->allocated==bytes && texture->charged==bytes);
- assert(backend.resourceBytes()==baseline+bytes);
+ assert(backend.resourceBytes()==baseline && backend.importedBytes()==importBaseline+bytes); // client pages: the import account
  auto *read=backend.allocate(pixels);fuxi::Operation copy{};copy.texture=texture;copy.dst=read;
  backend.submit({copy});for(size_t y=0;y<height;++y)assert(!memcmp((uint8_t *)host+offset+y*row,(uint8_t *)read->contents+y*width*4,width*4));
  auto *upload=backend.allocate(pixels);memset(upload->contents,0x39,pixels);
@@ -37,6 +38,6 @@ int main(int argc,char **argv){
   assert(!memcmp((uint8_t *)host+offset+y*row+x*4,red,4) && !memcmp((uint8_t *)read->contents+(y*width+x)*4,red,4));}
  for(size_t i=0;i<offset;++i)assert(((uint8_t *)host)[i]==0xa7);
  for(size_t i=offset+row*height;i<bytes;++i)assert(((uint8_t *)host)[i]==0xa7);
- backend.destroy(texture);backend.destroy(read);backend.destroy(upload);free(host);assert(backend.resourceBytes()==baseline);
+ backend.destroy(texture);backend.destroy(read);backend.destroy(upload);free(host);assert(backend.resourceBytes()==baseline && backend.importedBytes()==importBaseline);
  puts("PASS: M9m null-pipeline draw drops/count/schedule, whole-surface HostImport at plane offset/rowbytes, read/upload/clear pixels, sentinels, layout/bounds refusal and budget rollback");
 }
