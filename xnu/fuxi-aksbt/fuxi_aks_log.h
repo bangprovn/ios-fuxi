@@ -86,27 +86,29 @@ fuxi_aks_same_name(const char *a, const char *b)
 static inline struct fuxi_aks_slot *
 fuxi_aks_slot_for(struct fuxi_aks_table *t, int pid, const char *name, unsigned int selector)
 {
-	struct fuxi_aks_slot *s, *free_slot = NULL, *idle = NULL, *oldest = NULL;
+	/* Indices, FUXI_AKS_SLOTS for none: the same code as C and C++ whatever NULL is. */
+	unsigned int free_i = FUXI_AKS_SLOTS, idle_i = FUXI_AKS_SLOTS, oldest_i = FUXI_AKS_SLOTS;
+	struct fuxi_aks_slot *s;
 
 	for (unsigned int i = 0; i < FUXI_AKS_SLOTS; i++) {
 		s = &t->slot[i];
 		if (!s->used) {
-			if (free_slot == NULL) {
-				free_slot = s;
+			if (free_i == FUXI_AKS_SLOTS) {
+				free_i = i;
 			}
 			continue;
 		}
 		if (s->pid == pid && s->selector == selector && fuxi_aks_same_name(s->name, name)) {
 			return s;
 		}
-		if (s->pending == 0 && (idle == NULL || s->last_ns < idle->last_ns)) {
-			idle = s;
+		if (s->pending == 0 && (idle_i == FUXI_AKS_SLOTS || s->last_ns < t->slot[idle_i].last_ns)) {
+			idle_i = i;
 		}
-		if (oldest == NULL || s->last_ns < oldest->last_ns) {
-			oldest = s;
+		if (oldest_i == FUXI_AKS_SLOTS || s->last_ns < t->slot[oldest_i].last_ns) {
+			oldest_i = i;
 		}
 	}
-	s = free_slot != NULL ? free_slot : idle != NULL ? idle : oldest;
+	s = &t->slot[free_i != FUXI_AKS_SLOTS ? free_i : idle_i != FUXI_AKS_SLOTS ? idle_i : oldest_i];
 	t->lost += s->pending;
 	__builtin_memset(s, 0, sizeof(*s));
 	s->used = 1;

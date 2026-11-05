@@ -48,6 +48,12 @@ MODEL = r'''
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__cplusplus)
+#define NOPTR nullptr
+#else
+#define NOPTR ((void *)0)
+#endif
+
 static char out[1 << 16];
 static size_t outlen;
 static unsigned int printed;
@@ -157,8 +163,8 @@ main(void)
 	CHECK(n_bt == 0 && n_print == 2 * FUXI_AKS_FIRST && n_counted == 2 * (3000 - FUXI_AKS_FIRST));
 	call(500, "securityd", 7, (int)0xe00002c7, now + SEC);
 	CHECK(fuxi_aks_report(&table) == 2);
-	CHECK(strstr(out, "SWEET AKS: securityd sel 7: 2993 calls in the last 10 s (rc 0xe00002c7)\n") != NULL);
-	CHECK(strstr(out, "SWEET AKS: securityd sel 35: 2992 calls in the last 10 s (rc 0x0)\n") != NULL);
+	CHECK(strstr(out, "SWEET AKS: securityd sel 7: 2993 calls in the last 10 s (rc 0xe00002c7)\n") != NOPTR);
+	CHECK(strstr(out, "SWEET AKS: securityd sel 35: 2992 calls in the last 10 s (rc 0x0)\n") != NOPTR);
 
 	/* Two processes in a burst at once: their own slots, counts and backtraces. */
 	zero();
@@ -182,14 +188,14 @@ main(void)
 	}
 	CHECK(n_counted == 70 * 2);
 	CHECK(fuxi_aks_report(&table) == FUXI_AKS_SLOTS + 1);
-	CHECK(strstr(out, "SWEET AKS: 12 counted calls lost to slot reuse\n") != NULL);
+	CHECK(strstr(out, "SWEET AKS: 12 counted calls lost to slot reuse\n") != NOPTR);
 	unsigned long long said = 0;
-	for (const char *p = out; (p = strstr(p, " calls in the last ")) != NULL; p++) {
+	for (const char *p = out; (p = strstr(p, " calls in the last ")) != NOPTR; p++) {
 		const char *q = p;
 		while (q > out && q[-1] >= '0' && q[-1] <= '9') {
 			q--;
 		}
-		said += strtoull(q, NULL, 10);
+		said += strtoull(q, NOPTR, 10);
 	}
 	CHECK(said == 64 * 2);
 	/* With nothing counted, a new pair takes the slot least recently used and loses nothing. */

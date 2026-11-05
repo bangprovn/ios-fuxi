@@ -90,6 +90,8 @@ fuxi_aks_user_bt(const char *name, int pid, unsigned int selector, unsigned int 
 	uint64_t load[FUXI_AKS_BT_FRAMES], path[FUXI_AKS_BT_FRAMES];
 	uint64_t base = 0, size = 0, slide = 0, mh;
 	mach_vm_offset_t start = 0;
+	vm_shared_region_t sr;
+	vm_size_t got;
 	struct backtrace_user_info info;
 	char tname[64];
 	char where[FUXI_AKS_BT_PATH];
@@ -108,7 +110,7 @@ fuxi_aks_user_bt(const char *name, int pid, unsigned int selector, unsigned int 
 	    thread_tid(thread), tname, selector, calls, (unsigned long long)get_saved_state_pc(ss),
 	    (unsigned long long)get_saved_state_lr(ss), (unsigned long long)get_saved_state_fp(ss));
 
-	vm_shared_region_t sr = vm_shared_region_get(task);
+	sr = vm_shared_region_get(task);
 	if (sr != NULL) {
 		base = sr->sr_base_address;
 		size = sr->sr_size;
@@ -140,7 +142,7 @@ fuxi_aks_user_bt(const char *name, int pid, unsigned int selector, unsigned int 
 			continue;
 		}
 		/* A path longer than the buffer is printed cut (copyinstr fails but has filled it). */
-		vm_size_t got = 0;
+		got = 0;
 		memset(where, 0, sizeof(where));
 		if (path[i] != 0) {
 			(void)copyinstr((user_addr_t)path[i], where, sizeof(where), &got);
