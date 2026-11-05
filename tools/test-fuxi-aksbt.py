@@ -35,9 +35,9 @@ XNU_WARN = ('-Weverything -Werror -Wno-pedantic -Wno-bad-function-cast -Wno-bitw
             '-Wno-anon-enum-enum-conversion -Wno-error=enum-enum-conversion -Wno-error=c99-designator '
             '-Wno-error=reorder-init-list -Wno-error=declaration-after-statement -Wno-sign-compare -Wno-sign-conversion '
             '-Wpointer-arith '
-            # host-only: newer clang than Xcode 15's
+            # host-only: newer clang than Xcode 15's; Apple clang's warning about /usr/local/include (owner's Mac)
             '-Wno-unsafe-buffer-usage -Wno-reserved-identifier -Wno-reserved-macro-identifier -Wno-pre-c2x-compat '
-            '-Wno-declaration-after-statement').split()
+            '-Wno-declaration-after-statement -Wno-poison-system-directories').split()
 XNU_CXX_WARN = '-Wno-c++98-compat-pedantic -Wno-exit-time-destructors -Wno-global-constructors -Wno-old-style-cast'.split()
 
 MODEL = r'''
