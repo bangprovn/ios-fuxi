@@ -252,6 +252,8 @@ kernel() {
     python3 tools/test-fuxi-pac.py
     python3 tools/sync-fuxi-pac.py --check
     python3 tools/test-fuxi-arm64e.py
+    python3 tools/test-fuxi-aksbt.py
+    python3 tools/sync-fuxi-aksbt.py --check
     if [[ $target == kernel-wlan6g || $target == kernel-metal4wifi ]]; then
         # WLAN source keeps the existing artifact/target and cmdlines. Exercise the
         # exact C carried by patch 0099 before spending a hosted kernel build.

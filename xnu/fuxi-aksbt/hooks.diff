@@ -1,0 +1,40 @@
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -20,6 +20,7 @@
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOUserClient.h>
+ #include <IOKit/IOKitKeys.h>
++#include "fuxi_aks_log.h"      /* the call log's rate limit and burst backtrace */
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOMemoryDescriptor.h>
+ #include <libkern/c++/OSString.h>
+@@ -75,6 +76,7 @@
+ 	if (!IOService::start(provider)) {
+ 		return false;
+ 	}
++	fuxi_aks_log_init();
+ 	setProperty(kIOUserClientClassKey, "AppleKeyStoreUserClient");
+ 	registerService();
+ 	IOLog("SWEET AKS: AppleKeyStore registered (no passcode, unlocked)\n");
+@@ -285,10 +287,7 @@
+ 		break;
+ 	}
+ 
+-	char name[32];
+-	proc_selfname(name, sizeof(name));
+-	IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,
+-	    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
++	fuxi_aks_log(selector, arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
+ 	return ret;
+ }
+ #endif /* SWEET */
+--- a/osfmk/conf/files
++++ b/osfmk/conf/files
+@@ -111,6 +111,7 @@
+ osfmk/kern/ast.c			standard
+ osfmk/kern/audit_sessionport.c		optional config_audit
+ osfmk/kern/backtrace.c			standard
++osfmk/kern/fuxi_aks_bt.c		standard
+ osfmk/kern/btlog.c			standard
+ osfmk/kern/build_config.c		standard
+ osfmk/kern/clock.c			standard
