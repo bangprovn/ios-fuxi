@@ -12,7 +12,13 @@
 /* Internal quotas, independent of the unchanged per-object wire limit. */
 #define FG_ABI_MAX_BOS 1024u
 #define FG_ABI_MAX_WIRED_BYTES (UINT64_C(768) << 20)
-#define FG_ABI_MAX_IMPORTS 512u
+/* Mapped host imports at once, in the backend's global table (fg_abi_imports). Each import is also a BO of the one open client, so that
+ * client's imports stop at FG_ABI_MAX_BOS less its allocated BOs (BoImport stage 3); the rest is room for BOs a closed client left
+ * quarantined (still mapped until reset). v-yuv1 (YouTube in Safari, FuxiMetal d92d25b, two imports per video frame) held the old 512
+ * full in eight windows while BoMap refused 1,294 imports, and the same backboardd fell back to 116-169 once the video page went: a
+ * working set, not a leak. Scans of the table stop at fg_abi_import_top, so the size costs nothing per submit. Kernel-only: no wire
+ * structure or userland (Turnip, FuxiMetal) is sized by it. */
+#define FG_ABI_MAX_IMPORTS 2048u
 /* A BO that does not require one physical run asks for one only up to 128 KiB, and not for 5 s after a failed search of its size or
  * less (UniXNU Adreno740 01ed692, MIT). A search the kernel cannot serve scans every free page first: theirs took 21.7 s over 124
  * failures of 0.1-64 MiB while every success was 64-128 KiB; ours measured 50-58 ms per failed large attempt. A BO that requires one
@@ -32,11 +38,13 @@ static inline void fg_abi_contig_failed(struct fg_abi_contig *c, uint64_t bytes,
 /* Internal: bit 8 of the permissions handed to fuxi_gpu_abi_map_import means NativeAdrenoMapGpuOnly was passed in BoMap.reserved. */
 #define FG_ABI_IMPORT_GPU_ONLY 0x100u
 /* fuxi_gpu_abi_clean_split: what the per-submit import clean cost, by class [GPU-writable, read-only] and size bucket, the KiB GPU_ONLY
- * imports skipped, and the three biggest mapped imports (KiB, permission bits, +16 when GPU_ONLY). */
+ * imports skipped, and the three biggest mapped imports (KiB, permission bits, +16 when GPU_ONLY). import_top: the slots the per-submit
+ * scans walk (fg_abi_import_top). */
 struct fuxi_gpu_clean_split {
  uint64_t kib[2], ns[2], bkt_kib[4], bkt_ns[4], go_kib, mapped_kib, top_kib[3];
  uint64_t dty_checked, dty_dirty, dty_kib, dty_full_kib, dty_check_ns, dty_clean_ns, ivac_ns;
  uint32_t imports, go_imports, top_perm[3], dty_state, dty_imports, submits; /* dty_state: 0 off, 1 untested, 2 active, 3 refused */
+ uint32_t import_top;
 };
 /* Exact direct-selector wire lengths. */
 static inline unsigned fg_abi_input_size(unsigned method)

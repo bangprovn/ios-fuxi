@@ -860,8 +860,9 @@ static void abiSplitReport(const uint64_t *sum, unsigned n, uint64_t lockMax, co
       (unsigned)(cs.dty_check_ns/sb/1000),(unsigned)(cs.dty_check_ns/sb/100)%10,(unsigned)(cs.dty_clean_ns/sb/1000),(unsigned)(cs.dty_clean_ns/sb/100)%10,
       (unsigned)(cs.dty_check_ns/pg),(unsigned)(cs.ivac_ns/sb/1000),(unsigned)(cs.ivac_ns/sb/100)%10);
  }
- IOLog("FUXI GPU ABI: submit_split clean/ok kb rw %u ro %u go_skip %u us rw %u.%u ro %u.%u imports %u gpu_only %u mapped_mb %u\n",
-     (unsigned)(cs.kib[0]/ok),(unsigned)(cs.kib[1]/ok),(unsigned)(cs.go_kib/ok),T1(cs.ns[0],ok),T1(cs.ns[1],ok),cs.imports,cs.go_imports,(unsigned)(cs.mapped_kib>>10));
+ IOLog("FUXI GPU ABI: submit_split clean/ok kb rw %u ro %u go_skip %u us rw %u.%u ro %u.%u imports %u gpu_only %u mapped_mb %u top %u of %u\n",
+     (unsigned)(cs.kib[0]/ok),(unsigned)(cs.kib[1]/ok),(unsigned)(cs.go_kib/ok),T1(cs.ns[0],ok),T1(cs.ns[1],ok),cs.imports,cs.go_imports,(unsigned)(cs.mapped_kib>>10),
+     cs.import_top,FG_ABI_MAX_IMPORTS);
  IOLog("FUXI GPU ABI: submit_split buckets kb/us <64K %u/%u.%u <1M %u/%u.%u <16M %u/%u.%u big %u/%u.%u\n",
      (unsigned)(cs.bkt_kib[0]/ok),T1(cs.bkt_ns[0],ok),(unsigned)(cs.bkt_kib[1]/ok),T1(cs.bkt_ns[1],ok),(unsigned)(cs.bkt_kib[2]/ok),T1(cs.bkt_ns[2],ok),
      (unsigned)(cs.bkt_kib[3]/ok),T1(cs.bkt_ns[3],ok));

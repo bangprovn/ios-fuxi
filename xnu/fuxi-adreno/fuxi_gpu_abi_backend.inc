@@ -20,6 +20,13 @@ static thread_call_data_t fg_client_watchdog;
  * list. Serialize cache handoff with the same GPU lock as submit/retirement.
  * The user client owns these prepared kernel mappings until successful unmap. */
 static struct { uint64_t iova, bytes; uintptr_t source; unsigned permissions, gpu_only, dty_first, dty_pages; } fg_abi_imports[FG_ABI_MAX_IMPORTS];
+/* One past the highest slot that may be live: every slot with iova set is below it. Only fuxi_gpu_abi_map_import raises it (a new slot
+ * is the lowest free one, so live slots stay packed at the bottom) and fg_abi_import_remove lowers it past empty top slots, both under
+ * the GPU lock like every scan. The per-submit clean and the retirement invalidate (fg_abi_import_cache) and the per-unmap search walk
+ * only up to it: about the live count (v-yuv1: 50-220 outside the video page, 512 at most), not the 2048-slot table. Too high is only
+ * slower; it is never lowered past a live slot. */
+static unsigned fg_abi_import_top;
+static int fg_abi_import_top_said; /* fuxi_gpu_abi_clean_split found a live slot above the mark (logged once) */
 static unsigned fg_abi_host_handoff, fg_abi_ncimport, fg_abi_unstick, fg_abi_cohtest, fg_abi_tlbpages, fg_abi_mapwait, fg_abi_queue, fg_abi_roimport, fg_abi_pace;
 /* Queue mode (bit 512): jobs in flight are seq-completed, at most this many; stats: queued, deepest chain, refused for a waiting present, refused full. */
 #define FG_ABI_QUEUE_MAX 4u
@@ -225,13 +232,13 @@ static void fg_abi_import_cache(int complete)
  if (complete && !fg_abi_host_handoff) return;
  __asm__ volatile("dsb sy" ::: "memory");
  if (fg_abi_coh==1) { /* self-test proved CPU/GPU coherence for import-class mappings: no cache maintenance */
-  for (unsigned i=0;i<FG_ABI_MAX_IMPORTS;i++) if (fg_abi_imports[i].iova) fg_abi_skipped+=fg_abi_imports[i].bytes;
+  for (unsigned i=0;i<fg_abi_import_top;i++) if (fg_abi_imports[i].iova) fg_abi_skipped+=fg_abi_imports[i].bytes;
   fg_abi_host_handoff=0;
   return;
  }
  /* A read-only PTE cannot be written by the GPU, so retirement has no stale
   * lines to drop for it; the submit-side clean still covers every import. */
- for (unsigned i=0;i<FG_ABI_MAX_IMPORTS;i++) if (fg_abi_imports[i].iova && (!complete || (fg_abi_imports[i].permissions&2))) {
+ for (unsigned i=0;i<fg_abi_import_top;i++) if (fg_abi_imports[i].iova && (!complete || (fg_abi_imports[i].permissions&2))) {
   /* GPU_ONLY (NativeAdrenoMapGpuOnly): the client promised no CPU access for the mapped lifetime, the range was cleaned at map and is
    * invalidated at unmap, so neither the submit clean nor the retirement invalidate has anything to do. */
   if (fg_abi_imports[i].gpu_only) { fg_abi_skipped+=fg_abi_imports[i].bytes; if (!complete) fg_abi_cc_go+=fg_abi_imports[i].bytes; continue; }
@@ -264,7 +271,7 @@ void fuxi_gpu_import_stats(uint64_t *cleaned, uint64_t *skipped, uint64_t *inval
  FG_GUARD;
  *cleaned=fg_abi_cleaned; *skipped=fg_abi_skipped; *invalidated=fg_abi_invalidated;
  *mapped=0; *imports=0;
- for (unsigned i=0;i<FG_ABI_MAX_IMPORTS;i++) if (fg_abi_imports[i].iova) {
+ for (unsigned i=0;i<fg_abi_import_top;i++) if (fg_abi_imports[i].iova) {
   *mapped+=fg_abi_imports[i].bytes; ++*imports;
  }
 }
@@ -803,12 +810,13 @@ int fuxi_gpu_abi_map_import(uint64_t iova, uintptr_t source, uint64_t bytes, uns
   }
   fg_abi_imports[slot].permissions=permissions; fg_abi_imports[slot].gpu_only=gpu_only;
   fg_abi_imports[slot].source=source; fg_abi_imports[slot].bytes=bytes; fg_abi_imports[slot].iova=iova;
+  if (slot>=fg_abi_import_top) fg_abi_import_top=slot+1;
  }
  return s;
 }
 static void fg_abi_import_remove(uint64_t iova, uint64_t bytes)
 {
- for (unsigned i=0;i<FG_ABI_MAX_IMPORTS;i++)
+ for (unsigned i=0;i<fg_abi_import_top;i++)
   if (fg_abi_imports[i].iova==iova && fg_abi_imports[i].bytes==bytes) {
    /* A GPU_ONLY range was never touched by the CPU after the map-time clean, but a speculative CPU fetch may have cached lines the GPU then
     * overwrote: drop them before the pages go back to the kernel. */
@@ -820,6 +828,7 @@ static void fg_abi_import_remove(uint64_t iova, uint64_t bytes)
    fg_abi_dty_detach(i);
    fg_abi_imports[i].iova=0; fg_abi_imports[i].gpu_only=0;
   }
+ while (fg_abi_import_top && !fg_abi_imports[fg_abi_import_top-1].iova) fg_abi_import_top--;
 }
 static int fg_abi_unmap_locked(uint64_t iova, uint64_t bytes)
 {
@@ -1244,7 +1253,13 @@ void fuxi_gpu_abi_clean_split(struct fuxi_gpu_clean_split *o)
  o->dty_check_ns=fg_abi_dty_st[4]*1000000000ull/f; o->dty_clean_ns=fg_abi_dty_st[5]*1000000000ull/f; o->ivac_ns=fg_abi_dty_st[6]*1000000000ull/f; o->submits=(uint32_t)fg_abi_dty_st[7];
  o->dty_imports=0; for (unsigned i=0;i<FG_ABI_MAX_IMPORTS;i++) if (fg_abi_imports[i].iova && fg_abi_imports[i].dty_first) o->dty_imports++;
  memset(fg_abi_dty_st,0,sizeof(fg_abi_dty_st)-sizeof(fg_abi_dty_st[0]));
+ /* Once per window, the whole table: a live slot at or above fg_abi_import_top (never expected) is reported once and the mark raised,
+  * since the bounded scans would have skipped its cache maintenance. */
  for (unsigned i=0;i<FG_ABI_MAX_IMPORTS;i++) if (fg_abi_imports[i].iova) {
+  if (i>=fg_abi_import_top) {
+   if (!fg_abi_import_top_said) { fg_abi_import_top_said=1; printf("FUXI GPU ABI: import slot %u live above top %u, raised\n",i,fg_abi_import_top); }
+   fg_abi_import_top=i+1;
+  }
   o->imports++; o->mapped_kib+=fg_abi_imports[i].bytes>>10; if (fg_abi_imports[i].gpu_only) o->go_imports++;
   for (unsigned k=0;k<3;k++) if (fg_abi_imports[i].bytes>o->top_kib[k]<<10 || !o->top_kib[k]) {
    for (unsigned j=2;j>k;j--) { o->top_kib[j]=o->top_kib[j-1]; o->top_perm[j]=o->top_perm[j-1]; }
@@ -1252,6 +1267,7 @@ void fuxi_gpu_abi_clean_split(struct fuxi_gpu_clean_split *o)
    break;
   }
  }
+ o->import_top=fg_abi_import_top;
  memset(fg_abi_cc_bytes,0,sizeof(fg_abi_cc_bytes)); memset(fg_abi_cc_ticks,0,sizeof(fg_abi_cc_ticks));
  memset(fg_abi_cc_bb,0,sizeof(fg_abi_cc_bb)); memset(fg_abi_cc_bt,0,sizeof(fg_abi_cc_bt)); fg_abi_cc_go=0;
 }

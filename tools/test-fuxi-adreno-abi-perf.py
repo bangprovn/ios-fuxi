@@ -41,7 +41,7 @@ static unsigned irqStatCalls;
 static unsigned fuxi_gpu_irq_stats(uint64_t s[FG_IRQ_STATS],unsigned *why) {assert(!openLock->held);irqStatCalls++;for(unsigned i=0;i<FG_IRQ_STATS;i++)s[i]=i+1;
  s[FG_IRQ_LAT_N]=4;s[FG_IRQ_LAT_SUM]=4*25300;s[FG_IRQ_LAT_MAX]=91000;*why=4;return 3;}
 static void fuxi_gpu_abi_submit_split(uint64_t ns[8],uint32_t why[5],uint32_t n[2],uint64_t *lm,uint64_t kib[2]) {for(int i=0;i<8;i++)ns[i]=(i+1)*600000;memcpy(why,splitWhy,sizeof(splitWhy));n[0]=900;n[1]=600;*lm=6400000;kib[0]=1200*600;kib[1]=0;}
-static void fuxi_gpu_abi_clean_split(struct fuxi_gpu_clean_split *o) {memset(o,0,sizeof(*o));o->kib[0]=100*600;o->kib[1]=300*600;o->ns[0]=1000*600;o->ns[1]=2500*600;o->go_kib=50*600;o->imports=40;o->go_imports=9;o->mapped_kib=300<<10;
+static void fuxi_gpu_abi_clean_split(struct fuxi_gpu_clean_split *o) {memset(o,0,sizeof(*o));o->kib[0]=100*600;o->kib[1]=300*600;o->ns[0]=1000*600;o->ns[1]=2500*600;o->go_kib=50*600;o->imports=40;o->go_imports=9;o->mapped_kib=300<<10;o->import_top=41;
  o->bkt_kib[0]=10*600;o->bkt_ns[0]=100*600;o->bkt_kib[3]=390*600;o->bkt_ns[3]=3400*600;o->top_kib[0]=65536;o->top_perm[0]=3|16;o->top_kib[1]=16384;o->top_perm[1]=1;o->dty_state=2;o->dty_imports=7;o->submits=600;o->dty_checked=3300*600;o->dty_dirty=40*600;o->dty_kib=640*600;o->dty_full_kib=0;o->dty_check_ns=900000ull*600;o->dty_clean_ns=100000ull*600;o->ivac_ns=300000ull*600;}
 /* The EPSS L3 page for abiL3Report: any write fails the test; one offset can abort. */
 typedef uintptr_t vm_offset_t;typedef uintptr_t vm_size_t;
@@ -109,7 +109,7 @@ int main() {
  assert(strstr(logs[1],"att 900 ok 600 ref 300 (busy/hold/noq/pw/full 1/2/3/4/5)") && strstr(logs[1],"lockwait 4.6 max 6.4") && strstr(logs[1],"refused_us 16.0"));
  assert(strstr(logs[2],"waits/submit by kind: hold 0.0 (0 us each) copy 0.0 (0 us each) other 0.0 (0 us each); event wakes 600 of 1200"));
  assert(strstr(logs[3],"dirty state 2 (2 active 3 refused) tracked_imports 7 submits 600 per submit: pages_checked 3300 dirty 40 kb_cleaned 640 full_kb 0 check_us 900.0 clean_us 100.0 per_page_ns 272 ivac_us 300.0"));
- assert(strstr(logs[4],"clean/ok kb rw 100 ro 300 go_skip 50 us rw 1.0 ro 2.5 imports 40 gpu_only 9 mapped_mb 300"));
+ assert(strstr(logs[4],"clean/ok kb rw 100 ro 300 go_skip 50 us rw 1.0 ro 2.5 imports 40 gpu_only 9 mapped_mb 300 top 41 of 2048"));
  assert(strstr(logs[5],"buckets kb/us <64K 10/0.1 <1M 0/0.0 <16M 0/0.0 big 390/3.4") && strstr(logs[6],"top3 kb/perm 65536/19 16384/1 0/0"));
  for(unsigned l=0;l<8;l++)assert(strlen(logs[l])<300);
  assert(strstr(logs[7],"lock_ max 6.4 ms") && strstr(logs[7]," submit 1/6.4") && !strstr(logs[7]," wait "));

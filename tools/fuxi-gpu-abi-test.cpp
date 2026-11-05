@@ -145,8 +145,10 @@ static int round(io_connect_t c,bool hang)
      hang ? "status reports watchdog loss" : "healthy status unchanged",kr);
  return errors;
 }
-/* Explicit resource stress uses only 16 MiB ordinary + 8 MiB imported backing,
- * in separate phases. Never run automatically through exec-swap host argv. */
+/* Explicit resource stress uses only 16 MiB ordinary + 16 MiB imported backing,
+ * in separate phases. Never run automatically through exec-swap host argv.
+ * Each import is a BO of this client too, so one client maps at most
+ * FG_ABI_MAX_BOS imports even though the kernel's import table holds more. */
 static int limits(io_connect_t c)
 {
  int errors=0;
@@ -167,10 +169,11 @@ static int limits(io_connect_t c)
  }
  if (errors) return errors;
  void *host=nullptr;
- if (posix_memalign(&host,16384,FG_ABI_MAX_IMPORTS*16384)) return line(false,"import stress backing");
- memset(host,0,FG_ABI_MAX_IMPORTS*16384);
+ const unsigned imports=FG_ABI_MAX_IMPORTS<FG_ABI_MAX_BOS ? FG_ABI_MAX_IMPORTS : FG_ABI_MAX_BOS;
+ if (posix_memalign(&host,16384,(size_t)imports*16384)) return line(false,"import stress backing");
+ memset(host,0,(size_t)imports*16384);
  count=0;
- for (;count<FG_ABI_MAX_IMPORTS;count++) {
+ for (;count<imports;count++) {
   NativeAdrenoAbiBoImport import{(uint64_t)(uintptr_t)host+count*16384,16384};
   kr=call(c,16,&import,&reply);
   if (kr || !reply.handle) break;
@@ -179,7 +182,7 @@ static int limits(io_connect_t c)
   NativeAdrenoAbiBoMapReply mapped{};kr=call(c,3,&map,&mapped);
   if (kr || mapped.iova!=map.iova) { errors+=line(false,"stress import map",kr);++count;break; }
  }
- errors+=line(count==FG_ABI_MAX_IMPORTS && !kr && !errors,"512 mapped host imports",kr);
+ errors+=line(count==imports && !kr && !errors,"1024 mapped host imports",kr);
  bool released=true;
  for (unsigned i=0;i<count;i++) {
   NativeAdrenoAbiBoFree release{handles[i]};kr=call(c,4,&release,nullptr);

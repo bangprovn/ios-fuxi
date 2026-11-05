@@ -276,7 +276,7 @@ static void seed(void) {
  fg_abi_live=fg_abi_seq=fg_abi_completed=fg_abi_poisoned=fg_abi_timed_out=0;fg_abi_hang_dumped=0;
  fg_faults=fg_suspends=highReads=rollover=0;
  ticks=tlbs=failTlb=doorbells=enqueued=drains=fault=cacheClean=cacheInvalidate=0;tlbiWrites=failTlbi=cohMode=delays=0;
- memset(fg_abi_imports,0,sizeof(fg_abi_imports));fg_abi_host_handoff=fg_abi_ncimport=ncimportArg=0;fg_abi_coh=fg_abi_coh_tries=0;memset(fg_abi_coh_page,0,sizeof(fg_abi_coh_page));
+ memset(fg_abi_imports,0,sizeof(fg_abi_imports));fg_abi_import_top=0;fg_abi_host_handoff=fg_abi_ncimport=ncimportArg=0;fg_abi_coh=fg_abi_coh_tries=0;memset(fg_abi_coh_page,0,sizeof(fg_abi_coh_page));
  fg_abi_cleaned=fg_abi_skipped=fg_abi_invalidated=0;
  readFault=sreadFault=writeFail=writeCount=logLines=hangLines=0;
  memset(gmuRegs,0,sizeof(gmuRegs));fenceDrops=fenceStuck=gmuReads=gmuWrites=stallLines=0;
@@ -467,22 +467,43 @@ int main(void) {
  assert(fuxi_gpu_abi_poll(fence)==-1 && drains==1 && state==2);
  reset();failTlb=1;assert(fuxi_gpu_abi_submit(addresses,sizes,1,&fence)==-1 && !doorbells && drains==1);
  // Fill every import slot, refuse overflow without publishing a PTE, reuse
- // a slot beyond the old 64-entry limit, then retire/cache and drain all 512.
+ // a slot beyond the old 64- and 512-entry limits, then retire/cache and drain them all.
  reset();
  for(unsigned i=0;i<FG_ABI_MAX_IMPORTS;i++)
   assert(!fuxi_gpu_abi_map_import(0x20000000+i*16384,source+i*16384,16384,3));
- assert(FG_ABI_MAX_IMPORTS>=512);
+ assert(FG_ABI_MAX_IMPORTS>=2048 && fg_abi_import_top==FG_ABI_MAX_IMPORTS);
  assert(fuxi_gpu_abi_map_import(0x30000000,source,16384,3)==-1 && !*fg_abi_leaf(0x30000000));
- assert(!fuxi_gpu_abi_unmap(0x20000000+300*16384,16384));
- assert(!fuxi_gpu_abi_map_import(0x20000000+300*16384,source,16384,3));
+ assert(!fuxi_gpu_abi_unmap(0x20000000+300*16384,16384) && fg_abi_import_top==FG_ABI_MAX_IMPORTS);
+ assert(!fuxi_gpu_abi_map_import(0x20000000+300*16384,source,16384,3) && fg_abi_imports[300].iova);
+ assert(!fuxi_gpu_abi_unmap(0x20000000+1500*16384,16384));
+ assert(!fuxi_gpu_abi_map_import(0x20000000+1500*16384,source,16384,3) && fg_abi_imports[1500].iova);
  assert(!fuxi_gpu_abi_submit(addresses,sizes,1,&fence));
  assert(cacheClean==FG_ABI_MAX_IMPORTS*256);
  complete();assert(!fuxi_gpu_abi_poll(fence) && cacheInvalidate==cacheClean);
  for(unsigned i=0;i<FG_ABI_MAX_IMPORTS;i++) {
   assert(!fuxi_gpu_abi_unmap(0x20000000+i*16384,16384));
   assert(!fg_abi_imports[i].iova);
+  assert(fg_abi_import_top==(i+1<FG_ABI_MAX_IMPORTS ? FG_ABI_MAX_IMPORTS : 0)); /* the last slot holds the mark until it goes */
  }
- puts("PASS: all 512 import slots, overflow refusal, high-slot reuse, full cache retirement and unmap");
+ fprintf(stdout,"PASS: all %u import slots, overflow refusal, high-slot reuse, full cache retirement and unmap\n",FG_ABI_MAX_IMPORTS);
+ // The scans stop at fg_abi_import_top: it follows the highest live slot down past holes, a new import takes the lowest free slot,
+ // the submit clean and the retirement invalidate still cover every live import under it, and a live slot found above it (never
+ // expected) is reported by the per-window stats and raises it.
+ reset();
+ for(unsigned i=0;i<3;i++) assert(!fuxi_gpu_abi_map_import(0x20000000+i*16384,source+i*16384,16384,3));
+ assert(fg_abi_import_top==3);
+ assert(!fuxi_gpu_abi_unmap(0x20000000+2*16384,16384) && fg_abi_import_top==2);
+ assert(!fuxi_gpu_abi_unmap(0x20000000,16384) && fg_abi_import_top==2); /* slot 1 still live */
+ assert(!fuxi_gpu_abi_submit(addresses,sizes,1,&fence) && cacheClean==256);
+ complete();assert(!fuxi_gpu_abi_poll(fence) && cacheInvalidate==256);
+ assert(!fuxi_gpu_abi_map_import(0x20000000+5*16384,source,16384,3) && fg_abi_imports[0].iova==0x20000000+5*16384 && fg_abi_import_top==2);
+ assert(!fuxi_gpu_abi_unmap(0x20000000+16384,16384) && fg_abi_import_top==1);
+ {fg_abi_imports[7]=fg_abi_imports[0];fg_abi_imports[7].iova=0x20000000+7*16384; /* a slot the scans cannot see */
+  struct fuxi_gpu_clean_split cs;fuxi_gpu_abi_clean_split(&cs);
+  assert(cs.imports==2 && cs.import_top==8 && fg_abi_import_top==8 && strstr(lastLog,"FUXI GPU ABI: import slot 7 live above top 1, raised"));
+  fg_abi_imports[7].iova=0;}
+ assert(!fuxi_gpu_abi_unmap(0x20000000+5*16384,16384) && !fg_abi_imports[0].iova && fg_abi_import_top==0);
+ puts("PASS: import scans bounded by the highest live slot, holes, lowest-slot reuse, stats raise a stale mark");
  // Indirectly referenced imported BOs must participate, even though the IB
  // itself lives in a different ordinary BO. Watchdog retires without WaitFence.
  reset();
